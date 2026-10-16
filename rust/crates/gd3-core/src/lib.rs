@@ -7,6 +7,7 @@ pub mod ed2k;
 pub mod filename;
 pub mod ghd;
 pub mod github;
+pub mod hls;
 pub mod http_pack;
 pub mod m3u8;
 pub mod store;
