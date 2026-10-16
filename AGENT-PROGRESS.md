@@ -143,3 +143,24 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   FAILED+ERROR 集合 diff 为空（38 条 = 基线 android_config_parity / github_probe /
   runtime_install + android 系列 errors，与基线一致）。本轮基线计数从 846P 涨到 933P
   = 本步 21 + 此前各步累计新增测试。
+
+## 2026-10-16 第 9 步（commit 4178f2d，第 2 轮）
+- 做了什么：hf `parse` 的 entries → files 纯变换层下沉 Rust 影子分支
+  （`GD3_RUST_HF_FILES`，默认关）。
+  - `gd3_net::hf::build_files(entries, base, repo_id, repo_type, revision)`：
+    镜像 `for i, entry in enumerate(entries)` 循环——`path` 缺失为空串（不报错）、
+    `size` 缺失为 0、`lfs` 为对象且带 `size` 时覆盖（lfs 缺 size 键保留原值）；
+    `file_url`/`type_prefix` 镜像 `_fileUrl`（dataset→datasets/、space→spaces/）。
+    内嵌单测 1 项（含 lfs=非 dict、lfs={}、只写 size 条目的 URL 尾斜杠形态）。
+  - PyO3 `hf_build_files`（depythonize 收 Vec<serde_json::Value>，返回
+    (path, size, downloadUrl) 元组列）+ `features/huggingface_pack/rust_files.py`
+    适配器 + `pack.py` 接线（`base` 提前到 apiUrl 计算处，复用同一值）。
+  - `tests/test_hf_files.py`：11 case（10 参数化 + 边界组），独立 pyRef，双模式
+    各跑一遍全过（11 + 11 passed）。
+- 验证：fmt 0；clippy 0；cargo test 0 failed；maturin develop 重建后桥冒烟正确
+  （dataset 前缀 + lfs 覆盖逐条核对）；双模式全量回归单独跑两轮：
+  开关关 / GD3_RUST_HF_FILES=1 均 **3 failed / 944 passed / 8 skipped / 35 errors**，
+  FAILED+ERROR 集合 diff 为空（与基线一致；933→944P = 本步 11 + 上轮收口的 bili URL 测试 21→已计入…——
+  修正：+11 即本步新增）。
+- 下一步：按 `rust/README.md`「下一步的顺序」剩余可下沉项（bili/github 其余解析层 }),
+  之后就是 UI（Phase 7 Slint）与 cfg 伴生工作。
