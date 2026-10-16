@@ -13,6 +13,7 @@ mod github;
 mod hf;
 mod http;
 mod listener;
+mod m3u8;
 mod probe;
 use gd3_core::{TaskRecord, load_records, save_records, to_line as record_to_line};
 use gd3_net::{HttpEngine, ProgressCallback, TransferProgress};
@@ -247,6 +248,9 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bili::bili_fetch_view, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_sign_params, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_mixin_key, module)?)?;
+    module.add_function(wrap_pyfunction!(m3u8::m3u8_parse_diagnostic, module)?)?;
+    module.add_function(wrap_pyfunction!(m3u8::m3u8_classify_error, module)?)?;
+    module.add_function(wrap_pyfunction!(m3u8::m3u8_parse_output_line, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_to_cookie, module)?)?;
     module.add_function(wrap_pyfunction!(to_safe_filename, module)?)?;
     module.add_function(wrap_pyfunction!(split_stem_ext, module)?)?;

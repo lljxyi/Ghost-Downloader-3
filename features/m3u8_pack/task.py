@@ -64,14 +64,15 @@ UNHANDLED_PATTERN = re.compile(
 )
 
 
-def parseError(output: str, returncode: int) -> TaskError:
+def parseErrorPython(output: str, returncode: int) -> TaskError:
+    """纯 Python 参考实现（`GD3_RUST_M3U8_OUTPUT` 关闭时走这条）。"""
     lowered = output.lower()
     for needle, message in ERROR_HINTS:
         if needle in lowered:
-            detail = parseDiagnostic(output)
+            detail = parseDiagnosticPython(output)
             return TaskError(message, detail=detail)
 
-    detail = parseDiagnostic(output)
+    detail = parseDiagnosticPython(output)
     return TaskError(
         "进程异常退出（{code}）：{detail}",
         code=returncode,
@@ -79,7 +80,17 @@ def parseError(output: str, returncode: int) -> TaskError:
     )
 
 
-def parseDiagnostic(output: str) -> str:
+def parseError(output: str, returncode: int) -> TaskError:
+    from .rust_output import isEnabled as rustOutputEnabled
+    from .rust_output import parseError as rustParseError
+
+    if rustOutputEnabled():
+        return rustParseError(output, returncode)
+    return parseErrorPython(output, returncode)
+
+
+def parseDiagnosticPython(output: str) -> str:
+    """纯 Python 参考实现（`GD3_RUST_M3U8_OUTPUT` 关闭时走这条）。"""
     last = ""
     for m in LOG_LINE_PATTERN.finditer(output):
         last = m.group(2).strip()
@@ -90,6 +101,15 @@ def parseDiagnostic(output: str) -> str:
         return last
     m = UNHANDLED_PATTERN.search(output)
     return m.group(1).strip() if m else ""
+
+
+def parseDiagnostic(output: str) -> str:
+    from .rust_output import isEnabled as rustOutputEnabled
+    from .rust_output import parseDiagnostic as rustParseDiagnostic
+
+    if rustOutputEnabled():
+        return rustParseDiagnostic(output)
+    return parseDiagnosticPython(output)
 
 
 @dataclass(kw_only=True, eq=False)
@@ -288,7 +308,8 @@ class M3U8TaskStep(TaskStep):
 
         return args
 
-    def _parseOutputLine(self, line: str):
+    def _parseOutputLinePython(self, line: str):
+        """纯 Python 参考实现（`GD3_RUST_M3U8_OUTPUT` 关闭时走这条）。"""
         text = line.strip()
         if not text:
             return
@@ -327,6 +348,15 @@ class M3U8TaskStep(TaskStep):
             self.liveTotal = recordMatch.group(2)
             self.liveStatus = recordMatch.group(3)
             self.speed = 0 if recordMatch.group(4) == "-" else toBytes(recordMatch.group(5), recordMatch.group(6))
+
+    def _parseOutputLine(self, line: str):
+        from .rust_output import applyOutputLine as rustApplyOutputLine
+        from .rust_output import isEnabled as rustOutputEnabled
+
+        if rustOutputEnabled():
+            rustApplyOutputLine(self, line)
+            return
+        self._parseOutputLinePython(line)
 
     async def _readOutput(self, stream: asyncio.StreamReader):
         rawChunks = []
