@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 mod browser;
 mod listener;
+mod probe;
 fn to_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -222,6 +223,8 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load_lines, module)?)?;
     module.add_function(wrap_pyfunction!(save_lines, module)?)?;
     module.add_function(wrap_pyfunction!(http_run, module)?)?;
+    module.add_function(wrap_pyfunction!(probe::probe, module)?)?;
+    module.add_class::<probe::ProbeOutcome>()?;
     module.add_function(wrap_pyfunction!(to_safe_filename, module)?)?;
     module.add_function(wrap_pyfunction!(split_stem_ext, module)?)?;
     module.add_class::<HttpOutcome>()?;

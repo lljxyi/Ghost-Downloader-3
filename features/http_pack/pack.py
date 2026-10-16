@@ -223,7 +223,9 @@ class HttpParser(TaskParser):
                 canUseRangeRequests=options.canUseRangeRequests,
             )
         else:
-            file = await probe(options)
+            from .rust_probe import isEnabled as rustProbeEnabled, probe as rustProbe
+
+            file = await (rustProbe(options) if rustProbeEnabled() else probe(options))
         return buildTask(options, file)
 
 
