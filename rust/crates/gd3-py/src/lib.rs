@@ -7,9 +7,11 @@
 //!
 //! Python 仍然拥有领域对象与调度，产出的文件与纯 Python 路径一致。
 
+mod bili;
 mod browser;
 mod github;
 mod hf;
+mod http;
 mod listener;
 mod probe;
 use gd3_core::{TaskRecord, load_records, save_records, to_line as record_to_line};
@@ -232,10 +234,14 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(github::github_is_file_url, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_match_file, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_proxy_headers, module)?)?;
-    module.add_class::<probe::ProbeOutcome>()?;
+    module.add_function(wrap_pyfunction!(http::http_parser_match, module)?)?;
+    module.add_function(wrap_pyfunction!(http::http_parser_match_passive, module)?)?;
+    module.add_function(wrap_pyfunction!(bili::bili_build_fnval, module)?)?;
+    module.add_function(wrap_pyfunction!(bili::bili_parse_dash, module)?)?;
     module.add_function(wrap_pyfunction!(to_safe_filename, module)?)?;
     module.add_function(wrap_pyfunction!(split_stem_ext, module)?)?;
     module.add_class::<HttpOutcome>()?;
+    module.add_class::<probe::ProbeOutcome>()?;
     module.add_class::<listener::Aria2Listener>()?;
     module.add_class::<browser::BrowserListener>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;

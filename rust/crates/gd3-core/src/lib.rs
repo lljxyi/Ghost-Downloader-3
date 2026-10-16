@@ -6,6 +6,7 @@ pub mod container;
 pub mod filename;
 pub mod ghd;
 pub mod github;
+pub mod http_pack;
 pub mod store;
 pub mod task;
 pub mod task_error;

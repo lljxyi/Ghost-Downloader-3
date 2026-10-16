@@ -215,10 +215,20 @@ class HttpParser(TaskParser):
     priority = 100
 
     def match(self, options: TaskOptions) -> bool:
-        return urlparse(options.url).scheme.lower() in {"http", "https"}
+        from .rust_match import isEnabled as rustMatchEnabled, match as rustMatch
+
+        url = options.url
+        if rustMatchEnabled():
+            return rustMatch(url)
+        return urlparse(url).scheme.lower() in {"http", "https"}
 
     def matchPassive(self, options: TaskOptions) -> bool:
-        parsed = urlparse(options.url)
+        from .rust_match import isEnabled as rustMatchEnabled, matchPassive as rustMatchPassive
+
+        url = options.url
+        if rustMatchEnabled():
+            return rustMatchPassive(url)
+        parsed = urlparse(url)
         if parsed.scheme.lower() not in {"http", "https"}:
             return False
         path = parsed.path.lower()

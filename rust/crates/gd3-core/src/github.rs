@@ -24,16 +24,17 @@ const GITHUB_HOSTS: [&str; 10] = [
 ];
 
 /// 极简 `urlparse` 子集：`hostname` 与 lowercase 之后的 `path`。
-struct ParsedUrl {
-    scheme: String,
-    host: String,
-    path: String,
+pub(crate) struct ParsedUrl {
+    pub(crate) scheme: String,
+    pub(crate) host: String,
+    pub(crate) path: String,
 }
 
-/// 与 Python `urlparse(url)` 在三个字段上等价的最小解析。
+/// 与 Python `urlparse(url)` 在三个字段上等价的最小解析（`pub(crate)`：
+/// `http_pack` 的 `HttpParser.match` / `matchPassive` 复用它）。
 ///
 /// 没有 `://` 的输入不会产生 host（Python 里这种输入的 `netloc` 为空）。
-fn parse_url(url: &str) -> ParsedUrl {
+pub(crate) fn parse_url(url: &str) -> ParsedUrl {
     let colon = url.find(':');
     let (scheme, rest) = match colon {
         Some(idx) => {
