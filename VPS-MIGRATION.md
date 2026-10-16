@@ -192,3 +192,104 @@ Python 实现的白盒测试（ENOSPC、停滞恢复、死连接重试），它�
 probe 的**网络层**（`bytes=1-1` 主探 + `bytes=0-0` 兜底 + 416 分支）需要给
 `tests/support/test_server.rs` 加一个「自定义响应头」模式，然后写集成测试；
 之后是 PyO3 桥 + `GD3_RUST_PROBE` 影子开关 + 双模式回归。
+
+
+---
+
+## 运营提示：给自动化 agent 的补充指令（每轮都要看）
+
+这一节是运维方（人类）随时会追加指令的地方，**每轮开工都读一遍**。
+
+### 1. 先固化基线，别再追偶发失败
+
+开工第一件事：跑一次全量测试，把失败集合存下来，之后只做对比：
+
+```bash
+cd /root/Ghost-Downloader-3
+.venv/bin/python -m pytest -q 2>&1 | grep -E '^(FAILED|ERROR)' | sort > /root/baseline-failures.txt
+wc -l /root/baseline-failures.txt
+```
+
+**已知偶发（不是回归，别去修，更不要反复重跑）**：
+
+- `tests/test_engine_listeners.py::test_stopping_the_engine_releases_both_ports[asyncio]`
+- `tests/test_engine_listeners.py::test_stopping_the_engine_releases_both_ports[uvloop]`
+
+这两项在本机会随机失败（端口释放时序 + gc 资源清理），同一份代码重跑会时过时不过。
+**判定标准：只要失败项都在 `/root/baseline-failures.txt` 里，就算通过。**
+不要为了确认它而把同一条命令跑十几遍 —— 那是纯粹的浪费。
+
+跑测试时**别只 `tail -1`**：摘要行会被 `ResourceWarning` 之类的东西挤掉，
+要留失败明细就用 `2>&1 | grep -E '^(FAILED|ERROR)|passed|failed'`。
+
+### 2. 改文件别用「反复 Edit 猜行号」
+
+Edit 工具的行号锚点很容易失效，本项目里已经多次因此整回合中止
+（错误码 `MUTATION_RETRY_BUDGET_EXHAUSTED`）。优先级：
+
+1. **整块重写文件**（最稳）；
+2. 用脚本做**精确字符串替换 + 唯一性断言**，例如：
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+p = Path("some/file.rs")
+text = p.read_text(encoding="utf-8")
+old = "精确的原文片段"
+assert text.count(old) == 1, f"锚点匹配 {text.count(old)} 次"
+p.write_text(text.replace(old, "新内容"), encoding="utf-8")
+PY
+```
+
+3. 实在要用 Edit，就**每次改完立刻重读文件**再算下一处行号。
+
+### 3. 进度笔记是硬要求
+
+每完成一个可验证的步骤，**立刻**追加到 `AGENT-PROGRESS.md`（不是攒到最后）：
+
+```markdown
+## 第 N 步 — <一句话>
+- 改动：<文件 + 做了什么>
+- 验证：<命令 + 结果数字>
+- 下一步：<下一件事>
+- 卡点：<没有就写「无」>
+```
+
+没有进度笔记，运维方就无法判断你在推进还是在原地打转。
+
+### 4. 小步提交
+
+每完成一个小步骤（哪怕只是一个文件接通）就 `git commit`。
+回合被中止时未提交的工作很容易在下一轮被覆盖或遗忘。**仍然不要 `git push`。**
+
+### 5. 里程碑切细（重要）
+
+不要把一个里程碑当成一整块做。**每完成一小步就验证 + 提交**，这样即使回合被中止，
+已完成的成果也不会丢。以 milestone 1 为例，应当拆成：
+
+| 小步 | 完成标准 | 验证方式 |
+|---|---|---|
+| 1a | `gd3-py` 能导出 probe，Python 侧 `import` 成功 | `.venv/bin/python -c "from ghost_downloader_rust import probe"` 不报错 |
+| 1b | `GD3_RUST_PROBE=1` 时 `pack.py` 走 Rust 分支 | 开/关开关各跑一次 http_pack 相关测试 |
+| 1c | 双模式回归：失败集合与基线完全一致 | 对比 `/root/baseline-failures.txt` |
+
+**每完成一个小步就 `git commit`**，commit message 写清「做了什么 + 验证命令 + 结果数字」。
+
+### 6. 提交粒度（硬要求）
+
+**每接通一个文件就提交一次**，不要攒到里程碑结束。
+
+- 新建文件后 → 提交
+- 一个文件改完且质量门通过 → 提交
+- 回合结束前 → 确认没有「改了一半但没提交」的文件
+
+理由：回合可能因 Edit 失败、连接中断、超时被中止；未提交的改动在下一轮很容易
+被覆盖或遗忘。**仍然不要 `git push`。**
+
+### 7. 回合内自检清单
+
+每轮结束前确认：
+
+1. `git status` 里没有「改了一半」的文件（要么提交，要么还原）
+2. `AGENT-PROGRESS.md` 已追加本轮的进展
+3. 仓库处于可编译、测试全绿状态

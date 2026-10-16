@@ -41,6 +41,15 @@ class RemoteFile:
 
 
 async def probe(options: TaskOptions) -> RemoteFile:
+    """探测一个 URL。`GD3_RUST_PROBE=1` 时交给 Rust，否则走 Python 实现。"""
+    from .rust_probe import isEnabled as rustProbeEnabled, probe as rustProbe
+
+    if rustProbeEnabled():
+        return await rustProbe(options)
+    return await probePython(options)
+
+
+async def probePython(options: TaskOptions) -> RemoteFile:
     url = options.url
     headers = dict(options.headers)
     userAgent = options.userAgent
@@ -223,9 +232,7 @@ class HttpParser(TaskParser):
                 canUseRangeRequests=options.canUseRangeRequests,
             )
         else:
-            from .rust_probe import isEnabled as rustProbeEnabled, probe as rustProbe
-
-            file = await (rustProbe(options) if rustProbeEnabled() else probe(options))
+            file = await probe(options)
         return buildTask(options, file)
 
 
