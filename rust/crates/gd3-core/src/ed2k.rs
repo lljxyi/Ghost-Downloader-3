@@ -251,7 +251,9 @@ fn type_error_subscript(value: &Value) -> ProgressParseError {
         Value::Array(_) => {
             ProgressParseError::Type("list indices must be integers or slices, not str".into())
         }
-        Value::String(_) => ProgressParseError::Type("string indices must be integers".into()),
+        Value::String(_) => {
+            ProgressParseError::Type("string indices must be integers, not 'str'".into())
+        }
         other => ProgressParseError::Type(format!(
             "'{}' object is not subscriptable",
             py_type_name(other)
@@ -267,7 +269,7 @@ fn parse_sources(sources: &Value) -> Result<Vec<[Value; 6]>, ProgressParseError>
         Value::Object(map) => {
             if map.keys().next().is_some() {
                 return Err(ProgressParseError::Type(
-                    "string indices must be integers".into(),
+                    "string indices must be integers, not 'str'".into(),
                 ));
             }
             Ok(Vec::new())
@@ -276,7 +278,7 @@ fn parse_sources(sources: &Value) -> Result<Vec<[Value; 6]>, ProgressParseError>
         Value::String(text) if text.is_empty() => Ok(Vec::new()),
         // 非空字符串：Python 迭代得到字符，首个元素下标取值即失败。
         Value::String(_) => Err(ProgressParseError::Type(
-            "string indices must be integers".into(),
+            "string indices must be integers, not 'str'".into(),
         )),
         other => Err(ProgressParseError::Type(format!(
             "'{}' object is not iterable",
@@ -306,11 +308,13 @@ pub fn parse_progress(message: &Value) -> Result<ProgressShape, ProgressParseErr
         Value::Object(object) => object,
         other => return Err(type_error_subscript(other)),
     };
-    let sources = parse_sources(&field_of(object, "sources")?)?;
+    // Python 原实现按关键字求值顺序：10 个普通字段先于 `sources=`，
+    // 所以两者同时缺坏时 KeyError/TypeError 必须先报字段再报 sources。
     let mut fields = PROGRESS_FIELDS
         .iter()
         .map(|key| field_of(object, key))
         .collect::<Result<Vec<_>, _>>()?;
+    let sources = parse_sources(&field_of(object, "sources")?)?;
     let held_until = fields.pop().expect("10 个字段");
     let held_sources = fields.pop().expect("10 个字段");
     let active_peers = fields.pop().expect("10 个字段");
@@ -462,55 +466,99 @@ mod tests {
 
     #[test]
     fn progress_failures_follow_python_messages() {
-        let missing_sources = serde_json::json!({"hash": "h"});
-        assert_eq!(
-            parse_progress(&missing_sources),
-            Err(ProgressParseError::Key("sources"))
-        );
-
         let full = serde_json::json!({
             "hash": "h", "size": 1, "received": 2, "downloadRate": 3, "uploadRate": 4,
             "uploaded": 5, "peers": 6, "activePeers": 7, "heldSources": 8, "heldUntil": 9,
             "sources": [{"address": "a:1", "software": "s", "status": "ok"}],
         });
-        assert_eq!(parse_progress(&full), Err(ProgressParseError::Key("rank")));
+        let fields_of = |sources| {
+            serde_json::json!({
+                "hash": "h", "size": 1, "received": 2, "downloadRate": 3, "uploadRate": 4,
+                "uploaded": 5, "peers": 6, "activePeers": 7, "heldSources": 8, "heldUntil": 9,
+                "sources": sources,
+            })
+        };
 
-        let alone = serde_json::json!({"sources": [1]});
+        // 字段阶段先于 sources 阶段（Python 关键字求值顺序，2026-XX 实证：
+        // {"hash":"h"} → KeyError 'size'，{"sources":[1]} → KeyError 'hash'）
         assert_eq!(
-            parse_progress(&alone),
-            Err(ProgressParseError::Type(
-                "'int' object is not subscriptable".to_string()
-            ))
+            parse_progress(&serde_json::json!({"hash": "h"})),
+            Err(ProgressParseError::Key("size"))
+        );
+        assert_eq!(
+            parse_progress(&serde_json::json!({})),
+            Err(ProgressParseError::Key("hash"))
+        );
+        let mut missing_sources = full.clone();
+        missing_sources.as_object_mut().unwrap().remove("sources");
+        assert_eq!(
+            parse_progress(&missing_sources),
+            Err(ProgressParseError::Key("sources"))
         );
 
-        let text = serde_json::json!({"sources": "ab"});
-        assert_eq!(
-            parse_progress(&text),
-            Err(ProgressParseError::Type(
-                "string indices must be integers".to_string()
-            ))
+        // sources 阶段（10 字段齐全，屏蔽字段阶段干扰）
+        let expect_type = |sources, message: &str| {
+            assert_eq!(
+                parse_progress(&fields_of(sources)),
+                Err(ProgressParseError::Type(message.to_string())),
+                "sources case"
+            );
+        };
+        // 元素下标错误：int / bool / NoneType / float → … is not subscriptable
+        expect_type(serde_json::json!([1]), "'int' object is not subscriptable");
+        expect_type(
+            serde_json::json!([serde_json::Value::Null]),
+            "'NoneType' object is not subscriptable",
         );
-
-        let empty_text = serde_json::json!({
-            "hash": "h", "size": 1, "received": 2, "downloadRate": 3, "uploadRate": 4,
-            "uploaded": 5, "peers": 6, "activePeers": 7, "heldSources": 8, "heldUntil": 9,
-            "sources": "",
-        });
+        // str 与 list 元素 → indices 文案（str 带 ", not 'str'" 尾巴，CPython 3.13 实测）
+        expect_type(
+            serde_json::json!(["ab"]),
+            "string indices must be integers, not 'str'",
+        );
+        expect_type(
+            serde_json::json!([[1]]),
+            "list indices must be integers or slices, not str",
+        );
+        // sources 不可迭代
+        expect_type(serde_json::json!(5), "'int' object is not iterable");
+        expect_type(serde_json::json!(true), "'bool' object is not iterable");
+        // 空 sources（零循环）成功返回零来源；dict 迭代得键并立即下标失败
         assert!(
-            parse_progress(&empty_text)
+            parse_progress(&fields_of(serde_json::json!("")))
                 .expect("空串零循环")
                 .sources
                 .is_empty()
         );
-
-        let lone = serde_json::json!({"sources": 5});
+        assert!(
+            parse_progress(&fields_of(serde_json::json!({})))
+                .expect("空 dict 零循环")
+                .sources
+                .is_empty()
+        );
+        expect_type(
+            serde_json::json!({"a": 1}),
+            "string indices must be integers, not 'str'",
+        );
+        // source 缺字段按 SOURCE_FIELDS 顺序报第一个缺失
+        let mut missing_software = full.clone();
+        let first = missing_software
+            .as_object_mut()
+            .unwrap()
+            .get_mut("sources")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .get_mut(0)
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        first.remove("software");
         assert_eq!(
-            parse_progress(&lone),
-            Err(ProgressParseError::Type(
-                "'int' object is not iterable".to_string()
-            ))
+            parse_progress(&missing_software),
+            Err(ProgressParseError::Key("software"))
         );
 
+        // 根值不是 dict
         let not_dict = serde_json::json!([1]);
         assert_eq!(
             parse_progress(&not_dict),
