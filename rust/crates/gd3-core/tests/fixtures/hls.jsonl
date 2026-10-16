@@ -1,0 +1,75 @@
+{"name": "vod_basic", "body": "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:5.5,\ntitle\nseg1.ts\n#EXT-X-ENDLIST\n", "is_endlist": true, "segment_count": 1, "variants": []}
+{"name": "live_no_endlist", "body": "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:1,\na.ts\n#EXTINF:2,\nb.ts\n", "is_endlist": false, "segment_count": 2, "variants": []}
+{"name": "trailing_extinf", "body": "#EXTM3U\n#EXTINF:5.5,\nseg1.ts\n#EXTINF:3,\n", "is_endlist": false, "segment_count": 2, "variants": []}
+{"name": "trailing_byterange", "body": "#EXTM3U\n#EXT-X-BYTERANGE:4500@0\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "byterange_with_uri", "body": "#EXTM3U\n#EXT-X-BYTERANGE:4500@0\nseg1.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "empty_body", "body": "", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "only_text", "body": "seg1.ts\nseg2.ts\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "comments_only", "body": "# just a comment\n# another\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "blank_after_extinf", "body": "#EXTM3U\n#EXTINF:1,\n   \na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "blank_between", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": null, "frame_rate": null}]}
+{"name": "crlf", "body": "#EXTM3U\r\n#EXT-X-ENDLIST\r\n#EXTINF:1,\r\na.ts\r\n", "is_endlist": true, "segment_count": 1, "variants": []}
+{"name": "padded_body", "body": "  #EXTM3U\n#EXTINF:1,\na.ts\n\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "stream_inf_blank_crlf", "body": "#EXTM3U\r\n\r\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=16x16\r\n\r\nv.m3u8\r\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": 16, "height": 16, "codecs": null, "frame_rate": null}]}
+{"name": "media_sequence_underscore", "body": "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:99_0\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "media_sequence_bad", "body": "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:1e2\n", "error": "ValueError: invalid literal for int() with base 10: '1e2'"}
+{"name": "media_sequence_negative", "body": "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:-5\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "targetduration_bad", "body": "#EXTM3U\n#EXT-X-TARGETDURATION:5.5\n", "error": "ValueError: invalid literal for int() with base 10: '5.5'"}
+{"name": "targetduration_underscore", "body": "#EXTM3U\n#EXT-X-TARGETDURATION:6_0\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "disc_seq_bad", "body": "#EXTM3U\n#EXT-X-DISCONTINUITY-SEQUENCE:02x\n", "error": "ValueError: invalid literal for int() with base 10: '02x'"}
+{"name": "bitrate_bad", "body": "#EXTM3U\n#EXT-X-BITRATE:abc\n", "error": "ValueError: invalid literal for int() with base 10: 'abc'"}
+{"name": "version_underscore", "body": "#EXTM3U\n#EXT-X-VERSION:1_2\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "version_no_colon", "body": "#EXTM3U\n#EXT-X-VERSION\n", "error": "ValueError: not enough values to unpack (expected 2, got 1)"}
+{"name": "allow_cache_bad", "body": "#EXTM3U\n#EXT-X-ALLOW-CACHE:no\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "allow_cache_blank_value", "body": "#EXTM3U\n#EXT-X-ALLOW-CACHE:\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "allow_cache_no_colon", "body": "#EXTM3U\n#EXT-X-ALLOW-CACHE\n", "error": "ValueError: not enough values to unpack (expected 2, got 1)"}
+{"name": "playlist_type_no_colon", "body": "#EXTM3U\n#EXT-X-PLAYLIST-TYPE\n", "error": "ValueError: not enough values to unpack (expected 2, got 1)"}
+{"name": "discontinuity_cue", "body": "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:1,\na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "media_tag_silent", "body": "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",NAME=\"Track\"\n#EXTINF:1,\na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "unknown_tags", "body": "#EXTM3U\n#EXT-X-DATERANGE:ID=x\n#FOO:bar\n#EXTINF:1,\na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "images_only", "body": "#EXTM3U\n#EXT-X-IMAGES-ONLY\n#EXT-X-ENDLIST\n", "is_endlist": true, "segment_count": 0, "variants": []}
+{"name": "tile_tags", "body": "#EXTM3U\n#EXT-X-TILES:RESOLUTION=320x180,LAYOUT=5x5,DURATION=6.006\n#EXTINF:1,\na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "key_basic", "body": "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"x.key\",IV=0xdead\n#EXTINF:1,\na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "key_duplicates", "body": "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k1\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"k1\"\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "key_missing_method", "body": "#EXTM3U\n#EXT-X-KEY:URI=\"x.key\"\n#EXTINF:1,\na.ts\n", "error": "TypeError: Key.__init__() missing 1 required positional argument: 'method'"}
+{"name": "key_missing_equals", "body": "#EXTM3U\n#EXT-X-KEY:METHODAES\n", "error": "ValueError: not enough values to unpack (expected 2, got 1)"}
+{"name": "key_empty_params", "body": "#EXTM3U\n#EXT-X-KEY:\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "key_weird_name", "body": "#EXTM3U\n#EXT-X-KEY:=\n", "error": "TypeError: Key.__init__() missing 1 required positional argument: 'method'"}
+{"name": "key_next_segment", "body": "#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXT-X-KEY:URI=\"x.key\"\n#EXTINF:1,\nfirstseg.ts\n", "error": "TypeError: Key.__init__() missing 1 required positional argument: 'method'"}
+{"name": "key_method_none_after_key", "body": "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:1,\nfirstseg.ts\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:2,\nsecondseg\n", "is_endlist": false, "segment_count": 2, "variants": []}
+{"name": "extinf_no_comma", "body": "#EXTM3U\n#EXTINF:5.5\na.ts\n", "is_endlist": false, "segment_count": 1, "variants": []}
+{"name": "extinf_empty_duration", "body": "#EXTM3U\n#EXTINF:,t\na.ts\n", "error": "ValueError: could not convert string to float: ''"}
+{"name": "extinf_negative", "body": "#EXTM3U\n#EXT-X-ENDLIST\n#EXTINF:-1.5,\na.ts\n", "is_endlist": true, "segment_count": 1, "variants": []}
+{"name": "master_basic", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=1920x1080,CODECS=\"avc1.4d401f\",FRAME-RATE=29.97\nmain.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "main.m3u8", "width": 1920, "height": 1080, "codecs": "avc1.4d401f", "frame_rate": 29.97}]}
+{"name": "master_multi", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=640x360\nlow.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=2,RESOLUTION=1920x1080,CODECS=\"avc1\"\nhi.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "low.m3u8", "width": 640, "height": 360, "codecs": null, "frame_rate": null}, {"uri": "hi.m3u8", "width": 1920, "height": 1080, "codecs": "avc1", "frame_rate": null}]}
+{"name": "master_resolution_quoted", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=\"1920x1080\"\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": 1920, "height": 1080, "codecs": null, "frame_rate": null}]}
+{"name": "master_resolution_float", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=3.0\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: '3.0'"}
+{"name": "master_resolution_no_x", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1920\nv.m3u8\n", "error": "IndexError: list index out of range"}
+{"name": "master_resolution_negative", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=-1920x1080\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": -1920, "height": 1080, "codecs": null, "frame_rate": null}]}
+{"name": "master_resolution_empty", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: ''"}
+{"name": "master_resolution_three_x", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=1920x1080x4\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": 1920, "height": 1080, "codecs": null, "frame_rate": null}]}
+{"name": "master_resolution_x", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=x\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: ''"}
+{"name": "master_resolution_unclosed_quote", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION=\"1920x1080\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: ''"}
+{"name": "master_resolution_with_spaces", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,RESOLUTION= 1920 x 1080 \nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": 1920, "height": 1080, "codecs": null, "frame_rate": null}]}
+{"name": "master_missing_bandwidth", "body": "#EXTM3U\n#EXT-X-STREAM-INF:RESOLUTION=1920x1080\nv.m3u8\n", "error": "KeyError: 'bandwidth'"}
+{"name": "master_no_uri", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n#EXT-X-ENDLIST\n", "is_endlist": true, "segment_count": 0, "variants": []}
+{"name": "master_bandwidth_float", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100.5\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": null, "frame_rate": null}]}
+{"name": "master_bandwidth_infinity", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=inf\nv.m3u8\n", "error": "OverflowError: cannot convert float infinity to integer"}
+{"name": "master_bandwidth_nan", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=nan\nv.m3u8\n", "error": "ValueError: cannot convert float NaN to integer"}
+{"name": "master_bandwidth_underscore", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1_024_000\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": null, "frame_rate": null}]}
+{"name": "master_bandwidth_bad_underscore", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=10__24\nv.m3u8\n", "error": "ValueError: could not convert string to float: '10__24'"}
+{"name": "master_bandwidth_exponent", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1e2\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": null, "frame_rate": null}]}
+{"name": "master_avg_bw_int", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1024_000\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": null, "frame_rate": null}]}
+{"name": "master_avg_bw_bad", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,AVERAGE-BANDWIDTH=1e\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: '1e'"}
+{"name": "master_program_id", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,PROGRAM-ID=1_0\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": null, "frame_rate": null}]}
+{"name": "master_program_id_cast", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,PROGRAM-ID=1e2\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: '1e2'"}
+{"name": "master_program_id_hex", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,PROGRAM-ID=0x10\nv.m3u8\n", "error": "ValueError: invalid literal for int() with base 10: '0x10'"}
+{"name": "master_frame_rate_bad", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,FRAME-RATE=1e\nv.m3u8\n", "error": "ValueError: could not convert string to float: '1e'"}
+{"name": "master_codecs_unclosed", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": "", "frame_rate": null}]}
+{"name": "master_codecs_mismatch", "body": "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS=\"avc1'\nv.m3u8\n", "is_endlist": false, "segment_count": 0, "variants": [{"uri": "v.m3u8", "width": null, "height": null, "codecs": "", "frame_rate": null}]}
+{"name": "iframe_basic", "body": "#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=200,RESOLUTION=640x360,URI=\"i.m3u8\"\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "iframe_bad_resolution_with_uri", "body": "#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=1,RESOLUTION=3.0,URI=\"x\"\n", "error": "ValueError: invalid literal for int() with base 10: '3.0'"}
+{"name": "iframe_missing_uri", "body": "#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=9\n", "error": "KeyError: 'uri'"}
+{"name": "iframe_program_id_bad", "body": "#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=9,PROGRAM-ID=1.0,URI=\"x\"\n", "error": "ValueError: invalid literal for int() with base 10: '1.0'"}
+{"name": "image_basic", "body": "#EXTM3U\n#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=200,RESOLUTION=640x360,URI=\"i.jpg\"\n", "is_endlist": false, "segment_count": 0, "variants": []}
+{"name": "image_missing_uri", "body": "#EXTM3U\n#EXT-X-IMAGE-STREAM-INF:BANDWIDTH=9\n", "error": "KeyError: 'uri'"}

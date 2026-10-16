@@ -99,7 +99,8 @@ pub fn probe(body: &str) -> Result<HlsProbe, HlsError> {
     // model 层构造顺序（`M3U8._initialize_attributes`）：keys → segments →
     // simple attrs → media → playlists → iframes → images。
     for params in state.keys.iter().flatten() {
-        if params.iter().all(|attr| attr.name != "method") {
+        // 空 key dict（`#EXT-X-KEY:` 无参数）在 model 层是 None，不构造 Key。
+        if !params.is_empty() && params.iter().all(|attr| attr.name != "method") {
             return Err(HlsError::new(
                 "TypeError",
                 "Key.__init__() missing 1 required positional argument: 'method'",
@@ -197,6 +198,14 @@ fn scan(body: &str) -> Result<State, HlsError> {
             || line.starts_with("#EXT-X-DISCONTINUITY-SEQUENCE")
         {
             py_simple_param(line)?;
+        } else if line.starts_with("#EXT-X-VERSION") {
+            // `_parse_version`：cast_to=int（normalize）。
+            py_simple_param(line)?;
+        } else if line.starts_with("#EXT-X-ALLOW-CACHE") || line.starts_with("#EXT-X-PLAYLIST-TYPE")
+        {
+            // cast_to=str（值不观测），但缺 `:` 仍走 `line.split(":", 1)`
+            // 的 unpack ValueError。
+            py_simple_param_raw(line)?;
         } else if line.starts_with("#EXT-X-PROGRAM-DATE-TIME")
             || line.starts_with("#EXT-X-DISCONTINUITY")
             || line.starts_with("#EXT-X-CUE-OUT-CONT")
@@ -205,8 +214,6 @@ fn scan(body: &str) -> Result<State, HlsError> {
             || line.starts_with("#EXT-X-ASSET:")
             || line.starts_with("#EXT-X-CUE-IN")
             || line.starts_with("#EXT-X-CUE-SPAN")
-            || line.starts_with("#EXT-X-VERSION")
-            || line.starts_with("#EXT-X-ALLOW-CACHE")
         {
             // 静默类 tag（部分 cast 报错不镜像，见模块头「已知偏差」）。
         } else if line.starts_with("#EXT-X-KEY") {
@@ -220,7 +227,6 @@ fn scan(body: &str) -> Result<State, HlsError> {
         } else if line.starts_with("#EXT-X-I-FRAME-STREAM-INF") {
             state.iframes.push(parse_i_frame(line)?);
         } else if line.starts_with("#EXT-X-MEDIA")
-            || line.starts_with("#EXT-X-PLAYLIST-TYPE")
             || line.starts_with("#EXT-X-I-FRAMES-ONLY")
             || line.starts_with("#EXT-X-INDEPENDENT-SEGMENTS")
         {
@@ -402,9 +408,9 @@ fn consume_ts_chunk(state: &mut State) {
     state.expect_segment = false;
 }
 
-/// `_parse_simple_parameter(cast_to=int)`：`value = line.split(":", 1)[1]`
-/// （缺 `:` 时 ValueError），再 `value.strip().lower()` 后走 `int`。
-fn py_simple_param(line: &str) -> Result<(), HlsError> {
+/// `_parse_and_set_simple_parameter_raw_value(normalize=True)` 的共用步：
+/// 缺 `:` 时 `line.split(":", 1)` 的 unpack ValueError。
+fn py_simple_param_raw(line: &str) -> Result<String, HlsError> {
     let value = match line.split_once(':') {
         Some((_param, value)) => value,
         None => {
@@ -414,7 +420,12 @@ fn py_simple_param(line: &str) -> Result<(), HlsError> {
             ));
         }
     };
-    let value = value.trim_matches(is_python_space).to_lowercase();
+    Ok(value.trim_matches(is_python_space).to_lowercase())
+}
+
+/// `_parse_simple_parameter(cast_to=int)`：`value.strip().lower()` 后走 `int`。
+fn py_simple_param(line: &str) -> Result<(), HlsError> {
+    let value = py_simple_param_raw(line)?;
     py_int(&value)?;
     Ok(())
 }
@@ -575,7 +586,10 @@ fn py_int(text: &str) -> Result<i64, HlsError> {
     let body = stripped.strip_prefix(['+', '-']).unwrap_or(stripped);
     let digits = validate_int_body(body, text)?;
     match digits.parse::<i128>() {
-        Ok(value) => Ok(value.clamp(i64::MIN as i128, i64::MAX as i128) as i64),
+        Ok(value) => {
+            let signed = if negative { -value } else { value };
+            Ok(signed.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+        }
         Err(_) => {
             // 位数上溢：Python 是任意精度，这里取 i64 极值（观测面不取该值）。
             Ok(if negative { i64::MIN } else { i64::MAX })
@@ -808,6 +822,11 @@ mod tests {
             assert_eq!(py_int(text).unwrap(), 12, "int({text:?})");
         }
         assert_eq!(py_int("-0").unwrap(), 0);
+        assert_eq!(py_int("-1920").unwrap(), -1920);
+        assert_eq!(
+            py_int("- 1").unwrap_err().message,
+            "invalid literal for int() with base 10: '- 1'"
+        );
         assert_eq!(py_int("0012").unwrap(), 12);
         for text in ["1__2", "_12", "12_", "1e2", "1.0", "0x10", "", "+"] {
             assert!(
@@ -965,6 +984,11 @@ mod tests {
         let error = probe("#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=9\n").unwrap_err();
         assert_eq!(error.kind, "KeyError");
         assert_eq!(error.message, "'uri'");
+        // 空 key dict（`#EXT-X-KEY:` 无参数）→ model 层 None，不报错。
+        //
+        // 其他普通 key（RESOLUTION 负值也回 model 层 cast 成功）见金文件对比测试。
+        let probe = probe("#EXTM3U\n#EXT-X-KEY:\n").unwrap();
+        assert_eq!(probe.segment_count, 0);
     }
 
     #[test]
