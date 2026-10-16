@@ -164,3 +164,25 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   修正：+11 即本步新增）。
 - 下一步：按 `rust/README.md`「下一步的顺序」剩余可下沉项（bili/github 其余解析层 }),
   之后就是 UI（Phase 7 Slint）与 cfg 伴生工作。
+
+## 2026-10-16 第 10 步（commit c2d1b3d，第 3 轮）
+- 做了什么：bili `buildPages` JSON 变换层下沉 Rust 影子分支（`GD3_RUST_BILI_PAGES`，默认关）
+  - Rust：`gd3_net::bili::build_pages`（镜像 season/pages 遍历、`x or default` 真值、
+    选页规则 setVideoSelection/setSeasonSelection、episodeCover 三级 fallback、toHttps、
+    `int(raw["cid"])` 缺失→KeyError("cid")、int 文案逐字）+ PyO3 `bili_build_pages`
+    （KeyError→PyKeyError；返回扁平 dict {pages,title,coverUrl}）。内嵌单测 6 项全过。
+  - 接线：`features/bili_pack/rust_pages.py` 适配器（同步直调，与 rust_url 同模式；
+    parse.py::buildPages 开头按开关分流）。适配器初稿误写 async + to_thread，
+    调用方全为同步，改同步直调。
+  - `tests/test_bili_pages.py`：9 参数化 parity（正常视频/点名选页/season 多分区/
+    seasonId 全选/单分区连载/空 viewData 默认标题/空 pages）+ missing-cid KeyError +
+    关态断言，双实现（monkeypatch 环境变量切分支）逐字段对表：37 passed（含 test_bili_parse 26）。
+  - 收尾坑：clippy 4 连（elided lifetime/let match/2×`clone_clone`，`.map(Clone::clone)` 换 `.cloned()`）；
+    `test_disabled_mode_is_python` 在全开环境跑会假红（isEnabled()=True），已 monkeypatch.delenv。
+- 验证：fmt 0 / clippy 0 / cargo test 三 crate 全绿（18 个 ok 无失败）；maturin develop 重建；
+  双模式全量回归两轮：开关关 / 全部开关+新开关，均 **3 failed / 955 passed / 8 skipped / 34 errors**，
+  FAILED+ERROR 集合 diff 为空。
+- 环境注意：本轮回归时 `android/` 目录整个消失（非本会话改动，疑似并行 agent 操作），
+  `test_android_pack_import.py` 因缺 `android/app/build.gradle.kts` 收集失败已 `--ignore`；
+  android errors 基线由 35 → 34。若下轮 android 目录回来，恢复原口径。
+- 下一步：PortListener 接入评估，或 github/tree 剩余解析层。
