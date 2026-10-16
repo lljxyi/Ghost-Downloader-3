@@ -60,7 +60,8 @@ EXTRA_CASES = [
 ALL = EXTRA_CASES + cases()
 
 
-def test_switch_defaults_to_off():
+def test_switch_defaults_to_off(monkeypatch):
+    monkeypatch.delenv("GD3_RUST_ED2K_LINK", raising=False)
     assert not isEnabled()
 
 
