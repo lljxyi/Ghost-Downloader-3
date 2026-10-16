@@ -94,3 +94,22 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
 - 验证：`tests/test_http_match.py` 27 passed（补 3 个多分号 URL）；fmt/clippy/cargo test 全绿。
 - 提交：rust/crates/gd3-core/src/http_pack.rs + tests/test_http_match.py。
 - 下一步：github_pack 树枚举（hf fetch_tree 同款模式）。
+
+## 2026-10-16 第 6 步（commit 2d7a248）
+- 做了什么：HuggingFace URL 解析层（`parseHuggingFaceUrl`）署 Rust 影子分支（`GD3_RUST_HF_URL`，默认关）。
+  - `gd3_net::hf::parse_url_entry(url, proxy_site)`：不引 regex crate，行内手写
+    `REPO_PATTERN` 的线性匹配（host 判定与 Python 相同：scheme 无关、hostname
+    小写 + 去 www；代理站只比 hostname——去 scheme/userinfo/端口，路径保留）。
+    语义要点（边界测试盯住）：`org/repo/`（尾斜杠、无动词）不匹配；`resolve/`
+    与 `resolve/main/`（path 至少 1 字符）不匹配；`resolve/main//x` 的 filePath
+    贪婪保留 `/x`；大小写只对 verb/`datasets|spaces` 前缀敏感、org/repo 不限。
+  - PyO3 `hf_parse_url` → `features/huggingface_pack/rust_url.py`；pack.py 顶层
+    `parseHuggingFaceUrl` 按开关分流（代理站由 `selectedProxySite()` 传入）。
+  - `tests/test_hf_url.py`：独立 pyRef 防两实现一起错；20 URL × 3 代理站全对表。
+- 修掉的本轮坑：Rust 侧 `repo` 无尾随段漏判（`split_once` None 分支）；`/org/repo/`
+  与 `/org/repo` 需区分（Python 正则要求 `/` 后必接动词）。
+- 验证：cargo fmt/clippy（0 error）/cargo test（140 passed）全绿；maturin 重建；
+  `tests/test_hf_url.py tests/test_hf_tree.py` = 6 passed；
+  `pytest -q` 单独跑两轮（开关关/全开含新开关）：**3F/846P/8S/35E，失败集逐条一致**。
+  （_connected 注意：两轮 pytest 连着跑会互相污染状态出现 41F 的假警报——必须每轮单独跑。）
+- 下一步：bili `parseBiliUrl`（同款纯判定层）或 hf `parse` 剩余（buildPages/fetchView 的 JSON 变换层抽象），之后 PortListener。
