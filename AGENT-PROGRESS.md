@@ -333,3 +333,46 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
 - 下一步：m3u8 pack 的下一层（`parse`，依赖 m3u8/mpegdash 库语义，先摸底再决定）；
   或按 README「未做」清单继续。
 - 卡点：无。
+## 2026-11-02 第 17 步：ed2k `Link.parse` 下沉 Rust（`GD3_RUST_ED2K_LINK`，默认关）
+- 改动：
+  - `rust/crates/gd3-core/src/ed2k.rs`（新）：镜像 `kelpie/models.py::Link.parse`，
+    含镜像 CPython 的 `python_strip`（Unicode White_Space + \x1c–\x1f）、
+    `python_unquote`（逐字节 %XX + 逐字节 U+FFFD 替换）、`python_lower`；
+    size 先去前导零按位数封顶（MAX_SIZE 是 12 位数）再让 u128 承接，幂等承接 Python 任意精度 int。
+  - `rust/crates/gd3-py/src/ed2k.rs`（新桥）：`ed2k_parse_link(text) -> (name, size, hash)`，
+    失败抛 `Ed2kInvalidLinkError(message)`；`lib.rs` 注册（含异常类型导出）。
+  - 金文件 `tests/fixtures/ed2k.jsonl`（53 条，Python 生成）+ generator
+    `generate_ed2k_fixture.py`；`rust/crates/gd3-core/tests/ed2k.rs` 逐条比对。
+  - Python 适配 `features/ed2k_pack/rust_link.py`（isEnabled/parse，
+    异常翻 `Error(ErrorCode.INVALID_LINK, message)`，`toTaskError` 不动）；
+    `features/ed2k_pack/pack.py::ED2kParser.parse` 加开关分支。
+  - `tests/test_ed2k_link_rust.py`：金文件 53 条 + 8 条补例 + 常规用例，
+    直接对跑 Python/Rust 两实现断言逐字段一致；开关默认值断言用
+    `monkeypatch.delenv`（不与「全开回归」环境冲突）。
+- 过程中的语义修正（对照 CPython 实测，上一轮的假设有误）：
+  - 错误消息用 strip **之后**的 text（此前 `rot="   "` 用例暴露）；
+  - 普通链接里 name 的 `%7C` 始终由 `unquote` 解码（`Link.parse` 文件注释里
+    「%7C is part of the name」只是说明整体解码分支不触发——CPython 实测 name 已解码）;
+  - hash 全大写合法（HASH_PATTERN 是 `[0-9A-Fa-f]{32}`）。
+- 注意事项：本机 pytest 需先 `source /root/gd3-env.sh`（内含
+  `QT_QPA_PLATFORM=offscreen`）。未 source 时 Qt（pytestqt `qapp` fixture）
+  初始化即 SIGABRT（「could not connect to display」），与代码改动无关；
+  本轮在 `/tmp/off-full.txt` 各留有一份现场(backtrace)确认。
+- 验证：
+  - `cargo fmt --all --check` OK；`cargo clippy --all-targets -- -D warnings` 干净；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers` 全 0 失败
+    （含 `--test ed2k` 2 passed：53 条金文件逐条比对 + MAX_SIZE 断言）；
+  - maturin 重建桥 OK；
+  - `pytest tests/test_ed2k_link_rust.py tests/test_ed2k_task.py` → 181 passed；
+    `tests/test_ed2k_kelpie.py` 8 skipped（kelpie 引擎未装，既有状态）；
+  - 双模式全量回归（`--ignore=tests/test_android_pack_import.py -p no:randomly`）：
+    开关关 → **3 failed / 1126 passed / 8 skipped / 34 errors**，FAILED+ERROR
+    与 `/root/baseline-failures.txt` diff 仅少被 ignore 的 android 一条；
+    21 开关全开 → **5 failed / 1121 passed / 11 skipped / 34 errors**，与开关关的
+    FAILED+ERROR diff 仅两条：`test_switch_defaults_to_off`（by-design，修正后败局消失）
+    与 `test_engine_listeners.py…[uvloop]`（既有 flake，单跑 2 passed 复验非回归）。
+- 提交：`b5033bc`（核心层+金文件+Rust 测试）、`8a739cd`（适配器+接线+parity）、
+  `1452b24`（monkeypatch 修正）。
+- 下一步：m3u8 `parse` 摸底（`m3u8`/`mpegdash` 库语义，先实测再决定）；
+  ed2k `parseProgress`（`kelpie.py::336`，纯 JSON 变换）；bili `fetchPlayurl`（量大）。
+- 卡点：无。
