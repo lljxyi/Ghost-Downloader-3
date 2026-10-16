@@ -23,6 +23,11 @@ API_BASE = "https://huggingface.co"
 
 
 def parseHuggingFaceUrl(url: str) -> dict | None:
+    from .rust_url import isEnabled as rustUrlEnabled, parseHuggingFaceUrl as rustParseUrl
+
+    if rustUrlEnabled():
+        return rustParseUrl(url, selectedProxySite())
+
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().removeprefix("www.")
     if host not in {"huggingface.co"}:

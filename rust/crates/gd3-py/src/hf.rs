@@ -8,6 +8,7 @@ use crate::to_error;
 use gd3_net::hf::{HfTreeEntry, HfTreeError};
 use pyo3::exceptions::{PyPermissionError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// 一条树条目的结果，对应 Python 侧会拼回的 dict。
 #[pyclass]
@@ -55,5 +56,27 @@ fn err_to_py(error: HfTreeError) -> PyErr {
         }
         HfTreeError::Status(status) => PyValueError::new_err(status.to_string()),
         HfTreeError::Transport(message) => PyValueError::new_err(message),
+    }
+}
+
+/// `parseHuggingFaceUrl` 的桥（`GD3_RUST_HF_URL=1` 影子模式）。
+/// 返回 None 表示不匹配；成功时返回带四个字符串键的 dict。
+#[pyfunction]
+pub fn hf_parse_url(
+    py: Python<'_>,
+    url: String,
+    proxy_site: String,
+) -> PyResult<Option<Py<PyAny>>> {
+    match gd3_net::hf::parse_url_entry(&url, &proxy_site) {
+        None => Ok(None),
+        Some(info) => {
+            let dict = PyDict::new(py);
+            dict.set_item("org", info.org)?;
+            dict.set_item("repo", info.repo)?;
+            dict.set_item("repoType", info.repo_type)?;
+            dict.set_item("revision", info.revision)?;
+            dict.set_item("filePath", info.file_path)?;
+            Ok(Some(dict.into_any().unbind()))
+        }
     }
 }
