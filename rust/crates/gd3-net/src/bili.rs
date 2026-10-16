@@ -690,3 +690,476 @@ mod url_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// buildPages / buildSeasonPages / buildPage / selections —— 镜像
+// `features/bili_pack/parse.py` 的 JSON 变换层（`GD3_RUST_BILI_PAGES`）。
+//
+// 内嵌选页与真值语义照 Python 现状抄：
+// - `x or ""` / `or {}` / `or []`：Python 真值（空串、0、False、null、空容器都为假）；
+// - `int(x)`：int/float(向零截断)/bool/十进制字符串，失败抛 Python `int()` 文案；
+// - `raw["cid"]` 缺失 → KeyError（桥侧映射成 Python `KeyError('cid')`）；
+// - 非 list 的 "pages"/"sections"（字符串、dict 等）在本实现按缺失处理——
+//   现实 JSON 不会出现（记为已知偏差）。
+// ---------------------------------------------------------------------------
+
+/// buildPage 的产出：一个扁平 dict，适配器拿去构造 `BiliPage`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageOutcome {
+    pub index: i64,
+    pub cid: i64,
+    pub page_part: String,
+    pub page_number: i64,
+    pub bvid: String,
+    pub episode_title: String,
+    pub section_title: String,
+    pub cover_url: String,
+    pub duration: i64,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PagesOutcome {
+    pub pages: Vec<PageOutcome>,
+    pub title: String,
+    pub cover_url: String,
+}
+
+/// 错误通道：`KeyError("cid")` 与 `ValueError(int 文案)` 分开，桥侧映射对应异常。
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildPagesError {
+    KeyError(String),
+    PyValue(String),
+}
+
+fn truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => {
+            let zero = n.as_i64() == Some(0)
+                || n.as_u64() == Some(0)
+                || n.as_f64().map(|f| f == 0.0).unwrap_or(false);
+            !zero
+        }
+        Value::String(s) => !s.is_empty(),
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Python `x or default`：x 为真值取 x，否则取 default。返回 None 表示取 default。
+fn or_default(value: Option<&Value>) -> Option<&Value> {
+    match value {
+        Some(v) if truthy(v) => Some(v),
+        _ => None,
+    }
+}
+
+/// Python `str(x)` 的可镜像子集：字符串原样；数字/bool 走 repr；其它按 Python 会给
+/// `"{}"` 格式的子集（这里只会遇到 null 经 `or ""` 变空串前的原始值——null 已被
+/// `or` 吃掉）。真值非字符串数字的情况记为已知偏差（Python repr 与逐字节相等）。
+fn python_str(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => python_bool_str(*b),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn python_bool_str(value: bool) -> String {
+    if value { "True".into() } else { "False".into() }
+}
+
+/// Python `int(x)` 严格版：字符串走 `int()` 文案，浮点截断，bool 是 int。
+fn python_int_strict(value: &Value) -> Result<i64, BuildPagesError> {
+    match value {
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(i)
+            } else if let Some(f) = n.as_f64() {
+                // Python 对 NaN/inf 抛 ValueError(不能转 int 之类) —— 现实 JSON 无
+                Ok(f.trunc() as i64)
+            } else {
+                Err(BuildPagesError::PyValue(
+                    "int() argument must be a string, a bytes-like object or a real number, not 'float'".into(),
+                ))
+            }
+        }
+        Value::Bool(b) => Ok(i64::from(*b)),
+        Value::String(_) => {
+            python_str_to_int(value.as_str().expect("字符串分支")).map_err(BuildPagesError::PyValue)
+        }
+        _ => Err(BuildPagesError::PyValue(
+            "int() argument must be a string, a bytes-like object or a real number, not 'NoneType'"
+                .into(),
+        )),
+    }
+}
+
+/// `toHttps(url)`。
+pub fn to_https(url: &str) -> String {
+    let url = url.trim();
+    if let Some(rest) = url.strip_prefix("http://") {
+        return format!("https://{}", rest);
+    }
+    url.to_string()
+}
+
+/// `buildPage(index, raw, bvid=..., episodeTitle=..., sectionTitle=..., coverUrl=...)`。
+fn build_page(
+    index: i64,
+    raw: &Value,
+    bvid: &str,
+    episode_title: &str,
+    section_title: &str,
+    cover_url: &str,
+) -> Result<PageOutcome, BuildPagesError> {
+    let page_value = raw.get("page");
+    let selected_raw_number = page_value.as_ref().copied(); // 起点：raw.get("page")
+    let raw_obj = raw;
+    let page_number = or_as_int_or_index(selected_raw_number, index, raw_obj)?;
+    // `int(raw["cid"])`：缺失 → KeyError("cid")
+    let cid_value = raw
+        .get("cid")
+        .ok_or_else(|| BuildPagesError::KeyError("cid".into()))?;
+    let cid = python_int_strict(cid_value)?;
+    let part = raw.get("part").map(|v| v.as_str().unwrap_or(""));
+    let page_part = part.unwrap_or("").trim().to_string();
+    let duration = match or_default(raw.get("duration")) {
+        Some(v) => python_int_strict(v)?,
+        None => 0,
+    };
+    Ok(PageOutcome {
+        index,
+        cid,
+        page_part,
+        page_number,
+        bvid: bvid.to_string(),
+        episode_title: episode_title.to_string(),
+        section_title: section_title.to_string(),
+        cover_url: cover_url.to_string(),
+        duration,
+        selected: false,
+    })
+}
+
+/// `int(raw.get("page") or index + 1)`：真值 page 走 int()，否则 index+1。
+fn or_as_int_or_index(
+    page: Option<&Value>,
+    index: i64,
+    raw: &Value,
+) -> Result<i64, BuildPagesError> {
+    let _ = raw;
+    match or_default(page) {
+        Some(v) => python_int_strict(v),
+        None => Ok(index + 1),
+    }
+}
+
+/// `episodeCover(episode)`。
+fn episode_cover(episode: &Value) -> String {
+    let arc = or_default(episode.get("arc")).and_then(|v| v.as_object());
+    let pic = arc
+        .and_then(|arc| or_default(arc.get("pic")))
+        .map(python_str)
+        .unwrap_or_default();
+    if !pic.is_empty() {
+        return to_https(&pic);
+    }
+    let cover = or_default(episode.get("cover"))
+        .map(python_str)
+        .unwrap_or_default();
+    if !cover.is_empty() {
+        return to_https(&cover);
+    }
+    let pic2 = or_default(episode.get("pic"))
+        .map(python_str)
+        .unwrap_or_default();
+    to_https(&pic2)
+}
+
+/// `buildSeasonPages(season)`。
+fn build_season_pages(season: &Value) -> Result<Vec<PageOutcome>, BuildPagesError> {
+    let sections = season
+        .get("sections")
+        .and_then(|v| v.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[]);
+    let has_many_sections = sections.len() > 1;
+    let mut pages: Vec<PageOutcome> = Vec::new();
+    for section in sections {
+        let section_title = if has_many_sections {
+            or_default(section.get("title"))
+                .map(python_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        } else {
+            String::new()
+        };
+        for episode in section
+            .get("episodes")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[])
+        {
+            let bvid = or_default(episode.get("bvid"))
+                .map(python_str)
+                .unwrap_or_default();
+            let episode_title = or_default(episode.get("title"))
+                .map(python_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let mut owned_pages: Vec<Value> = episode
+                .get("pages")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if owned_pages.is_empty() {
+                if let Some(page) = or_default(episode.get("page")) {
+                    owned_pages = vec![page.clone()];
+                }
+            }
+            let raw_pages: Vec<&Value> = owned_pages.iter().collect();
+            let cover_url = episode_cover(episode);
+            for raw in raw_pages {
+                let index = pages.len() as i64;
+                pages.push(build_page(
+                    index,
+                    raw,
+                    &bvid,
+                    &episode_title,
+                    &section_title,
+                    &cover_url,
+                )?);
+            }
+        }
+    }
+    Ok(pages)
+}
+
+/// `setVideoSelection(pages, selectedPages)`。
+fn set_video_selection(pages: &mut [PageOutcome], selected: Option<&[i64]>) {
+    let wanted: Option<Vec<i64>> = match selected {
+        Some(list) => Some(list.to_vec()),
+        None => Some(pages.iter().map(|p| p.page_number).collect()),
+    };
+    let set: std::collections::HashSet<i64> = wanted.iter().flatten().copied().collect();
+    for page in pages.iter_mut() {
+        page.selected = set.contains(&page.page_number);
+    }
+}
+
+/// `setSeasonSelection(pages, biliUrl, currentBvid)`。
+fn set_season_selection(
+    pages: &mut [PageOutcome],
+    season_id: i64,
+    selected_pages: Option<&[i64]>,
+    current_bvid: &str,
+) {
+    if season_id != 0 {
+        for page in pages.iter_mut() {
+            page.selected = true;
+        }
+        return;
+    }
+    for page in pages.iter_mut() {
+        if page.bvid != current_bvid {
+            page.selected = false;
+        } else if selected_pages.is_none() {
+            page.selected = true;
+        } else {
+            page.selected = selected_pages.unwrap_or(&[]).contains(&page.page_number);
+        }
+    }
+}
+
+/// 镜像 `buildPages(viewData, biliUrl)`。
+pub fn build_pages(
+    view_data: &Value,
+    video_id: &str,
+    mid: i64,
+    season_id: i64,
+    selected_pages: Option<&[i64]>,
+) -> Result<PagesOutcome, BuildPagesError> {
+    let season = or_default(view_data.get("ugc_season"));
+    let _ = mid;
+    if let Some(season_value) = season {
+        let title = or_default(season_value.get("title"))
+            .map(python_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let title = if title.is_empty() {
+            "bilibili_video".to_string()
+        } else {
+            title
+        };
+        let cover_raw = or_default(mode_cover(season_value, view_data))
+            .map(python_str)
+            .unwrap_or_default();
+        let cover_url = to_https(&cover_raw);
+        let mut pages = build_season_pages(season_value)?;
+        let current_bvid = or_default(view_data.get("bvid"))
+            .map(python_str)
+            .unwrap_or_default();
+        let current_bvid = if current_bvid.is_empty() {
+            video_id.to_string()
+        } else {
+            current_bvid
+        };
+        set_season_selection(&mut pages, season_id, selected_pages, &current_bvid);
+        Ok(PagesOutcome {
+            pages,
+            title,
+            cover_url,
+        })
+    } else {
+        let title = match or_default(view_data.get("title")) {
+            Some(v) => python_str(v),
+            None => String::new(),
+        };
+        let title = title.trim().to_string();
+        let title = if title.is_empty() {
+            "bilibili_video".to_string()
+        } else {
+            title
+        };
+        let cover_raw = or_default(view_data.get("pic"))
+            .map(python_str)
+            .unwrap_or_default();
+        let cover_url = to_https(&cover_raw);
+        let bvid_raw = or_default(view_data.get("bvid"))
+            .map(python_str)
+            .unwrap_or_default();
+        let bvid = if bvid_raw.is_empty() {
+            video_id.to_string()
+        } else {
+            bvid_raw
+        };
+        let owned: Vec<Value> = view_data
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let raws: Vec<&Value> = owned.iter().collect();
+        let mut pages = Vec::with_capacity(raws.len());
+        for (index, raw) in raws.iter().enumerate() {
+            pages.push(build_page(index as i64, raw, &bvid, "", "", "")?);
+        }
+        set_video_selection(&mut pages, selected_pages);
+        Ok(PagesOutcome {
+            pages,
+            title,
+            cover_url,
+        })
+    }
+}
+
+/// `season.get("cover") or viewData.get("pic") or ""`。
+fn mode_cover<'a>(season: &'a Value, view_data: &'a Value) -> Option<&'a Value> {
+    or_default(season.get("cover")).or_else(|| or_default(view_data.get("pic")))
+}
+
+#[cfg(test)]
+mod build_pages_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pages_of(view: Value, video_id: &str, selected: Option<&[i64]>) -> PagesOutcome {
+        build_pages(&view, video_id, 0, 0, selected).expect("成功")
+    }
+
+    #[test]
+    fn normal_video_pages_and_selection() {
+        let view = json!({
+            "bvid": "BV1x", "title": "  Hello  ", "pic": "http://a/b.jpg",
+            "pages": [
+                {"page": 2, "cid": 100, "part": " Alfa ", "duration": 30},
+                {"cid": 101, "part": "Beta"}
+            ]
+        });
+        let out = pages_of(view, "BV1fallback", Some(&[2]));
+        assert_eq!(out.title, "Hello");
+        assert_eq!(out.cover_url, "https://a/b.jpg");
+        assert_eq!(out.pages[0].page_number, 2);
+        assert_eq!(out.pages[0].page_part, "Alfa");
+        assert_eq!(out.pages[1].page_number, 2);
+        assert!(out.pages[0].selected);
+        assert!(out.pages[1].selected);
+    }
+
+    #[test]
+    fn no_selection_means_all_selected() {
+        let view = json!({"bvid": "BV1", "pages": [{"cid": 1}, {"cid": 2}]});
+        let out = pages_of(view, "", None);
+        assert_eq!(out.pages[0].page_number, 1);
+        assert_eq!(out.pages[1].page_number, 2);
+        assert_eq!(out.pages[1].cid, 2);
+        assert!(out.pages.iter().all(|p| p.selected));
+    }
+
+    #[test]
+    fn season_selection_rules() {
+        let view = json!({
+            "bvid": "BVcurrent",
+            "ugc_season": {
+                "title": "S1", "cover": "http://c.jpg",
+                "sections": [{
+                    "title": "sec",
+                    "episodes": [
+                        {"bvid": "BVcurrent", "pages": [{"cid": 1, "page": 1}]},
+                        {"bvid": "BVother", "pages": [{"cid": 2}]}
+                    ]
+                }]
+            }
+        });
+        let out = pages_of(view.clone(), "", Some(&[]));
+        assert_eq!(out.title, "S1");
+        assert_eq!(out.cover_url, "https://c.jpg");
+        assert_eq!(out.pages.len(), 2);
+        assert_eq!(out.pages[0].cover_url, "");
+        // seasonId 存在 → 全选
+        let whole = build_pages(&view, "", 9, 7, Some(&[])).expect("ok");
+        assert!(whole.pages.iter().all(|p| p.selected));
+    }
+
+    #[test]
+    fn episode_cover_fallbacks() {
+        let view = json!({
+            "ugc_season": {
+                "sections": [{
+                    "episodes": [
+                        {"arc": {"pic": "http://arc.jpg"}, "pages": [{"cid": 1}]},
+                        {"cover": "http://cover.jpg", "pages": [{"cid": 2}]},
+                        {"pic": "http://pic.jpg", "pages": [{"cid": 3}]},
+                        {"pages": [{"cid": 4}]}
+                    ]
+                }]
+            }
+        });
+        let out = pages_of(view, "", Some(&[]));
+        assert_eq!(out.pages[0].cover_url, "https://arc.jpg");
+        assert_eq!(out.pages[1].cover_url, "https://cover.jpg");
+        assert_eq!(out.pages[2].cover_url, "https://pic.jpg");
+        assert_eq!(out.pages[3].cover_url, "");
+    }
+
+    #[test]
+    fn missing_cid_is_key_error() {
+        let view = json!({"bvid": "BV1", "pages": [{"part": "x no cid..."}]});
+        let err = build_pages(&view, "", 0, 0, None).expect_err("key error");
+        assert_eq!(err, BuildPagesError::KeyError("cid".into()));
+    }
+
+    #[test]
+    fn empty_everything_defaults() {
+        let out = pages_of(json!({}), "", None);
+        assert_eq!(out.title, "bilibili_video");
+        assert!(out.pages.is_empty());
+        assert_eq!(out.cover_url, "");
+    }
+}

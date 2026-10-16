@@ -46,6 +46,11 @@ def parseBiliUrl(url: str) -> BiliUrl:
 
 
 def buildPages(viewData: dict, biliUrl: BiliUrl) -> tuple[list[BiliPage], str, str]:
+    from .rust_pages import buildPages as rustBuildPages, isEnabled as rustPagesEnabled
+
+    if rustPagesEnabled():
+        return rustBuildPages(viewData, biliUrl)
+
     season = viewData.get("ugc_season") or None
     if season:
         title = str(season.get("title") or "").strip() or "bilibili_video"

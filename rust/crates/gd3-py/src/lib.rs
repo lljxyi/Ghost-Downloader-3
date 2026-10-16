@@ -241,6 +241,7 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bili::bili_build_fnval, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_parse_url, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_parse_dash, module)?)?;
+    module.add_function(wrap_pyfunction!(bili::bili_build_pages, module)?)?;
     module.add_function(wrap_pyfunction!(to_safe_filename, module)?)?;
     module.add_function(wrap_pyfunction!(split_stem_ext, module)?)?;
     module.add_class::<HttpOutcome>()?;

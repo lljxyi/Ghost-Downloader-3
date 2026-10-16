@@ -58,3 +58,59 @@ pub fn bili_parse_url(py: Python<'_>, url: String) -> PyResult<Py<PyAny>> {
         Err(message) => Err(PyValueError::new_err(message)),
     }
 }
+
+/// `buildPages` 的桥（`GD3_RUST_BILI_PAGES=1` 影子模式）。
+/// 返回 dict：`{pages: [扁平 dict...], title, coverUrl}`；
+/// `pages` 每个元素带 BiliPage 的全部构造参数（含 selected）。
+/// KeyError("cid") 映射成 Python `KeyError`；int 失败映射 `ValueError`（文案一致）。
+#[pyfunction]
+#[pyo3(signature = (view_data, video_id, mid, season_id, selected_pages))]
+pub fn bili_build_pages(
+    py: Python<'_>,
+    view_data: &Bound<'_, PyAny>,
+    video_id: String,
+    mid: i64,
+    season_id: i64,
+    selected_pages: Option<Vec<i64>>,
+) -> PyResult<Py<PyAny>> {
+    let value: serde_json::Value = depythonize(view_data)?;
+    let list: Option<pyo3::Bound<'_, pyo3::types::PyList>> = match selected_pages {
+        Some(pages) => Some(pyo3::types::PyList::new(py, pages)?),
+        None => None,
+    };
+    let outcome = gd3_net::bili::build_pages(
+        &value,
+        &video_id,
+        mid,
+        season_id,
+        list.as_deref()
+            .map(|l| l.extract::<Vec<i64>>())
+            .transpose()?
+            .as_deref(),
+    )
+    .map_err(|error_value| match error_value {
+        gd3_net::bili::BuildPagesError::KeyError(key) => pyo3::exceptions::PyKeyError::new_err(key),
+        gd3_net::bili::BuildPagesError::PyValue(message) => PyValueError::new_err(message),
+    })?;
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("title", outcome.title)?;
+    dict.set_item("coverUrl", outcome.cover_url)?;
+    let pages = pyo3::types::PyList::empty(py);
+    for page in &outcome.pages {
+        let page_dict = pyo3::types::PyDict::new(py);
+        page_dict.set_item("index", page.index)?;
+        page_dict.set_item("relativePath", "")?;
+        page_dict.set_item("cid", page.cid)?;
+        page_dict.set_item("pagePart", page.page_part.clone())?;
+        page_dict.set_item("pageNumber", page.page_number)?;
+        page_dict.set_item("bvid", page.bvid.clone())?;
+        page_dict.set_item("episodeTitle", page.episode_title.clone())?;
+        page_dict.set_item("sectionTitle", page.section_title.clone())?;
+        page_dict.set_item("coverUrl", page.cover_url.clone())?;
+        page_dict.set_item("_duration", page.duration)?;
+        page_dict.set_item("selected", page.selected)?;
+        pages.append(page_dict)?;
+    }
+    dict.set_item("pages", pages)?;
+    Ok(dict.into_any().unbind())
+}
