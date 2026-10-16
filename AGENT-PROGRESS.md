@@ -113,3 +113,10 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   `pytest -q` 单独跑两轮（开关关/全开含新开关）：**3F/846P/8S/35E，失败集逐条一致**。
   （_connected 注意：两轮 pytest 连着跑会互相污染状态出现 41F 的假警报——必须每轮单独跑。）
 - 下一步：bili `parseBiliUrl`（同款纯判定层）或 hf `parse` 剩余（buildPages/fetchView 的 JSON 变换层抽象），之后 PortListener。
+
+## 2026-10-16 第 7 步（commit d78df9d）
+- 做了什么：`tests/test_hf_url.py` 升级为参数化加强版（67 case）：每条 URL×代理站
+  独立成一个用例（失败定位更准），并新增 pack 级入口（无开关/开关皆然）冒烟。
+  保留独立 pyRef 实现。
+- 验证：`pytest tests/test_hf_url.py` = 67 passed；git status 干净。
+- 下一步：bili `parseBiliUrl` 纯判定层（同款模式），随后 PortListener。
