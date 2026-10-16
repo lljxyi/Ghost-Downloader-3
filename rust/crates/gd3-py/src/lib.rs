@@ -12,6 +12,7 @@ mod browser;
 mod ed2k;
 mod github;
 mod hf;
+mod hls;
 mod http;
 mod listener;
 mod m3u8;
@@ -253,6 +254,7 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(m3u8::m3u8_classify_error, module)?)?;
     module.add_function(wrap_pyfunction!(m3u8::m3u8_parse_output_line, module)?)?;
     module.add_function(wrap_pyfunction!(ed2k::ed2k_parse_link, module)?)?;
+    module.add_function(wrap_pyfunction!(hls::m3u8_probe, module)?)?;
     module.add(
         "Ed2kInvalidLinkError",
         module.py().get_type::<ed2k::Ed2kInvalidLinkError>(),
