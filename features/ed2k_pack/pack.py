@@ -11,6 +11,8 @@ from app.platform.filesystem import toSafeFilename
 from .config import ed2kConfig, kelpieRuntime
 from .kelpie import PROXY_SCHEMES, Error, Kelpie, Link, Network
 from .lists import nodeList, serverList
+from .rust_link import isEnabled as rustLinkEnabled
+from .rust_link import parse as rustLinkParse
 from .session import buildSettings, ed2kSession, toTaskError
 from .task import ED2kTask, ED2kTaskStep
 
@@ -28,7 +30,10 @@ class ED2kParser(TaskParser):
     async def parse(self, options: TaskOptions) -> Task:
         url = options.url.strip()
         try:
-            link = Link.parse(url)
+            if rustLinkEnabled():
+                link = rustLinkParse(url)
+            else:
+                link = Link.parse(url)
         except Error as error:
             raise toTaskError(error) from error
 
