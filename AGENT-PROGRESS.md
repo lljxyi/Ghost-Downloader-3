@@ -86,3 +86,11 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   - 提交：features/bili_pack/rust_parse.py（新适配器）+ stream.py 接线 + tests/test_bili_rust_parse.py（152 行），42ec437。
 - 下一步：`rust/README.md` 未做清单——github_pack 树枚举（hf `fetch_tree` 同款模式）、
   huggingface/bili 其余解析、`PortListener` 接入。无卡点。
+## 2026-10-16 第 5 步（第 13 轮追加）
+- 做了什么：收掉工作区一份未提交的 http_match 修正——`parser_match_passive` 补上
+  urlparse 对最后一个 path 段 `;` 之后 params 的摘除（实测 CPython 是从路径最后一个
+  `/` 之后的第一个 `;` 截断；带多分号逐字对比 4 组边界与 LIVE Python/参考实现完全一致），
+  上一轮记录的「`https://a/b.mp4;` → false」预期其实是当时没跑双实现的误判。
+- 验证：`tests/test_http_match.py` 27 passed（补 3 个多分号 URL）；fmt/clippy/cargo test 全绿。
+- 提交：rust/crates/gd3-core/src/http_pack.rs + tests/test_http_match.py。
+- 下一步：github_pack 树枚举（hf fetch_tree 同款模式）。
