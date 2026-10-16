@@ -250,7 +250,6 @@ pub fn parse_dash(
 mod tests {
     use super::*;
     use serde_json::json;
-
     fn stream(id: i64, url: &str) -> Value {
         json!({"id": id, "baseUrl": url})
     }
@@ -1081,7 +1080,6 @@ fn mode_cover<'a>(season: &'a Value, view_data: &'a Value) -> Option<&'a Value> 
 mod build_pages_tests {
     use super::*;
     use serde_json::json;
-
     fn pages_of(view: Value, video_id: &str, selected: Option<&[i64]>) -> PagesOutcome {
         build_pages(&view, video_id, 0, 0, selected).expect("成功")
     }
@@ -1302,7 +1300,6 @@ pub async fn fetch_view(
 mod view_tests {
     use super::*;
     use serde_json::json;
-
     #[test]
     fn view_url_uses_avid_for_av_id() {
         assert_eq!(
@@ -1382,5 +1379,205 @@ mod view_tests {
             check_view_payload(&json!({"code": -404})),
             Err(ViewError::ValueError(m)) if m == "获取 Bilibili 视频信息失败"
         ));
+    }
+}
+
+// ==== account 纯函数（features/bili_pack/account.py） ====
+
+/// `MIXIN_KEY_ENC_TAB` 逐字照抄。
+const MIXIN_KEY_ENC_TAB: [usize; 64] = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29,
+    28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25,
+    54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+];
+
+/// `_updateWbiKeys` 的 key 派生：`img_url/sub_url` 各取末段去掉 `.` 后缀
+/// （空 URL → 空 key），img 与 sub 都非空才有 key；
+/// `reduce(lambda s, i: s + orig[i], TAB, "")[:32]`。
+///
+/// `Ok(None)` 对应 Python 里 `imgKey and subKey` 为假（调用方保持原 key）；
+/// `Err(index)` 对应 Python 的 `orig[index]` 抛 `IndexError`（两段合起来不足 64 字符，
+/// 只有伪造的 URL 才会出现）——桥侧按原样抛 `IndexError`。
+pub fn mixin_key_from_urls(img_url: &str, sub_url: &str) -> Result<Option<String>, usize> {
+    fn key_of(url: &str) -> String {
+        let last = url.rsplit('/').next().unwrap_or("");
+        let stem = last.split('.').next().unwrap_or("");
+        stem.to_string()
+    }
+    let img_key = key_of(img_url);
+    let sub_key = key_of(sub_url);
+    if img_key.is_empty() || sub_key.is_empty() {
+        return Ok(None);
+    }
+    let orig = format!("{img_key}{sub_key}");
+    let chars: Vec<char> = orig.chars().collect();
+    let mut mixin = String::new();
+    for index in MIXIN_KEY_ENC_TAB {
+        match chars.get(index) {
+            Some(ch) => mixin.push(*ch),
+            None => return Err(index),
+        }
+    }
+    Ok(Some(mixin.chars().take(32).collect()))
+}
+
+/// Python `urllib.parse.quote_plus`（`urlencode` 的默认 `quote_via`）：
+/// `ALWAYS_SAFE` = 字母数字 + `_.-~` 原样，空格 → `+`，其余按 UTF-8 字节 `%XX`。
+/// 注意 `*` **不在**安全集里（Python 3.7 起），会被编成 `%2A`。
+fn quote_plus(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'~') {
+            out.push(byte as char);
+        } else if byte == b' ' {
+            out.push('+');
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+use md5::{Digest, Md5};
+
+/// `md5(hexdigest())` 小写串。`entries` 已在桥侧排序并清洗。
+pub fn wbi_rid(entries: &[(String, String)], mixin: &str) -> String {
+    let query: Vec<String> = entries
+        .iter()
+        .map(|(name, value)| format!("{}={}", quote_plus(name), quote_plus(value)))
+        .collect();
+    let plain = format!("{}{mixin}", query.join("&"));
+    let mut hasher = Md5::new();
+    hasher.update(plain.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect::<String>()
+}
+
+pub const COOKIE_ORDER: [&str; 5] = [
+    "SESSDATA",
+    "bili_jct",
+    "DedeUserID",
+    "DedeUserID__ckMd5",
+    "sid",
+];
+
+/// CPython `str.strip()` 的空白集：Unicode `White_Space` 之外还含 `\x1c`–`\x1f`
+/// （Rust 的 `char::is_whitespace` 不含这四个，直接 trim 会留下它们）。
+fn is_python_space(ch: char) -> bool {
+    ch.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&ch)
+}
+
+/// `toCookie(raw)`：分号整理、重名取后者、`COOKIE_ORDER` 排前其余按原序排后。
+pub fn to_cookie(raw: &str) -> String {
+    let mut parts: Vec<(String, String)> = Vec::new();
+    let normalized = raw.replace(['\r', '\n'], ";");
+    for part in normalized.split(';') {
+        let part = part.trim_matches(is_python_space);
+        if part.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        let (name, value) = (
+            name.trim_matches(is_python_space),
+            value.trim_matches(is_python_space),
+        );
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        if let Some(slot) = parts.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = value.to_string();
+        } else {
+            parts.push((name.to_string(), value.to_string()));
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    let mut ordered: Vec<(String, String)> = Vec::new();
+    for want in COOKIE_ORDER {
+        if let Some(pos) = parts.iter().position(|(name, _)| name == want) {
+            ordered.push(parts.remove(pos));
+        }
+    }
+    ordered.extend(parts);
+    ordered
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+    #[test]
+    fn mixin_key_matches_table_mapping() {
+        let orig: String = (0..64).map(|i| char::from(b'a' + (i as u8 % 26))).collect();
+        let img = format!("/{0}.jpg", &orig[..32]);
+        let sub = format!("/{0}.png", &orig[32..]);
+        let key = mixin_key_from_urls(&img, &sub).unwrap().unwrap();
+        let full = MIXIN_KEY_ENC_TAB
+            .iter()
+            .map(|&i| orig.chars().nth(i).unwrap())
+            .collect::<String>();
+        let expected: String = full.chars().take(32).collect();
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn mixin_key_needs_both_urls() {
+        assert_eq!(mixin_key_from_urls("", "x.png"), Ok(None));
+        assert_eq!(mixin_key_from_urls("/img.jpg", ""), Ok(None));
+        // 真 key 是 32 字符（`orig` 刚好 64）；`img.v2.jpg` 取到 `img`。
+        let (img, sub) = ("a".repeat(32), "b".repeat(32));
+        let (img_url, sub_url) = (format!("/{img}.v2.jpg"), format!("/{sub}.png"));
+        assert!(mixin_key_from_urls(&img_url, &sub_url).unwrap().is_some());
+    }
+
+    #[test]
+    fn mixin_key_shorter_than_the_table_is_an_index_error() {
+        // Python: `reduce(lambda s, i: s + orig[i], TAB, "")` 会先撞上越界索引
+        // （TAB 首项是 46，`"ab"` 只有 2 个字符）。
+        assert_eq!(mixin_key_from_urls("/a.jpg", "/b.png"), Err(46));
+    }
+
+    #[test]
+    fn quote_plus_matches_python() {
+        assert_eq!(quote_plus("hello world"), "hello+world");
+        assert_eq!(quote_plus("a&b=c"), "a%26b%3Dc");
+        assert_eq!(quote_plus("a*b-c_d.e~f"), "a%2Ab-c_d.e~f");
+        assert_eq!(quote_plus("中文"), "%E4%B8%AD%E6%96%87");
+        assert_eq!(quote_plus(""), "");
+    }
+
+    #[test]
+    fn to_cookie_orders_dedups_and_cleans() {
+        assert_eq!(
+            to_cookie(" junk=0;  sid=9; SESSDATA=abc; sid=1; bili_jct=f  "),
+            "SESSDATA=abc; bili_jct=f; sid=1; junk=0"
+        );
+        assert_eq!(to_cookie("  ; junk=  ; "), "");
+        // CPython 的 `str.strip()` 连 `\x1c`–`\x1f` 一起剥掉。
+        assert_eq!(to_cookie("sid=1\u{1c}"), "sid=1");
+        assert_eq!(to_cookie("\u{1c}sid=1\u{1d}"), "sid=1");
+        assert_eq!(to_cookie("sid=9"), "sid=9");
+    }
+
+    #[test]
+    fn wbi_rid_is_lowercase_hex32() {
+        let rid = wbi_rid(
+            &[("cid".into(), "11".into()), ("qn".into(), "80".into())],
+            "mix",
+        );
+        assert_eq!(rid.chars().count(), 32);
+        assert!(
+            rid.chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
     }
 }

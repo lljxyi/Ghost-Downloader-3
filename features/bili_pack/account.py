@@ -52,6 +52,10 @@ def cookiesFrom(response) -> dict[str, str]:
 
 
 def toCookie(raw: str) -> str:
+    from features.bili_pack import rust_sign
+
+    if rust_sign.isEnabled():
+        return rust_sign.toCookie(raw)
     parts: dict[str, str] = {}
     for part in raw.replace("\r", ";").replace("\n", ";").split(";"):
         part = part.strip()
@@ -103,16 +107,26 @@ class BilibiliAccount:
         return self._vip
 
     def _updateWbiKeys(self, data: dict) -> None:
+        from features.bili_pack import rust_sign
+
         wbiImg = data.get("wbi_img") or {}
         imgUrl = str(wbiImg.get("img_url") or "")
         subUrl = str(wbiImg.get("sub_url") or "")
         imgKey = imgUrl.rsplit("/", 1)[-1].split(".")[0] if imgUrl else ""
         subKey = subUrl.rsplit("/", 1)[-1].split(".")[0] if subUrl else ""
-        if imgKey and subKey:
+        if rust_sign.isEnabled():
+            mixinKey = rust_sign.mixinKeyFrom(imgUrl, subUrl)
+            if mixinKey:
+                self._mixinKey = mixinKey
+        elif imgKey and subKey:
             orig = imgKey + subKey
             self._mixinKey = reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, "")[:32]
 
     def signParams(self, params: dict) -> dict:
+        from features.bili_pack import rust_sign
+
+        if rust_sign.isEnabled() and self._mixinKey:
+            return rust_sign.signParams(params, self._mixinKey)
         if not self._mixinKey:
             return params
         params["wts"] = round(time.time())

@@ -151,3 +151,58 @@ pub fn bili_fetch_view(
     let dict = value.extract::<Bound<'_, PyDict>>()?;
     Ok(dict.clone().unbind())
 }
+
+/// `signParams` 的桥（`GD3_RUST_BILI_SIGN` 影子模式）：
+/// 加 `wts`、按键排序、值清洗 `!'()*`、urlencode + md5 拼 `w_rid`。
+#[pyfunction]
+pub fn bili_sign_params(
+    py: Python<'_>,
+    params: &Bound<'_, PyDict>,
+    mixin_key: String,
+    wts: i64,
+) -> PyResult<Py<PyDict>> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for (key, value) in params.iter() {
+        let key: String = key.extract()?;
+        let text = value.str()?;
+        entries.push((key, text.to_str()?.to_string()));
+    }
+    // Python 是 `params["wts"] = round(time.time())`——赋值语义，调用方自带的 wts 被覆盖。
+    entries.retain(|(key, _)| key != "wts");
+    entries.push(("wts".to_string(), wts.to_string()));
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let cleaned: Vec<(String, String)> = entries
+        .into_iter()
+        .map(|(key, text)| {
+            (
+                key,
+                text.chars().filter(|c| !"!'()*".contains(*c)).collect(),
+            )
+        })
+        .collect();
+    let rid = gd3_net::bili::wbi_rid(&cleaned, &mixin_key);
+    let dict = pyo3::types::PyDict::new(py);
+    for (key, text) in &cleaned {
+        dict.set_item(key, text)?;
+    }
+    dict.set_item("w_rid", rid)?;
+    Ok(dict.clone().unbind())
+}
+
+/// `signParams` 前置的派生（`_updateWbiKeys`）：两 URL 都有效才返回 Some；
+/// key 合起来不足 64 字符时抛 `IndexError`（镜像 Python 的 `orig[i]`）。
+#[pyfunction]
+pub fn bili_mixin_key(img_url: String, sub_url: String) -> PyResult<Option<String>> {
+    match gd3_net::bili::mixin_key_from_urls(&img_url, &sub_url) {
+        Ok(key) => Ok(key),
+        Err(_) => Err(pyo3::exceptions::PyIndexError::new_err(
+            "string index out of range",
+        )),
+    }
+}
+
+/// `toCookie` 的桥（`GD3_RUST_BILI_SIGN` 影子模式）。
+#[pyfunction]
+pub fn bili_to_cookie(raw: String) -> String {
+    gd3_net::bili::to_cookie(&raw)
+}
