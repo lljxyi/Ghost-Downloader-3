@@ -16,6 +16,17 @@ class BiliUrl:
 
 
 def parseBiliUrl(url: str) -> BiliUrl:
+    from .rust_url import isEnabled as rustUrlEnabled, parseBiliUrl as rustParseUrl
+
+    if rustUrlEnabled():
+        fields = rustParseUrl(url)
+        return BiliUrl(
+            videoId=fields["videoId"],
+            mid=fields["mid"],
+            seasonId=fields["seasonId"],
+            selectedPages=fields["selectedPages"],
+        )
+
     parsed = urlparse(url)
     videoIdMatch = re.match(r"/video/(BV[a-zA-Z0-9]+|av\d+)", parsed.path)
     if videoIdMatch:

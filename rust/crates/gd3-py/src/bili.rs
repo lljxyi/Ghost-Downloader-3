@@ -5,6 +5,7 @@
 use gd3_net::bili;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pythonize::depythonize;
 
 fn error(message: String) -> PyErr {
@@ -39,4 +40,21 @@ pub fn bili_parse_dash(
 #[pyo3(signature = (qn, include_hdr, include_dolby))]
 pub fn bili_build_fnval(qn: i64, include_hdr: bool, include_dolby: bool) -> i64 {
     bili::build_fnval(qn, include_hdr, include_dolby)
+}
+
+/// `parseBiliUrl` 的桥（`GD3_RUST_BILI_URL=1` 影子模式）。
+/// 成功 → 与 `BiliUrl` 字段同构的 dict；失败 → `ValueError`（文案与 Python 逐字一致）。
+#[pyfunction]
+pub fn bili_parse_url(py: Python<'_>, url: String) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    match gd3_net::bili::parse_url(&url) {
+        Ok(outcome) => {
+            dict.set_item("videoId", outcome.video_id)?;
+            dict.set_item("mid", outcome.mid)?;
+            dict.set_item("seasonId", outcome.season_id)?;
+            dict.set_item("selectedPages", outcome.selected_pages)?;
+            Ok(dict.into_any().unbind())
+        }
+        Err(message) => Err(PyValueError::new_err(message)),
+    }
 }

@@ -383,3 +383,310 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `parseBiliUrl` / `parsePageSpec`（features/bili_pack/parse.py）
+// ---------------------------------------------------------------------------
+
+/// `BiliUrl` 的镜像：字段与 Python dataclass 同名同默认。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BiliUrlOutcome {
+    pub video_id: String,
+    pub mid: i64,
+    pub season_id: i64,
+    pub selected_pages: Option<Vec<i64>>,
+}
+
+/// 拆出 urllib.parse 用得到的两个字段：path（首段 URL，`?`/`#` 之前的部）
+/// 与 query（`?` 之后 `#` 的之前）。不 lowercase——两侧比较都大小写敏感。
+fn split_path_query(input: &str) -> (String, String) {
+    // scheme 摘除：与 hf::split_url 相同的最小 urlparse 镜像
+    let rest = match input.find(':') {
+        Some(idx)
+            if input[..idx]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.') =>
+        {
+            &input[idx + 1..]
+        }
+        _ => input,
+    };
+    let rest = match rest.strip_prefix("//") {
+        Some(after) => match after.find('/') {
+            Some(slash) => &after[slash..],
+            None => "",
+        },
+        None => rest,
+    };
+    let rest = rest.split('#').next().unwrap_or("");
+    let (path, query) = match rest.find('?') {
+        Some(idx) => (&rest[..idx], &rest[idx + 1..]),
+        None => (rest, ""),
+    };
+    (path.to_string(), query.to_string())
+}
+
+/// 镜像 `urllib.parse.unquote_plus`：`+` → 空格，`%XX` → 对应字节。
+/// 非法残序（`%` 后不是 Hexadecimal）原样保留。
+fn unquote_plus(text: &str) -> String {
+    if !text.contains(['%', '+']) {
+        return text.to_string();
+    }
+    let mut out = Vec::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &text[i + 1..i + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 镜像 `urllib.parse.parse_qs`（keep_blank_values=False）：
+/// 空段丢弃、无 `=` 或空值丢弃，键值 unquote_plus；保序。
+fn parse_qs(query: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for piece in query.split('&') {
+        if piece.is_empty() {
+            continue;
+        }
+        let (name, value) = match piece.split_once('=') {
+            Some((name, value)) if !value.is_empty() => (name, value),
+            _ => continue,
+        };
+        pairs.push((unquote_plus(name), unquote_plus(value)));
+    }
+    pairs
+}
+
+fn query_first(query: &str, key: &str) -> String {
+    parse_qs(query)
+        .into_iter()
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value)
+        .unwrap_or_default()
+}
+
+/// 镜像 `parsePageSpec`：`p` 参数 `1,3-5` 展开成有序页码；缺 `p` → None。
+/// `int()` 语义镜像——`ValueError` 原样上抛（文案与 Python 一致）。
+fn parse_page_spec(query: &str) -> Result<Option<Vec<i64>>, String> {
+    let page_param = query_first(query, "p").trim().to_string();
+    if page_param.is_empty() {
+        return Ok(None);
+    }
+    let mut selected = Vec::new();
+    for part in page_param.split(',') {
+        let part = part.trim();
+        if part.contains('-') {
+            let (start_text, end_text) = part.split_once('-').unwrap();
+            let mut start = python_str_to_int(start_text.trim())?;
+            let mut end = python_str_to_int(end_text.trim())?;
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            selected.extend(start..=end);
+        } else {
+            selected.push(python_str_to_int(part)?);
+        }
+    }
+    Ok(Some(selected))
+}
+
+/// 镜像 Python `int(text)`（十进制）：允许两侧空白/正负号，失败报同文案。
+fn python_str_to_int(text: &str) -> Result<i64, String> {
+    let trimmed = text.trim();
+    match trimmed.parse::<i64>() {
+        Ok(value) => Ok(value),
+        _ => {
+            let _ = trimmed;
+            Err(format!("invalid literal for int() with base 10: '{text}'"))
+        }
+    }
+}
+
+/// 镜像 `parseBiliUrl`：三种路径规则逐一 `re.match`（锚定开头），全不中报
+/// `ValueError("不是有效的 Bilibili 视频链接")` 文案原样返回 Err。
+pub fn parse_url(input: &str) -> Result<BiliUrlOutcome, String> {
+    let (path, query) = split_path_query(input);
+
+    // r"/video/(BV[a-zA-Z0-9]+|av\d+)"
+    if let Some(rest) = path.strip_prefix("/video/") {
+        let video_id = if let Some(bv) = rest.strip_prefix("BV") {
+            let n = bv
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(bv.len());
+            if n > 0 {
+                format!("BV{}", &bv[..n])
+            } else {
+                String::new()
+            }
+        } else if let Some(av) = rest.strip_prefix("av") {
+            let n = av.find(|c: char| !c.is_ascii_digit()).unwrap_or(av.len());
+            if n > 0 {
+                format!("av{}", &av[..n])
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        if !video_id.is_empty() {
+            let selected_pages = parse_page_spec(&query)?;
+            return Ok(BiliUrlOutcome {
+                video_id,
+                selected_pages,
+                ..BiliUrlOutcome::default()
+            });
+        }
+    }
+
+    // r"/(\d+)/lists/(\d+)"（全部锚定开头，首个字符必须就是数字段）
+    let after_video = path.strip_prefix('/');
+    if let Some(rest) = after_video {
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits_end > 0 {
+            let mid_text = &rest[..digits_end];
+            let after = &rest[digits_end..];
+            // `/lists/(\d+)`
+            if let Some(after) = after.strip_prefix("/lists/") {
+                let season_end = after
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after.len());
+                if season_end > 0 {
+                    let mid: i64 = mid_text.parse().unwrap_or(0);
+                    let season_id: i64 = after[..season_end].parse().unwrap_or(0);
+                    return Ok(BiliUrlOutcome {
+                        mid,
+                        season_id,
+                        ..BiliUrlOutcome::default()
+                    });
+                }
+            }
+            // `/(\d+)/channel/collectiondetail`
+            if after == "/channel/collectiondetail" {
+                let sid = query_first(&query, "sid");
+                if sid.chars().all(|c| c.is_ascii_digit()) && !sid.is_empty() {
+                    let mid: i64 = mid_text.parse().unwrap_or(0);
+                    let season_id: i64 = sid.parse().unwrap_or(0);
+                    return Ok(BiliUrlOutcome {
+                        mid,
+                        season_id,
+                        ..BiliUrlOutcome::default()
+                    });
+                }
+            }
+        }
+    }
+
+    Err("不是有效的 Bilibili 视频链接".to_string())
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    fn of(url: &str) -> Result<BiliUrlOutcome, String> {
+        parse_url(url)
+    }
+
+    #[test]
+    fn video_urls() {
+        assert_eq!(
+            of("https://www.bilibili.com/video/BV1abc123/?p=2"),
+            Ok(BiliUrlOutcome {
+                video_id: "BV1abc123".into(),
+                selected_pages: Some(vec![2]),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            of("https://b23.tv/video/av170001/doc"),
+            Ok(BiliUrlOutcome {
+                video_id: "av170001".into(),
+                selected_pages: None,
+                ..Default::default()
+            })
+        );
+        // page 范围与逗号展开
+        assert_eq!(
+            of("https://a/video/BV1?p=1,3-5"),
+            Ok(BiliUrlOutcome {
+                video_id: "BV1".into(),
+                selected_pages: Some(vec![1, 3, 4, 5]),
+                ..Default::default()
+            })
+        );
+        // `av` 后无数字 / `BV` 后无字符 → 视频规则不中
+        assert!(of("https://a/video/avx").is_err());
+        assert!(of("https://a/video/BV").is_err());
+    }
+
+    #[test]
+    fn list_and_collection_urls() {
+        assert_eq!(
+            of("https://space.bilibili.com/487/lists/920"),
+            Ok(BiliUrlOutcome {
+                mid: 487,
+                season_id: 920,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            of("https://space.bilibili.com/487/channel/collectiondetail?sid=920"),
+            Ok(BiliUrlOutcome {
+                mid: 487,
+                season_id: 920,
+                ..Default::default()
+            })
+        );
+        // sid 非法 / 缺失 → 掉到最终报错
+        assert!(of("https://space.bilibili.com/487/channel/collectiondetail?sid=x").is_err());
+        assert!(of("https://space.bilibili.com/x/lists/920").is_err());
+    }
+
+    #[test]
+    fn invalid_urls() {
+        assert!(of("").is_err());
+        assert!(of("https://www.bilibili.com/").is_err());
+        assert_eq!(
+            of("https://example.com/foo").unwrap_err(),
+            "不是有效的 Bilibili 视频链接"
+        );
+    }
+
+    #[test]
+    fn page_spec_parsing() {
+        // %2C 与 + 都要 unquote_plus
+        assert_eq!(parse_page_spec("p=1%2C2").unwrap(), Some(vec![1, 2]));
+        assert_eq!(parse_page_spec("p=%31").unwrap(), Some(vec![1]));
+        assert_eq!(parse_page_spec("").unwrap(), None);
+        // int() 报错文案逐字
+        assert_eq!(
+            parse_page_spec("p=x").unwrap_err(),
+            "invalid literal for int() with base 10: 'x'"
+        );
+    }
+}
