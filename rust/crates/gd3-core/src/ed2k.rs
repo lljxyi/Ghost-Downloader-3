@@ -13,6 +13,8 @@
 //!   `decode_utf8_replacing_per_byte` 的单测）；
 //! - `str.lower()`：Unicode 简单小写映射（Rust `to_lowercase` 同源）。
 
+use serde_json::Value;
+
 /// Python 侧 `models.MAX_SIZE`：eMule 的 `MAX_EMULE_FILE_SIZE`。
 pub const MAX_SIZE: u64 = 256 << 30;
 
@@ -166,6 +168,175 @@ fn decode_utf8_replacing_per_byte(bytes: &[u8]) -> String {
     out
 }
 
+/// progress 消息变换层。镜像 `features/ed2k_pack/kelpie/kelpie.py::parseProgress`：
+/// 字段原样透传（Python 对出现即用，不做类型收窄）；只实现取键/迭代/下标语义——
+/// 缺字段 → `KeyError("字段名")`；`sources` 不可迭代 / 元素不可下标 → 对应的
+/// Python `TypeError` 文案；空 sources / 空字符串 / 空 dict（循环零次）按零个
+/// 来源成功返回。`Type(message)` 的文案已按 Python 逐字拼好。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgressShape {
+    pub hash: Value,
+    pub size: Value,
+    pub received: Value,
+    pub download_rate: Value,
+    pub upload_rate: Value,
+    pub uploaded: Value,
+    pub peers: Value,
+    pub active_peers: Value,
+    pub held_sources: Value,
+    pub held_until: Value,
+    pub sources: Vec<[Value; 6]>,
+}
+
+/// 失败：`Key(k)` → Python `KeyError(k)`，`Type(message)` → Python `TypeError`（文案已拼好）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressParseError {
+    Key(&'static str),
+    Type(String),
+}
+
+/// Python 侧 `kelpie.py::parseProgress` 的字段与顺序。
+const PROGRESS_FIELDS: [&str; 10] = [
+    "hash",
+    "size",
+    "received",
+    "downloadRate",
+    "uploadRate",
+    "uploaded",
+    "peers",
+    "activePeers",
+    "heldSources",
+    "heldUntil",
+];
+
+/// Python 侧 `kelpie.py::parseSource` 的字段与顺序。
+const SOURCE_FIELDS: [&str; 6] = [
+    "address",
+    "software",
+    "status",
+    "rank",
+    "downloadRate",
+    "channel",
+];
+
+fn field_of(
+    object: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Value, ProgressParseError> {
+    object.get(key).cloned().ok_or(ProgressParseError::Key(key))
+}
+
+/// Python `type(value)` 的名字（这是我们需要的全部差异）。
+fn py_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(number) => {
+            if number.is_f64() {
+                "float"
+            } else {
+                "int"
+            }
+        }
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// Python `value[字段名]` 在非 dict 上的 TypeError 文案
+/// （`str`/`list` 有各自的特殊文案，其余走 `'<type>' object is not subscriptable`）。
+fn type_error_subscript(value: &Value) -> ProgressParseError {
+    match value {
+        Value::Array(_) => {
+            ProgressParseError::Type("list indices must be integers or slices, not str".into())
+        }
+        Value::String(_) => ProgressParseError::Type("string indices must be integers".into()),
+        other => ProgressParseError::Type(format!(
+            "'{}' object is not subscriptable",
+            py_type_name(other)
+        )),
+    }
+}
+
+/// Python `for source in message["sources"]`。
+fn parse_sources(sources: &Value) -> Result<Vec<[Value; 6]>, ProgressParseError> {
+    match sources {
+        Value::Array(items) => items.iter().map(parse_source).collect(),
+        // Python 迭代 dict 得到键（字符串）；首个元素下标取值即失败，空 dict 不进循环。
+        Value::Object(map) => {
+            if map.keys().next().is_some() {
+                return Err(ProgressParseError::Type(
+                    "string indices must be integers".into(),
+                ));
+            }
+            Ok(Vec::new())
+        }
+        // 空字符串一次循环都不进，不报错。
+        Value::String(text) if text.is_empty() => Ok(Vec::new()),
+        // 非空字符串：Python 迭代得到字符，首个元素下标取值即失败。
+        Value::String(_) => Err(ProgressParseError::Type(
+            "string indices must be integers".into(),
+        )),
+        other => Err(ProgressParseError::Type(format!(
+            "'{}' object is not iterable",
+            py_type_name(other)
+        ))),
+    }
+}
+
+/// Python `kelpie.py::parseSource(source)`。
+fn parse_source(element: &Value) -> Result<[Value; 6], ProgressParseError> {
+    let object = match element {
+        Value::Object(object) => object,
+        other => return Err(type_error_subscript(other)),
+    };
+    let source: [Value; 6] = SOURCE_FIELDS
+        .iter()
+        .map(|key| field_of(object, key))
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .expect("SOURCE_FIELDS 是 6 个字段");
+    Ok(source)
+}
+
+/// `kelpie.py::parseProgress(message)`。
+pub fn parse_progress(message: &Value) -> Result<ProgressShape, ProgressParseError> {
+    let object = match message {
+        Value::Object(object) => object,
+        other => return Err(type_error_subscript(other)),
+    };
+    let sources = parse_sources(&field_of(object, "sources")?)?;
+    let mut fields = PROGRESS_FIELDS
+        .iter()
+        .map(|key| field_of(object, key))
+        .collect::<Result<Vec<_>, _>>()?;
+    let held_until = fields.pop().expect("10 个字段");
+    let held_sources = fields.pop().expect("10 个字段");
+    let active_peers = fields.pop().expect("10 个字段");
+    let peers = fields.pop().expect("10 个字段");
+    let uploaded = fields.pop().expect("10 个字段");
+    let upload_rate = fields.pop().expect("10 个字段");
+    let download_rate = fields.pop().expect("10 个字段");
+    let received = fields.pop().expect("10 个字段");
+    let size = fields.pop().expect("10 个字段");
+    let hash = fields.pop().expect("10 个字段");
+    debug_assert!(fields.is_empty());
+    Ok(ProgressShape {
+        hash,
+        size,
+        received,
+        download_rate,
+        upload_rate,
+        uploaded,
+        peers,
+        active_peers,
+        held_sources,
+        held_until,
+        sources,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,7 +417,6 @@ mod tests {
             "link has an invalid hash: ed2k://|file|n|1|0123456789abcdef0123456789abcde|/"
         );
     }
-
     #[test]
     fn size_bounds_follow_emule_limit() {
         assert!(parse("ed2k://|file|n|274877906944|0123456789abcdef0123456789abcdef|/").is_ok());
@@ -255,6 +425,98 @@ mod tests {
                 .expect_err("超上限")
                 .message,
             "link has an invalid size: ed2k://|file|n|274877906945|0123456789abcdef0123456789abcdef|/"
+        );
+    }
+
+    #[test]
+    fn wellformed_progress() {
+        let message: Value = serde_json::json!({
+            "type": "progress", "run": 3,
+            "hash": "0123456789abcdef0123456789abcdef", "size": 1024, "received": 10,
+            "downloadRate": 1, "uploadRate": 2, "uploaded": 20,
+            "peers": 4, "activePeers": 2, "heldSources": 0, "heldUntil": 99,
+            "sources": [
+                {"address": "1.2.3.4:4662", "software": "kelpie", "status": "active",
+                 "rank": 7, "downloadRate": 5, "channel": "tcp"},
+                {"address": "", "software": "", "status": "handshake", "rank": 1,
+                 "downloadRate": 0, "channel": "udp"},
+            ],
+        });
+        let shape = parse_progress(&message).expect("should parse");
+        assert_eq!(shape.hash, Value::from("0123456789abcdef0123456789abcdef"));
+        assert_eq!(shape.download_rate, Value::from(1));
+        assert_eq!(shape.held_until, Value::from(99));
+        assert_eq!(shape.sources.len(), 2);
+        assert_eq!(
+            shape.sources[0],
+            [
+                Value::from("1.2.3.4:4662"),
+                Value::from("kelpie"),
+                Value::from("active"),
+                Value::from(7),
+                Value::from(5),
+                Value::from("tcp"),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_failures_follow_python_messages() {
+        let missing_sources = serde_json::json!({"hash": "h"});
+        assert_eq!(
+            parse_progress(&missing_sources),
+            Err(ProgressParseError::Key("sources"))
+        );
+
+        let full = serde_json::json!({
+            "hash": "h", "size": 1, "received": 2, "downloadRate": 3, "uploadRate": 4,
+            "uploaded": 5, "peers": 6, "activePeers": 7, "heldSources": 8, "heldUntil": 9,
+            "sources": [{"address": "a:1", "software": "s", "status": "ok"}],
+        });
+        assert_eq!(parse_progress(&full), Err(ProgressParseError::Key("rank")));
+
+        let alone = serde_json::json!({"sources": [1]});
+        assert_eq!(
+            parse_progress(&alone),
+            Err(ProgressParseError::Type(
+                "'int' object is not subscriptable".to_string()
+            ))
+        );
+
+        let text = serde_json::json!({"sources": "ab"});
+        assert_eq!(
+            parse_progress(&text),
+            Err(ProgressParseError::Type(
+                "string indices must be integers".to_string()
+            ))
+        );
+
+        let empty_text = serde_json::json!({
+            "hash": "h", "size": 1, "received": 2, "downloadRate": 3, "uploadRate": 4,
+            "uploaded": 5, "peers": 6, "activePeers": 7, "heldSources": 8, "heldUntil": 9,
+            "sources": "",
+        });
+        assert!(
+            parse_progress(&empty_text)
+                .expect("空串零循环")
+                .sources
+                .is_empty()
+        );
+
+        let lone = serde_json::json!({"sources": 5});
+        assert_eq!(
+            parse_progress(&lone),
+            Err(ProgressParseError::Type(
+                "'int' object is not iterable".to_string()
+            ))
+        );
+
+        let not_dict = serde_json::json!([1]);
+        assert_eq!(
+            parse_progress(&not_dict),
+            Err(ProgressParseError::Type(
+                "list indices must be integers or slices, not str".to_string()
+            ))
         );
     }
 }
