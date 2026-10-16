@@ -114,3 +114,40 @@ pub fn bili_build_pages(
     dict.set_item("pages", pages)?;
     Ok(dict.into_any().unbind())
 }
+
+/// `fetchView` 的桥（`GD3_RUST_BILI_VIEW` 影子模式）。
+/// cookie 以键值对列表传（client 默认头），profile 决定 UA/指纹，
+/// 与 `hf_fetch_tree` 同款限制。返回 view `data` dict。
+#[pyfunction]
+#[pyo3(signature = (video_id, mid, season_id, api_headers, client_profile))]
+pub fn bili_fetch_view(
+    py: Python<'_>,
+    video_id: String,
+    mid: i64,
+    season_id: i64,
+    api_headers: Vec<(String, String)>,
+    client_profile: String,
+) -> PyResult<Py<PyDict>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+
+    let client = gd3_net::build_client(None, None, &client_profile);
+    let result = py.detach(|| {
+        runtime.block_on(gd3_net::bili::fetch_view(
+            &client,
+            &api_headers,
+            &video_id,
+            mid,
+            season_id,
+        ))
+    });
+    let data = result.map_err(|error_value| match error_value {
+        gd3_net::bili::ViewError::ValueError(message) => PyValueError::new_err(message),
+        gd3_net::bili::ViewError::Transport(message) => PyValueError::new_err(message),
+    })?;
+    let value = pythonize::pythonize(py, &data)?;
+    let dict = value.extract::<Bound<'_, PyDict>>()?;
+    Ok(dict.clone().unbind())
+}

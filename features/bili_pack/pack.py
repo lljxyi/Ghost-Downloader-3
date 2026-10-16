@@ -9,6 +9,7 @@ from app.platform.filesystem import toSafeFilename
 from .account import BilibiliAccount
 from .config import bilibiliConfig
 from .parse import buildPages, parseBiliUrl
+from .rust_view import isEnabled as rustViewEnabled, fetchView as rustFetchView
 from .stream import buildSize, fetchPlayurl, toStreamUrl
 from .task import BilibiliTask
 
@@ -60,7 +61,10 @@ class BilibiliParser(TaskParser):
             if not biliUrl.videoId and not biliUrl.seasonId:
                 raise ValueError("不是有效的 Bilibili 视频链接")
 
-            viewData = await fetchView(client, biliUrl)
+            if rustViewEnabled():
+                viewData = await rustFetchView(apiHeaders, biliUrl)
+            else:
+                viewData = await fetchView(client, biliUrl)
             parsedPages, title, coverUrl = buildPages(viewData, biliUrl)
             if not parsedPages:
                 raise ValueError("未获取到视频分P信息")

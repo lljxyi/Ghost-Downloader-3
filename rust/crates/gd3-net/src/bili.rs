@@ -16,7 +16,20 @@
 //! - 质量筛选只在 `quality is not None 且 acceptQuality 非空` 时生效，
 //!   且允许 `id == 目标` 但 `toStreamUrl` 为空时继续找下一条。
 
+//! ### 收集阶段：`fetchView`（`features/bili_pack/pack.py::fetchView`）
+//!
+//! 两个请求共用 `api_headers`（Python 里 cookie 是 client 默认头）：
+//! 1. `videoId` 为空且 `seasonId` 真值：先取 seasons_archives_list 第一页，
+//!    拿第一个 `archives[].bvid`；空列表 / 无 bvid → `ValueError("未获取到合集信息")`；
+//! 2. `av…` 用 `avid={videoId[2:]}`，否则 `bvid={videoId}`；
+//! 3. `code not in {None, 0}` → `ValueError(message or "获取 Bilibili 视频信息失败")`，
+//!    返回 `data or {}`。
+//!
+//!    HTTP 失败与 JSON 解析失败都按 `ValueError` 文案 Transport 抛出
+//!    （Python 抛 httpx 异常，桥侧只保证非 2xx / 解析错误也是异常，不逐字对齐 httpx 文案）。
+
 use serde_json::Value;
+use wreq::Client;
 
 /// `parseDash` 的产出（Python 侧写回 `BiliPage` 的四个字段）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,5 +1174,213 @@ mod build_pages_tests {
         assert_eq!(out.title, "bilibili_video");
         assert!(out.pages.is_empty());
         assert_eq!(out.cover_url, "");
+    }
+}
+
+// ==== fetchView（features/bili_pack/pack.py::fetchView） ====
+
+#[derive(Debug)]
+pub enum ViewError {
+    /// 传输 / 非 2xx / JSON 解析失败（Python 抛 httpx 异常，文案不逐字对齐）。
+    Transport(String),
+    /// Python `ValueError`，文案逐字。
+    ValueError(String),
+}
+
+impl std::fmt::Display for ViewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ViewError::Transport(m) => write!(f, "{m}"),
+            ViewError::ValueError(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Python `f"?mid={mid}&season_id={seasonId}&page_num=1&page_size=1"`。
+pub fn season_list_url(mid: i64, season_id: i64) -> String {
+    format!(
+        "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list\
+         ?mid={mid}&season_id={season_id}&page_num=1&page_size=1"
+    )
+}
+
+/// `av…` → `avid=` 去掉前两位；其余 → `bvid=`。`videoId` 期望非空（上层已判定）。
+pub fn view_api_url(video_id: &str) -> String {
+    if let Some(rest) = video_id.strip_prefix("av") {
+        format!("https://api.bilibili.com/x/web-interface/view?avid={rest}")
+    } else {
+        format!("https://api.bilibili.com/x/web-interface/view?bvid={video_id}")
+    }
+}
+
+/// `archives = (payload.get("data") or {}).get("archives") or []`；
+/// 空或第一个没有 `bvid` → `ValueError("未获取到合集信息")`。
+pub fn pick_season_video_id(payload: &Value) -> Result<String, ViewError> {
+    let empty = vec![];
+    let archives = payload
+        .get("data")
+        .and_then(|data| data.get("archives"))
+        .and_then(|item| item.as_array())
+        .unwrap_or(&empty);
+    let bvid = archives
+        .first()
+        .and_then(|item| item.get("bvid"))
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    if bvid.is_empty() {
+        return Err(ViewError::ValueError("未获取到合集信息".into()));
+    }
+    Ok(bvid.to_string())
+}
+
+/// `code not in {None, 0}` → `ValueError(message or "获取 Bilibili 视频信息失败")`；
+/// 否则返回 `data or {}`。
+pub fn check_view_payload(payload: &Value) -> Result<Value, ViewError> {
+    let code = payload.get("code");
+    if code.is_some() && code != Some(&Value::Null) && code != Some(&Value::from(0)) {
+        let message = payload
+            .get("message")
+            .and_then(|item| item.as_str())
+            .filter(|item| !item.is_empty())
+            .unwrap_or("获取 Bilibili 视频信息失败");
+        return Err(ViewError::ValueError(message.into()));
+    }
+    match payload.get("data") {
+        Some(data) if !data.is_null() => Ok(data.clone()),
+        _ => Ok(Value::Object(serde_json::Map::new())),
+    }
+}
+
+async fn get_json(
+    client: &Client,
+    api_headers: &[(String, String)],
+    url: &str,
+) -> Result<Value, ViewError> {
+    let mut headers = wreq::header::HeaderMap::new();
+    for (name, value) in api_headers {
+        let name = wreq::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| ViewError::Transport(error.to_string()))?;
+        let value = wreq::header::HeaderValue::from_str(value)
+            .map_err(|error| ViewError::Transport(error.to_string()))?;
+        headers.insert(name, value);
+    }
+    let response = client
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|error| ViewError::Transport(error.to_string()))?;
+    let status = response.status().as_u16();
+    if (400..600).contains(&status) {
+        return Err(ViewError::Transport(format!("HTTP {status}")));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| ViewError::Transport(error.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|error| ViewError::Transport(error.to_string()))
+}
+
+/// `fetchView(client, biliUrl)` 的 Rust 版：`videoId`、`mid`、`seasonId` 真值由桥传入。
+pub async fn fetch_view(
+    client: &Client,
+    api_headers: &[(String, String)],
+    video_id: &str,
+    mid: i64,
+    season_id: i64,
+) -> Result<Value, ViewError> {
+    let mut video_id = video_id.to_string();
+    if video_id.is_empty() && season_id != 0 {
+        let payload = get_json(client, api_headers, &season_list_url(mid, season_id)).await?;
+        video_id = pick_season_video_id(&payload)?;
+    }
+    let payload = get_json(client, api_headers, &view_api_url(&video_id)).await?;
+    check_view_payload(&payload)
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn view_url_uses_avid_for_av_id() {
+        assert_eq!(
+            view_api_url("av123"),
+            "https://api.bilibili.com/x/web-interface/view?avid=123"
+        );
+        assert_eq!(
+            view_api_url("BV1abc"),
+            "https://api.bilibili.com/x/web-interface/view?bvid=BV1abc"
+        );
+        // Python `videoId[2:]` 只适用于前缀 `av`；其他串按 bvid 原样传
+        assert_eq!(
+            view_api_url("av"),
+            "https://api.bilibili.com/x/web-interface/view?avid="
+        );
+    }
+
+    #[test]
+    fn season_list_url_has_same_query_shape() {
+        assert_eq!(
+            season_list_url(487, 920),
+            "https://api.bilibili.com/x/polymer/web-space/seasons_archives_list\
+             ?mid=487&season_id=920&page_num=1&page_size=1"
+        );
+    }
+
+    #[test]
+    fn pick_season_uses_first_archive_bvid() {
+        let payload = json!({"data": {"archives": [{"bvid": "BV1x"}, {}]}});
+        assert!(matches!(
+            pick_season_video_id(&payload),
+            Ok(v) if v == "BV1x"
+        ));
+    }
+
+    #[test]
+    fn pick_season_error_messages_are_verbatim() {
+        for payload in [
+            json!({}),
+            json!({"data": {}}),
+            json!({"data": {"archives": []}}),
+            json!({"data": {"archives": [{}]}}),
+        ] {
+            assert!(matches!(
+                pick_season_video_id(&payload),
+                Err(ViewError::ValueError(m)) if m == "未获取到合集信息"
+            ));
+        }
+    }
+
+    #[test]
+    fn check_payload_codes() {
+        // code 缺失 / null / 0 都放行，取 data or {}
+        for payload in [
+            json!({"code": 0, "data": {"title": "t"}}),
+            json!({"code": null, "data": {"title": "t"}}),
+            json!({"data": {"title": "t"}}),
+        ] {
+            assert!(matches!(
+                check_view_payload(&payload),
+                Ok(data) if data["title"] == "t"
+            ));
+        }
+        assert!(matches!(
+            check_view_payload(&json!({})),
+            Ok(data) if data.as_object().unwrap().is_empty()
+        ));
+        assert!(matches!(
+            check_view_payload(&json!({"data": null})),
+            Ok(data) if data.as_object().unwrap().is_empty()
+        ));
+        assert!(matches!(
+            check_view_payload(&json!({"code": -404, "message": "稿件不可见"})),
+            Err(ViewError::ValueError(m)) if m == "稿件不可见"
+        ));
+        assert!(matches!(
+            check_view_payload(&json!({"code": -404})),
+            Err(ViewError::ValueError(m)) if m == "获取 Bilibili 视频信息失败"
+        ));
     }
 }
