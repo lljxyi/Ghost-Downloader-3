@@ -115,11 +115,16 @@ class HuggingFaceParser(TaskParser):
         base = selectedProxySite() or API_BASE
         apiUrl = f"{base}/api/{apiPrefix}/{repoId}/tree/{revision}"
 
-        client = buildClient(headers=headers)
-        try:
-            entries = await self._fetchTree(client, apiUrl)
-        finally:
-            client.close()
+        from .rust_tree import isEnabled as rustTreeEnabled, fetchTree as rustFetchTree
+
+        if rustTreeEnabled():
+            entries = await rustFetchTree(apiUrl, headers)
+        else:
+            client = buildClient(headers=headers)
+            try:
+                entries = await self._fetchTree(client, apiUrl)
+            finally:
+                client.close()
 
         if not entries:
             raise ValueError(f"仓库 {repoId} 为空或无法访问")

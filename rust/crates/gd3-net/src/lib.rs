@@ -1,6 +1,7 @@
 //! HTTP 传输引擎：镜像 `features/http_pack/task.py` 的分片下载语义。
 
 pub mod engine;
+pub mod hf;
 pub mod plan;
 pub mod probe;
 pub mod ranges;
