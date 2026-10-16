@@ -60,11 +60,18 @@ pub fn parser_match(url: &str) -> bool {
 }
 
 /// 镜像 `HttpParser.matchPassive`：scheme 合格 + lowercase path 以可下载扩展名结尾。
+///
+/// Python `urlparse` 会把最后一个 path 段里 `;` 之后的 `params` 摘掉
+///（`u/b.mp4;` 的 path 是 `/b.mp4`），所以先复刻这一步再比对扩展名。
 pub fn parser_match_passive(url: &str) -> bool {
     if !parser_match(url) {
         return false;
     }
-    let parsed = parse_url(url);
+    let mut parsed = parse_url(url);
+    let slash = parsed.path.rfind('/').unwrap_or(0);
+    if let Some(offset) = parsed.path[slash..].find(';') {
+        parsed.path.truncate(slash + offset);
+    }
     DOWNLOADABLE_EXTENSIONS
         .iter()
         .any(|ext| parsed.path.ends_with(ext))
@@ -93,7 +100,7 @@ mod tests {
         assert!(!parser_match_passive("http://a/b"));
         assert!(parser_match_passive("http://a/b.mp4"));
         assert!(parser_match_passive("HTTPS://A.COM/x.TS?y=1"));
-        // 分号属于 path：'/b.mp4;' 不以 '.mp4' 结尾（Python 同样为 False）
-        assert!(!parser_match_passive("https://a/b.mp4;"));
+        // 分号截断 params：'/b.mp4;' 的 path 是 '/b.mp4'（Python 侧同为 True）
+        assert!(parser_match_passive("https://a/b.mp4;"));
     }
 }
