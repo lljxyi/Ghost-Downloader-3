@@ -18,6 +18,7 @@ from aiohttp import web
 from app.client import buildClient as realBuildClient
 from features.http_pack.task import HttpTask, HttpTaskStep, HttpSubworker, PermanentDownloadError, RangeNotSupportedError
 from app.models.task import TaskStatus, TaskError
+from features.http_pack import rust_engine as rustEngine
 from tests.helpers import buildFileContent, buildRangeHandler, runStep
 
 
@@ -551,6 +552,10 @@ class TestRangeFallback:
 
 
 class TestDiskFull:
+    pytestmark = pytest.mark.skipif(
+        rustEngine.isEnabled(),
+        reason="白盒测试：打桩 Python 实现的 pwrite，Rust 引擎模式下不适用",
+    )
 
     async def test_enospc_raises_task_error(self, server, tmp_path, monkeypatch):
         """pwrite raises ENOSPC — should bubble as TaskError, not retry."""
@@ -574,6 +579,10 @@ class TestDiskFull:
 
 
 class TestStallRecovery:
+    pytestmark = pytest.mark.skipif(
+        rustEngine.isEnabled(),
+        reason="白盒测试：打桩 Python 实现的读超时与重试，Rust 引擎模式下不适用",
+    )
 
     async def test_stalled_stream_recovers_and_completes(self, server, tmp_path, monkeypatch):
         """Stream stalls mid-transfer; read_timeout triggers retry, download completes."""
@@ -703,6 +712,81 @@ class TestInitialStart:
         assert (tmp_path / "test.bin").read_bytes() == content
         assert requestTimes[3] - requestTimes[0] < 0.5
 
+
+# ── 暂停 / 恢复：两种实现共用同一份 .ghd ──
+
+
+def slowRangeHandler(content: bytes, chunkSize: int = 8192, delay: float = 0.15):
+    """逐块慢速返回 206，好让下载撑过监管器 1 秒的采样间隔。"""
+
+    async def handler(request: web.Request) -> web.StreamResponse:
+        rangeHeader = request.headers.get("Range")
+        start = 0
+        end = len(content) - 1
+        if rangeHeader:
+            parts = rangeHeader.replace("bytes=", "").split("-")
+            start = int(parts[0])
+            end = int(parts[1]) if parts[1] else end
+        body = content[start:end + 1]
+
+        response = web.StreamResponse(
+            status=206,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{len(content)}",
+                "Content-Length": str(len(body)),
+            },
+        )
+        await response.prepare(request)
+        for offset in range(0, len(body), chunkSize):
+            await response.write(body[offset:offset + chunkSize])
+            await asyncio.sleep(delay)
+        await response.write_eof()
+        return response
+
+    return handler
+
+
+class TestPauseResume:
+
+    async def test_pause_keeps_record_and_resume_completes(self, server, tmp_path):
+        from struct import unpack
+
+        content = buildFileContent(400_000)
+        url = await server(slowRangeHandler(content))
+        task, step = makeStep(url, tmp_path, fileSize=len(content), subworkerCount=4)
+        task.setStatus(TaskStatus.RUNNING)
+
+        filepath = tmp_path / "test.bin"
+        record = Path(str(filepath) + ".ghd")
+        speeds = []
+
+        def reportSpeed(n):
+            speeds.append(n)
+
+        async def slowSpeedLimit():
+            await asyncio.sleep(0.05)
+
+        running = asyncio.ensure_future(task.run(reportSpeed, slowSpeedLimit))
+        await asyncio.sleep(1.5)
+        assert not running.done(), "下载应当还在进行中"
+
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        task.setStatus(TaskStatus.PAUSED)
+        assert record.exists(), "暂停必须留下 .ghd 以便续传"
+
+        data = record.read_bytes()
+        records = [unpack("<QQQ", data[i:i + 24]) for i in range(0, len(data), 24)]
+        assert records, "记录里应当有分片"
+        assert any(position > start for start, position, _ in records), "应当记录了部分进度"
+
+        task.setStatus(TaskStatus.RUNNING)
+        await asyncio.wait_for(task.run(reportSpeed, slowSpeedLimit), timeout=60)
+
+        assert filepath.read_bytes() == content
+        assert not record.exists(), "完成后必须删掉 .ghd"
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

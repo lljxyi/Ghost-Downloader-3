@@ -1,0 +1,36 @@
+[package]
+name = "gd3-net"
+description = "HTTP 分片传输引擎"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gd3-core = { path = "../gd3-core" }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio-util = "0.7"
+wreq = { version = "6.0.0-rc.31", features = ["stream"] }
+wreq-util = "3.0.0-rc.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+serde_json.workspace = true
+gd3-core = { path = "../gd3-core" }
+
+[target.'cfg(windows)'.dependencies]
+# 只为 `FSCTL_SET_SPARSE`（预分配前标稀疏，否则 NTFS 会真的写零）
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# 测试要读 `FILE_STANDARD_INFO.AllocationSize` 来验证稀疏确实生效
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

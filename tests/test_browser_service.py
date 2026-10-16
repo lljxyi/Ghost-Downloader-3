@@ -13,6 +13,7 @@ from websockets.exceptions import ConnectionClosed
 from app.config.cfg import cfg
 from app.config.constants import LATEST_EXTENSION_VERSION, VERSION
 from app.models.task import Task, TaskStatus
+from app.services import rust_browser as rustBrowser
 from app.services.browser_service import PROTOCOL_VERSION, BrowserService, PairRequest
 from app.services.coroutine_runner import CoroutineRunner
 from app.services.port_listener import ListenStatus, PortListener
@@ -108,7 +109,10 @@ async def startBrowser(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg.shouldDraftTakenDownload, "value", False)
     monkeypatch.setattr(cfg.downloadFolder, "value", str(tmp_path))
     loop = asyncio.get_running_loop()
-    runner = CoroutineRunner(loop.call_soon, loop=loop)
+    # Rust 侧的回调来自 Rust 线程，派发器必须线程安全；应用里的派发器（QTimer.singleShot）本来就是
+    runner = CoroutineRunner(
+        loop.call_soon_threadsafe if rustBrowser.isEnabled() else loop.call_soon, loop=loop,
+    )
     taskService = FakeTaskService()
     speedChanged = BoundSignal()
     drafted, events = [], []
@@ -126,7 +130,11 @@ async def startBrowser(monkeypatch, tmp_path):
     service.connectionChanged.connect(lambda: events.append("connectionChanged"))
     service.protocolMismatched.connect(lambda: events.append("protocolMismatched"))
     service.pairRequestChanged.connect(lambda request: events.append(request))
-    listener = PortListener(runner, service.handle, isEnabled=FakeItem(True), port=FakeItem(findFreePort()))
+    port = findFreePort()
+    if rustBrowser.isEnabled():
+        listener = rustBrowser.RustBrowserListener(runner, service, isEnabled=FakeItem(True), port=FakeItem(port))
+    else:
+        listener = PortListener(runner, service.handle, isEnabled=FakeItem(True), port=FakeItem(port))
     listener.start()
     await waitFor(lambda: listener.state.status == ListenStatus.LISTENING)
 

@@ -209,12 +209,16 @@ class Aria2RpcService:
             outputFolder=Path(directory or cfg.downloadFolder.value),
             clientProfile="" if cfg.aria2RpcEmulateFingerprint.value else "raw",
         )
-        self._coroutineRunner.submit(
-            self._parse(taskOptions),
-            done=self._onTaskParsed, failed=self._onTaskParseFailed,
-            name=toText(options, "out"), url=uris[0],
-        )
+        self.applyTaskOptions(taskOptions, toText(options, "out"))
         return token_hex(8)
+
+    def applyTaskOptions(self, options: TaskOptions, name: str) -> None:
+        """把已解析的 Task Options 交给解析与加入流程。Rust 引擎的回调入口。"""
+        self._coroutineRunner.submit(
+            self._parse(options),
+            done=self._onTaskParsed, failed=self._onTaskParseFailed,
+            name=name, url=options.url,
+        )
 
     def _onTaskParsed(self, task: Task, name: str, **_) -> None:
         if name:

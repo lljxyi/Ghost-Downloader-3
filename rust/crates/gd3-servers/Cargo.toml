@@ -1,0 +1,22 @@
+[package]
+name = "gd3-servers"
+description = "回环监听、HTTP 与 aria2 JSON-RPC 协议适配器"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gd3-core = { path = "../gd3-core" }
+base64 = "0.22"
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = "0.10"
+socket2 = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net"] }
+tokio-tungstenite = "0.30"
+tokio-util = "0.7"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }

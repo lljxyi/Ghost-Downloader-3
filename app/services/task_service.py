@@ -16,6 +16,7 @@ from loguru import logger
 from app.config.cfg import cfg
 from app.config.paths import APP_DATA_DIR
 from app.platform.filesystem import deletePath, isExisting, splitStemExt
+from app.services import rust_store
 from app.signal import Signal
 
 if TYPE_CHECKING:
@@ -179,15 +180,19 @@ class TaskStore:
         if not self._loaded:
             return
 
-        lines: list[str] = []
-        for task in self._tasks.values():
-            try:
-                lines.append(json.dumps(task.toDict(), ensure_ascii=False) + "\n")
-            except Exception as e:
-                logger.opt(exception=e).error("failed to serialize task {}", task.taskId)
-
-        tempFile = self._path.with_name(self._path.name + ".tmp")
         try:
+            if rust_store.isEnabled():
+                rust_store.saveLines(self._path, [task.toDict() for task in self._tasks.values()])
+                return
+
+            lines: list[str] = []
+            for task in self._tasks.values():
+                try:
+                    lines.append(json.dumps(task.toDict(), ensure_ascii=False) + "\n")
+                except Exception as e:
+                    logger.opt(exception=e).error("failed to serialize task {}", task.taskId)
+
+            tempFile = self._path.with_name(self._path.name + ".tmp")
             tempFile.parent.mkdir(parents=True, exist_ok=True)
             with open(tempFile, "w", encoding="utf-8") as f:
                 f.writelines(lines)
@@ -203,21 +208,36 @@ class TaskStore:
             self._loaded = True
             return tasks
 
+        for record in self._readRecords():
+            try:
+                task = Task.fromDict(record)
+                self._tasks[task.taskId] = task
+                self._setPlaceholders(task)
+                tasks.append(task)
+            except Exception as e:
+                logger.opt(exception=e).error("failed to parse task record")
+
+        self._loaded = True
+        return tasks
+
+    def _readRecords(self) -> list[dict]:
+        if rust_store.isEnabled():
+            records, failures = rust_store.loadLines(self._path)
+            for failure in failures:
+                logger.error("failed to parse task record: {}", failure)
+            return records
+
+        records: list[dict] = []
         with open(self._path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    task = Task.fromDict(json.loads(line))
-                    self._tasks[task.taskId] = task
-                    self._setPlaceholders(task)
-                    tasks.append(task)
+                    records.append(json.loads(line))
                 except Exception as e:
                     logger.opt(exception=e).error("failed to parse task record")
-
-        self._loaded = True
-        return tasks
+        return records
 
 
 class TaskQueue:

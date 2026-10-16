@@ -1,0 +1,23 @@
+[package]
+name = "gd3-py"
+description = "gd3-core / gd3-net / gd3-servers 的 Python 桥（PyO3）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "gd3_py"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gd3-core = { path = "../gd3-core" }
+gd3-net = { path = "../gd3-net" }
+gd3-servers = { path = "../gd3-servers" }
+futures-util = "0.3"
+pyo3 = { version = "0.26", features = ["extension-module"] }
+pythonize = "0.26"
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-tungstenite = "0.30"
+tokio-util = "0.7"

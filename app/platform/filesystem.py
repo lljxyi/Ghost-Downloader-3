@@ -9,6 +9,10 @@ from stat import S_ISDIR
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
+from app.platform import rust_filesystem
+
+
+
 INVALID_FILENAME_PATTERN = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]+')
 WINDOWS_RESERVED_FILENAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -33,6 +37,8 @@ def isFolder(path: str | PathLike[str]) -> bool:
 
 
 def toSafeFilename(name: str, fallback: str = "file", maxLength: int = 200) -> str:
+    if rust_filesystem.isEnabled():
+        return rust_filesystem.toSafeFilename(name, fallback, maxLength)
     candidate = str(name or "")
     candidate = INVALID_FILENAME_PATTERN.sub("_", candidate).strip().rstrip(". ")
 
@@ -55,6 +61,8 @@ def toSafeFilename(name: str, fallback: str = "file", maxLength: int = 200) -> s
 
 
 def splitStemExt(name: str) -> tuple[str, str]:
+    if rust_filesystem.isEnabled():
+        return rust_filesystem.splitStemExt(name)
     m = re.search(r'\.[A-Za-z0-9]{1,4}\.(?:bz2?|gz|lzma|lzo|xz|z|zst)$', name, re.IGNORECASE)
     if m:
         return name[: m.start()], name[m.start():]

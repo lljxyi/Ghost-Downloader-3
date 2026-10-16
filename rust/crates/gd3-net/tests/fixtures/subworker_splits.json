@@ -1,0 +1,740 @@
+{
+  "splits": [
+    {
+      "fileSize": 1000,
+      "subworkerCount": 2,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 499,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 500,
+          "end": 999,
+          "position": 500
+        }
+      ]
+    },
+    {
+      "fileSize": 1000,
+      "subworkerCount": 3,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 332,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 333,
+          "end": 665,
+          "position": 333
+        },
+        {
+          "index": 2,
+          "start": 666,
+          "end": 999,
+          "position": 666
+        }
+      ]
+    },
+    {
+      "fileSize": 1000,
+      "subworkerCount": 8,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 124,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 125,
+          "end": 249,
+          "position": 125
+        },
+        {
+          "index": 2,
+          "start": 250,
+          "end": 374,
+          "position": 250
+        },
+        {
+          "index": 3,
+          "start": 375,
+          "end": 499,
+          "position": 375
+        },
+        {
+          "index": 4,
+          "start": 500,
+          "end": 624,
+          "position": 500
+        },
+        {
+          "index": 5,
+          "start": 625,
+          "end": 749,
+          "position": 625
+        },
+        {
+          "index": 6,
+          "start": 750,
+          "end": 874,
+          "position": 750
+        },
+        {
+          "index": 7,
+          "start": 875,
+          "end": 999,
+          "position": 875
+        }
+      ]
+    },
+    {
+      "fileSize": 1,
+      "subworkerCount": 8,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 0,
+          "position": 0
+        }
+      ]
+    },
+    {
+      "fileSize": 0,
+      "subworkerCount": 8,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 0,
+          "position": 0
+        }
+      ]
+    },
+    {
+      "fileSize": 100,
+      "subworkerCount": 1,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 99,
+          "position": 0
+        }
+      ]
+    },
+    {
+      "fileSize": 7,
+      "subworkerCount": 3,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 1,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 2,
+          "end": 3,
+          "position": 2
+        },
+        {
+          "index": 2,
+          "start": 4,
+          "end": 6,
+          "position": 4
+        }
+      ]
+    },
+    {
+      "fileSize": 999,
+      "subworkerCount": 4,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 248,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 249,
+          "end": 497,
+          "position": 249
+        },
+        {
+          "index": 2,
+          "start": 498,
+          "end": 746,
+          "position": 498
+        },
+        {
+          "index": 3,
+          "start": 747,
+          "end": 998,
+          "position": 747
+        }
+      ]
+    },
+    {
+      "fileSize": 1000000000,
+      "subworkerCount": 16,
+      "canUseRangeRequests": true,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 62499999,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 62500000,
+          "end": 124999999,
+          "position": 62500000
+        },
+        {
+          "index": 2,
+          "start": 125000000,
+          "end": 187499999,
+          "position": 125000000
+        },
+        {
+          "index": 3,
+          "start": 187500000,
+          "end": 249999999,
+          "position": 187500000
+        },
+        {
+          "index": 4,
+          "start": 250000000,
+          "end": 312499999,
+          "position": 250000000
+        },
+        {
+          "index": 5,
+          "start": 312500000,
+          "end": 374999999,
+          "position": 312500000
+        },
+        {
+          "index": 6,
+          "start": 375000000,
+          "end": 437499999,
+          "position": 375000000
+        },
+        {
+          "index": 7,
+          "start": 437500000,
+          "end": 499999999,
+          "position": 437500000
+        },
+        {
+          "index": 8,
+          "start": 500000000,
+          "end": 562499999,
+          "position": 500000000
+        },
+        {
+          "index": 9,
+          "start": 562500000,
+          "end": 624999999,
+          "position": 562500000
+        },
+        {
+          "index": 10,
+          "start": 625000000,
+          "end": 687499999,
+          "position": 625000000
+        },
+        {
+          "index": 11,
+          "start": 687500000,
+          "end": 749999999,
+          "position": 687500000
+        },
+        {
+          "index": 12,
+          "start": 750000000,
+          "end": 812499999,
+          "position": 750000000
+        },
+        {
+          "index": 13,
+          "start": 812500000,
+          "end": 874999999,
+          "position": 812500000
+        },
+        {
+          "index": 14,
+          "start": 875000000,
+          "end": 937499999,
+          "position": 875000000
+        },
+        {
+          "index": 15,
+          "start": 937500000,
+          "end": 999999999,
+          "position": 937500000
+        }
+      ]
+    },
+    {
+      "fileSize": 100,
+      "subworkerCount": 8,
+      "canUseRangeRequests": false,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": -1,
+          "position": 0
+        }
+      ]
+    }
+  ],
+  "splitSlowest": [
+    {
+      "fileSize": 1000000,
+      "subworkerCount": 2,
+      "times": 1,
+      "states": [
+        {
+          "newSubworker": {
+            "index": 2,
+            "start": 250000,
+            "end": 499999,
+            "position": 250000
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 249999,
+              "position": 0
+            },
+            {
+              "index": 2,
+              "start": 250000,
+              "end": 499999,
+              "position": 250000
+            },
+            {
+              "index": 1,
+              "start": 500000,
+              "end": 999999,
+              "position": 500000
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "fileSize": 1000000,
+      "subworkerCount": 2,
+      "times": 2,
+      "states": [
+        {
+          "newSubworker": {
+            "index": 2,
+            "start": 250000,
+            "end": 499999,
+            "position": 250000
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 249999,
+              "position": 0
+            },
+            {
+              "index": 2,
+              "start": 250000,
+              "end": 499999,
+              "position": 250000
+            },
+            {
+              "index": 1,
+              "start": 500000,
+              "end": 999999,
+              "position": 500000
+            }
+          ]
+        },
+        {
+          "newSubworker": {
+            "index": 3,
+            "start": 750000,
+            "end": 999999,
+            "position": 750000
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 249999,
+              "position": 0
+            },
+            {
+              "index": 2,
+              "start": 250000,
+              "end": 499999,
+              "position": 250000
+            },
+            {
+              "index": 1,
+              "start": 500000,
+              "end": 749999,
+              "position": 500000
+            },
+            {
+              "index": 3,
+              "start": 750000,
+              "end": 999999,
+              "position": 750000
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "fileSize": 1000000,
+      "subworkerCount": 3,
+      "times": 3,
+      "states": [
+        {
+          "newSubworker": {
+            "index": 3,
+            "start": 833333,
+            "end": 999999,
+            "position": 833333
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 333332,
+              "position": 0
+            },
+            {
+              "index": 1,
+              "start": 333333,
+              "end": 666665,
+              "position": 333333
+            },
+            {
+              "index": 2,
+              "start": 666666,
+              "end": 833332,
+              "position": 666666
+            },
+            {
+              "index": 3,
+              "start": 833333,
+              "end": 999999,
+              "position": 833333
+            }
+          ]
+        },
+        {
+          "newSubworker": {
+            "index": 4,
+            "start": 166667,
+            "end": 333332,
+            "position": 166667
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 166666,
+              "position": 0
+            },
+            {
+              "index": 4,
+              "start": 166667,
+              "end": 333332,
+              "position": 166667
+            },
+            {
+              "index": 1,
+              "start": 333333,
+              "end": 666665,
+              "position": 333333
+            },
+            {
+              "index": 2,
+              "start": 666666,
+              "end": 833332,
+              "position": 666666
+            },
+            {
+              "index": 3,
+              "start": 833333,
+              "end": 999999,
+              "position": 833333
+            }
+          ]
+        },
+        {
+          "newSubworker": {
+            "index": 5,
+            "start": 500000,
+            "end": 666665,
+            "position": 500000
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 166666,
+              "position": 0
+            },
+            {
+              "index": 4,
+              "start": 166667,
+              "end": 333332,
+              "position": 166667
+            },
+            {
+              "index": 1,
+              "start": 333333,
+              "end": 499999,
+              "position": 333333
+            },
+            {
+              "index": 5,
+              "start": 500000,
+              "end": 666665,
+              "position": 500000
+            },
+            {
+              "index": 2,
+              "start": 666666,
+              "end": 833332,
+              "position": 666666
+            },
+            {
+              "index": 3,
+              "start": 833333,
+              "end": 999999,
+              "position": 833333
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "fileSize": 17,
+      "subworkerCount": 2,
+      "times": 1,
+      "states": [
+        {
+          "newSubworker": {
+            "index": 2,
+            "start": 13,
+            "end": 16,
+            "position": 13
+          },
+          "subworkers": [
+            {
+              "index": 0,
+              "start": 0,
+              "end": 7,
+              "position": 0
+            },
+            {
+              "index": 1,
+              "start": 8,
+              "end": 12,
+              "position": 8
+            },
+            {
+              "index": 2,
+              "start": 13,
+              "end": 16,
+              "position": 13
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "topUp": [
+    {
+      "restored": [
+        {
+          "index": 0,
+          "start": 0,
+          "position": 0,
+          "end": 100000
+        },
+        {
+          "index": 1,
+          "start": 100000,
+          "position": 100000,
+          "end": 999999
+        }
+      ],
+      "target": 4,
+      "fileSize": 1000000,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 100000,
+          "position": 0
+        },
+        {
+          "index": 1,
+          "start": 100000,
+          "end": 324999,
+          "position": 100000
+        },
+        {
+          "index": 3,
+          "start": 325000,
+          "end": 549999,
+          "position": 325000
+        },
+        {
+          "index": 2,
+          "start": 550000,
+          "end": 999999,
+          "position": 550000
+        }
+      ]
+    },
+    {
+      "restored": [
+        {
+          "index": 0,
+          "start": 0,
+          "position": 0,
+          "end": 499999
+        },
+        {
+          "index": 1,
+          "start": 500000,
+          "position": 500000,
+          "end": 999999
+        }
+      ],
+      "target": 8,
+      "fileSize": 1000000,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 124999,
+          "position": 0
+        },
+        {
+          "index": 4,
+          "start": 125000,
+          "end": 249999,
+          "position": 125000
+        },
+        {
+          "index": 2,
+          "start": 250000,
+          "end": 374999,
+          "position": 250000
+        },
+        {
+          "index": 5,
+          "start": 375000,
+          "end": 499999,
+          "position": 375000
+        },
+        {
+          "index": 1,
+          "start": 500000,
+          "end": 624999,
+          "position": 500000
+        },
+        {
+          "index": 6,
+          "start": 625000,
+          "end": 749999,
+          "position": 625000
+        },
+        {
+          "index": 3,
+          "start": 750000,
+          "end": 874999,
+          "position": 750000
+        },
+        {
+          "index": 7,
+          "start": 875000,
+          "end": 999999,
+          "position": 875000
+        }
+      ]
+    },
+    {
+      "restored": [
+        {
+          "index": 0,
+          "start": 0,
+          "position": 250000,
+          "end": 499999
+        },
+        {
+          "index": 1,
+          "start": 500000,
+          "position": 500000,
+          "end": 999999
+        }
+      ],
+      "target": 4,
+      "fileSize": 1000000,
+      "subworkers": [
+        {
+          "index": 0,
+          "start": 0,
+          "end": 374999,
+          "position": 250000
+        },
+        {
+          "index": 3,
+          "start": 375000,
+          "end": 499999,
+          "position": 375000
+        },
+        {
+          "index": 1,
+          "start": 500000,
+          "end": 749999,
+          "position": 500000
+        },
+        {
+          "index": 2,
+          "start": 750000,
+          "end": 999999,
+          "position": 750000
+        }
+      ]
+    }
+  ]
+}

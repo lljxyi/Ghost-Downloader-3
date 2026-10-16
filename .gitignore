@@ -45,3 +45,6 @@ browser_extension/firefox/
 
 # Android 是独立的私有仓库
 /android/
+
+# 忽略 Rust 构建产物
+rust/target/

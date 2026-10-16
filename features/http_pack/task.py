@@ -16,6 +16,7 @@ from app.client import buildClient, toEmulation
 from app.config.cfg import cfg
 from app.models.task import Task, TaskError, TaskStep, TaskStatus, SpecialFileSize
 from app.platform.sysio import ftruncate, pwrite
+from . import rust_engine
 
 STREAM_READ_TIMEOUT = 30
 SPLIT_START_INTERVAL = 0.2
@@ -372,6 +373,11 @@ class HttpTaskStep(TaskStep):
             self._reassignSubworker()
 
     async def run(self, reportSpeed, waitForSpeedLimit) -> None:
+
+        if rust_engine.isEnabled():
+            await rust_engine.run(self, reportSpeed, waitForSpeedLimit)
+            return
+
         self._reportSpeed = reportSpeed
         self._waitForSpeedLimit = waitForSpeedLimit
         self._speedHistory: list[int] = []

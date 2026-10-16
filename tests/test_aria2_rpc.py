@@ -13,6 +13,7 @@ from websockets.exceptions import InvalidStatus
 from app.config.cfg import cfg
 from app.config.constants import VERSION
 from app.models.task import TaskError
+from app.services import rust_aria2 as rustAria2
 from app.services.aria2_rpc import Aria2RpcService
 from app.services.coroutine_runner import CoroutineRunner
 from app.services.port_listener import ListenStatus, PortListener
@@ -90,7 +91,14 @@ async def aria2(monkeypatch, tmp_path):
     rpc = Aria2RpcService(runner, parse=parse, addTask=added.append)
     rpc.taskDraftRequested.connect(drafted.extend)
     rpc.parseFailed.connect(lambda url, error: failed.append((url, error)))
-    listener = PortListener(runner, rpc.handle, isEnabled=FakeItem(True), port=FakeItem(findFreePort()))
+
+    port = findFreePort()
+    if rustAria2.isEnabled():
+        listener = rustAria2.RustAria2Listener(
+            rpc, isEnabled=FakeItem(True), port=FakeItem(port),
+        )
+    else:
+        listener = PortListener(runner, rpc.handle, isEnabled=FakeItem(True), port=FakeItem(port))
     listener.start()
     await waitFor(lambda: listener.state.status == ListenStatus.LISTENING)
 

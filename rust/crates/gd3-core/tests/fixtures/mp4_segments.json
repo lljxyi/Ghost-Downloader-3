@@ -1,0 +1,67 @@
+{
+  "boxes": {
+    "ftyp": [
+      0,
+      28
+    ],
+    "moov": [
+      28,
+      710
+    ],
+    "sidx": [
+      738,
+      1784
+    ],
+    "moof": [
+      2522,
+      1244
+    ]
+  },
+  "segments": [
+    {
+      "start": 60,
+      "end": 65,
+      "segStart": 474839,
+      "segEnd": 607551,
+      "segStartTime": 54.25425425425424,
+      "segDuration": 13.213213213213216,
+      "patchedHeaderLength": 738
+    },
+    {
+      "start": 0,
+      "end": 5,
+      "segStart": 2522,
+      "segEnd": 57774,
+      "segStartTime": 0.0,
+      "segDuration": 7.741074407741074,
+      "patchedHeaderLength": 738
+    },
+    {
+      "start": 726,
+      "end": 731,
+      "segStart": 6690674,
+      "segEnd": 6744153,
+      "segStartTime": 724.8915582248916,
+      "segDuration": 6.03937270603933,
+      "patchedHeaderLength": 738
+    },
+    {
+      "start": 0,
+      "end": 731,
+      "segStart": 2522,
+      "segEnd": 6744153,
+      "segStartTime": 0.0,
+      "segDuration": 730.9309309309309,
+      "patchedHeaderLength": 738
+    },
+    {
+      "start": 120,
+      "end": 121,
+      "segStart": 994664,
+      "segEnd": 1052572,
+      "segStartTime": 118.71871871871869,
+      "segDuration": 4.971638304971634,
+      "patchedHeaderLength": 738
+    }
+  ]
+}

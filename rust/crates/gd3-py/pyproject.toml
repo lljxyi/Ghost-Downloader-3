@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "gd3-py"
+description = "gd3-core 的 Python 桥（PyO3）"
+requires-python = ">=3.13"
+version = "0.1.0"
+
+[tool.maturin]
+module-name = "gd3_py"
+manifest-path = "Cargo.toml"

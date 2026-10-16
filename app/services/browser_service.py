@@ -275,6 +275,17 @@ class BrowserService:
         finally:
             self._coroutineRunner.post(self._onDisconnected, stream)
 
+    # ── Rust 监听器（`app/services/rust_browser.py`）的入口，与 `handle` 等价 ──
+
+    def onRustConnected(self, stream, peerAddress: str) -> None:
+        self._onConnected(stream, peerAddress)
+
+    def onRustMessage(self, stream, message) -> None:
+        self._onMessageReceived(stream, message)
+
+    def onRustDisconnected(self, stream) -> None:
+        self._onDisconnected(stream)
+
     def _send(self, session: BrowserClientSession, payload: dict) -> None:
         self._coroutineRunner.submit(session.stream.send(json.dumps(payload, ensure_ascii=False)))
 

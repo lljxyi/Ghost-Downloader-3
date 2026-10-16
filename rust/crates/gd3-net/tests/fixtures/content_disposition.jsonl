@@ -1,0 +1,40 @@
+{"cd": "attachment; filename=\"video.mp4\"", "name": "video.mp4"}
+{"cd": "attachment; filename=video.mp4", "name": "video.mp4"}
+{"cd": "attachment; filename='video.mp4'", "name": "video.mp4"}
+{"cd": "inline; filename=\"a b c.bin\"", "name": "a b c.bin"}
+{"cd": "attachment", "name": ""}
+{"cd": "", "name": ""}
+{"cd": "   ", "name": ""}
+{"cd": "attachment; filename=\"a\\\"b.mp4\"", "name": "a\"b.mp4"}
+{"cd": "attachment; filename=\"  spaced.mp4  \"", "name": "spaced.mp4"}
+{"cd": "attachment; filename=\"trailing.mp4\" ", "name": "trailing.mp4"}
+{"cd": "attachment; filename=\"\"", "name": ""}
+{"cd": "attachment; filename=\"a;b.mp4\"", "name": "a;b.mp4"}
+{"cd": "attachment; filename=\"a=b.mp4\"", "name": "a=b.mp4"}
+{"cd": "attachment; filename=\"v.mp4\"; size=1234", "name": "v.mp4"}
+{"cd": "attachment; size=1234; filename=\"v.mp4\"", "name": "v.mp4"}
+{"cd": "attachment; filename=\"v.mp4\"; filename=\"w.mp4\"", "name": "w.mp4"}
+{"cd": "attachment; filename*=UTF-8''%E8%A7%86%E9%A2%91.mp4", "name": "视频.mp4"}
+{"cd": "attachment; filename*=utf-8''%e8%a7%86%e9%a2%91.mp4", "name": "视频.mp4"}
+{"cd": "attachment; filename*=UTF-8'en'%E8%A7%86%E9%A2%91.mp4", "name": "视频.mp4"}
+{"cd": "attachment; filename*=ISO-8859-1''%E9%C5.mp4", "name": "éÅ.mp4"}
+{"cd": "attachment; filename*=UTF-8''%2Fetc%2Fpasswd", "name": "/etc/passwd"}
+{"cd": "attachment; filename=\"plain.mp4\"; filename*=UTF-8''%E8%A7%86%E9%A2%91.mp4", "name": "视频.mp4"}
+{"cd": "attachment; filename*=UTF-8''%E8%A7%86%E9%A2%91.mp4; filename=\"plain.mp4\"", "name": "视频.mp4"}
+{"cd": "attachment; filename=\"%E8%A7%86%E9%A2%91.mp4\"", "name": "视频.mp4"}
+{"cd": "attachment; filename=\"a%20b.mp4\"", "name": "a b.mp4"}
+{"cd": "attachment; filename", "name": ""}
+{"cd": "attachment; =value", "name": ""}
+{"cd": "attachment; filename*", "name": ""}
+{"cd": "attachment; filename*=UTF-8''", "name": ""}
+{"cd": "attachment; filename*=UTF-8''%ZZ.mp4", "name": "%ZZ.mp4"}
+{"cd": "attachment; filename*=bogus", "name": "bogus"}
+{"cd": "attachment; filename=\"unterminated", "name": "unterminated"}
+{"cd": "attachment;;;", "name": ""}
+{"cd": "attachment; ;", "name": ""}
+{"cd": "ATTACHMENT; FILENAME=\"Upper.MP4\"", "name": "Upper.MP4"}
+{"cd": "attachment; FileName=\"Mixed.MP4\"", "name": "Mixed.MP4"}
+{"cd": "attachment; filename=\"视频.mp4\"", "name": "视频.mp4"}
+{"cd": "attachment; filename=\"😀.mp4\"", "name": "😀.mp4"}
+{"cd": "attachment; filename=\"/etc/passwd\"", "name": "/etc/passwd"}
+{"cd": "attachment; filename=\"..\\..\\evil.mp4\"", "name": "..\\..\\evil.mp4"}
