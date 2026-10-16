@@ -186,3 +186,22 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   `test_android_pack_import.py` 因缺 `android/app/build.gradle.kts` 收集失败已 `--ignore`；
   android errors 基线由 35 → 34。若下轮 android 目录回来，恢复原口径。
 - 下一步：PortListener 接入评估，或 github/tree 剩余解析层。
+
+## 2026-10-16 第 11 步（第 4 轮）
+- 做了什么：bili `fetchView` 网络层下沉 Rust 影子分支（`GD3_RUST_BILI_VIEW`，默认关）。
+  - Rust：`gd3_net::bili::fetch_view`，分段纯函数 `season_list_url` / `view_api_url`（av→avid
+    去前两位）/ `pick_season_video_id`（「未获取到合集信息」逐字）/ `check_view_payload`
+    （code missing/null/0 放行、取 data or {}、message 兜底文案逐字）+ async `get_json`
+    共用 api_headers；ViewError{Transport, ValueError}。内嵌单测 5 项（gd3-net lib 40 passed）。
+  - PyO3 `bili_fetch_view(video_id, mid, season_id, api_headers, client_profile)`
+    （wreq client + 每次 build runtime，与 hf_fetch_tree 同款限制）→ 返回 data dict。
+  - `features/bili_pack/rust_view.py` 适配器（asyncio.to_thread；真实 seasonId 传入——
+    早稿误传 `1 if seasonId else 0`，会把 URL 里的 season_id 写成 1，已修）；pack.py 接线。
+  - 桥冒烟：真实 API 可达；错误路径 `ValueError 啥都木有`（bilibili message 原样透传）。
+- 验证：fmt 0 / clippy 0 / 三 crate cargo test 全绿（18 ok）；maturin 重建；
+  bili 相关定向测试 93 passed；双模式全量回归两轮均 **3F/955P/8S/34E**，集合 diff 为空
+  （android/ 目录仍缺，继续 --ignore test_android_pack_import）。
+- 文档坑：`//!` 有序列表后续行缩进 5 空格会报 overindented、不缩进报 without indentation——
+  4 空格才算挂到列表项下。
+- 下一步：m3u8 parse 层（依赖 `m3u8` 库语义，量大）或 ftp/其他纯层；bili 网络层其余
+  （fetchPlayurl 请求侧）可继续同款。
