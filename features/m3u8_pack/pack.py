@@ -79,11 +79,24 @@ class M3U8Parser(TaskParser):
             lowered = body.lower()
             isLive = 'type="dynamic"' in lowered or "type='dynamic'" in lowered
         else:
-            playlist = m3u8.loads(body, uri=manifestUrl)
-            if playlist.segments:
-                isLive = not playlist.is_endlist
-            elif playlist.playlists:
-                variantUrl = playlist.playlists[0].absolute_uri or ""
+            from .rust_playlist import isEnabled as rustPlaylistEnabled
+            if rustPlaylistEnabled():
+                from .rust_playlist import absoluteUri as rustAbsoluteUri, loadsSnapshot
+                isEndlist, segmentCount, variants = loadsSnapshot(body)
+                firstVariantUrl = (
+                    rustAbsoluteUri(variants[0][0], manifestUrl) if variants else None
+                )
+            else:
+                playlist = m3u8.loads(body, uri=manifestUrl)
+                segmentCount = len(playlist.segments)
+                isEndlist = playlist.is_endlist
+                firstVariantUrl = (
+                    playlist.playlists[0].absolute_uri if playlist.playlists else None
+                )
+            if segmentCount:
+                isLive = not isEndlist
+            elif firstVariantUrl is not None:
+                variantUrl = firstVariantUrl or ""
                 if variantUrl.lower().startswith(("http://", "https://")):
                     try:
                         variantClient = buildClient(emulation=toEmulation(
@@ -97,7 +110,12 @@ class M3U8Parser(TaskParser):
                             variantBody = await variantResponse.text()
                         finally:
                             variantClient.close()
-                        isLive = not m3u8.loads(variantBody, uri=variantUrl).is_endlist
+                        from .rust_playlist import isEnabled as rustPlaylistEnabled
+                        if rustPlaylistEnabled():
+                            from .rust_playlist import loadsSnapshot
+                            isLive = not loadsSnapshot(variantBody)[0]
+                        else:
+                            isLive = not m3u8.loads(variantBody, uri=variantUrl).is_endlist
                     except Exception as e:
                         logger.warning("取变体清单判活失败, 按点播处理: {}", repr(e))
                         isLive = False
@@ -197,8 +215,21 @@ class M3U8Parser(TaskParser):
             return []
 
     def _hlsStreams(self, body: str) -> list[dict]:
-        playlist = m3u8.loads(body)
         streams = []
+        from .rust_playlist import isEnabled as rustPlaylistEnabled
+        if rustPlaylistEnabled():
+            from .rust_playlist import loadsSnapshot
+            for _, width, height, codecs, frameRate in loadsSnapshot(body)[2]:
+                if width is None:
+                    continue
+                streams.append({
+                    "width": width,
+                    "height": height,
+                    "codecs": codecs,
+                    "frameRate": frameRate,
+                })
+            return streams
+        playlist = m3u8.loads(body)
         for variant in playlist.playlists:
             resolution = variant.stream_info.resolution
             if not resolution:
