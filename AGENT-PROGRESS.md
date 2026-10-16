@@ -376,3 +376,52 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
 - 下一步：m3u8 `parse` 摸底（`m3u8`/`mpegdash` 库语义，先实测再决定）；
   ed2k `parseProgress`（`kelpie.py::336`，纯 JSON 变换）；bili `fetchPlayurl`（量大）。
 - 卡点：无。
+## 2026-11-03 第 18 步：m3u8 清单 parse 扫描面下沉 Rust（`GD3_RUST_M3U8_PARSE`，默认关，第 10/11 轮收口）
+
+- 做了什么：
+  - 核心层收口（`rust/crates/gd3-core/src/hls.rs`，上轮半成品 + 本轮修正，`495f285`）：
+    `#EXT-X-VERSION` 移入 int cast（`py_simple_param`，重构出 `py_simple_param_raw`）；
+    `#EXT-X-ALLOW-CACHE`/`#EXT-X-PLAYLIST-TYPE` 只做 split-unpack ValueError 面（str cast）；
+    修两个扫描层 bug：`py_int` 的 Ok 分支漏应用负号（`-1920` 回 `1920`，与上轮 `py_float` 同款，
+    金文件 `master_resolution_negative` 暴露）；空 key dict（`#EXT-X-KEY:` 无参数）应容忍
+    （model 层 `Key(...) if params else None` → None 不构造，`key_empty_params` 暴露）。
+    附回归断言（`py_int("-1920")==-1920`、`py_int("- 1")` invalid literal 文案、空 key probe 不报错）。
+  - 桥（`rust/crates/gd3-py/src/hls.rs` + `lib.rs` 注册，`6c35a96`）：
+    `gd3_py.m3u8_probe(body) -> (tag, message, is_endlist, segment_count, [(uri,width,height,codecs,frame_rate),…])`，
+    error 时 `("error", "Kind: message", false, 0, [])`，不抛 Err。
+  - Rust 金文件对比（`tests/hls.rs` 重写为 mismatch 收集器，`495f285`）：75 条（46 ok / 29 error）
+    逐条比对，dump 全部不一致而不是第一条就 panic（本轮用它一次抓出两个 bug）。
+  - 适配器（`features/m3u8_pack/rust_playlist.py`，`e9b39ee`）：`loadsSnapshot(body)` +
+    `isEnabled()`（`GD3_RUST_M3U8_PARSE`）+ `absoluteUri`（逐字镜像 `BasePathMixin.absolute_uri`
+    的 urljoin+scheme 判定含报错文案）+ 异常同型翻译：按 Kind 挑 ValueError/OverflowError/
+    TypeError/IndexError 原型重抛；KeyError 的 `str(e)` 是参数 repr（`'bandwidth'`），
+    所以先 `ast.literal_eval` 解一层引号再抛——native `str`/`repr`/`f"{type}:{e}"` 三件套对齐。
+  - 接线（`features/m3u8_pack/pack.py`，`0902878`）：三处 `m3u8.loads` 扫描面分流——
+    主清单 live 判定（segments/变体 + `absoluteUri` 拼第一个变体 URL）、变体清单判活、
+    `_hlsStreams` 的 streams 枚举。相对导入沿用 pack 的函数内延迟 import（与 task.py 同 pattern，
+    顶层 `from . import X` 在这种动态加载包里 ImportError）。
+  - Python parity（`tests/test_m3u8_parse_rust.py`，`0902878`）：金文件 75 条逐条对表
+    （error 路径 type 名/str/repr 三件套、ok 路径 isEndlist/段数/rawUris/streams）+ absoluteUri
+    与库 Segment mixin 对表（含空 base_uri 抛 ValueError 文案逐字）+ pack 级 `_hlsStreams`
+    双模式冒烟 + 开关默认值（monkeypatch.delenv）。**82 passed**。
+- 踩坑记录：
+  - 测试里一开始用 `m3u8.M3U8(base_uri=…).uri` 想拿 mixin 的 absolute_uri——顶层对象没有
+    `uri` 属性，要构造 `m3u8.model.Segment(uri=…, base_uri=…)`；且空 base_uri 时库也抛
+    （不是返回相对结果），删掉错误预期。
+  - maturin 记得同时加 `/root/.cargo/bin` 进 PATH（只加 .local/bin 会报 rustc 不在 PATH）。
+- 验证：
+  - `cargo fmt --all --check` OK；`cargo clippy --all-targets -- -D warnings` 干净
+    （修掉桥里 `Option<f64>` 的 clone ×1）；`cargo test -p gd3-core -p gd3-net -p gd3-servers`
+    全 0 失败（含 `--test hls` 1 passed：75 条金文件逐条比对）；
+  - maturin 重建 OK；m3u8 四件定向（parse_rust/output/error/progress）= 177 passed；
+  - 双模式全量回归（`--ignore=tests/test_android_pack_import.py -p no:randomly`）：
+    开关关 → **3 failed / 1208 passed / 8 skipped / 34 errors**；
+    22 开关全开 → **3 failed / 1205 passed / 11 skipped / 34 errors**；
+    FAILED+ERROR 集合 diff **为空**（1208→1205 的差 = 走 Rust 分支后白盒 Python 分支测试
+    skip，之前各步已建立）。失败 3 条仍是既有基线（android_config_parity / github_probe /
+    runtime_install）。
+- 提交：`495f285`（核心层 + 金文件 + Rust 对比测试）、`6c35a96`（桥）、`e9b39ee`（适配器）、
+  `0902878`（接线 + parity）。
+- 下一步：ed2k `parseProgress`（kelpie.py::336，纯 JSON 变换，小）；或 bili `fetchPlayurl`（量大）；
+  mpegdash 评估。之后 Phase 7 Slint UI 与 `/root/Ghost-Downloader-3/AGENT-DONE`。
+- 卡点：无（android 目录仍未回来，34 errors 口径不变）。
