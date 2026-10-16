@@ -1,0 +1,53 @@
+{"text": "ed2k://|file|video.mp4|1234|0123456789abcdef0123456789abcdef|/", "name": "video.mp4", "size": 1234, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|video.mp4|1234|0123456789ABCDEF0123456789ABCDEF|/", "name": "video.mp4", "size": 1234, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|video.mp4|0|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|video.mp4|0|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|video.mp4|00|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|video.mp4|00|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|video.mp4|274877906944|0123456789abcdef0123456789abcdef|/", "name": "video.mp4", "size": 274877906944, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|video.mp4|274877906945|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|video.mp4|274877906945|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|video.mp4|1111111111111111111111111111111111111111|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|video.mp4|1111111111111111111111111111111111111111|0123456789abcdef0123456789abcdef|/"}
+{"text": "ED2K://|file|video.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "Ed2k://|file|video.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|FILE|video.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|File|video.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://| File|video.mp4|1|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: not an eD2k file link: ed2k://| File|video.mp4|1|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|folder|name|", "error": "INVALID_LINK: not an eD2k file link: ed2k://|folder|name|"}
+{"text": " ed2k://|file|video.mp4|1|0123456789abcdef0123456789abcdef|/ ", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "\ted2k://|file|video.mp4|1|0123456789abcdef0123456789abcdef|/\n", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "\u001ced2k://|file|video.mp4|1|0123456789abcdef0123456789abcdef|/\u001d", "name": "video.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://%7Cfile%7Cname%2Bspace%7C333%7C0123456789abcdef0123456789abcdef%7C/", "name": "name+space", "size": 333, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://%7cfile%7cpl.txt%7c2%7c0123456789abcdef0123456789abcdef%7c/", "name": "pl.txt", "size": 2, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ED2K://%7CFILE%7C%D1%86.txt%7C4%7C0123456789abcdef0123456789abcdef%7C/", "name": "ц.txt", "size": 4, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://%7Cfile%7C%E8%A7%86%E9%A2%91%20.mp4%7C9%7C0123456789abcdef0123456789abcdef%7C/", "name": "视频 .mp4", "size": 9, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|a%7Cb.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "a|b.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|%7Clead.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "|lead.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|100%25.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "100%.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|a%20b.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "a b.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|a%FFb.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "a�b.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|%C3%A9.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "é.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|%C3.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "�.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|%E0%80%A0.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "���.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|%F0%9F%98%80%F0.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "😀�.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|x%zz.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "x%zz.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|a%%b.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "a%%b.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|%2.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "%2.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|emoji😀.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "emoji😀.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|视频.mp4|1|0123456789abcdef0123456789abcdef|/", "name": "视频.mp4", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file||1|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has no name: ed2k://|file||1|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n|-1|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|n|-1|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n|abc|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|n|abc|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n| |0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|n| |0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n|+1|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|n|+1|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n|1.0|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|n|1.0|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n|０|0123456789abcdef0123456789abcdef|/", "error": "INVALID_LINK: link has an invalid size: ed2k://|file|n|０|0123456789abcdef0123456789abcdef|/"}
+{"text": "ed2k://|file|n|1|0123456789ABCDEF0123456789ABCDEF|/", "name": "n", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}
+{"text": "ed2k://|file|n|1|0123456789abcdef0123456789abcde|/", "error": "INVALID_LINK: link has an invalid hash: ed2k://|file|n|1|0123456789abcdef0123456789abcde|/"}
+{"text": "ed2k://|file|n|1|0123456789abcdef0123456789abcdef0|/", "error": "INVALID_LINK: link has an invalid hash: ed2k://|file|n|1|0123456789abcdef0123456789abcdef0|/"}
+{"text": "ed2k://|file|n|1|0123456789abcdef0123456789abcdeg|/", "error": "INVALID_LINK: link has an invalid hash: ed2k://|file|n|1|0123456789abcdef0123456789abcdeg|/"}
+{"text": "ed2k://|file|n|1||/", "error": "INVALID_LINK: link has an invalid hash: ed2k://|file|n|1||/"}
+{"text": "ed2k://", "error": "INVALID_LINK: not an eD2k file link: ed2k://"}
+{"text": "ed2k://|file|", "error": "INVALID_LINK: not an eD2k file link: ed2k://|file|"}
+{"text": "ed2k://|file|n|1", "error": "INVALID_LINK: not an eD2k file link: ed2k://|file|n|1"}
+{"text": "http://example.com", "error": "INVALID_LINK: not an eD2k link: http://example.com"}
+{"text": "", "error": "INVALID_LINK: not an eD2k link: "}
+{"text": "   ", "error": "INVALID_LINK: not an eD2k link: "}
+{"text": "ed2k://|file|n|1|0123456789abcdef0123456789abcdef|/|v2", "name": "n", "size": 1, "hash": "0123456789ABCDEF0123456789ABCDEF"}

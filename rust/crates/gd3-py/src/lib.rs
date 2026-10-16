@@ -9,6 +9,7 @@
 
 mod bili;
 mod browser;
+mod ed2k;
 mod github;
 mod hf;
 mod http;
@@ -251,6 +252,11 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(m3u8::m3u8_parse_diagnostic, module)?)?;
     module.add_function(wrap_pyfunction!(m3u8::m3u8_classify_error, module)?)?;
     module.add_function(wrap_pyfunction!(m3u8::m3u8_parse_output_line, module)?)?;
+    module.add_function(wrap_pyfunction!(ed2k::ed2k_parse_link, module)?)?;
+    module.add(
+        "Ed2kInvalidLinkError",
+        module.py().get_type::<ed2k::Ed2kInvalidLinkError>(),
+    )?;
     module.add_function(wrap_pyfunction!(bili::bili_to_cookie, module)?)?;
     module.add_function(wrap_pyfunction!(to_safe_filename, module)?)?;
     module.add_function(wrap_pyfunction!(split_stem_ext, module)?)?;
