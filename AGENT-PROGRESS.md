@@ -138,3 +138,8 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   合并做（本轮只动了默认关的新分支，pytest 全量两轮已在上一步基线一致，本步新增
   测试文件独立跑通过）。
 - 下一步：hf `parse` 剩余（buildPages/fetchView JSON 变换层）或 `PortListener` 接入。
+- 补充（同轮）：bili URL 层双模式全量回归已单独跑完两轮
+  （开关关 / GD3_RUST_BILI_URL=1）：均为 **3 failed / 933 passed / 8 skipped / 35 errors**，
+  FAILED+ERROR 集合 diff 为空（38 条 = 基线 android_config_parity / github_probe /
+  runtime_install + android 系列 errors，与基线一致）。本轮基线计数从 846P 涨到 933P
+  = 本步 21 + 此前各步累计新增测试。
