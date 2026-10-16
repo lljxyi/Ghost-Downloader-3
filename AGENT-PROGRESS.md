@@ -314,3 +314,22 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   `tests/test_http_subworker.py::TestTransientRetry::test_500_retries_then_succeeds` 卡住 1 小时，
   随后同命令连跑 2 次均 33s 正常完成；单开关 `GD3_RUST_HTTP=1`、18 开关（无 HF_HEAD）、
   单开关 `GD3_RUST_HF_HEAD=1` 也都正常。判为既有环境 flake，未修，后续全量跑一律加 `timeout`）。
+
+## 2026-10-16 22:00 第 16 步：收口上一轮留下的 m3u8 半成品（第 6 轮开工）
+- 做了什么：新会话开工时发现工作区有未提交的 m3u8 输出解析层半成品
+  （`rust/crates/gd3-core/src/m3u8.rs` 362 行、`gd3-py/src/m3u8.rs` 桥、
+  `features/m3u8_pack/rust_output.py` 适配、`task.py` 三处接线、
+  `tests/test_m3u8_output_rust.py` 61 用例），内容完整，跑通质量门后提交。
+  新增依赖：`gd3-core` 引入 `regex` crate（正则照抄 Python 模式）。开关
+  `GD3_RUST_M3U8_OUTPUT` 默认关。
+- 验证：`cargo fmt --all --check` OK；`cargo clippy --all-targets -- -D warnings` 干净；
+  `cargo test -p gd3-core -p gd3-net -p gd3-servers` 0 失败；maturin 重建桥 OK；
+  `pytest tests/test_m3u8_output_rust.py` 61 passed；`tests/test_m3u8_error.py +
+  test_m3u8_progress.py` 34 passed。双模式全量回归（`--ignore=android_pack_import`）：
+  开关关 3F/1063P/8S/34E，FAILED+ERROR 与基线 diff 只差被 ignore 的 android 一条；
+  20 开关全开 4F/1059P/11S/34E，diff 仅
+  `test_engine_listeners.py::test_stopping_the_engine_releases_both_ports[uvloop]`
+  ——运维文档记录的既有 flake，单跑 `2 passed` 复验非回归。
+- 下一步：m3u8 pack 的下一层（`parse`，依赖 m3u8/mpegdash 库语义，先摸底再决定）；
+  或按 README「未做」清单继续。
+- 卡点：无。
