@@ -44,6 +44,8 @@ $env:GD3_RUST_HTTP = "1"      # HTTP Step 传输交给 Rust
 $env:GD3_RUST_ARIA2 = "1"     # aria2 监听器交给 Rust
 $env:GD3_RUST_BROWSER = "1"   # 浏览器扩展监听器交给 Rust
 $env:GD3_RUST_FILENAME = "1"  # 文件名净化与拆分交给 Rust
+$env:GD3_RUST_PROBE = "1"     # 远程文件探测（name/size/range）交给 Rust
+$env:GD3_RUST_HF_TREE = "1"   # HuggingFace 仓库树枚举交给 Rust
 uv run pytest -q
 ```
 
