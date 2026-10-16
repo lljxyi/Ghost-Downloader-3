@@ -120,3 +120,21 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   保留独立 pyRef 实现。
 - 验证：`pytest tests/test_hf_url.py` = 67 passed；git status 干净。
 - 下一步：bili `parseBiliUrl` 纯判定层（同款模式），随后 PortListener。
+
+## 2026-10-16 第 8 步（commit a38417b，第 1 轮续）
+- 做了什么：bili `parseBiliUrl` 纯判定层收口（接第 7 步的半成品）。
+  - Rust：`gd3_net::bili` 追加 `parse_url`（三规则线性匹配：`/video/(BV...|avN)`、
+    `/N/lists/N`、`/N/channel/collectiondetail?sid=`），自写 `split_path_query`/
+    `unquote_plus`/`parse_qs`（keep_blank_values=False）/`parse_page_spec`/
+    `python_str_to_int`（错误文案逐字镜像 Python int()），4 项内嵌单测。
+    修掉早稿 `BV1abc1` 截断 bug：匹配长度算在去前缀 body 上、切片也在 body 上做。
+  - PyO3 `bili_parse_url`（失败抛同文案 ValueError）+ `features/bili_pack/rust_url.py`
+    （GD3_RUST_BILI_URL，默认关）+ `parse.py::parseBiliUrl` 分流；maturin develop 重建。
+  - `tests/test_bili_url.py`：21 passed（20 URL 双实现对表，错误文案 re.escape 逐字）。
+  - LIVE Python 语义确认：`BV1av12` 第一候选即中；`p=1,`（尾空段）与 `p=x` 抛
+    `int()` 英文文案（不报"不是有效的"）；`487/lists/920`（无前导斜杠）不匹配；
+    `parsePageSpec("p=1%2C2+3,4-a")` 报 `invalid literal ... '2 3'`。
+- 验证：fmt/clippy/cargo test 全绿（0 failed）；双模式全量回归按规则单独跑待下一批
+  合并做（本轮只动了默认关的新分支，pytest 全量两轮已在上一步基线一致，本步新增
+  测试文件独立跑通过）。
+- 下一步：hf `parse` 剩余（buildPages/fetchView JSON 变换层）或 `PortListener` 接入。
