@@ -275,3 +275,42 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
     contentType='application/octet-stream')` 两侧一致。
 - 下一步：HF 单文件 `head` 探测（`features/huggingface_pack/pack.py:89-98`，小）。
 - 卡点：无。
+
+## 2026-10-16 20:55 第 15 步
+- 做了什么：HF 单文件 HEAD 探测下沉到 Rust 影子分支（开关 `GD3_RUST_HF_HEAD`，默认关）。
+  - `rust/crates/gd3-net/src/hf.rs` 追加 `HfFileHead { file_size: i64, can_use_range: bool }`、
+    `pub async fn head_file(client, headers, url) -> Result<HfFileHead, HfTreeError>`、
+    私有 `fn parse_int(text: &str) -> Option<i64>`（ASCII 子集：trim、可选 `+`/`-`、数字间单个 `_`），
+    内嵌单测 `parse_int_follows_cpython`。
+  - `rust/crates/gd3-py/src/hf.rs` 追加 `#[pyfunction] hf_head_file(url, headers, client_profile)
+    -> PyResult<(i64, bool)>`；`lib.rs` 在 `hf_build_files` 之后注册。
+  - `rust/crates/gd3-net/tests/hf_head.rs`（新，6 个集成测试）：`content_length_and_accept_ranges_are_read`、
+    `forbidden_responses_still_report_headers`、`accept_ranges_value_is_ignored`、
+    `missing_content_length_is_zero`、`negative_content_length_is_kept`、
+    `non_numeric_content_length_is_an_error`。
+  - Python 适配 `features/huggingface_pack/rust_head.py`（新）：`isEnabled()` 读
+    `GD3_RUST_HF_HEAD == "1"`；`headFile(downloadUrl, headers) -> (fileSize, canUseRange)`，
+    内部 `asyncio.to_thread(gd3_py.hf_head_file, ...)`，profile 取 `cfg.clientProfile.value`。
+    `features/huggingface_pack/pack.py:89-98` 接线影子开关（原 `client.head` 那段保留在 else 分支）。
+  - `tests/test_hf_head.py`（新，154 行）双实现 parity → **7 passed**：裸 socket `RawHeadServer`
+    工厂 fixture + `rawResponse()`（aiohttp 造不出「缺 accept-ranges」「非整数 content-length」这类响应），
+    `runCase`/`runBoth` 逐例对比 `(task.fileSize, task.steps[0].canUseRangeRequests)`，
+    异常路径返回 `("error", type(error).__name__, str(error))`。7 个用例：
+    content-length+accept-ranges / 缺 accept-ranges / `Accept-Ranges: none` / 负数 content-length /
+    缺 content-length / 404 不抛 / 非整数 content-length 抛 ValueError。
+- 验证：
+  - `cargo fmt --all --check` OK；`cargo clippy --all-targets -- -D warnings` 干净；
+    `cargo test -p gd3-core -p gd3-net -p gd3-servers` 全绿（含 `gd3-net --test hf_head` 6 passed）。
+  - `pytest tests/test_hf_head.py -q` → **7 passed**（1.51s）。
+  - 双模式全量回归（均 `--ignore=tests/test_android_pack_import.py -p no:randomly`）：
+    开关关 → **3 failed / 1002 passed / 8 skipped / 34 errors**，与 `/root/baseline-failures.txt`
+    的 FAILED+ERROR 集合 diff **仅**多出被 ignore 的 `ERROR tests/test_android_pack_import.py`；
+    19 个开关全开（含 `GD3_RUST_HF_HEAD=1`）→ **3 failed / 999 passed / 11 skipped / 34 errors**，
+    与开关关那轮的 FAILED+ERROR 集合 diff **为空**（完全一致）。
+- 下一步：Phase 5 继续。候选（按性价比）：m3u8 `parse`（`features/m3u8_pack`，依赖 `m3u8`/`mpegdash`
+  库语义，风险高）、bili `fetchPlayurl`（`features/bili_pack/stream.py`，量大）、
+  ed2k `kelpie/models.py::Link.parse`、`PortListener` 接入。
+- 卡点：无（一次 flake：19 开关首轮全量跑在
+  `tests/test_http_subworker.py::TestTransientRetry::test_500_retries_then_succeeds` 卡住 1 小时，
+  随后同命令连跑 2 次均 33s 正常完成；单开关 `GD3_RUST_HTTP=1`、18 开关（无 HF_HEAD）、
+  单开关 `GD3_RUST_HF_HEAD=1` 也都正常。判为既有环境 flake，未修，后续全量跑一律加 `timeout`）。

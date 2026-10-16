@@ -86,16 +86,21 @@ class HuggingFaceParser(TaskParser):
             downloadUrl = self._fileUrl(repoId, repoType, revision, filePath)
             name = toSafeFilename(filePath.rsplit("/", 1)[-1], fallback="download")
 
-            client = buildClient(headers=headers)
-            try:
-                response = await client.head(downloadUrl)
-                fileSize = 0
-                cl = response.headers.get("content-length")
-                if cl:
-                    fileSize = int(cl.decode() if isinstance(cl, bytes) else cl)
-                canUseRange = response.headers.contains_key("accept-ranges")
-            finally:
-                client.close()
+            from .rust_head import isEnabled as rustHeadEnabled, headFile as rustHeadFile
+
+            if rustHeadEnabled():
+                fileSize, canUseRange = await rustHeadFile(downloadUrl, headers)
+            else:
+                client = buildClient(headers=headers)
+                try:
+                    response = await client.head(downloadUrl)
+                    fileSize = 0
+                    cl = response.headers.get("content-length")
+                    if cl:
+                        fileSize = int(cl.decode() if isinstance(cl, bytes) else cl)
+                    canUseRange = response.headers.contains_key("accept-ranges")
+                finally:
+                    client.close()
 
             task = HuggingFaceTask(
                 name=name,

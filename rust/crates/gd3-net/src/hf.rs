@@ -359,6 +359,99 @@ pub fn build_files(
         .collect()
 }
 
+/// `HuggingFaceParser.parse` 单文件分支里 `client.head(downloadUrl)` 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfFileHead {
+    /// `int(content-length)`。Python 侧可能为负（`int("-5") == -5`），故用 `i64`。
+    pub file_size: i64,
+    /// `"accept-ranges" in response.headers`：只看键在不在，不看值
+    /// （`Accept-Ranges: none` 也算 true）。
+    pub can_use_range: bool,
+}
+
+/// 镜像 `features/huggingface_pack/pack.py:89-98` 的 HEAD 探测。
+///
+/// 与 Python 逐字对应的语义（照着真实现抄，别去"修正"）：
+///
+/// - **不检查状态码**：404 / 403 也照常读头部（Python 没有 `raise_for_status`）；
+/// - 没有 `content-length` 头 → `file_size = 0`；
+/// - `content-length` 不是整数 → `int()` 的 `ValueError`（这里是
+///   `HfTreeError::Transport`，桥侧翻成 `ValueError`），文案也照抄 CPython；
+/// - `can_use_range` 只看 `accept-ranges` 键在不在。
+///
+/// 已知偏差：CPython 的 `int(str)` 还接受 unicode 数字，这里只实现 ASCII 子集
+/// （HTTP 头的实际取值范围）。
+pub async fn head_file(
+    client: &Client,
+    headers: &[(String, String)],
+    url: &str,
+) -> Result<HfFileHead, HfTreeError> {
+    let mut request_headers = wreq::header::HeaderMap::new();
+    for (name, value) in headers {
+        let name = wreq::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| HfTreeError::Transport(error.to_string()))?;
+        let value = wreq::header::HeaderValue::from_str(value)
+            .map_err(|error| HfTreeError::Transport(error.to_string()))?;
+        request_headers.insert(name, value);
+    }
+
+    let response = client
+        .head(url)
+        .headers(request_headers)
+        .send()
+        .await
+        .map_err(|error| HfTreeError::Transport(error.to_string()))?;
+
+    let file_size = match response.headers().get("content-length") {
+        None => 0,
+        Some(value) => {
+            // Python：`cl.decode() if isinstance(cl, bytes) else cl`
+            let raw = String::from_utf8_lossy(value.as_bytes()).into_owned();
+            parse_int(&raw).ok_or_else(|| {
+                HfTreeError::Transport(format!("invalid literal for int() with base 10: '{raw}'"))
+            })?
+        }
+    };
+    let can_use_range = response.headers().contains_key("accept-ranges");
+    Ok(HfFileHead {
+        file_size,
+        can_use_range,
+    })
+}
+
+/// `int(text)` 的 ASCII 子集：两侧空白可省、可选 `+` / `-`、数字之间允许单个 `_`
+/// （`int("1_2") == 12`，但 `"_1"` / `"1_"` / `"1__2"` 都是 `ValueError`）。
+fn parse_int(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    let (negative, digits) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+
+    let mut value: i64 = 0;
+    let mut previous_is_digit = false;
+    for character in digits.chars() {
+        if character == '_' {
+            // 下划线必须夹在数字之间
+            if !previous_is_digit {
+                return None;
+            }
+            previous_is_digit = false;
+            continue;
+        }
+        let digit = character.to_digit(10)?;
+        value = value.checked_mul(10)?.checked_add(i64::from(digit))?;
+        previous_is_digit = true;
+    }
+    if !previous_is_digit {
+        return None;
+    }
+    Some(if negative { -value } else { value })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +641,27 @@ mod tests {
             file_url("https://hf.co", "other", "o/r", "main", "x"),
             "https://hf.co/o/r/resolve/main/x"
         );
+    }
+
+    #[test]
+    fn parse_int_follows_cpython() {
+        assert_eq!(parse_int("1024"), Some(1024));
+        assert_eq!(parse_int(" 12 "), Some(12));
+        assert_eq!(parse_int("+12"), Some(12));
+        assert_eq!(parse_int("-5"), Some(-5));
+        assert_eq!(parse_int("0"), Some(0));
+        assert_eq!(parse_int("1_2"), Some(12));
+        // CPython 会报 ValueError 的形状
+        assert_eq!(parse_int(""), None);
+        assert_eq!(parse_int("abc"), None);
+        assert_eq!(parse_int("12abc"), None);
+        assert_eq!(parse_int("1.0"), None);
+        assert_eq!(parse_int("_1"), None);
+        assert_eq!(parse_int("1_"), None);
+        assert_eq!(parse_int("1__2"), None);
+        assert_eq!(parse_int("+"), None);
+        assert_eq!(parse_int("-"), None);
+        // `int("0x10")` 也是 ValueError（base 10 下 x 非法）
+        assert_eq!(parse_int("0x10"), None);
     }
 }

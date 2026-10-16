@@ -106,3 +106,27 @@ pub fn hf_build_files(
             .collect(),
     )
 }
+
+/// 单文件 HEAD 探测的桥（`GD3_RUST_HF_HEAD=1` 影子模式）：镜像
+/// `features/huggingface_pack/pack.py:89-98`。返回 `(fileSize, canUseRange)`。
+///
+/// 注意 Python 侧**不检查状态码**，所以非 2xx 也照常返回头部信息；
+/// `content-length` 不是整数时抛 `ValueError`（文案照抄 CPython `int()`）。
+#[pyfunction]
+pub fn hf_head_file(
+    py: Python<'_>,
+    url: String,
+    headers: Vec<(String, String)>,
+    client_profile: String,
+) -> PyResult<(i64, bool)> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(to_error)?;
+
+    let client = gd3_net::build_client(None, None, &client_profile);
+    let head = py
+        .detach(|| runtime.block_on(gd3_net::hf::head_file(&client, &headers, &url)))
+        .map_err(err_to_py)?;
+    Ok((head.file_size, head.can_use_range))
+}
