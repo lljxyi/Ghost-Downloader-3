@@ -26,6 +26,10 @@ GITHUB_HOSTS = {
 
 
 def isGitHubFileUrl(url: str) -> bool:
+    from .rust_match import isEnabled as rustMatchEnabled, isGitHubFileUrl as rustIsGitHubFileUrl
+    if rustMatchEnabled():
+        return rustIsGitHubFileUrl(url)
+
     parsedUrl = urlparse(url)
     scheme = parsedUrl.scheme.lower()
     host = (parsedUrl.hostname or "").lower().removeprefix("www.")

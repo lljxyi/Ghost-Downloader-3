@@ -17,10 +17,17 @@ PROBE_TIMEOUT = -2
 
 
 def toProxyHeaders(headers: dict[str, str]) -> dict[str, str]:
+    from .rust_match import isEnabled as rustMatchEnabled, toProxyHeaders as rustToProxyHeaders
+    if rustMatchEnabled():
+        return rustToProxyHeaders(headers)
     return {k: v for k, v in headers.items() if k.lower() not in {"authorization", "cookie"}}
 
 
 def matchFile(originalUrl: str, file: RemoteFile) -> bool:
+    from .rust_match import isEnabled as rustMatchEnabled, matchFile as rustMatchFile
+    if rustMatchEnabled():
+        return rustMatchFile(originalUrl, file)
+
     parsedUrl = urlparse(originalUrl)
     if parsedUrl.hostname == "codeload.github.com" or "/archive/" in parsedUrl.path:
         return not file.contentType.startswith("text/")

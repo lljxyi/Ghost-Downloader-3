@@ -40,6 +40,14 @@ def buildSize(stream: dict | None, duration: int) -> int:
 
 
 async def probeSize(url: str, headers: dict | None = None) -> int:
+    from .rust_size import isEnabled as rustSizeEnabled, probeSize as rustProbeSize
+
+    if rustSizeEnabled():
+        return await rustProbeSize(url, headers)
+    return await probeSizePython(url, headers)
+
+
+async def probeSizePython(url: str, headers: dict | None = None) -> int:
     if not url:
         return 0
     client = buildClient()

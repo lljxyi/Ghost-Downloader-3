@@ -24,6 +24,23 @@ pub struct ProbeOutcome {
     content_type: String,
 }
 
+/// 镜像 `bili_pack.stream.probeSize`：任何失败（网络错、非法头名）都返回 0。
+#[pyfunction]
+#[pyo3(signature = (url, headers, client_profile))]
+pub fn probe_size(
+    py: Python<'_>,
+    url: String,
+    headers: Vec<(String, String)>,
+    client_profile: String,
+) -> PyResult<u64> {
+    let client = gd3_net::engine::build_client(None, None, &client_profile);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(to_error)?;
+    Ok(py.detach(|| runtime.block_on(gd3_net::probe::probe_size(&client, &headers, &url))))
+}
+
 /// 探测一个 URL。`guess_extension(content_type) -> 扩展名或 None` 由 Python 提供。
 ///
 /// 非 200/206/416 的响应会抛 `ValueError`（镜像 Python 的 `raise_for_status`）。

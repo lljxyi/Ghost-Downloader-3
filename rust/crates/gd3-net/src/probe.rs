@@ -159,6 +159,30 @@ async fn request(
     })
 }
 
+/// 镜像 `features/bili_pack/stream.py::probeSize`：
+/// `bytes=0-0` + `accept-encoding: identity` 去 GET，取 `content-range` 的总数。
+///
+/// 与 Python 一致的宽松语义：**不检查状态码**（404 也照读头）、任何异常
+/// （含网络错误、非法头名）都返回 0，绝不抛出。
+pub async fn probe_size(client: &wreq::Client, headers: &[(String, String)], url: &str) -> u64 {
+    // Python 用 `{**headers, range: ..., accept-encoding: identity}`，同名键被覆盖
+    let mut merged: Vec<(String, String)> = headers.to_vec();
+    merged.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("range") && !name.eq_ignore_ascii_case("accept-encoding")
+    });
+    merged.push(("range".to_string(), "bytes=0-0".to_string()));
+    merged.push(("accept-encoding".to_string(), "identity".to_string()));
+
+    let map = match to_header_map(&merged) {
+        Ok(map) => map,
+        Err(_) => return 0,
+    };
+    match client.get(url).headers(map).send().await {
+        Ok(response) => range_total(response.headers()),
+        Err(_) => 0,
+    }
+}
+
 /// 探测一个 URL。
 pub async fn probe(
     options: &ProbeOptions,

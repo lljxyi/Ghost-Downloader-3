@@ -7,6 +7,11 @@
 //!
 //! Python 仍然拥有领域对象与调度，产出的文件与纯 Python 路径一致。
 
+mod browser;
+mod github;
+mod hf;
+mod listener;
+mod probe;
 use gd3_core::{TaskRecord, load_records, save_records, to_line as record_to_line};
 use gd3_net::{HttpEngine, ProgressCallback, TransferProgress};
 use pyo3::exceptions::PyValueError;
@@ -17,10 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-mod browser;
-mod hf;
-mod listener;
-mod probe;
+
 fn to_error(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
 }
@@ -225,7 +227,11 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(save_lines, module)?)?;
     module.add_function(wrap_pyfunction!(http_run, module)?)?;
     module.add_function(wrap_pyfunction!(probe::probe, module)?)?;
+    module.add_function(wrap_pyfunction!(probe::probe_size, module)?)?;
     module.add_function(wrap_pyfunction!(hf::hf_fetch_tree, module)?)?;
+    module.add_function(wrap_pyfunction!(github::github_is_file_url, module)?)?;
+    module.add_function(wrap_pyfunction!(github::github_match_file, module)?)?;
+    module.add_function(wrap_pyfunction!(github::github_proxy_headers, module)?)?;
     module.add_class::<probe::ProbeOutcome>()?;
     module.add_function(wrap_pyfunction!(to_safe_filename, module)?)?;
     module.add_function(wrap_pyfunction!(split_stem_ext, module)?)?;
