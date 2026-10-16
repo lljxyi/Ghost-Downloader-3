@@ -67,3 +67,22 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   - `pytest -q --continue-on-collection-errors` 开关关 **3 failed / 783 passed / 8 skipped / 35 errors**（基线同失败集合，passed 增 22 = 新测试）；
     开关全开（GD3_RUST_GITHUB/GD3_RUST_PROBE_SIZE/GD3_RUST_PROBE/GD3_RUST_HF_TREE/GD3_RUST_PERSIST/GD3_RUST_HTTP/GD3_RUST_ARIA2/GD3_RUST_BROWSER/GD3_RUST_FILENAME）两轮：第一轮多 1 个 `test_engine_listeners` 既有环境 flake，第二轮失败/错误集合与基线**逐条一致**。
 - 下一步：按 README「未做」清单继续——github_pack 树枚举（同 hf_fetch_tree 模式）或 http_pack parse 剩余（buildTask/HttpParser.match），之后 PortListener。无卡点。
+
+## 2026-10-16 第 4 步（第 13 轮收口，commit 42ec437）
+- 做了什么：接手上一轮未提交的 Python 侧半成品并收口。
+  - 冒烟验证 `GD3_RUST_BILI_PARSE=1` 下 `stream.py::parseDash`/`buildFnval` 走 Rust：
+    正确路径写回 `videoUrl/audioUrl/videoSize/audioSize/_videoStreams/_audioStreams`；
+    video 为空时 ValueError 文案逐字（`"Bilibili 返回结果中不存在可用的媒体流"`）。
+    （冒烟时先纠正自己的预期：`toStreamUrl()` 取 `baseUrl`，不是 `toStreamUrl` 字段。）
+  - 诊断：Previous `ModuleNotFoundError: bili_pack` 是裸 `python -c` 路径问题——冒烟脚本
+    `sys.path` 指到仓库根后 `from features.bili_pack import stream` 即正常。
+  - 验证：
+    - `pytest tests/test_bili_rust_parse.py tests/test_bili_parse.py` = 61 passed；
+    - `pytest -q --continue-on-collection-errors` 双模式各一轮：
+      开关关 **3F/842P/8S/35E**，开关全开（含 GD3_RUST_BILI_PARSE/GITHUB/PROBE_SIZE/PROBE/HF_TREE）
+      **3F/842P/8S/35E** —— 计数完全相同；逐条对比失败/错误集合，与基线一致
+      （3 failed = android_config_parity / github_probe / runtime_install；35 errors = android 系列；未出现 flake）；
+    - fmt/clippy/cargo test 上一轮已绿；构建已 `maturin develop`。
+  - 提交：features/bili_pack/rust_parse.py（新适配器）+ stream.py 接线 + tests/test_bili_rust_parse.py（152 行），42ec437。
+- 下一步：`rust/README.md` 未做清单——github_pack 树枚举（hf `fetch_tree` 同款模式）、
+  huggingface/bili 其余解析、`PortListener` 接入。无卡点。
