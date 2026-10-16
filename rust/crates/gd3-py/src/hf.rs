@@ -80,3 +80,29 @@ pub fn hf_parse_url(
         }
     }
 }
+
+/// `HuggingFaceParser.parse` 里 entries → files 纯变换层的桥
+/// （`GD3_RUST_HF_FILES=1` 影子模式）。`entries` 是 Python 传入的 JSON 可序列化
+/// 条目列表（dict）；返回按顺序的 (path, size, downloadUrl)。
+#[pyfunction]
+pub fn hf_build_files(
+    py: Python<'_>,
+    entries: Vec<Bound<'_, PyAny>>,
+    base: String,
+    repo_id: String,
+    repo_type: String,
+    revision: String,
+) -> PyResult<Vec<(String, u64, String)>> {
+    let mut values = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        values
+            .push(pythonize::depythonize(entry).map_err(|e| PyValueError::new_err(e.to_string()))?);
+    }
+    let _ = py;
+    Ok(
+        gd3_net::hf::build_files(&values, &base, &repo_id, &repo_type, &revision)
+            .into_iter()
+            .map(|f| (f.path, f.size, f.download_url))
+            .collect(),
+    )
+}

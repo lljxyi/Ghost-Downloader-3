@@ -232,6 +232,7 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(probe::probe_size, module)?)?;
     module.add_function(wrap_pyfunction!(hf::hf_fetch_tree, module)?)?;
     module.add_function(wrap_pyfunction!(hf::hf_parse_url, module)?)?;
+    module.add_function(wrap_pyfunction!(hf::hf_build_files, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_is_file_url, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_match_file, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_proxy_headers, module)?)?;

@@ -134,19 +134,29 @@ class HuggingFaceParser(TaskParser):
         if not entries:
             raise ValueError(f"仓库 {repoId} 为空或无法访问")
 
-        files: list[HuggingFaceFile] = []
-        for i, entry in enumerate(entries):
-            path = entry.get("path", "")
-            size = entry.get("size", 0)
-            lfs = entry.get("lfs")
-            if lfs and isinstance(lfs, dict):
-                size = lfs.get("size", size)
-            files.append(HuggingFaceFile(
-                index=i,
-                relativePath=path,
-                size=size,
-                downloadUrl=self._fileUrl(repoId, repoType, revision, path),
-            ))
+        from .rust_files import isEnabled as rustFilesEnabled, buildFiles as rustBuildFiles
+
+        if rustFilesEnabled():
+            files: list[HuggingFaceFile] = [HuggingFaceFile(
+                index=item["index"],
+                relativePath=item["relativePath"],
+                size=item["size"],
+                downloadUrl=item["downloadUrl"],
+            ) for item in rustBuildFiles(entries, base=base, repoId=repoId, repoType=repoType, revision=revision)]
+        else:
+            files = []
+            for i, entry in enumerate(entries):
+                path = entry.get("path", "")
+                size = entry.get("size", 0)
+                lfs = entry.get("lfs")
+                if lfs and isinstance(lfs, dict):
+                    size = lfs.get("size", size)
+                files.append(HuggingFaceFile(
+                    index=i,
+                    relativePath=path,
+                    size=size,
+                    downloadUrl=self._fileUrl(repoId, repoType, revision, path),
+                ))
 
         if len(files) == 1:
             repoName = toSafeFilename(PurePosixPath(files[0].relativePath).name, fallback="huggingface")

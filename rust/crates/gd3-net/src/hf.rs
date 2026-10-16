@@ -284,6 +284,81 @@ pub fn parse_url_entry(url: &str, proxy_site: &str) -> Option<HfUrlInfo> {
     })
 }
 
+/// `typePrefix` 映射：镜像 `HuggingFaceParser._fileUrl` / `parse` 里的
+/// `{"dataset": "datasets/", "space": "spaces/"}.get(repoType, "")`。
+pub fn type_prefix(repo_type: &str) -> &'static str {
+    match repo_type {
+        "dataset" => "datasets/",
+        "space" => "spaces/",
+        _ => "",
+    }
+}
+
+/// 镜像 `HuggingFaceParser._fileUrl`。
+pub fn file_url(
+    base: &str,
+    repo_type: &str,
+    repo_id: &str,
+    revision: &str,
+    file_path: &str,
+) -> String {
+    format!(
+        "{}/{index}{repo_id}/resolve/{revision}/{file_path}",
+        base,
+        index = type_prefix(repo_type)
+    )
+}
+
+/// 一条待下载文件（`parse` 的 entries → files 纯变换层的输出）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfFileInfo {
+    pub index: usize,
+    pub path: String,
+    pub size: u64,
+    pub download_url: String,
+}
+
+/// 镜像 `HuggingFaceParser.parse` 里 `for i, entry in enumerate(entries)` 循环：
+///
+/// - `path = entry.get("path", "")`：缺失是空串（不报错）；
+/// - `size = entry.get("size", 0)`：缺失是 0；
+/// - `lfs` 若是对象且带 `size`，覆盖 `size`（`lfs.get("size", size)`——
+///   lfs 对象缺 `size` 键时保留原 size）。
+///
+/// `entries` 是 （可能来自 Python `json.loads` 的）JSON 数组，逐条按顺序编号。
+pub fn build_files(
+    entries: &[serde_json::Value],
+    base: &str,
+    repo_id: &str,
+    repo_type: &str,
+    revision: &str,
+) -> Vec<HfFileInfo> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let path = entry
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mut size = entry.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            if let Some(lfs) = entry.get("lfs").filter(|v| v.is_object()) {
+                if let Some(lfs_size) = lfs.get("size").and_then(|v| v.as_u64()) {
+                    size = lfs_size;
+                }
+            }
+            let download_url = file_url(base, repo_type, repo_id, revision, &path);
+            HfFileInfo {
+                index: i,
+                path,
+                size,
+                download_url,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +497,56 @@ mod tests {
                 "main".into(),
                 "f".into()
             ))
+        );
+    }
+
+    #[test]
+    fn build_files_and_file_url() {
+        use serde_json::json;
+        // 基本映射 + lfs 覆盖 + 缺失字段
+        let files = build_files(
+            &[
+                json!({"path": "a.bin", "size": 5}),
+                json!({"path": "b/c.d", "size": 7, "lfs": {"size": 12}}),
+                json!({"path": "e.txt"}),
+                json!({"size": 3}),
+                json!({"path": "f", "lfs": {}}),
+            ],
+            "https://hf.co",
+            "org/repo",
+            "model",
+            "main",
+        );
+        let urls: Vec<&str> = files.iter().map(|f| f.download_url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://hf.co/org/repo/resolve/main/a.bin",
+                "https://hf.co/org/repo/resolve/main/b/c.d",
+                "https://hf.co/org/repo/resolve/main/e.txt",
+                "https://hf.co/org/repo/resolve/main/",
+                "https://hf.co/org/repo/resolve/main/f",
+            ]
+        );
+        let sizes: Vec<u64> = files.iter().map(|f| f.size).collect();
+        assert_eq!(sizes, [5, 12, 0, 3, 0]); // 缺 size→0；lfs 无 size 键保留原值
+        assert_eq!(
+            files.iter().map(|f| f.index).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+
+        // typePrefix
+        assert_eq!(
+            file_url("https://hf.co", "dataset", "o/r", "main", "x"),
+            "https://hf.co/datasets/o/r/resolve/main/x"
+        );
+        assert_eq!(
+            file_url("https://hf.co", "space", "o/r", "main", "x"),
+            "https://hf.co/spaces/o/r/resolve/main/x"
+        );
+        assert_eq!(
+            file_url("https://hf.co", "other", "o/r", "main", "x"),
+            "https://hf.co/o/r/resolve/main/x"
         );
     }
 }
