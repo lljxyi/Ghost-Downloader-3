@@ -334,6 +334,12 @@ def matchOutdated(version: str) -> bool:
 
 
 def parseProgress(message: dict[str, Any]) -> Progress:
+    # 消疑层（影子模式，默认关）：GD3_RUST_ED2K_PROGRESS=1 时走 Rust 实现。
+    from .rust_progress import isEnabled, parseProgress as rustParseProgress
+
+    if isEnabled():
+        return rustParseProgress(message)
+
     return Progress(
         hash=message["hash"],
         size=message["size"],
