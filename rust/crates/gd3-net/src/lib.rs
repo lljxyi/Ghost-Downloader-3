@@ -2,6 +2,7 @@
 
 pub mod bili;
 pub mod engine;
+pub mod github;
 pub mod hf;
 pub mod plan;
 pub mod probe;

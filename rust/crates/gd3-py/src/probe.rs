@@ -24,6 +24,33 @@ pub struct ProbeOutcome {
     content_type: String,
 }
 
+impl ProbeOutcome {
+    pub(crate) fn from_file(file: gd3_net::probe::RemoteFile) -> Self {
+        ProbeOutcome {
+            name: file.name,
+            file_size: file.file_size,
+            can_use_range_requests: file.can_use_range_requests,
+            last_modified: file.last_modified,
+            content_type: file.content_type,
+        }
+    }
+}
+
+/// 把 Python 的 `guess_extension(content_type) -> 扩展名或 None` 包成 Rust 回调。
+pub(crate) fn extension_resolver(guess_extension: Option<Py<PyAny>>) -> Option<ExtensionResolver> {
+    guess_extension.map(|callback| {
+        Arc::new(move |content_type: &str| -> Option<String> {
+            Python::attach(|py| {
+                callback
+                    .bind(py)
+                    .call1((content_type,))
+                    .ok()
+                    .and_then(|value| value.extract::<String>().ok())
+            })
+        }) as ExtensionResolver
+    })
+}
+
 /// 镜像 `bili_pack.stream.probeSize`：任何失败（网络错、非法头名）都返回 0。
 #[pyfunction]
 #[pyo3(signature = (url, headers, client_profile))]
@@ -55,17 +82,7 @@ pub fn probe(
     fallback_name: String,
     guess_extension: Option<Py<PyAny>>,
 ) -> PyResult<ProbeOutcome> {
-    let resolver: Option<ExtensionResolver> = guess_extension.map(|callback| {
-        Arc::new(move |content_type: &str| -> Option<String> {
-            Python::attach(|py| {
-                callback
-                    .bind(py)
-                    .call1((content_type,))
-                    .ok()
-                    .and_then(|value| value.extract::<String>().ok())
-            })
-        }) as ExtensionResolver
-    });
+    let resolver = extension_resolver(guess_extension);
 
     let options = ProbeOptions {
         url,
@@ -84,11 +101,5 @@ pub fn probe(
         .detach(|| runtime.block_on(gd3_net::probe::probe(&options, resolver)))
         .map_err(to_error)?;
 
-    Ok(ProbeOutcome {
-        name: file.name,
-        file_size: file.file_size,
-        can_use_range_requests: file.can_use_range_requests,
-        last_modified: file.last_modified,
-        content_type: file.content_type,
-    })
+    Ok(ProbeOutcome::from_file(file))
 }

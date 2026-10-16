@@ -236,6 +236,7 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(github::github_is_file_url, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_match_file, module)?)?;
     module.add_function(wrap_pyfunction!(github::github_proxy_headers, module)?)?;
+    module.add_function(wrap_pyfunction!(github::github_probe_urls, module)?)?;
     module.add_function(wrap_pyfunction!(http::http_parser_match, module)?)?;
     module.add_function(wrap_pyfunction!(http::http_parser_match_passive, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_build_fnval, module)?)?;
@@ -252,6 +253,10 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<probe::ProbeOutcome>()?;
     module.add_class::<listener::Aria2Listener>()?;
     module.add_class::<browser::BrowserListener>()?;
+    module.add(
+        "GithubUnmatchedError",
+        module.py().get_type::<github::GithubUnmatchedError>(),
+    )?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

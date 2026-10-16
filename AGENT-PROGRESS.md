@@ -205,3 +205,73 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   4 空格才算挂到列表项下。
 - 下一步：m3u8 parse 层（依赖 `m3u8` 库语义，量大）或 ftp/其他纯层；bili 网络层其余
   （fetchPlayurl 请求侧）可继续同款。
+
+## 2026-10-16 第 12 步（第 5 轮，commit eb9321e）
+- 做了什么：bili WBI 签名/账号纯函数下沉 Rust 影子分支（`GD3_RUST_BILI_SIGN`，默认关）。
+  - Rust：`gd3_net::bili` 新增 `sign_params` / `mixin_key_from_urls` / `to_cookie` / 手写
+    `quote_plus`（安全集对齐 CPython `_ALWAYS_SAFE`：保留 `_.-~`，`*`→`%2A`）。
+  - 4 处与 Python 的偏差在收口时修掉：`quote_plus` 安全集；`wts` 改**覆盖**语义
+    （先 `retain` 掉同名再 push，否则重复 `wts=` 导致 w_rid 不一致）；`mixin_key_from_urls`
+    改 `Result<Option<String>, usize>`，越界索引在桥侧抛 `IndexError: string index out of range`；
+    `to_cookie` 空白集改用 CPython `str.strip()` 语义（含 `\x1c`-`\x1f`）。
+  - 桥：`gd3_py.bili_sign_params(params, mixin_key, wts)`、`gd3_py.bili_mixin_key(img_url, sub_url)`、
+    `gd3_py.bili_to_cookie(raw)`；Python 侧 `features/bili_pack/rust_sign.py` + `account.py`
+    三处接线（`toCookie` / `_updateWbiKeys` / `signParams`）。
+  - `tests/test_bili_sign.py`（34 case）用 `monkeypatch` 定住 `time.time`，保证 wts 可比。
+- 验证：fmt 0 / clippy 0 / 三 crate cargo test 全绿；maturin 重建后桥冒烟逐字段一致；
+  34 passed；双模式全量回归两轮（开关关 / 17 开关全开）失败集合 diff 仅
+  `test_engine_listeners.py::test_stopping_the_engine_releases_both_ports[asyncio]`
+  （VPS-MIGRATION 第 1 节记录的既有环境 flake），+3 skip 是 Python 实现自身的白盒测试。
+- 基线快照：`/root/baseline-failures.txt`（开关关那轮的 FAILED+ERROR，38 行）。
+- 下一步：github `probeUrls` 竞速层（github_pack 的最后一块）。
+- 卡点：无。
+
+## 2026-10-16 第 13 步（第 5 轮）：github `probeUrls` 竞速层摸底
+- 做了什么：评估候选下沉目标（github probeUrls / m3u8 / ftp / bili fetchPlayurl / HF 单文件 head），
+  并实测 `test_github_probe.py::testProxySiteGetsNoCredentials` 失败根因。
+- 根因（已实测确认，不是本会话引入）：Python 侧 `wreq` 会把**非规范头名**小写化，
+  `X-Other` 上线变成 `x-other`，而 `Authorization` / `Cookie` 保持原样。
+  `GD3_RUST_PROBE=1` 走 Rust 网络层时表现**完全相同**（同样 KeyError），所以把
+  probeUrls 搬进 Rust 不会改变这条基线红灯的状态。
+- 结论：github probeUrls 是下一步的合适目标（纯 HTTP，无外部库语义依赖）。
+## 2026-10-16 第 14 步（第 5 轮）：github `probeUrls` 竞速层下沉 Rust 影子分支
+- 做了什么：github_pack 的最后一块（`features/github_pack/probe.py::probeUrls`，37 行起）下沉 Rust。
+  - Rust 网络层 `rust/crates/gd3-net/src/github.rs`：`CANDIDATE_TIMEOUT = 5s`、
+    `CandidateError{Unmatched, Transport(String), Timeout}`（`Display`：`Unmatched`→`"代理站响应不合格"`、
+    `Timeout`→`""`）、`pub async fn probe_urls(original_url, urls, template: &ProbeOptions,
+    resolve_extension) -> Result<(String, RemoteFile, Vec<String>), CandidateError>`。
+    用 `tokio::task::JoinSet` 逐候选 spawn + `tokio::time::timeout`，按**完成顺序**取首个
+    `match_file` 通过者，胜出后 `candidates.shutdown().await` 取消并等待其余候选
+    （对应 Python 的 `finally: cancel + gather`）；`unmatched` 记录不合格/失败候选并最终从
+    fallback 列表剔除；`urls` 为空返回 `Transport("没有候选 URL")`。
+  - 桥 `gd3-py/src/github.rs`：新增 `create_exception!(gd3_py, GithubUnmatchedError, PyException, ...)`
+    与 `#[pyfunction] github_probe_urls(original_url, urls, headers, user_agent, client_profile,
+    fallback_name, guess_extension=None) -> PyResult<(String, ProbeOutcome, Vec<String>)>`；
+    `py.detach(...)` 内 `runtime.block_on(probe_urls(...))`；`CandidateError::Unmatched` 抛
+    `GithubUnmatchedError`，其余走 `to_error`。`lib.rs` 注册函数与异常类型。
+  - `gd3-py/src/probe.rs` 重构（105 行）：抽出 `ProbeOutcome::from_file` 与
+    `extension_resolver(guess_extension)` 供 github 复用，`probe()` 改为调用这两个。
+  - Python 适配 `features/github_pack/rust_probe.py`（新，67 行）：`isEnabled()` 读
+    `GD3_RUST_GITHUB_PROBE == "1"`；`probeUrls()` 用 `asyncio.to_thread(gd3_py.github_probe_urls, ...)`，
+    `except gd3_py.GithubUnmatchedError` → `raise TaskError("代理站响应不合格") from error`；
+    返回 `(winner, RemoteFile(...), fallbackUrls)`。`features/github_pack/probe.py::probeUrls`
+    开头接线影子开关。模块文档写明两点已知差异：竞速内部探测固定走 Rust（不受 `GD3_RUST_PROBE` 影响）；
+    兜底文件名整场只生成一次。`probeProxyLatencies` 不迁移（耗时不可比）。
+- 验证：
+  - `cargo test -p gd3-net --test github` → **6 passed**（`archive_urls_accept_any_non_text_content_type`、
+    `all_unmatched_reports_unmatched`、`proxy_candidates_lose_credentials_but_keep_other_headers`、
+    `forbidden_candidates_report_a_transport_error`、`the_original_candidate_keeps_credentials`、
+    `unmatched_candidates_are_dropped_from_the_fallback_list`）；`tests/support/test_server.rs` 的
+    `RecordedRequest` 增加 `headers` 字段。
+  - `tests/test_github_probe_rust.py`（新，212 行）双实现 parity → **6 passed**：6 个用例
+    （unmatched 剔除 / 传输失败剔除 / pending 候选保留在 fallback / 单候选即原始 URL /
+    全失败抛 TaskError / 代理候选掉凭据）。用例构造成「只有一个候选能赢」（0.1s vs 0.5s 延迟差），
+    不依赖竞速顺序；头比较用 dict（小写化后）且排除 `host`（每个候选独立端口，必然不同）。
+  - `tests/test_github_probe.py` 双模式：开关关 `1 failed, 12 passed`；
+    `GD3_RUST_GITHUB_PROBE=1` `1 failed, 12 passed` —— 失败同为 `testProxySiteGetsNoCredentials`
+    （既有基线红灯，`KeyError: 'X-Other'`，状态未变）。
+  - 实测确认两侧请求头逐字一致（临时 dump 脚本已删）：开关关/开关开除 `host` 与头顺序外完全相同；
+    `RemoteFile(name='file.bin', fileSize=100, canUseRangeRequests=True, lastModified='',
+    contentType='application/octet-stream')` 两侧一致。
+- 下一步：HF 单文件 `head` 探测（`features/huggingface_pack/pack.py:89-98`，小）。
+- 卡点：无。

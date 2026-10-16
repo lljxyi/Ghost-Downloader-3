@@ -35,6 +35,11 @@ def matchFile(originalUrl: str, file: RemoteFile) -> bool:
 
 
 async def probeUrls(options: TaskOptions, urls: list[str]) -> tuple[str, RemoteFile, list[str]]:
+    from .rust_probe import isEnabled as rustProbeEnabled, probeUrls as rustProbeUrls
+
+    if rustProbeEnabled():
+        return await rustProbeUrls(options, urls)
+
     originalUrl = options.url
 
     async def probeOne(url: str) -> RemoteFile:

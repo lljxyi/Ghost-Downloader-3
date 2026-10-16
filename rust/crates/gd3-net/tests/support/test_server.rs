@@ -80,6 +80,8 @@ pub struct RecordedRequest {
     pub path: String,
     /// 原始 Range 头的值，如 "bytes=0-99"
     pub range: Option<String>,
+    /// 请求头的原始 `(名, 值)` 列表（`X-Other` 这类非规范头名保留原样）。
+    pub headers: Vec<(String, String)>,
 }
 
 /// 服务器可变状态 / mutable state shared between the accept loop and connections.
@@ -221,6 +223,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             method,
             path,
             range: range.clone(),
+            headers,
         });
         guard.served = guard.served.saturating_add(1);
         let mut response = plan_response(&guard, range.as_deref());
