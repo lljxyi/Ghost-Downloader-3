@@ -78,10 +78,16 @@ async def probeSizePython(url: str, headers: dict | None = None) -> int:
 
 
 def buildFnval(qn: int) -> int:
+    from .rust_parse import isEnabled as rustParseEnabled, buildFnval as rustBuildFnval
+
+    includeHdr = bilibiliConfig.shouldIncludeHdr.value
+    includeDolby = bilibiliConfig.shouldIncludeDolby.value
+    if rustParseEnabled():
+        return rustBuildFnval(qn, includeHdr, includeDolby)
     fnval = 16
-    if bilibiliConfig.shouldIncludeHdr.value:
+    if includeHdr:
         fnval |= 64
-    if bilibiliConfig.shouldIncludeDolby.value:
+    if includeDolby:
         fnval |= 256 | 512
     if qn == 128:
         fnval |= 1024
@@ -91,8 +97,28 @@ def buildFnval(qn: int) -> int:
 
 
 def parseDash(page: BiliPage, dash: dict, *, qn: int, acceptQuality: list[int], audioQn: int = 0) -> None:
+    from .rust_parse import isEnabled as rustParseEnabled, parseDash as rustParseDash
+
     videoStreams = list(dash.get("video") or [])
     audioStreams = list(dash.get("audio") or [])
+    if rustParseEnabled():
+        videoUrl, audioUrl, videoSize, audioSize = rustParseDash(
+            dash,
+            page._duration,
+            qn,
+            acceptQuality,
+            audioQn,
+            bilibiliConfig.alternativeQuality.value,
+            bilibiliConfig.shouldIncludeHdr.value,
+            bilibiliConfig.shouldIncludeDolby.value,
+        )
+        page.videoUrl = videoUrl
+        page.audioUrl = audioUrl
+        page._videoStreams = videoStreams
+        page._audioStreams = audioStreams
+        page.videoSize = videoSize
+        page.audioSize = audioSize
+        return
     if not videoStreams:
         raise ValueError("Bilibili 返回结果中不存在可用的媒体流")
     video = matchStream(videoStreams, qn, acceptQuality)
