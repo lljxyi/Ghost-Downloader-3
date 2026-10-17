@@ -2,6 +2,7 @@
 // 当前只装一个最小窗口骨架，逐页 strangler 迁移时按 Qt 版一一镜像展开。
 
 import { VerticalBox } from "std-widgets.slint";
+import { TaskPage, TaskRow } from "task_page.slint";
 
 export component AppWindow inherits Window {
     title: "Ghost-Downloader-3";
@@ -9,12 +10,17 @@ export component AppWindow inherits Window {
     min-height: 400px;
 
     in property <string> statusText: "Ghost-Downloader-3 (Slint)";
+    in property <[TaskRow]> tasks;
 
     VerticalBox {
         Text {
             text: root.statusText;
             font-size: 18px;
             vertical-alignment: center;
+        }
+
+        TaskPage {
+            tasks: root.tasks;
         }
     }
 }

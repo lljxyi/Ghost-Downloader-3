@@ -34,8 +34,18 @@ pub fn create_headless() -> AppWindow {
     window
 }
 
+/// Rust 侧推送任务行到 UI（Phase 7b 契约）。
+///
+/// 行文案（statusText/progressText）由调用方负责；这里只做 model 装配。
+/// （slint 1.18 生成的模型属性 setter 是无返回值的，见 target build 产物实证。）
+pub fn set_task_rows(window: &AppWindow, rows: Vec<TaskRow>) {
+    let model = slint::ModelRc::new(slint::VecModel::from(rows));
+    window.set_tasks(model);
+}
+
 #[cfg(test)]
 mod smoke {
+    use slint::Model;
     /// 无头实例化：组件树的属性可读写、状态文本可镜像给 Rust 侧。
     #[test]
     fn appwindow_instantiates_headless_and_rust_side_sets_status() {
@@ -43,5 +53,37 @@ mod smoke {
         assert_eq!(window.get_statusText(), "Ghost-Downloader-3 (Slint)");
         window.set_statusText("headless smoke".into());
         assert_eq!(window.get_statusText(), "headless smoke");
+    }
+
+    /// 任务列表行模型：Rust 侧推送 → Slint model 逐行可读。
+    #[test]
+    fn task_page_rows_round_trip_headless() {
+        let window = crate::create_headless();
+        crate::set_task_rows(
+            &window,
+            vec![
+                crate::TaskRow {
+                    taskId: "tsk_1".into(),
+                    name: "a.bin".into(),
+                    statusText: "等待中".into(),
+                    progressText: "0.00 B / --".into(),
+                },
+                crate::TaskRow {
+                    taskId: "tsk_2".into(),
+                    name: "b.iso".into(),
+                    statusText: "正在下载".into(),
+                    progressText: "1.00 MB / 4.00 MB".into(),
+                },
+            ],
+        );
+        let model = window.get_tasks();
+        assert_eq!(model.row_count(), 2);
+        let first = model.row_data(0).expect("首行缺失");
+        assert_eq!(first.taskId, "tsk_1");
+        assert_eq!(first.name, "a.bin");
+        assert_eq!(first.statusText, "等待中");
+        let second = model.row_data(1).expect("次行缺失");
+        assert_eq!(second.taskId, "tsk_2");
+        assert_eq!(second.statusText, "正在下载");
     }
 }

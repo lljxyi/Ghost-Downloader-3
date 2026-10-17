@@ -1,0 +1,53 @@
+// 任务列表页（Phase 7b 起步）：先固化「行数据契约」，Qt 视觉（卡片/图标/
+// 进度环）逐页迁移时再展开。行字段对齐 app/view/pages/task_page.py +
+// app/view/cards/task_cards.py 的最小展示集。
+//
+// 文案（状态/进度/速度）由调用方（Rust 或 Python 桥）给出；Slint 侧
+// 不管格式化语义——与「兜底不在核心层」同一分层原则。
+
+import { ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+export struct TaskRow {
+    taskId: string,
+    name: string,
+    statusText: string,
+    progressText: string,
+}
+
+export component TaskPage inherits Rectangle {
+    in property <[TaskRow]> tasks;
+    in property <string> searchText: "";
+
+    background: transparent;
+
+    VerticalBox {
+        Text {
+            // 搜索过滤在迁移中期接 cfg 伴生时生效；本步空文本仅占位。
+            text: root.searchText;
+            font-size: 13px;
+        }
+
+        ListView {
+            for row in root.tasks: Rectangle {
+                height: 32px;
+
+                HorizontalBox {
+                    Text {
+                        vertical-alignment: center;
+                        text: row.name;
+                    }
+                    Text {
+                        vertical-alignment: center;
+                        text: row.statusText;
+                        font-size: 12px;
+                    }
+                    Text {
+                        vertical-alignment: center;
+                        text: row.progressText;
+                        font-size: 12px;
+                    }
+                }
+            }
+        }
+    }
+}
