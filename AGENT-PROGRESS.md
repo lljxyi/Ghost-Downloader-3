@@ -1135,3 +1135,53 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 1. filterMode 段高亮（三段按钮选中态视觉 + 派生 bool 供测试锁）。
 2. 暂停/删除接 gd3-core 真实语义（bridging 层决策：调用方是谁）。
 3. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 30 步 — filterMode 段高亮（SegmentItem + 单向派生）
+
+### 改动
+
+- **ui/task_page.slint**：
+  - 新自绘 `SegmentItem inherits Rectangle` 组件（等价 Python
+    SegmentedToggleToolWidget 最小同构）：`label/selected` 两属性 +
+    `clicked` 回调 + TouchArea；选中段临时高亮色 #E2E6Ed（主题
+    对齐步再调）。三个原 Button 替换为三段实例，仍发
+    `filterModeChanged("all"/"active"/"completed")` 字面量。
+  - 三高亮属性改 `in`（由窗口层传入消费）；**派生绑定从 TaskPage
+    移走**——`filterMode == "all"` 等唯一派生点在 AppWindow。
+- **ui/appwindow.slint**：补 `filterMode`（in，缺省 "all"，此前从未
+  暴露到窗口层）+ 三高亮 `in-out` 派生属性；TaskPage 三高亮单向
+  传入（高亮值随之回读）。
+- **lib.rs**：smoke `filter_mode_segment_highlight_follows_route_...`
+  锁三组派生：缺省 all → (T,F,F)；set active → (F,T,F)；**未知
+  字面量 "weird" → 全不选中**（slint 侧不做容错，容错语义在
+  filter.rs from_route 镜像层）。
+
+### 本步实证（新坑）
+
+- **自定义 component 缺基类编译错**：`component SegmentItem {` 不写
+  `inherits Rectangle` 时是基元组件，`background/border-radius` 全
+  报 Unknown property——自绘组件必须显式 inherits。
+- **`<=>` 双链初值竞态**：AppWindow 端 `in-out highlightAll;`（无派
+  生绑定）与 TaskPage 端派生绑定经 `<=>` 相接后，窗口端默认 false
+  互相覆盖，TaskPage 派生值丢失（测试第一时间失败：缺省高亮==
+  false）。修法：**派生绑定收敛到唯一一层**——AppWindow 派生，
+  TaskPage 只 `in` 消费，禁止同语义双端派生。
+- **内部组件属性不自动上浮到 AppWindow**：第 26 步「filterMode 由
+  调用方回写」从未真的可达（窗口层无此属性）——本轮补上。属性/回
+  调都要在 AppWindow 显式声明/透传才入生成 API。
+
+### 验证
+
+- `cargo test -p gd3-ui`：**23 → 24 passed**（+1 高亮派生 smoke）。0 failed。
+- `cargo fmt --all --check`、`cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 干净。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7b 续）
+
+1. 暂停/删除接 gd3-core 真实语义（bridging 层决策：调用方是谁、
+   Rust UI 直执还是桥回 Python 服务）。
+2. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
