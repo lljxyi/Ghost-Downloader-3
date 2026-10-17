@@ -18,6 +18,7 @@ pub mod close_mode;
 pub mod conflict;
 pub mod filter;
 mod format;
+pub mod profile;
 pub mod proxy;
 pub mod row;
 pub mod sort;
@@ -224,6 +225,14 @@ pub fn push_settings(
             .unwrap_or("")
             .into(),
     );
+    // 第 41 步：模拟身份（cfg.py Network/ClientProfile 缺省 "auto"；
+    // 镜像 DropDownPushButton setText(toProfileLabel(value)) 的索引
+    // 口径，映射在 profile.rs 镜像层）。
+    window.set_clientProfileIndex(profile::index_of(
+        config
+            .get_str("Network", "ClientProfile")
+            .unwrap_or(profile::DEFAULT_PROFILE),
+    ) as i32);
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
     // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
     // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
@@ -298,6 +307,9 @@ pub struct SettingsActions {
     pub store_url_open: Box<dyn Fn(String)>,
     pub chromium_install: Box<dyn Fn()>,
     pub chromium_crx_export: Box<dyn Fn()>,
+    // 第 41 步：模拟身份动作收 profile 字面量（auto/raw/家族），索引
+    // →字面量换算在 install 层 profile.rs；引擎 resolve 在 gd3-net。
+    pub client_profile: Box<dyn Fn(&str)>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
     pub url_scheme_enabled: Box<dyn Fn(bool)>,
@@ -414,6 +426,11 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_chromiumInstall(move || (chromium_install.chromium_install)());
     let chromium_crx = actions.clone();
     window.on_exportCrx(move || (chromium_crx.chromium_crx_export)());
+    // 第 41 步：模拟身份注册（索引 → 字面量，镜像 _onPick）。
+    let client_profile = actions.clone();
+    window.on_clientProfileChanged(move |i| {
+        (client_profile.client_profile)(profile::value_of(i as i64))
+    });
     // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
     // 开机启动注册归引擎桥接步）。
     let url_scheme = actions.clone();
@@ -700,6 +717,7 @@ mod smoke {
         config.set_bool("Software", "ClipboardListener", false);
         config.set_f64("Personalization", "DpiScale", 1.25);
         config.set_str("Browser", "BrowserExtensionPairToken", "p41rt0kenal");
+        config.set_str("Network", "ClientProfile", "firefox-android");
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -736,6 +754,8 @@ mod smoke {
         assert_eq!(window.get_browserPort(), 15370);
         // 第 40 步：有值推送（配对令牌原样串）。
         assert_eq!(window.get_pairToken(), "p41rt0kenal");
+        // 第 41 步：有值推送（ClientProfile="firefox-android" → 索引 5）。
+        assert_eq!(window.get_clientProfileIndex(), 5);
         // 第 38 步：有值推送（urlScheme=F / 更新=F / 自启=T /
         // CloseMode="Quit"→索引 2 / 剪贴板=F）。
         assert!(!window.get_urlSchemeEnabled());
@@ -788,6 +808,8 @@ mod smoke {
         assert_eq!(window.get_uiScalePercent(), 0);
         // 第 40 步：缺省容错（BrowserExtensionPairToken 缺省 ""）。
         assert_eq!(window.get_pairToken(), "");
+        // 第 41 步：缺省容错（ClientProfile 缺省 "auto" → 索引 0）。
+        assert_eq!(window.get_clientProfileIndex(), 0);
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -803,6 +825,7 @@ mod smoke {
         let token_regen_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let store_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let chromium_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let profile_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -867,6 +890,11 @@ mod smoke {
                 move || h.borrow_mut().push(())
             }),
             chromium_crx_export: Box::new(|| {}),
+            // 第 41 步：模拟身份（索引→字面量通路验证）。
+            client_profile: Box::new({
+                let h = profile_hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
             // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
             // 索引⇄字面量通路）。
             url_scheme_enabled: Box::new(|_| {}),
@@ -953,6 +981,13 @@ mod smoke {
         );
         window.invoke_chromiumInstall();
         assert_eq!(chromium_hits.borrow().len(), 1);
+        // 第 41 步：模拟身份 invoke 通路（索引 3 → "edge"，镜像
+        // buildProfileMenu 家族字面量选项）。
+        window.invoke_clientProfileChanged(3);
+        assert_eq!(
+            profile_hits.borrow().last().map(|s| s.as_str()),
+            Some("edge")
+        );
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

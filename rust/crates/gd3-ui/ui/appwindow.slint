@@ -53,6 +53,9 @@ export component AppWindow inherits Window {
     // 第 40 步：浏览器扩展动作卡（cfg.py:269 缺省 ""；复制/重新生成/
     // 商店链接/一键安装/导出 CRX 动作的真实生效归调用方与引擎桥接步）。
     in-out property <string> pairToken: "";
+    // 第 41 步：模拟身份（Network/ClientProfile 缺省 "auto"；映射归
+    // Rust profile.rs，引擎解析对接 gd3-net resolve_emulation）。
+    in-out property <int> clientProfileIndex: 0;
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版五键
     // （cfg.py 缺省 T/T/F/"Ask"/T；CloseMode 映射归 close_mode.rs）。
     in-out property <bool> urlSchemeEnabled: true;
@@ -100,6 +103,7 @@ export component AppWindow inherits Window {
     callback browserEnabledChanged(bool);
     callback browserDraftTakenChanged(bool);
     callback browserPortChanged(int);
+    callback clientProfileChanged(int);
     callback copyPairToken();
     callback regeneratePairToken();
     callback openStoreUrl(string);
@@ -188,6 +192,8 @@ export component AppWindow inherits Window {
             regeneratePairToken() => { root.regeneratePairToken(); }
             openStoreUrl(url) => { root.openStoreUrl(url); }
             chromiumInstall() => { root.chromiumInstall(); }
+            clientProfileIndex <=> root.clientProfileIndex;
+            clientProfileChanged(i) => { root.clientProfileChanged(i); }
             exportCrx() => { root.exportCrx(); }
             urlSchemeEnabled <=> root.urlSchemeEnabled;
             checkUpdateAtStartup <=> root.checkUpdateAtStartup;
