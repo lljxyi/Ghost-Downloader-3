@@ -31,6 +31,7 @@ pub mod pystr;
 pub mod row;
 pub mod sort;
 pub mod speed;
+pub mod window;
 
 slint::include_modules!();
 

@@ -3033,3 +3033,84 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   1. 暂停/删除/继续的真实语义（`toggle_action` → 服务层调用）。
   2. 按 `VPS-MIGRATION.md` 的 P0→P6 表继续（P1 设置页剩余卡片）。
 - 卡点：无
+
+## 2026-10-17 14:25 第 56 步
+- 做了什么：
+  - 新建 `rust/crates/gd3-ui/src/window.rs`（**592 行，12 个单测**），
+    `lib.rs` 加 `pub mod window;`（字母序在 `speed` 之后）。这是主窗口
+    `main_window.py` 的**派生层**：只搬「不依赖 Qt 部件」的判定与文案。
+    - 导航表：`PAGE_TASK`/`PAGE_SETTINGS`/`ROUTE_ADD_TASK` 三个路由键、
+      `NavPosition`、`NavItem`、`NAV_ITEMS: [NavItem; 3]`（`下载任务`/`新建任务`/
+      `设置`，图标名 `DOWNLOAD`/`ADD`/`SETTING`，`addTaskButton` 不可选中）。
+    - 搜索框：`search_target(route_key)` → `SearchTarget { placeholder, accepts_text }`
+      （`TaskPage`→`搜索任务`、`SettingPage`→`搜索设置`、其余 → `None`/`false`）；
+      `search_edit_geometry(tb_w, tb_h, edit_h)` → `SearchGeometry { width, x, y }`。
+    - 拖放：`DropInput`/`DropDecision`/`drop_decision(input, matches)`（镜像
+      `dragEnterEvent` 四级短路）/ `drop_urls(input, matches)`（镜像 `dropEvent`
+      的取址：有 URL 取 URL，否则取能 match 的文本行）。
+    - 关闭：`PLATFORM_*`、`MODE_ASK`/`MODE_BACKGROUND`/`MODE_QUIT`、
+      `CloseAction`（`RejectModal`/`ShowNormalThenClose`/`HideToTray`/`Ask`/`Quit`/
+      `Close`）、`close_action(platform, mode, modal_visible, fullscreen, quitting)`、
+      `AskOutcome` + `resolve_ask(quit, remember)`。
+    - 文案：`pair_request_text`（`PAIR_REQUEST_TITLE`/`ALLOW`/`DENY` 三个按钮 +
+      两处 `or` 兜底）、`LISTEN_FAILED_*`（浏览器/aria2 两条 InfoBar）、
+      `UPDATE_AVAILABLE_*` + `update_available_content`、`EXCEPTION_*` +
+      `exception_text`、`CLOSE_ASK_*`（含「记住我的选择」）。
+    - 更新提示：`PROGRESS_TOAST_STATES`（`DOWNLOADING`/`READY`/`FAILED`）+
+      `UPDATE_TARGET_APP` + `wants_progress_toast(target_id, state)`。
+  - 金文件 `rust/crates/gd3-ui/tests/fixtures/window.jsonl`：**119 条**，
+    md5 `2fe3b123b6edde6dccc588ed53db06c7`。分布：`drop` 48 / `close` 26 /
+    `update-changed` 12 / `pair` 10 / `geometry` 9 / `search` 4 / `exception` 4 /
+    `update-available` 3 / `listen-failed` 2 / `nav` 1。
+  - 生成脚本 `tests/fixtures/generate_window_fixture.py`（~960 行）：把真方法绑到
+    桩宿主上跑（`NavHost` 绑 `_addPage`、`SearchHost` 绑 `_updateSearchTarget`、
+    `GeometryHost` 绑 `_refreshSearchEditGeometry`、`DragHost` 绑
+    `dragEnterEvent`/`dropEvent`、`CloseHost` 绑 `_onCloseClicked`、`NotifyHost` 绑
+    `_onListenFailed`），Qt 部件（`MessageBox`/`CheckBox`/`InfoBar`/`PushButton`/
+    `TransparentToolButton`/`ToolTipFilter`/`ProgressToast`/`QTimer`/`QApplication`/
+    `QHBoxLayout`）全换成记录型替身。
+  - `window.rs` 的 `mod tests` 新增 `matches_python_main_window_fixture`：按 `kind`
+    逐条重算并比对，末尾断言 `cases.len() == 119` 与各 kind 计数
+    `(nav, search, geometry) == (1, 4, 9)`、`(drop, close, pair) == (48, 26, 10)`、
+    `(listen, update, exception, changed) == (2, 3, 4, 12)`。
+- 决策与理由：
+  - **只搬「不依赖 Qt 部件」的判定与文案**——`DropOverlay` 自绘、Mica/Acrylic、
+    主题色、窗口几何持久化的落盘、`setupPacks` 都在头注释里记为未镜像，
+    等 Slint 侧真做窗口外壳时再定。
+  - **`search_edit_geometry` 用 `div_euclid(2)` 而不是 `/`**——Python `//` 向下取整，
+    Rust `/` 向零截断，负差时不同（`(-5)//2 == -3` vs `-2`）。金文件里
+    `(800, 21, 32)` → `y = -6` 就是这条的钉子。
+  - **`close_action` 保持 Python 短路链顺序**（可见模态框 → macOS 全屏 →
+    macOS 非退出模式 → ASK → QUIT/Background），ASK 拆成「返回 `Ask`」+
+    调用方拿 `resolve_ask(quit, remember)` 两段，因为 `dialog.exec()` 是阻塞调用。
+  - **`MODE_*` 常量直接引用 `close_mode::OPTIONS[i]`**，并加单测
+    `mode_literals_share_close_mode_options` 断言两者同源，避免字面量漂移。
+  - **`pair_request_text` 的兜底用 `filter(|v| !v.is_empty())`**——Python
+    `x or fallback` 是假值判断，`None` 与空串都兜底。
+  - **金文件的 `search` 用例里 `PlaceholderOnly` 探针不做 routeKey 比对**——Python
+    靠 `hasattr` 判定、Rust 靠 routeKey 查表，pack 页面在 Rust 侧一律按「没有」
+    处理；测试里显式 `continue` 并注释说明，只钉住「两个 flag 在 Python 里互相
+    独立」这一事实，**不静默容忍分歧**。
+  - **`close` 用例的 `cfg.set` 键名由生成脚本归一**——`FakeCfg.set` 把
+    `cfg.closeMode`（SimpleNamespace）当键记进 JSON 会 `TypeError`，改为记键名
+    `"closeMode"`/`"geometry"`；Rust 侧只比对「geometry 写了几次 / closeMode 写了
+    几次 + 值」，几何内容归调用方。
+  - **生成脚本踩的 6 个坑**（都修了）：`FakeLayout` 缺 `addWidget`；`edit` 工具的
+    `PUT a.=b:` 把 `FakeMsgBox.__init__` 首两行吃掉（用 Python 脚本还原）；
+    `FakeCfg` 缺 `geometry` 属性；`NotifyHost._onListenFailed = None` 占位把真方法
+    盖掉（改在用例里 `types.MethodType(MainWindow._onListenFailed, host)`）；
+    `dialog.titleLabel`/`logButton` 不是 QWidget → `titleRow.addWidget` 抛
+    `TypeError`（改为补丁 `main_window.QHBoxLayout`）。
+  - **clippy `manual_clamp`**：`(tb_w - 300).min(360).max(200)` 被拦，改
+    `(tb_w - 300).clamp(200, 360)`（`200 <= 360` 故等价）。
+- 验证：
+  - `cargo fmt --all --check` 通过。
+  - `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**250 passed**。
+  - `cargo test -p gd3-ui`：**100 → 112 passed**（12 个 `window::tests::*`，
+    含 `matches_python_main_window_fixture ... ok`）。
+  - Python 全量：**3 failed, 1347 passed, 8 skipped, 35 errors**，= 基线。
+- 下一步：
+  1. P0 主链路收口：把 `toggle_action` 接到服务层（暂停/继续/删除的真调用）。
+  2. `VPS-MIGRATION.md` 的 P1：设置页剩余卡片（网络/下载/其他三个分区）。
+- 卡点：无
