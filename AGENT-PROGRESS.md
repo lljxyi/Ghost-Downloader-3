@@ -799,3 +799,63 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
    依赖 gd3-core、状态文案/进度文案的语义口径对齐 task_cards.py 的
    FieldSpec/formats——先 Python 实测再镜像）。
 2. 之后任务列表的交互回调（暂停/删除/分类筛选）逐个接。
+
+## 第 24 步（2026-10-17 04:52；Phase 7b 数据映射）【完成】
+
+### TaskRecord → TaskRow 的 Rust 侧映射（commit a9b7d1c）
+
+gd3-ui 首次接入 gd3-core 依赖，UI 侧文案语义从 Python 先验镜像：
+
+- **src/format.rs**：`to_readable_size(f64)` / `to_readable_time(i64)`
+  算法级镜像 `app/format.py`。Python 先验字面量（10-17 实测：
+  `toReadableSize(0/1/512/1024/1048576/2**40/1536/1.5*1024³)` →
+  "0.00 B"/…/"1.00 TB"/"1.50 KB"/"1.50 GB"；`toReadableTime(0/59/60/125/
+  3900)` → "0s"/"59s"/"1m0s"/"2m5s"/"1h5m0s"）全部锁进测试。
+- **src/row.rs**：
+  - `to_size_text(&TaskRecord, received)` 镜像
+    `task_cards.py::toSizeText`：COMPLETED 且 fileSize>0 → 纯大小；
+    否则「已收/总量」；fileSize=0 → "已收/--"。
+  - `to_status_text(&TaskRecord, speed, received, is_seeding)` 镜像
+    `task_drawer.py::DetailCard._toStatusText`：RUNNING →
+    "速度/s · 已收 / 总量 · eta"（join " · "，eta = int 截断），
+    completed → 做种中/已完成、failed → 失败、paused → 已暂停、
+    缺省 → 等待中。
+  - `to_task_row` / `to_task_row_with`：复用 gd3-core
+    `TaskRecord::current_snapshot()`（不重算），装配 TaskRow。
+  - **isSeeding 分层实证**：`Task.isSeeding` 为运行时属性、
+    tasks.jsonl 记录无此字段 → COMPLETED 文案由调用方经
+    `is_seeding` 传入，缺省 `to_task_row` 恒 false。
+- **serde 字段名经测试锁定**：TaskRecord/TaskStep 均
+  `rename_all = "camelCase"`（taskId/fileSize/url/name/packId、
+  steps[].stepIndex/progress/speed/receivedBytes），TaskStatus
+  serde 为 UPPERCASE——测试用 serde_json `json!` 以磁盘同态构造，
+  8 测试一次全绿（含整行装配用例：speed 512+512 / received
+  384+128 → "1.00 KB/s · 512.00 B / 4.00 KB · 3s"）。
+
+### 工具坑（本步实证）
+
+- **Edit ops 语法再澄清**：此前连续失败的真正原因是
+  `PUT N.=M:`（冒号结尾）后面**必须跟至少一行 `+` 正文**——
+  「字面替换 + 改行内容」不能用旧 `:content` 单行形式，需写
+  `PUT N.=N:` 然后 `+ 新行`；`CUT` 单独一行时冒号可带可不带。
+  legacy old_string/new_string 形式在本环境直接报 `ops required`，
+  **不可用**。整块替换宁多给一行 `+` 也比挨个试省事。
+- **替换范围要含括号**：`PUT N.=M` 是**含首尾**替换；漏掉块尾
+  括号会残留孤立 `)`，rustfmt 会直接解析错。修完若 fmt --check
+  报 Diff，先重读该处再修，不要盲跑 `cargo fmt`。
+- 本步写入经重读核对，未出现杂字注入（write()- 注入问题仅见
+  于 write()，Edit 未再复现）。
+
+### 质量门
+
+`cargo fmt --all --check` 干净、`cargo clippy -p gd3-ui
+--all-targets -- -D warnings` 干净、`timeout 1200 cargo test -p
+gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
+
+### 下一步（Phase 7b 续）
+
+1. 把 `row::to_task_row` 接进推流路径：调用方（桥接层）持
+   `Vec<TaskRecord>` → `set_task_rows` 的端到端通路，无头测试从
+   records 构造到 getter round-trip。
+2. 列表页交互回调逐个接：暂停/删除/分类筛选。
+3. 之后设置页 → 引擎状态桥接。
