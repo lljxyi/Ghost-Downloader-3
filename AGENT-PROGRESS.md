@@ -1700,3 +1700,71 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    复制+重新生成/Chromium 一键安装 pressed）；或直接起手暂停/删除
    真实语义（Phase 8 桥接一体考虑）。
 2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 40 步 — 浏览器扩展动作卡骨架 + gd3-core pair_token（cfg.py）
+
+- 时间：2026-10-17 08:20（date 实取；代码提交 `ca29c40`）
+
+### 改动
+
+- `gd3-core` 增依赖 `base64 = "0.22"`（gd3-servers 同版本已在
+  lockfile，离线缓存可解）。
+- `gd3-core/src/pair_token.rs`（新，40 行）：镜像
+  `browser_service.regenerateToken` 的 `token_urlsafe(16)`——uuid v4
+  → 16 密码学安全随机字节 → base64url 无填充 22 字符；+2 单测
+  （22 长度/[A-Za-z0-9_-] 字母表/两次生成互异）。
+- `ui/settings_page.slint`（547 行）：`pairToken` in-out +
+  `copyPairToken`/`regeneratePairToken`/`openStoreUrl(string)`/
+  `chromiumInstall`/`exportCrx` 五回调 + 三动作卡（Button 镜像
+  PrimaryPush/HyperlinkCard，std 无 primary 变体与 ToolButton，
+  图标留主题步）；头注释 32-40 步。
+- `ui/appwindow.slint`（206 行）：同名透传。
+- `src/lib.rs`（1040 行，python 替换脚本 9 处锚点全中一次通过）：
+  push `set_pairToken(get_str 原样 into)`；SettingsActions 增五动作
+  （复制/重新生成/一键安装/导出收 ()、商店收 URL 原样串）；
+  install 注册；smoke 补有值/缺省/四 invoke 通路。
+
+### 键位与语义实证
+
+- `Browser/BrowserExtensionPairToken` 缺省 ""（cfg.py:269）。
+- 三商店 URL 逐字实证 `constants.py:11-13`：Firefox
+  `addons.mozilla.org/firefox/addon/ghost-downloader/`、Edge
+  `microsoftedge.microsoft.com/addons/.../odaohmfj...`、Chrome
+  `chromewebstore.google.com/.../lagbjgk...`。
+- 语义分层：复制令牌=剪贴板写归平台桥接步；重新生成=() 动作、
+  调用方生成+cfg.set+回推（断联已认证会话留引擎桥接步）；
+  一键安装/导出 CRX=解包与拉浏览器归引擎桥接步；商店链接收
+  URL 原样串（openUrl 归平台桥接步）。
+- 初稿笔误：草稿模式文案行混入 `);`（Write 一次事实层语法
+  错误），python 唯一性锚点即时修复，编译验证。
+
+### 工具坑增量
+
+- Write 全量重写 slint 时夹带书写错误（`);`），证明「内容先
+  Read 取全」后生成仍需 post-write 审视；本次由 review diff
+  展示即时暴露。
+- SharedString ⇄ String 两处编译错误（set_ 收 Into<SharedString>、
+  on_openStoreUrl 收 SharedString）一次修正。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-core -p gd3-ui
+  --all-targets -- -D warnings` clippy 与 fmt 门首次 2 处
+  E0308 类型换算修正后一次通过。
+- `timeout 1200 cargo test -p gd3-core -p gd3-ui`：gd3-core
+  **40 → 42 passed**（+2 pair_token）；gd3-ui **29 passed**
+  （扩展 settings smoke：pairToken 有值/缺省推送 + 复制/重新生成
+  /商店 URL/一键安装 invoke 断言）。0 failed。
+- 坏 token 扫描（U+FFFD/西里尔/非常规串）：现场 CLEAN。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 41 步候选：GeneralDownload 复杂卡（clientProfileCard TLS
+   指纹/UA 预设、HeadersPresetSettingCard）；或 categoryRulesCard
+   （依赖 categoryService 数据，或与引擎桥接步并轨）；或直接起手
+   暂停/删除真实语义（Phase 8 桥接一体考虑）。
+2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
