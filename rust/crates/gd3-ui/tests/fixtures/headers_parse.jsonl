@@ -1,0 +1,203 @@
+{"kind": "split", "input": "", "tokens": []}
+{"kind": "split", "input": "   ", "tokens": []}
+{"kind": "split", "input": "\t\r\n ", "tokens": []}
+{"kind": "split", "input": "a", "tokens": ["a"]}
+{"kind": "split", "input": " a ", "tokens": ["a"]}
+{"kind": "split", "input": "a b", "tokens": ["a", "b"]}
+{"kind": "split", "input": "a  b", "tokens": ["a", "b"]}
+{"kind": "split", "input": "a\tb", "tokens": ["a", "b"]}
+{"kind": "split", "input": "a\rb", "tokens": ["a", "b"]}
+{"kind": "split", "input": "a\nb", "tokens": ["a", "b"]}
+{"kind": "split", "input": "a\r\nb", "tokens": ["a", "b"]}
+{"kind": "split", "input": "a b", "tokens": ["a b"]}
+{"kind": "split", "input": "a\u001cb", "tokens": ["a\u001cb"]}
+{"kind": "split", "input": "a\u001fb", "tokens": ["a\u001fb"]}
+{"kind": "split", "input": "a#b", "tokens": ["a#b"]}
+{"kind": "split", "input": "#a b", "tokens": ["#a", "b"]}
+{"kind": "split", "input": "''", "tokens": [""]}
+{"kind": "split", "input": "\"\"", "tokens": [""]}
+{"kind": "split", "input": "'' \"\"", "tokens": ["", ""]}
+{"kind": "split", "input": "'' '' ''", "tokens": ["", "", ""]}
+{"kind": "split", "input": "'a b' c", "tokens": ["a b", "c"]}
+{"kind": "split", "input": "\"a b\" c", "tokens": ["a b", "c"]}
+{"kind": "split", "input": "'a'\"b\"c", "tokens": ["abc"]}
+{"kind": "split", "input": "a'b'c", "tokens": ["abc"]}
+{"kind": "split", "input": "a\"b\"c", "tokens": ["abc"]}
+{"kind": "split", "input": "\"a\\\"b\"", "tokens": ["a\"b"]}
+{"kind": "split", "input": "'a\\'b'", "tokens": null}
+{"kind": "split", "input": "'a\\b'", "tokens": ["a\\b"]}
+{"kind": "split", "input": "\"a\\\\b\"", "tokens": ["a\\b"]}
+{"kind": "split", "input": "\"a\\$b\"", "tokens": ["a\\$b"]}
+{"kind": "split", "input": "\"a\\`b\"", "tokens": ["a\\`b"]}
+{"kind": "split", "input": "\"a\\nb\"", "tokens": ["a\\nb"]}
+{"kind": "split", "input": "\"a\\tb\"", "tokens": ["a\\tb"]}
+{"kind": "split", "input": "\"a\\ b\"", "tokens": ["a\\ b"]}
+{"kind": "split", "input": "\"a\\\"", "tokens": null}
+{"kind": "split", "input": "'a\\", "tokens": null}
+{"kind": "split", "input": "a\\ b", "tokens": ["a b"]}
+{"kind": "split", "input": "a\\\\ b", "tokens": ["a\\", "b"]}
+{"kind": "split", "input": "a\\", "tokens": null}
+{"kind": "split", "input": "\\", "tokens": null}
+{"kind": "split", "input": "\\a", "tokens": ["a"]}
+{"kind": "split", "input": "a\\'b", "tokens": ["a'b"]}
+{"kind": "split", "input": "a\\\"b", "tokens": ["a\"b"]}
+{"kind": "split", "input": "a\\$b", "tokens": ["a$b"]}
+{"kind": "split", "input": "a\\`b", "tokens": ["a`b"]}
+{"kind": "split", "input": "\\ x", "tokens": [" x"]}
+{"kind": "split", "input": "\\\tx", "tokens": ["\tx"]}
+{"kind": "split", "input": "a \\ b", "tokens": ["a", " b"]}
+{"kind": "split", "input": "'' \\ ", "tokens": ["", " "]}
+{"kind": "split", "input": "curl 'https://example.com/a b'", "tokens": ["curl", "https://example.com/a b"]}
+{"kind": "split", "input": "curl \"https://example.com/a b\" -H 'x: 1'", "tokens": ["curl", "https://example.com/a b", "-H", "x: 1"]}
+{"kind": "split", "input": "curl --data-raw '{\"a\":1}' https://x", "tokens": ["curl", "--data-raw", "{\"a\":1}", "https://x"]}
+{"kind": "split", "input": "curl -H $'x: 1' https://x", "tokens": ["curl", "-H", "$x: 1", "https://x"]}
+{"kind": "split", "input": "curl 'a' && echo hi", "tokens": ["curl", "a", "&&", "echo", "hi"]}
+{"kind": "split", "input": "curl 'a' && echo hi | grep x", "tokens": ["curl", "a", "&&", "echo", "hi", "|", "grep", "x"]}
+{"kind": "split", "input": "curl 'a' & curl 'b'", "tokens": ["curl", "a", "&", "curl", "b"]}
+{"kind": "split", "input": "curl 'a' ; curl 'b'", "tokens": ["curl", "a", ";", "curl", "b"]}
+{"kind": "split", "input": "curl 'a' || curl 'b'", "tokens": ["curl", "a", "||", "curl", "b"]}
+{"kind": "split", "input": "curl\t'https://x'", "tokens": ["curl", "https://x"]}
+{"kind": "split", "input": "curl 'https://x' \\\n -H 'x: 1'", "tokens": ["curl", "https://x", "\n", "-H", "x: 1"]}
+{"kind": "split", "input": "curl 'a b' 'c\"d' \"e'f\"", "tokens": ["curl", "a b", "c\"d", "e'f"]}
+{"kind": "split", "input": "  curl  'a'  ", "tokens": ["curl", "a"]}
+{"kind": "split", "input": "curl ''", "tokens": ["curl", ""]}
+{"kind": "split", "input": "curl '' ''", "tokens": ["curl", "", ""]}
+{"kind": "split", "input": "curl '\\u4e2d\\u6587'", "tokens": ["curl", "\\u4e2d\\u6587"]}
+{"kind": "split", "input": "curl '中文: 值'", "tokens": ["curl", "中文: 值"]}
+{"kind": "curl", "input": "", "normalized": "", "rows": []}
+{"kind": "curl", "input": "curl", "normalized": "curl", "rows": []}
+{"kind": "curl", "input": "curl ", "normalized": "curl ", "rows": []}
+{"kind": "curl", "input": "curl 'https://example.com/f.zip'", "normalized": "curl 'https://example.com/f.zip'", "rows": []}
+{"kind": "curl", "input": "curl 'https://example.com/f.zip' -H 'accept: text/html'", "normalized": "curl 'https://example.com/f.zip' -H 'accept: text/html'", "rows": [["accept", "text/html"]]}
+{"kind": "curl", "input": "curl 'https://example.com/f.zip' -H 'accept: text/html' -H 'x-a:1'", "normalized": "curl 'https://example.com/f.zip' -H 'accept: text/html' -H 'x-a:1'", "rows": [["accept", "text/html"], ["x-a", "1"]]}
+{"kind": "curl", "input": "curl -H 'x-a:1' 'https://example.com/f.zip'", "normalized": "curl -H 'x-a:1' 'https://example.com/f.zip'", "rows": [["x-a", "1"]]}
+{"kind": "curl", "input": "curl --header 'x-b: 2' https://x", "normalized": "curl --header 'x-b: 2' https://x", "rows": [["x-b", "2"]]}
+{"kind": "curl", "input": "curl -H 'x-c: ' https://x", "normalized": "curl -H 'x-c: ' https://x", "rows": [["x-c", ""]]}
+{"kind": "curl", "input": "curl -H 'x-d:' https://x", "normalized": "curl -H 'x-d:' https://x", "rows": [["x-d", ""]]}
+{"kind": "curl", "input": "curl -H 'x-e;' https://x", "normalized": "curl -H 'x-e;' https://x", "rows": []}
+{"kind": "curl", "input": "curl -H 'a b: 1' https://x", "normalized": "curl -H 'a b: 1' https://x", "rows": []}
+{"kind": "curl", "input": "curl -H ': v' https://x", "normalized": "curl -H ': v' https://x", "rows": []}
+{"kind": "curl", "input": "curl -H 'host: example.com' -H 'x-f: a: b' https://x", "normalized": "curl -H 'host: example.com' -H 'x-f: a: b' https://x", "rows": [["host", "example.com"], ["x-f", "a: b"]]}
+{"kind": "curl", "input": "curl -H 'X-Upper: V' https://x", "normalized": "curl -H 'X-Upper: V' https://x", "rows": [["X-Upper", "V"]]}
+{"kind": "curl", "input": "curl -b 'a=b; c=d' -A 'UA/1' -e 'https://r' https://x", "normalized": "curl -b 'a=b; c=d' -A 'UA/1' -e 'https://r' https://x", "rows": [["cookie", "a=b; c=d"], ["user-agent", "UA/1"], ["referer", "https://r"]]}
+{"kind": "curl", "input": "curl --cookie 'a=b' --user-agent 'UA/2' --referer 'https://r2' https://x", "normalized": "curl --cookie 'a=b' --user-agent 'UA/2' --referer 'https://r2' https://x", "rows": [["cookie", "a=b"], ["user-agent", "UA/2"], ["referer", "https://r2"]]}
+{"kind": "curl", "input": "curl -b ' padded ' https://x", "normalized": "curl -b ' padded ' https://x", "rows": [["cookie", "padded"]]}
+{"kind": "curl", "input": "curl -A ' ' https://x", "normalized": "curl -A ' ' https://x", "rows": [["user-agent", ""]]}
+{"kind": "curl", "input": "curl $'https://x' -H $'x-g: 7'", "normalized": "curl 'https://x' -H 'x-g: 7'", "rows": [["x-g", "7"]]}
+{"kind": "curl", "input": "curl 'a' && curl 'b' -H 'x-h: 8'", "normalized": "curl 'a' && curl 'b' -H 'x-h: 8'", "rows": []}
+{"kind": "curl", "input": "curl 'a' & curl 'b' -H 'x-i: 9'", "normalized": "curl 'a' & curl 'b' -H 'x-i: 9'", "rows": []}
+{"kind": "curl", "input": "curl 'a' ; -H 'x-j: 10'", "normalized": "curl 'a' ; -H 'x-j: 10'", "rows": []}
+{"kind": "curl", "input": "curl 'a' | grep x -H 'x-k: 11'", "normalized": "curl 'a' | grep x -H 'x-k: 11'", "rows": []}
+{"kind": "curl", "input": "curl 'a' || echo -H 'x-l: 12'", "normalized": "curl 'a' || echo -H 'x-l: 12'", "rows": []}
+{"kind": "curl", "input": "curl 'a' -H 'x-m: 13' -H", "normalized": "curl 'a' -H 'x-m: 13' -H", "rows": [["x-m", "13"]]}
+{"kind": "curl", "input": "curl 'a' -H", "normalized": "curl 'a' -H", "rows": []}
+{"kind": "curl", "input": "curl 'a' -H 'x-n: 14' -o out.bin -H 'x-o: 15'", "normalized": "curl 'a' -H 'x-n: 14' -o out.bin -H 'x-o: 15'", "rows": [["x-n", "14"], ["x-o", "15"]]}
+{"kind": "curl", "input": "curl 'a' -X POST --compressed -H 'x-p: 16'", "normalized": "curl 'a' -X POST --compressed -H 'x-p: 16'", "rows": [["x-p", "16"]]}
+{"kind": "curl", "input": "curl 'a' --data 'a=1&b=2' -H 'x-q: 17'", "normalized": "curl 'a' --data 'a=1&b=2' -H 'x-q: 17'", "rows": [["x-q", "17"]]}
+{"kind": "curl", "input": "curl 'a' -H 'x-r: 18' 'https://y' -H 'x-s: 19'", "normalized": "curl 'a' -H 'x-r: 18' 'https://y' -H 'x-s: 19'", "rows": [["x-r", "18"], ["x-s", "19"]]}
+{"kind": "curl", "input": "curl 'a -H 'x-t: 20'", "normalized": "curl 'a -H 'x-t: 20'", "rows": []}
+{"kind": "curl", "input": "curl 'a' -H 'x-u: 21' \\", "normalized": "curl 'a' -H 'x-u: 21' \\", "rows": []}
+{"kind": "curl", "input": "curl 'a' -H 'x-v: 22' -H 'x-v: 23'", "normalized": "curl 'a' -H 'x-v: 22' -H 'x-v: 23'", "rows": [["x-v", "22"], ["x-v", "23"]]}
+{"kind": "curl", "input": "curl 'a' -H \"x-w: 24\" -H 'x-x: 25'", "normalized": "curl 'a' -H \"x-w: 24\" -H 'x-x: 25'", "rows": [["x-w", "24"], ["x-x", "25"]]}
+{"kind": "curl", "input": "curl 'a' -H 'x-y: \\'quoted\\''", "normalized": "curl 'a' -H 'x-y: \\'quoted\\''", "rows": []}
+{"kind": "curl", "input": "curl 'a' -H $'x-z: 26'", "normalized": "curl 'a' -H 'x-z: 26'", "rows": [["x-z", "26"]]}
+{"kind": "curl", "input": "CURL 'a' -H 'x-aa: 27'", "normalized": "CURL 'a' -H 'x-aa: 27'", "rows": [["x-aa", "27"]]}
+{"kind": "curl", "input": " curl 'a' -H 'x-ab: 28'", "normalized": " curl 'a' -H 'x-ab: 28'", "rows": [["x-ab", "28"]]}
+{"kind": "curl", "input": "curlfoo 'a' -H 'x-ac: 29'", "normalized": "curlfoo 'a' -H 'x-ac: 29'", "rows": [["x-ac", "29"]]}
+{"kind": "curl", "input": "-H 'x-ad: 30'", "normalized": "-H 'x-ad: 30'", "rows": []}
+{"kind": "curl", "input": "curl 'a' -H 'x-ae: 31' -H 'x-ae: 32'", "normalized": "curl 'a' -H 'x-ae: 31' -H 'x-ae: 32'", "rows": [["x-ae", "31"], ["x-ae", "32"]]}
+{"kind": "curl", "input": "curl 'a' -H 'x-af: 33' ; curl 'b' -H 'x-ag: 34'", "normalized": "curl 'a' -H 'x-af: 33' ; curl 'b' -H 'x-ag: 34'", "rows": [["x-af", "33"]]}
+{"kind": "headers", "input": "", "lines": [], "rows": []}
+{"kind": "headers", "input": "   ", "lines": [], "rows": []}
+{"kind": "headers", "input": "\n\n\n", "lines": [], "rows": []}
+{"kind": "headers", "input": "a: 1", "lines": ["a: 1"], "rows": [["a", "1"]]}
+{"kind": "headers", "input": "a: 1\nb: 2", "lines": ["a: 1", "b: 2"], "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "headers", "input": "a: 1\r\nb: 2", "lines": ["a: 1", "b: 2"], "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "headers", "input": "a: 1\rb: 2", "lines": ["a: 1", "b: 2"], "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "headers", "input": "a: 1\u000bb: 2", "lines": ["a: 1", "b: 2"], "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "headers", "input": "a: 1 b: 2", "lines": ["a: 1", "b: 2"], "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "headers", "input": "  a :  1  \n\n  \n", "lines": ["a :  1"], "rows": [["a", "1"]]}
+{"kind": "headers", "input": "no-colon\nb: 2", "lines": ["no-colon", "b: 2"], "rows": [["b", "2"]]}
+{"kind": "headers", "input": ": v\nb: 2", "lines": [": v", "b: 2"], "rows": [["b", "2"]]}
+{"kind": "headers", "input": "a b: 1\nc: 2", "lines": ["a b: 1", "c: 2"], "rows": [["c", "2"]]}
+{"kind": "headers", "input": "a: 1\ncurl 'https://x' -H 'b: 2'", "lines": ["a: 1", "curl 'https://x' -H 'b: 2'"], "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "headers", "input": "curl 'https://x' -H 'b: 2'\nc: 3", "lines": ["curl 'https://x' -H 'b: 2'", "c: 3"], "rows": [["b", "2"], ["c", "3"]]}
+{"kind": "headers", "input": "curl 'https://x' -H 'b: 2'\ncurl 'https://y' -H 'd: 4'", "lines": ["curl 'https://x' -H 'b: 2'", "curl 'https://y' -H 'd: 4'"], "rows": [["b", "2"]]}
+{"kind": "headers", "input": "curl 'https://x' -H 'b: 2' && curl 'https://y' -H 'd: 4'", "lines": ["curl 'https://x' -H 'b: 2' && curl 'https://y' -H 'd: 4'"], "rows": [["b", "2"]]}
+{"kind": "headers", "input": "CURL 'https://x' -H 'b: 2'", "lines": ["CURL 'https://x' -H 'b: 2'"], "rows": [["b", "2"]]}
+{"kind": "headers", "input": "curl\t'https://x' -H 'b: 2'", "lines": ["curl\t'https://x' -H 'b: 2'"], "rows": []}
+{"kind": "headers", "input": "curlfoo: 1", "lines": ["curlfoo: 1"], "rows": [["curlfoo", "1"]]}
+{"kind": "headers", "input": "curl : 1", "lines": ["curl : 1"], "rows": []}
+{"kind": "headers", "input": "curl 'https://x' -H 'b: 2' \\\n  -H 'c: 3'", "lines": ["curl 'https://x' -H 'b: 2'    -H 'c: 3'"], "rows": [["b", "2"], ["c", "3"]]}
+{"kind": "headers", "input": "curl 'https://x' -H 'b: 2' ^\n  -H 'c: 3'", "lines": ["curl 'https://x' -H 'b: 2'    -H 'c: 3'"], "rows": [["b", "2"], ["c", "3"]]}
+{"kind": "headers", "input": "curl 'https://x' -H 'a b: 2'", "lines": ["curl 'https://x' -H 'a b: 2'"], "rows": []}
+{"kind": "headers", "input": "curl 'https://x' -H 'b: 2'\n\n\nd: 4\n", "lines": ["curl 'https://x' -H 'b: 2'", "d: 4"], "rows": [["b", "2"], ["d", "4"]]}
+{"kind": "headers", "input": "\u001f", "lines": [], "rows": []}
+{"kind": "headers", "input": "a: 1\u001fb: 2", "lines": ["a: 1\u001fb: 2"], "rows": [["a", "1\u001fb: 2"]]}
+{"kind": "rows", "input": "", "rows": []}
+{"kind": "rows", "input": "   ", "rows": []}
+{"kind": "rows", "input": "a: 1", "rows": [["a", "1"]]}
+{"kind": "rows", "input": "a: 1\nb: 2", "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "rows", "input": "a: 1\r\nb: 2", "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "rows", "input": "a: 1\rb: 2", "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "rows", "input": "a: 1\u000bb: 2", "rows": [["a", "1"], ["b", "2"]]}
+{"kind": "rows", "input": "no-colon", "rows": [["no-colon", ""]]}
+{"kind": "rows", "input": "no-colon\nb: 2", "rows": [["no-colon", ""], ["b", "2"]]}
+{"kind": "rows", "input": ": v", "rows": [["", "v"]]}
+{"kind": "rows", "input": "a: 1: 2", "rows": [["a", "1: 2"]]}
+{"kind": "rows", "input": "a :  1  ", "rows": [["a", "1"]]}
+{"kind": "rows", "input": "  a  ", "rows": [["a", ""]]}
+{"kind": "rows", "input": "a\n\n\nb", "rows": [["a", ""], ["b", ""]]}
+{"kind": "rows", "input": "curl 'https://x' -H 'b: 2'", "rows": [["curl 'https", "//x' -H 'b: 2'"]]}
+{"kind": "rows", "input": "a b: 1", "rows": [["a b", "1"]]}
+{"kind": "rows", "input": "a:", "rows": [["a", ""]]}
+{"kind": "rows", "input": ": ", "rows": [["", ""]]}
+{"kind": "rows", "input": " \t ", "rows": []}
+{"kind": "rows", "input": "\u001f", "rows": []}
+{"kind": "text", "pairs": [], "text": ""}
+{"kind": "text", "pairs": [["a", "1"]], "text": "a: 1"}
+{"kind": "text", "pairs": [["a", ""]], "text": "a"}
+{"kind": "text", "pairs": [["a", "1"], ["b", ""]], "text": "a: 1\nb"}
+{"kind": "text", "pairs": [["a", ""], ["b", "2"]], "text": "a\nb: 2"}
+{"kind": "text", "pairs": [["accept-encoding", "deflate, br, gzip"]], "text": "accept-encoding: deflate, br, gzip"}
+{"kind": "text", "pairs": [["a", " 1 "]], "text": "a:  1 "}
+{"kind": "text", "pairs": [["", "1"]], "text": ": 1"}
+{"kind": "text", "pairs": [["a", "1\n2"]], "text": "a: 1\n2"}
+{"kind": "text", "pairs": [["中文", "值"]], "text": "中文: 值"}
+{"kind": "map", "pairs": [], "rows": []}
+{"kind": "map", "pairs": [["a", "1"]], "rows": [["a", "1"]]}
+{"kind": "map", "pairs": [["A", "1"]], "rows": [["a", "1"]]}
+{"kind": "map", "pairs": [["  A  ", " 1 "]], "rows": [["a", "1"]]}
+{"kind": "map", "pairs": [["a", ""]], "rows": []}
+{"kind": "map", "pairs": [["", "1"]], "rows": []}
+{"kind": "map", "pairs": [["a", "1"], ["a", "2"]], "rows": [["a", "2"]]}
+{"kind": "map", "pairs": [["A", "1"], ["a", "2"]], "rows": [["a", "2"]]}
+{"kind": "map", "pairs": [["a", "2"], ["A", "1"]], "rows": [["a", "1"]]}
+{"kind": "map", "pairs": [["b", "1"], ["a", "2"], ["b", "3"]], "rows": [["b", "3"], ["a", "2"]]}
+{"kind": "map", "pairs": [["a", " "], ["b", "2"]], "rows": [["b", "2"]]}
+{"kind": "map", "pairs": [["no-colon", ""]], "rows": []}
+{"kind": "map", "pairs": [["中文", "值"]], "rows": [["中文", "值"]]}
+{"kind": "map", "pairs": [["İ", "1"]], "rows": [["i̇", "1"]]}
+{"kind": "dup", "pairs": [], "flags": []}
+{"kind": "dup", "pairs": [["a", "1"]], "flags": [false]}
+{"kind": "dup", "pairs": [["a", "1"], ["b", "2"]], "flags": [false, false]}
+{"kind": "dup", "pairs": [["a", "1"], ["a", "2"]], "flags": [false, true]}
+{"kind": "dup", "pairs": [["A", "1"], ["a", "2"]], "flags": [false, true]}
+{"kind": "dup", "pairs": [[" a ", "1"], ["a", "2"]], "flags": [false, true]}
+{"kind": "dup", "pairs": [["a", "1"], ["b", "2"], ["a", "3"]], "flags": [false, false, true]}
+{"kind": "dup", "pairs": [["", "1"], ["", "2"]], "flags": [false, false]}
+{"kind": "dup", "pairs": [["a", ""], ["a", ""]], "flags": [false, true]}
+{"kind": "dup", "pairs": [["a", "1"], ["b", "2"], ["c", "3"], ["B", "4"]], "flags": [false, false, false, true]}
+{"kind": "header_line", "input": "", "row": null}
+{"kind": "header_line", "input": "a", "row": null}
+{"kind": "header_line", "input": "a:", "row": ["a", ""]}
+{"kind": "header_line", "input": "a: ", "row": ["a", ""]}
+{"kind": "header_line", "input": ":", "row": null}
+{"kind": "header_line", "input": ": 1", "row": null}
+{"kind": "header_line", "input": " a : 1 ", "row": ["a", "1"]}
+{"kind": "header_line", "input": "a b: 1", "row": null}
+{"kind": "header_line", "input": "a\tb: 1", "row": null}
+{"kind": "header_line", "input": "a: b: c", "row": ["a", "b: c"]}
+{"kind": "header_line", "input": "a:b", "row": ["a", "b"]}
+{"kind": "header_line", "input": "\u001fa: 1", "row": ["a", "1"]}
+{"kind": "header_line", "input": "中文: 值", "row": ["中文", "值"]}

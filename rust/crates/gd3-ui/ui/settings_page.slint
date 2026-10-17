@@ -151,6 +151,10 @@ export component SettingsPage inherits Rectangle {
     in-out property <string> headersEditName: "";
     in-out property <string> headersEditPairs: "";
     in-out property <bool> headersEditNameError: false;
+    // 第 48 步：重复标头汇总警告。Slint 的 `TextEdit` 无法逐行染色，
+    // Python 的 `row.setDuplicate` 红框降级成一行汇总文字（内容由
+    // Rust `headers::duplicate_names` 算，空串=无重复）。
+    in-out property <string> headersEditDuplicateWarning: "";
     // 第 47 步：身份预设编辑覆盖层（镜像 PresetEditDialog：名称可空、
     // hosts 至少一条——「请添加匹配 Host」提示；profile 为 ComboBox，
     // 0 项「跟随全局默认」即空串字面量；labels/values 由 Rust 侧按
@@ -236,6 +240,9 @@ export component SettingsPage inherits Rectangle {
     callback headersPresetEditRequested(int);
     callback headersPresetEditClosed();
     callback headersPresetEditAccepted(HeadersEditDraft);
+    // 第 48 步：标头文本编辑中——用于实时重算重复标头警告（文本本身
+    // 走 `headersEditPairs` 双向绑定，这里带原样串方便 Rust 侧解析）。
+    callback headersPresetPairsEdited(string);
     // 第 47 步：身份预设添加/编辑动作（入口收 () 或索引；「取消」收 ()；
     // 「确定」回发草稿——hosts 校验（至少一条）在 Rust 侧做，未过时置
     // identityEditHostsError 且不收起覆盖层，镜像 validate() 拒绝后
@@ -895,7 +902,14 @@ export component SettingsPage inherits Rectangle {
                 }
                 TextEdit {
                     text <=> root.headersEditPairs;
-                    placeholder-text: "每行一条「名: 值」";
+                    placeholder-text: "每行一条「名: 值」，可直接粘贴 cURL";
+                    edited => {
+                        root.headersPresetPairsEdited(self.text);
+                    }
+                }
+                Text {
+                    text: root.headersEditDuplicateWarning;
+                    visible: root.headersEditDuplicateWarning != "";
                 }
                 HorizontalBox {
                     Button {

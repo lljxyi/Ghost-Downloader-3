@@ -2347,3 +2347,95 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 1. `HeadersEditor` 的 cURL 粘贴解析（`parseCurl`）与重复行高亮。
 2. `categoryRulesCard` 写路径的 `correct` 过滤。
 3. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
+
+---
+
+## 第 48 步（Phase 7c）：`HeadersEditor` 解析层（cURL 分词 + 归一化 + 重复标头）
+
+### 做了什么
+
+- **新建 `rust/crates/gd3-ui/src/pyshlex.rs`（209 行）**：手写状态机镜像
+  CPython 3.13 `shlex.shlex.read_token` 在
+  `posix=True, whitespace_split=True, commenters='', punctuation_chars=''`
+  下的行为（`shlex.split` 的口径）。`pub fn split(&str) -> Option<Vec<String>>`
+  （`None` = Python 的 `ValueError`）。要点：
+  - 空白集固定 `' ' '\t' '\r' '\n'`；NBSP / `\x1c` / `\x1f` **不是** shlex
+    空白（`char::is_whitespace` 会误判，不能直接用）；
+  - `whitespace_split=True` 让 `wordchars` 失效；`commenters=''` 使 `#`
+    是普通字符；`punctuation_chars=''` 使 `&&`/`||` 不切开；
+  - 单引号内反斜杠是字面量；双引号内只有 `\\` 与 `\"` 吃掉反斜杠
+    （`\$`/`` \` ``/`\n` 保留）；引号包裹空串是合法 token；
+  - 词外 `\` 的 `escapedstate` 是 `'a'` 而非 `' '`——逐字照抄 CPython
+    （可见后果：`"\ x"` → `[" x"]`，空白被带进词里）；
+  - EOF 在引号内 / 反斜杠后 → `None`。4 单测。
+- **`headers.rs` 新增解析层**：
+  - `CURL_HEADER_FLAGS` / `is_command_separator` / `curl_value_flag` /
+    `starts_with_curl_command`（逐字符 ASCII 小写比较，等价
+    `line[:5].lower() == "curl "`）/ `parse_curl` / `parse_headers`
+    （逐逻辑行分派，cURL 行只认第一条）；
+  - `to_header_rows`（字面切分、零丢弃，镜像 `toHeaderRows`）；
+  - `headers_map`（镜像 `HeadersEditor.headers()`：`strip().lower()`、
+    空名/空值丢弃、同名后者覆盖、键序取首次出现位置）；
+  - `duplicate_flags`（镜像 `_refreshDuplicates`）/ `duplicate_names` /
+    `duplicate_warning`（汇总文案，Slint 专用）。
+- **`headers_to_text` 改为镜像 `toHeadersText`**：值空只写名，行间 `\n`，
+  **末尾不带换行**（原来是每行带 `\n`）。
+- **`draft_to_header_preset` 改走 `headers_map(&parse_headers(pairs))`**：
+  Python 在**粘贴时**就归一化 cURL（`HeadersTextEdit.insertFromMimeData`），
+  Slint 的 `TextEdit` 拦不到粘贴，只能在确定时做等价归一化。
+- **重复标头实时提示接线**：`settings_page.slint` 加
+  `headersEditDuplicateWarning` 属性 + `TextEdit` 的 `edited` →
+  `headersPresetPairsEdited(string)` 回调 + 警告行；`appwindow.slint`
+  属性/回调透传；`lib.rs` 注册回调算 `duplicate_warning`
+  （纯呈现层派生，不进 `SettingsActions`），`open_headers_preset_edit`
+  也初算。
+- **金文件 `rust/crates/gd3-ui/tests/fixtures/headers_parse.jsonl`（203 条）**
+  由 `generate_headers_fixture.py` 生成：直接 import 真实 Python 的
+  `parseCurl`/`parseHeaders`/`toHeaderRows`/`toHeadersText`/`parseHeaderLine`/
+  `toLogicalLines`；`headers()` 与 `_refreshDuplicates()` 用桩替换
+  `_currentRows()`/`_rows()` 后跑真方法，保证镜像对象是 Python 本身。
+  语料：`SPLIT_CASES`(63) / `CURL_CASES`(43) / `HEADERS_CASES`(27) /
+  `ROWS_CASES`(20) / `TEXT_CASES`(10) / `MAP_CASES`(14) / `DUP_CASES`(10) /
+  `header_line`(13)。
+
+### 新事实
+
+- **`shlex` crate 不能用**：双引号内 `\$`/`` \` `` 会吃掉反斜杠、空白集缺
+  `\r`，与 CPython 有实质分歧。手写状态机 + 金文件逐条对比是唯一能做到
+  「逐断言一致」的路径。
+- **`toHeadersText` 末尾无换行**：`"\n".join(...)`。第 46 步的实现每行都
+  带 `\n`，已改（连带修了两处 smoke 断言）。
+- **`draft_to_header_preset` 的口径变化**：从 `parse_header_pairs`（保留空值
+  行）改成 `headers_map`（丢弃空值行、名称小写、同名覆盖）。唯一已知差异：
+  名称含空白的行——Python 文本视图会保留、表格视图被 `HeaderNameValidator`
+  拒绝，取更安全的一侧丢弃，已写进 doc 注释。
+- **重复行高亮降级**：Python 是 `row.setDuplicate` 逐行红框，Slint 的
+  `TextEdit` 无法逐行染色 → 一行汇总文字「重复标头：x, y（后一条覆盖
+  前一条）」，判定口径与 `_refreshDuplicates` 完全相同（`strip().lower()`、
+  空名不进 seen）。
+- 金文件**可复现**：连跑两次 md5 相同（`6e256b0c…` → 改语料后重算）。
+
+### 验证
+
+- `cargo fmt --all --check` 通过。
+- `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+- `timeout 1800 cargo test -p gd3-ui`：**61 passed**，0 failed
+  （含 `parse_layer_matches_python_fixture` 逐条对比 203 条金文件，
+  以及 8 类语料的下限断言防「金文件被清空仍全绿」）。
+- `timeout 2400 cargo test -p gd3-core -p gd3-net -p gd3-servers`：
+  **236 passed**，0 failed。
+- Python 全量：`pytest -q --continue-on-collection-errors` →
+  **3 failed, 1347 passed, 8 skipped, 35 errors**，失败集合
+  （`test_android_config_parity` / `test_github_probe::testProxySiteGetsNoCredentials` /
+  `test_runtime_install::test_delete_raises_when_a_path_cannot_be_deleted`）
+  与基线完全相同，无新增。本步只动 `gd3-ui`（未接进 Python 侧），
+  不涉及影子开关，故无需双模式回归。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. `categoryRulesCard` 写路径的 `correct` 过滤。
+2. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。

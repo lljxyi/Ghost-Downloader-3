@@ -23,6 +23,7 @@ pub mod headers;
 pub mod identity;
 pub mod profile;
 pub mod proxy;
+pub mod pyshlex;
 pub mod pystr;
 pub mod row;
 pub mod sort;
@@ -355,12 +356,12 @@ pub fn open_headers_preset_edit(
     };
     window.set_headersEditIndex(index.map(|i| i as i32).unwrap_or(-1));
     window.set_headersEditName(name.into());
-    window.set_headersEditPairs(
-        preset
-            .map(|p| headers::headers_to_text(&p.headers))
-            .unwrap_or_default()
-            .into(),
-    );
+    let pairs = preset
+        .map(|p| headers::headers_to_text(&p.headers))
+        .unwrap_or_default();
+    window.set_headersEditPairs(pairs.clone().into());
+    // 第 48 步：初算重复标头警告（手改过的 cfg 可能带重名）。
+    window.set_headersEditDuplicateWarning(headers::duplicate_warning(&pairs).into());
     window.set_headersEditNameError(false);
     window.set_headersEditVisible(true);
 }
@@ -693,6 +694,14 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
             d.index as i64,
             headers::draft_to_header_preset(&d.name, &d.pairs),
         ))
+    });
+    // 第 48 步：标头文本编辑中实时重算重复标头警告——纯呈现层派生
+    // （`duplicate_names` 汇总），不进 `SettingsActions`：Python 的逐行
+    // `row.setDuplicate` 红框在 Slint 的 `TextEdit` 上无法逐行染色，
+    // 降级成一行汇总文字。
+    let headers_dup_win = window.clone_strong();
+    window.on_headersPresetPairsEdited(move |text| {
+        headers_dup_win.set_headersEditDuplicateWarning(headers::duplicate_warning(&text).into());
     });
     // 第 43 步：身份预设注册（索引越界检查归调用方，镜像 Python
     // `if index < 0 or index >= len(presets): return` 守卫）。
@@ -1204,6 +1213,8 @@ mod smoke {
         // 第 46 步：缺省容错（编辑覆盖层收起、索引 -1=添加）。
         assert!(!window.get_headersEditVisible());
         assert_eq!(window.get_headersEditIndex(), -1);
+        // 第 48 步：缺省无重复标头警告。
+        assert_eq!(window.get_headersEditDuplicateWarning(), "");
         // 第 43 步：缺省容错（缺键 → 百度网盘客户端预设单行，启用）。
         let identity_rows = window.get_identityPresets();
         assert_eq!(identity_rows.row_count(), 1);
@@ -1540,6 +1551,7 @@ mod smoke {
         let (submitted_i, submitted_p) = headers_submit_hits.borrow().last().cloned().unwrap();
         assert_eq!(submitted_i, 0);
         assert_eq!(submitted_p.name, "A2");
+        // 第 48 步：标头走 `headers()` 口径——空值行（`c:`）被丢弃。
         assert_eq!(
             submitted_p.headers,
             vec![
@@ -1548,9 +1560,16 @@ mod smoke {
                     "deflate, br, gzip".to_string()
                 ),
                 ("x-a".to_string(), "1".to_string()),
-                ("c".to_string(), String::new()),
             ]
         );
+        // 第 48 步：文本编辑回调实时重算重复标头警告（纯呈现层派生）。
+        window.invoke_headersPresetPairsEdited("x-a: 1\nX-A: 2".into());
+        assert_eq!(
+            window.get_headersEditDuplicateWarning(),
+            "重复标头：x-a（后一条覆盖前一条）"
+        );
+        window.invoke_headersPresetPairsEdited("x-a: 1".into());
+        assert_eq!(window.get_headersEditDuplicateWarning(), "");
         window.invoke_headersPresetEditClosed();
         assert_eq!(headers_close_hits.borrow().len(), 1);
         // 第 43 步：身份预设 invoke 通路（开关 (索引, bool)、删除索引）。
@@ -1701,16 +1720,17 @@ mod smoke {
         assert!(window.get_headersEditVisible());
         assert_eq!(window.get_headersEditIndex(), -1);
         assert_eq!(window.get_headersEditName(), "");
+        // 第 48 步：`toHeadersText` 末尾不带换行（Python `"\n".join`）。
         assert_eq!(
             window.get_headersEditPairs(),
-            "y-b: 2\nz-c: 3\n",
+            "y-b: 2\nz-c: 3",
             "添加起点应为选中预设 B 的标头回显"
         );
         // 编辑（镜像 _onEditClicked：预设[index] 带值回显）。
         crate::open_headers_preset_edit(&window, &config, Some(0));
         assert_eq!(window.get_headersEditIndex(), 0);
         assert_eq!(window.get_headersEditName(), "A");
-        assert_eq!(window.get_headersEditPairs(), "x-a: 1\n");
+        assert_eq!(window.get_headersEditPairs(), "x-a: 1");
     }
 
     /// 第 47 步：open_identity_preset_edit 两态直写（添加=全空 + 「跟随

@@ -74,6 +74,7 @@ export component AppWindow inherits Window {
     in-out property <string> headersEditName;
     in-out property <string> headersEditPairs;
     in-out property <bool> headersEditNameError;
+    in-out property <string> headersEditDuplicateWarning;
     // 第 43 步：身份预设列表（行结构镜像 PresetRowWidget；编辑/添加
     // 留欠账步）。
     in-out property <[IdentityPresetData]> identityPresets;
@@ -155,6 +156,7 @@ export component AppWindow inherits Window {
     callback headersPresetEditRequested(int);
     callback headersPresetEditClosed();
     callback headersPresetEditAccepted(HeadersEditDraft);
+    callback headersPresetPairsEdited(string);
     callback identityPresetAddRequested();
     callback identityPresetEditRequested(int);
     callback identityPresetEditClosed();
@@ -299,10 +301,12 @@ export component AppWindow inherits Window {
             headersEditName <=> root.headersEditName;
             headersEditPairs <=> root.headersEditPairs;
             headersEditNameError <=> root.headersEditNameError;
+            headersEditDuplicateWarning <=> root.headersEditDuplicateWarning;
             headersPresetAddRequested() => { root.headersPresetAddRequested(); }
             headersPresetEditRequested(i) => { root.headersPresetEditRequested(i); }
             headersPresetEditClosed() => { root.headersPresetEditClosed(); }
             headersPresetEditAccepted(d) => { root.headersPresetEditAccepted(d); }
+            headersPresetPairsEdited(text) => { root.headersPresetPairsEdited(text); }
             exportCrx() => { root.exportCrx(); }
             urlSchemeEnabled <=> root.urlSchemeEnabled;
             checkUpdateAtStartup <=> root.checkUpdateAtStartup;
