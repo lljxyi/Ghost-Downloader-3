@@ -2003,3 +2003,81 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    （NewTaskCard）并轨。
 2. 之后：暂停/删除真实语义（Phase 8 桥接一体）→ 引擎状态桥接
    → Python UI 停用 + AGENT-DONE。
+
+## 第 44 步：库分类规则镜像层（cfg.py Category/CategoryRules + CategoryService）
+
+- 时间：2026-10-17 09:16（date 实取；代码提交 `cfd1006`）
+
+### 改动
+
+- `src/category.rs`（新，260 行）：
+  - `CATEGORY_PRESETS` 八预设逐字镜像（category_service.py:16-99，
+    fromDict 归一化后与源一致）：视频 VIDEO {default}/Video 20、
+    音频 MUSIC /Audio 12、图片 PHOTO /Images 13、字幕 CHAT
+    /Subtitles 10、文档 DOCUMENT /Documents 19、压缩包
+    ZIP_FOLDER /Archives 24（**含 tar.gz/tar.bz2/tar.xz/tar.zst
+    复合扩展字面量**）、程序 APPLICATION /Programs 21、其他 HELP
+    无 folder 无扩展；
+  - `parse_rules` 镜像 `CategoryService._load`（136-144）：缺键/
+    空串/`[]`/非 JSON/空数组 → 八预设；非空逐项 fromDict 容错
+    归一化（112-131）：extensions 逐项 str→strip→去点→小写→去重、
+    icon 缺省 DOCUMENT、name 缺省 ""、folder 空串→None；
+    **缺 categoryId 读侧保留空串不生成随机**（Python 端
+    `cat_{uuid4().hex}` 随机性不复刻，空 id 由写侧调用方处理）；
+  - `summary_of` 镜像 `_toSummary`：0 项「无扩展名」/≤4 项全量
+    `", "` join/>4 项「{前4} 等 {N} 项」；
+  - 3 单测：五路非法输入兜八预设（复合扩展保留）、disk 逐项
+    归一化断言、summary 三分支。
+- `ui/settings_page.slint`（python 脚本 4 处锚点全中）：
+  `CategoryRowData` 结构（name/desc/id）+ `categoryRows`/
+  `categoryRuleCount` 属性 + `categoryResetRequested()`/
+  `categoryRemoveRequested(string)` 回调 + 行列表卡（插在「启用
+  下载分类」HorizontalBox 块后：VerticalBox for 循环行——名称+
+  摘要 Text+「删除」按钮，尾行「共 N 个分类」+「恢复默认」按钮；
+  头注释 32-43→32-44 步）。
+- `ui/appwindow.slint`：结构导入 + 四行透传。
+- `src/lib.rs`（python 脚本 10 组锚点全中）：push 解析推送行模型
+  （desc 预拼 `category::summary_of`）；SettingsActions 增
+  `category_reset: Box<dyn Fn()>` / `category_remove: Box<dyn
+  Fn(String)>`（cfg 写与 categoriesChanged 重推归调用方，同
+  41/42/43 步「动作收配置单位」惯例；删除收 SharedString→String
+  原样）；smoke 补有值逐项归一化断言（去点/小写/去重→["mp4",
+  "mkv"]/空 folder→None/icon 缺省/缺 id 空串/计数 2）、缺省
+  八预设逐字断言（视频 4 头「mp4, mkv, avi, mov 等 20 项」 summaries、
+  其他「无扩展名」）、invoke 恢复默认 () 与删除 ("x") 通路。
+
+### 新事实（影响后续步骤）
+
+- 摘要格式坑：>4 项summary 是「{前4} 等 {N} 项」（N 为总数），
+  smoke 首版把缺省「视频」行预期写成纯前 4 join，测试即抓即修。
+- categoryRules 读侧与 identity 同口径（Load 不过
+  CategoryListValidator.correct）；写路径 correct 过滤随添加/
+  编辑对话框步再镜像。
+
+### 工具坑增量
+
+- clippy `doc_lazy_continuation` 第三次触发（模块注释列表行后接
+  段落须空 `//!` 行）+ 注释 `///`/`//!` 混用行（改统一 `//!`）。
+- 头两轮会话被压缩，本轮无净耗时损失；脚本 ROOT 变量首用
+  `__file__` 推导落在 scratch 目录致 FileNotFoundError，改为
+  硬编码仓库根后三文件锚点全中。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui
+  --all-targets -- -D warnings` 通过。
+- `timeout 1200 cargo test -p gd3-ui`：**37 → 40 passed**
+  （category.rs 3 单测 + smoke 增补并入）。0 failed。
+- post-write diff 复核：category.rs/slint×2/lib.rs 与设计一致，
+  无夹带；坏 token 扫描（Paras|comfirm|HALF|乱码区段）零命中。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 45 步候选：预设添加/编辑对话框骨架（HeadersPresetEditDialog
+   /CategoryEditDialog → Slint Dialog，含名称校验与 categories
+   重推镜像）；或暂停/删除真实语义（Phase 8 桥接一体化评估）。
+2. 之后：引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
