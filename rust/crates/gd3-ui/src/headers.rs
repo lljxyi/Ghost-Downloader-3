@@ -12,8 +12,11 @@
 //!   串；`currentHeadersPresetIndex()` = min(value, len-1)（cfg.py:347），
 //!   这里双端夹取属容错（负值/越界不复刻崩溃面）。
 //!
-//! 预设的添加/编辑对话框（HeadersPresetEditDialog + HeadersEditor）
-//! 与当前标头读取（currentHeaders）留欠账步。
+//! 第 46 步已镜像添加/编辑对话框（HeadersPresetEditDialog）的预设
+//! 归一化；HeadersEditor 的 cURL 粘贴解析（parseCurl）与重复行高亮
+//! 留欠账步。
+
+use crate::pystr::{py_isspace, py_strip, split_lines};
 
 /// cfg.py:29-38 逐字镜像（键序保持 Python dict 插入序）。
 pub const BASE_HEADERS: [(&str, &str); 8] = [
@@ -93,21 +96,9 @@ pub fn current_index(raw: Option<&str>, len: usize) -> usize {
     value.clamp(0, len as i64 - 1) as usize
 }
 
-/// CPython `str.isspace()` 口径：Unicode White_Space 之外，
-/// \x1c-\x1f（信息分隔符）也算空白——Rust `char::is_whitespace`
-/// 不含这四个码位。
-fn py_isspace(c: char) -> bool {
-    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
-}
-
-/// 镜像 CPython `str.strip()`（两端 py_isspace 字符）。
-fn py_strip(text: &str) -> &str {
-    text.trim_matches(py_isspace)
-}
-
 /// 镜像 HeadersEditor.parseHeaderLine（headers_editor.py:33-40）：
-/// partition(":")——分隔符缺失、名称 strip 后为空或含空白字符的
-/// 行丢弃（HTTP/2 伪头/请求行不是标头——原样发出会破坏请求）；值
+/// partition(":")——分隔符缺失、名称 strip 后为空或含空白字符的行
+/// 丢弃（HTTP/2 伪头/请求行不是标头——原样发出会破坏请求）；值
 /// strip（空值合法）。
 fn parse_header_line(line: &str) -> Option<(String, String)> {
     let idx = line.find(':')?;
@@ -116,43 +107,6 @@ fn parse_header_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     Some((name, py_strip(&line[idx + 1..]).to_string()))
-}
-
-/// 镜像 CPython `str.splitlines()` 的行界集合（\r、\n、\v、\f、
-/// \x1c-\x1e、\x85、U+2028/U+2029；\r\n 视为单个行界）——
-/// Rust `str::lines` 只认 \n/\r\n，粘贴文本里的老式行尾会漏切。
-fn split_lines(text: &str) -> Vec<String> {
-    fn is_boundary(c: char) -> bool {
-        matches!(
-            c,
-            '\n' | '\r'
-                | '\x0b'
-                | '\x0c'
-                | '\x1c'
-                | '\x1d'
-                | '\x1e'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        )
-    }
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if is_boundary(c) {
-            if c == '\r' && chars.peek() == Some(&'\n') {
-                chars.next();
-            }
-            lines.push(std::mem::take(&mut current));
-        } else {
-            current.push(c);
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
 }
 
 /// 镜像 HeadersEditor.toLogicalLines（headers_editor.py:28-31）：CRLF

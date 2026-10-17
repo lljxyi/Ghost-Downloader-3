@@ -52,6 +52,17 @@ export struct HeadersEditDraft {
     pairs: string,
 }
 
+// 第 47 步：身份预设编辑草稿（index -1=添加；hosts 为多行/逗号分隔
+// 原样串——token 归一化在 Rust identity.rs；profile 是磁盘字面量，
+// 空串 = 跟随全局默认）。
+export struct IdentityEditDraft {
+    index: int,
+    name: string,
+    hosts: string,
+    profile: string,
+    userAgent: string,
+}
+
 export component SettingsPage inherits Rectangle {
     // in-out 供 SpinBox/Switch 自身编辑态直写，AppWindow 推送覆盖。
     in-out property <string> downloadFolder: "";
@@ -140,6 +151,21 @@ export component SettingsPage inherits Rectangle {
     in-out property <string> headersEditName: "";
     in-out property <string> headersEditPairs: "";
     in-out property <bool> headersEditNameError: false;
+    // 第 47 步：身份预设编辑覆盖层（镜像 PresetEditDialog：名称可空、
+    // hosts 至少一条——「请添加匹配 Host」提示；profile 为 ComboBox，
+    // 0 项「跟随全局默认」即空串字面量；labels/values 由 Rust 侧按
+    // 既有预设动态推（未知特定版本追加一项，避免静默丢值））。
+    in-out property <bool> identityEditVisible: false;
+    in-out property <int> identityEditIndex: -1;
+    in-out property <string> identityEditName: "";
+    in-out property <string> identityEditHosts: "";
+    in-out property <bool> identityEditHostsError: false;
+    in-out property <string> identityEditProfile: "";
+    in-out property <int> identityEditProfileIndex: 0;
+    in-out property <[string]> identityEditProfileLabels;
+    in-out property <[string]> identityEditProfileValues;
+    in-out property <string> identityEditUserAgent: "";
+    in-out property <bool> identityEditHelpVisible: false;
     // 第 43 步：身份预设列表（cfg.py:334-340 缺省含百度网盘客户端
     // 预设；读盘仅 JSON 反序列化不过 validator.correct。行结构镜像
     // PresetRowWidget：名称+三段描述（Rust identity.rs 预拼）+开关
@@ -210,6 +236,14 @@ export component SettingsPage inherits Rectangle {
     callback headersPresetEditRequested(int);
     callback headersPresetEditClosed();
     callback headersPresetEditAccepted(HeadersEditDraft);
+    // 第 47 步：身份预设添加/编辑动作（入口收 () 或索引；「取消」收 ()；
+    // 「确定」回发草稿——hosts 校验（至少一条）在 Rust 侧做，未过时置
+    // identityEditHostsError 且不收起覆盖层，镜像 validate() 拒绝后
+    // 对话框保持打开）。
+    callback identityPresetAddRequested();
+    callback identityPresetEditRequested(int);
+    callback identityPresetEditClosed();
+    callback identityPresetEditAccepted(IdentityEditDraft);
     callback identityPresetToggled(int, bool);
     callback identityPresetRemoveRequested(int);
     // 第 44 步：库分类动作（恢复默认收 ()、删除收 categoryId）
@@ -690,9 +724,18 @@ export component SettingsPage inherits Rectangle {
                     toggled => { root.identityPresetToggled(i, self.checked); }
                 }
                 Button {
+                    text: "编辑";
+                    clicked => { root.identityPresetEditRequested(i); }
+                }
+                Button {
                     text: "删除";
                     clicked => { root.identityPresetRemoveRequested(i); }
                 }
+            }
+            // 第 47 步：添加入口（镜像 IdentitySettingCard 的「添加预设」）。
+            Button {
+                text: "添加预设";
+                clicked => { root.identityPresetAddRequested(); }
             }
         }
         // 第 38 步：关联组 urlScheme 静态卡 + 软件组简版卡（每包关联
@@ -874,6 +917,90 @@ export component SettingsPage inherits Rectangle {
                                     index: root.headersEditIndex,
                                     name: root.headersEditName,
                                     pairs: root.headersEditPairs,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 第 47 步：身份预设编辑覆盖层（镜像 PresetEditDialog：名称可空
+        // 兜「未命名预设」、hosts 至少一条、TLS 指纹下拉
+        // includeAuto=False、UA 留空跟随指纹；「?」帮助文案逐字镜像
+        // TeachingTip，弹窗形态留布局步）。确定先做 `hosts == ""` 的
+        // 廉价判定，完整 token 校验在 Rust（未过则覆盖层保持打开）。
+        Rectangle {
+            visible: root.identityEditVisible;
+            background: rgba(0, 0, 0, 0.4);
+            width: 100%;
+            height: 100%;
+            VerticalBox {
+                padding: 24px;
+                Text {
+                    text: root.identityEditIndex == -1 ? "添加身份预设" : "编辑身份预设";
+                    font-size: 18px;
+                }
+                Text { text: "名称"; }
+                LineEdit {
+                    text <=> root.identityEditName;
+                    placeholder-text: "预设名称";
+                }
+                HorizontalBox {
+                    Text {
+                        text: "匹配 Host";
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "?";
+                        clicked => { root.identityEditHelpVisible = !root.identityEditHelpVisible; }
+                    }
+                }
+                Text {
+                    text: "输入域名后按回车添加，支持两种格式：\n\n精确匹配: pcs.baidu.com\n通配符: *.pcs.baidu.com（匹配所有子域名）";
+                    visible: root.identityEditHelpVisible;
+                }
+                TextEdit {
+                    text <=> root.identityEditHosts;
+                    placeholder-text: "每行一条，如 *.pcs.baidu.com";
+                }
+                Text {
+                    text: "预设需要至少一个 Host 才能匹配请求";
+                    visible: root.identityEditHostsError;
+                }
+                Text { text: "TLS 指纹"; }
+                ComboBox {
+                    model: root.identityEditProfileLabels;
+                    current-index <=> root.identityEditProfileIndex;
+                    selected => {
+                        root.identityEditProfile = root.identityEditProfileValues[self.current-index];
+                    }
+                }
+                Text { text: "User-Agent"; }
+                LineEdit {
+                    text <=> root.identityEditUserAgent;
+                    placeholder-text: "留空则跟随 TLS 指纹自动生成";
+                }
+                HorizontalBox {
+                    Button {
+                        text: "取消";
+                        clicked => {
+                            root.identityEditVisible = false;
+                            root.identityPresetEditClosed();
+                        }
+                    }
+                    Button {
+                        text: "确定";
+                        clicked => {
+                            if (root.identityEditHosts == "") {
+                                root.identityEditHostsError = true;
+                            } else {
+                                root.identityEditHostsError = false;
+                                root.identityPresetEditAccepted({
+                                    index: root.identityEditIndex,
+                                    name: root.identityEditName,
+                                    hosts: root.identityEditHosts,
+                                    profile: root.identityEditProfile,
+                                    userAgent: root.identityEditUserAgent,
                                 });
                             }
                         }

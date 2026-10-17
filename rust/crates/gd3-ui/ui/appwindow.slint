@@ -6,6 +6,7 @@ import { TaskPage, TaskRow } from "task_page.slint";
 import {
     CategoryEditDraft,
     HeadersEditDraft,
+    IdentityEditDraft,
     SettingsPage,
     IdentityPresetData,
     CategoryRowData,
@@ -76,6 +77,19 @@ export component AppWindow inherits Window {
     // 第 43 步：身份预设列表（行结构镜像 PresetRowWidget；编辑/添加
     // 留欠账步）。
     in-out property <[IdentityPresetData]> identityPresets;
+    // 第 47 步：身份预设添加/编辑覆盖层（hosts 解析/校验/名称兜底
+    // 归 Rust identity.rs；index 缺省 -1 写在根组件，`<=>` 下才生效）。
+    in-out property <bool> identityEditVisible;
+    in-out property <int> identityEditIndex: -1;
+    in-out property <string> identityEditName;
+    in-out property <string> identityEditHosts;
+    in-out property <bool> identityEditHostsError;
+    in-out property <string> identityEditProfile;
+    in-out property <int> identityEditProfileIndex: 0;
+    in-out property <[string]> identityEditProfileLabels;
+    in-out property <[string]> identityEditProfileValues;
+    in-out property <string> identityEditUserAgent;
+    in-out property <bool> identityEditHelpVisible;
     in-out property <[CategoryRowData]> categoryRows;
     in-out property <int> categoryRuleCount;
     in-out property <[string]> categoryIconChoices;
@@ -141,6 +155,10 @@ export component AppWindow inherits Window {
     callback headersPresetEditRequested(int);
     callback headersPresetEditClosed();
     callback headersPresetEditAccepted(HeadersEditDraft);
+    callback identityPresetAddRequested();
+    callback identityPresetEditRequested(int);
+    callback identityPresetEditClosed();
+    callback identityPresetEditAccepted(IdentityEditDraft);
     callback categoryResetRequested();
     callback categoryRemoveRequested(string);
     callback categoryAddRequested();
@@ -246,6 +264,21 @@ export component AppWindow inherits Window {
             identityPresets <=> root.identityPresets;
             identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
             identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
+            identityEditVisible <=> root.identityEditVisible;
+            identityEditIndex <=> root.identityEditIndex;
+            identityEditName <=> root.identityEditName;
+            identityEditHosts <=> root.identityEditHosts;
+            identityEditHostsError <=> root.identityEditHostsError;
+            identityEditProfile <=> root.identityEditProfile;
+            identityEditProfileIndex <=> root.identityEditProfileIndex;
+            identityEditProfileLabels <=> root.identityEditProfileLabels;
+            identityEditProfileValues <=> root.identityEditProfileValues;
+            identityEditUserAgent <=> root.identityEditUserAgent;
+            identityEditHelpVisible <=> root.identityEditHelpVisible;
+            identityPresetAddRequested() => { root.identityPresetAddRequested(); }
+            identityPresetEditRequested(i) => { root.identityPresetEditRequested(i); }
+            identityPresetEditClosed() => { root.identityPresetEditClosed(); }
+            identityPresetEditAccepted(d) => { root.identityPresetEditAccepted(d); }
             categoryRows <=> root.categoryRows;
             categoryRuleCount <=> root.categoryRuleCount;
             categoryResetRequested() => { root.categoryResetRequested(); }

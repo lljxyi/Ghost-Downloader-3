@@ -23,6 +23,7 @@ pub mod headers;
 pub mod identity;
 pub mod profile;
 pub mod proxy;
+pub mod pystr;
 pub mod row;
 pub mod sort;
 pub mod speed;
@@ -364,6 +365,86 @@ pub fn open_headers_preset_edit(
     window.set_headersEditVisible(true);
 }
 
+/// 第 47 步：打开身份预设添加/编辑覆盖层（index None=添加镜像
+/// `PresetEditDialog(preset=None)`：名称/hosts/UA 空、TLS 指纹落「跟随
+/// 全局默认」（`_profileValue = ""`）；带值=编辑回显 `presets[index]`
+/// （`_populate` 名称/hosts 逐条/UA；索引越界同添加态，越界守卫归
+/// 调用方）。
+pub fn open_identity_preset_edit(
+    window: &AppWindow,
+    config: &gd3_core::config::UserConfig,
+    index: Option<usize>,
+) {
+    let presets = identity::parse_presets(config.get_str("Network", "IdentityPresets"));
+    let preset = index.and_then(|i| presets.get(i));
+    // 菜单模型镜像 `buildProfileMenu(includeAuto=False)`：首项空串「跟随
+    // 全局默认」+ raw + 九家族「最新」共 11 项。未知字面量（特定版本如
+    // chrome120）追加一项——Python 侧按钮文本走 toProfileLabel，菜单里
+    // 却没有该项，这里补上避免静默丢值。
+    let mut labels: Vec<slint::SharedString> = (0..=10i64)
+        .map(|i| identity::profile_label_of(i).into())
+        .collect();
+    let mut values: Vec<slint::SharedString> = (0..=10i64)
+        .map(|i| identity::profile_value_of(i).into())
+        .collect();
+    let profile = preset.map(|p| p.client_profile.clone()).unwrap_or_default();
+    let profile_index = match identity::profile_index_of(&profile) {
+        Some(i) => i,
+        None => {
+            labels.push(profile::label_of(&profile).into());
+            values.push(profile.as_str().into());
+            (values.len() - 1) as i64
+        }
+    };
+    window.set_identityEditProfileLabels(slint::ModelRc::new(slint::VecModel::from(labels)));
+    window.set_identityEditProfileValues(slint::ModelRc::new(slint::VecModel::from(values)));
+    window.set_identityEditProfileIndex(profile_index as i32);
+    window.set_identityEditProfile(profile.as_str().into());
+    window.set_identityEditIndex(index.map(|i| i as i32).unwrap_or(-1));
+    window.set_identityEditName(preset.map(|p| p.name.clone()).unwrap_or_default().into());
+    window.set_identityEditHosts(
+        preset
+            .map(|p| identity::hosts_to_text(&p.hosts))
+            .unwrap_or_default()
+            .into(),
+    );
+    window.set_identityEditUserAgent(
+        preset
+            .map(|p| p.user_agent.clone())
+            .unwrap_or_default()
+            .into(),
+    );
+    window.set_identityEditHostsError(false);
+    window.set_identityEditHelpVisible(false);
+    window.set_identityEditVisible(true);
+}
+
+/// 第 47 步：把覆盖层「确定」产物落到预设列表——index<0 追加（镜像
+/// `_onAddClicked` 的 `presets.append(dialog.preset())`），否则替换
+/// （`_onEditClicked` 的 `presets[index] = dialog.preset()`，越界直接
+/// 返回）。编辑态 isEnabled 继承既有值（镜像 `preset()` 的
+/// `result["isEnabled"] = self._preset.get("isEnabled", True)`；添加态
+/// 草稿里已是 True）。返回是否落地。
+pub fn apply_identity_preset_draft(
+    presets: &mut Vec<identity::IdentityPreset>,
+    index: i64,
+    mut draft: identity::IdentityPreset,
+) -> bool {
+    if index < 0 {
+        presets.push(draft);
+        return true;
+    }
+    let Ok(slot) = usize::try_from(index) else {
+        return false;
+    };
+    let Some(existing) = presets.get_mut(slot) else {
+        return false;
+    };
+    draft.is_enabled = existing.is_enabled;
+    *existing = draft;
+    true
+}
+
 /// 第 45 步：打开分类添加/编辑表单（直写窗口字段+置可见；`rule`
 /// None=添加镜像 Dialog(category=None)：字段前置空、icon 落 0）。
 pub fn open_category_edit(window: &AppWindow, rule: Option<&category::CategoryRule>) {
@@ -448,6 +529,14 @@ pub struct SettingsActions {
     // _onToggled/_onRemoveClicked；编辑/添加对话框留欠账步）。
     pub identity_preset_toggle: Box<dyn Fn(i64, bool)>,
     pub identity_preset_remove: Box<dyn Fn(i64)>,
+    // 第 47 步：身份预设添加/编辑动作（添加收 ()；编辑收 int 索引原样；
+    // 「取消」收 ()；「确定」回发 (索引, draft_to_identity_preset 归一化
+    // 预设)——编辑态 isEnabled 由调用方经 apply_identity_preset_draft
+    // 继承，cfg 写与 categoriesChanged 式重推归调用方）。
+    pub identity_preset_add_requested: Box<dyn Fn()>,
+    pub identity_preset_edit_requested: Box<dyn Fn(i64)>,
+    pub identity_preset_edit_closed: Box<dyn Fn()>,
+    pub identity_preset_edit_submit: Box<dyn Fn((i64, identity::IdentityPreset))>,
     // 第 44 步：库分类动作（恢复默认收 ()、删除收 categoryId 原样；
     // cfg 写与重推归调用方）。
     pub category_reset: Box<dyn Fn()>,
@@ -614,6 +703,32 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     let identity_remove = actions.clone();
     window.on_identityPresetRemoveRequested(move |i| {
         (identity_remove.identity_preset_remove)(i as i64)
+    });
+    // 第 47 步：身份预设添加/编辑注册（「确定」先过 `validate()` 口径：
+    // 至少一个 Host，否则只置 hostsError 不收起、不发事件——精确镜像
+    // 需 parse_hosts 归一化后判空，故收起责任落在 Rust 侧；通过后清错、
+    // 收起覆盖层并回发 draft_to_identity_preset 归一化预设）。
+    let identity_add = actions.clone();
+    window.on_identityPresetAddRequested(move || (identity_add.identity_preset_add_requested)());
+    let identity_edit = actions.clone();
+    window.on_identityPresetEditRequested(move |i| {
+        (identity_edit.identity_preset_edit_requested)(i as i64)
+    });
+    let identity_closed = actions.clone();
+    window.on_identityPresetEditClosed(move || (identity_closed.identity_preset_edit_closed)());
+    let identity_submit = actions.clone();
+    let identity_win = window.clone_strong();
+    window.on_identityPresetEditAccepted(move |d| {
+        if !identity::hosts_valid(&identity::parse_hosts(&d.hosts)) {
+            identity_win.set_identityEditHostsError(true);
+            return;
+        }
+        identity_win.set_identityEditHostsError(false);
+        identity_win.set_identityEditVisible(false);
+        (identity_submit.identity_preset_edit_submit)((
+            d.index as i64,
+            identity::draft_to_identity_preset(&d.name, &d.hosts, &d.profile, &d.userAgent, true),
+        ))
     });
     // 第 44 步：库分类动作注册（删除收 SharedString → String 原样）。
     let category_reset = actions.clone();
@@ -1101,6 +1216,12 @@ mod smoke {
             "*.pcs.baidu.com · 不模拟（原样发送） · pan.baidu.com"
         );
         assert!(identity_rows.row_data(0).as_ref().unwrap().enabled);
+        // 第 47 步：缺省容错（身份预设编辑覆盖层收起、索引 -1=添加）。
+        // profile labels/values 双模型不在此推——它们只在开框时由
+        // open_identity_preset_edit 按当前值现推（含未知字面量追加项）。
+        assert!(!window.get_identityEditVisible());
+        assert_eq!(window.get_identityEditIndex(), -1);
+        assert_eq!(window.get_identityEditProfileLabels().row_count(), 0);
         // 第 44 步：缺省容错（缺键 → CATEGORY_PRESETS 八预设逐字，
         // 计数 8）。
         let category_rows = window.get_categoryRows();
@@ -1144,6 +1265,11 @@ mod smoke {
         // 第 43 步：身份预设动作命中记录。
         let identity_toggle_hits: Rc<RefCell<Vec<(i64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
         let identity_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        let identity_add_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let identity_edit_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        let identity_close_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let identity_submit_hits: Rc<RefCell<Vec<(i64, crate::identity::IdentityPreset)>>> =
+            Rc::new(RefCell::new(Vec::new()));
         // 第 44 步：库分类动作命中记录。
         let category_reset_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let category_remove_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1256,6 +1382,23 @@ mod smoke {
             identity_preset_remove: Box::new({
                 let h = identity_remove_hits.clone();
                 move |i| h.borrow_mut().push(i)
+            }),
+            // 第 47 步：身份预设添加/编辑入口与确定草稿。
+            identity_preset_add_requested: Box::new({
+                let h = identity_add_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            identity_preset_edit_requested: Box::new({
+                let h = identity_edit_hits.clone();
+                move |i| h.borrow_mut().push(i)
+            }),
+            identity_preset_edit_closed: Box::new({
+                let h = identity_close_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            identity_preset_edit_submit: Box::new({
+                let h = identity_submit_hits.clone();
+                move |pair| h.borrow_mut().push(pair)
             }),
             // 第 44 步：库分类动作（通路验证）。
             category_reset: Box::new({
@@ -1418,6 +1561,42 @@ mod smoke {
         );
         window.invoke_identityPresetRemoveRequested(0);
         assert_eq!(identity_remove_hits.borrow().last().copied(), Some(0));
+        // 第 47 步：身份预设添加/编辑 invoke 通路——「确定」先过
+        // validate() 口径（hosts 归一化后判空）：拒绝时只置 hostsError、
+        // 不收起、不发事件；通过后清错、收起覆盖层并回发归一化预设。
+        window.invoke_identityPresetAddRequested();
+        assert_eq!(identity_add_hits.borrow().len(), 1);
+        window.invoke_identityPresetEditRequested(2);
+        assert_eq!(identity_edit_hits.borrow().last().copied(), Some(2));
+        window.set_identityEditVisible(true);
+        window.invoke_identityPresetEditAccepted(crate::IdentityEditDraft {
+            index: 1,
+            name: "  我的预设  ".into(),
+            hosts: "  , ; \n".into(),
+            profile: "raw".into(),
+            userAgent: "  UA  ".into(),
+        });
+        assert!(identity_submit_hits.borrow().is_empty(), "无 host 不应提交");
+        assert!(window.get_identityEditHostsError(), "应置 hosts 错误");
+        assert!(window.get_identityEditVisible(), "校验失败不收起覆盖层");
+        window.invoke_identityPresetEditAccepted(crate::IdentityEditDraft {
+            index: 1,
+            name: "  我的预设  ".into(),
+            hosts: "a.com\n*.b.com  a.com".into(),
+            profile: "raw".into(),
+            userAgent: "  UA  ".into(),
+        });
+        let (submitted_i, submitted_p) = identity_submit_hits.borrow().last().cloned().unwrap();
+        assert_eq!(submitted_i, 1);
+        assert_eq!(submitted_p.name, "我的预设", "名称 py_strip");
+        assert_eq!(submitted_p.client_profile, "raw");
+        assert_eq!(submitted_p.user_agent, "UA", "UA py_strip");
+        assert_eq!(submitted_p.hosts, vec!["a.com", "*.b.com"], "去重保序");
+        assert!(submitted_p.is_enabled, "草稿态恒 True，编辑态由调用方继承");
+        assert!(!window.get_identityEditHostsError(), "通过后清错");
+        assert!(!window.get_identityEditVisible(), "通过后收起覆盖层");
+        window.invoke_identityPresetEditClosed();
+        assert_eq!(identity_close_hits.borrow().len(), 1);
         // 第 44 步：库分类 invoke 通路（恢复默认 ()、删除收 id 原样）。
         window.invoke_categoryResetRequested();
         assert_eq!(category_reset_hits.borrow().len(), 1);
@@ -1532,6 +1711,98 @@ mod smoke {
         assert_eq!(window.get_headersEditIndex(), 0);
         assert_eq!(window.get_headersEditName(), "A");
         assert_eq!(window.get_headersEditPairs(), "x-a: 1\n");
+    }
+
+    /// 第 47 步：open_identity_preset_edit 两态直写（添加=全空 + 「跟随
+    /// 全局默认」；编辑=带值回显，未知 profile 字面量追加一项）。
+    #[test]
+    fn open_identity_preset_edit_form_states_headless() {
+        use gd3_core::config::UserConfig;
+
+        let window = crate::create_headless();
+        let mut config = UserConfig::new();
+        config.set_str(
+            "Network",
+            "IdentityPresets",
+            r#"[{"name": "A", "clientProfile": "raw", "userAgent": "UA-A",
+                 "hosts": ["a.com", "*.b.com"], "isEnabled": false},
+                {"name": "B", "clientProfile": "chrome120", "userAgent": "",
+                 "hosts": ["b.com"]}]"#,
+        );
+        // 添加（镜像 PresetEditDialog(preset=None)：字段全空、profile ""）。
+        crate::open_identity_preset_edit(&window, &config, None);
+        assert!(window.get_identityEditVisible());
+        assert_eq!(window.get_identityEditIndex(), -1);
+        assert_eq!(window.get_identityEditName(), "");
+        assert_eq!(window.get_identityEditHosts(), "");
+        assert_eq!(window.get_identityEditUserAgent(), "");
+        assert_eq!(window.get_identityEditProfile(), "");
+        assert_eq!(window.get_identityEditProfileIndex(), 0);
+        // 菜单模型镜像 buildProfileMenu(includeAuto=False)：11 项，首项
+        // 「跟随全局默认」（磁盘空串字面量）。
+        assert_eq!(window.get_identityEditProfileLabels().row_count(), 11);
+        assert_eq!(
+            window
+                .get_identityEditProfileLabels()
+                .row_data(0)
+                .as_deref(),
+            Some("跟随全局默认")
+        );
+        assert_eq!(
+            window
+                .get_identityEditProfileValues()
+                .row_data(1)
+                .as_deref(),
+            Some("raw")
+        );
+        // 编辑（镜像 _populate：名称/hosts 逐行/UA 回显 + profile 预选）。
+        crate::open_identity_preset_edit(&window, &config, Some(0));
+        assert_eq!(window.get_identityEditIndex(), 0);
+        assert_eq!(window.get_identityEditName(), "A");
+        assert_eq!(window.get_identityEditHosts(), "a.com\n*.b.com");
+        assert_eq!(window.get_identityEditUserAgent(), "UA-A");
+        assert_eq!(window.get_identityEditProfile(), "raw");
+        assert_eq!(window.get_identityEditProfileIndex(), 1);
+        // 特定版本字面量不在 includeAuto=False 菜单里 → 追加第 12 项并
+        // 原样保留值（避免静默丢值）。
+        crate::open_identity_preset_edit(&window, &config, Some(1));
+        assert_eq!(window.get_identityEditProfile(), "chrome120");
+        assert_eq!(window.get_identityEditProfileIndex(), 11);
+        assert_eq!(window.get_identityEditProfileLabels().row_count(), 12);
+        assert_eq!(
+            window
+                .get_identityEditProfileValues()
+                .row_data(11)
+                .as_deref(),
+            Some("chrome120")
+        );
+    }
+
+    /// 第 47 步：apply_identity_preset_draft 镜像 `_onAddClicked` 追加 /
+    /// `_onEditClicked` 替换 + isEnabled 继承 + 越界守卫。
+    #[test]
+    fn apply_identity_preset_draft_mirrors_row_handlers() {
+        use crate::identity::{draft_to_identity_preset, parse_presets};
+
+        let mut presets = parse_presets(None);
+        assert_eq!(presets.len(), 1);
+        // 添加：追加，isEnabled 用草稿值（preset() 无 _preset → True）。
+        let draft = draft_to_identity_preset("新预设", "x.com", "", "", true);
+        assert!(crate::apply_identity_preset_draft(&mut presets, -1, draft));
+        assert_eq!(presets.len(), 2);
+        assert_eq!(presets[1].name, "新预设");
+        // 编辑：替换但继承既有 isEnabled（缺省百度预设 enabled=false 后）。
+        presets[0].is_enabled = false;
+        let draft = draft_to_identity_preset("改名", "y.com", "raw", "UA", true);
+        assert!(crate::apply_identity_preset_draft(&mut presets, 0, draft));
+        assert_eq!(presets.len(), 2, "编辑不追加");
+        assert_eq!(presets[0].name, "改名");
+        assert_eq!(presets[0].hosts, vec!["y.com"]);
+        assert!(!presets[0].is_enabled, "编辑态继承既有 isEnabled");
+        // 越界（镜像 `if index < 0 or index >= len(presets): return`）。
+        let draft = draft_to_identity_preset("越界", "z.com", "", "", true);
+        assert!(!crate::apply_identity_preset_draft(&mut presets, 9, draft));
+        assert_eq!(presets.len(), 2);
     }
 
     /// 段高亮：filterMode → 派生选中态。缺省 all；未知字面量全不

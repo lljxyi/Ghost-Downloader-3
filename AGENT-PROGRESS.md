@@ -2256,3 +2256,94 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    `HeadersEditor` 的 cURL 粘贴解析（`parseCurl`）与重复行高亮。
 2. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 +
    `AGENT-DONE`。
+
+## 第 47 步：身份预设添加/编辑覆盖层（app/view/dialogs/preset_edit.py）
+
+### 做了什么
+
+- **新建 `rust/crates/gd3-ui/src/pystr.rs`（83 行）**：把 CPython 字符串口径
+  抽出共用——`py_isspace`（`\x1c-\x1f` 在 Python 为空白、Rust
+  `char::is_whitespace` 不含）、`py_strip`、`split_lines`（`str.splitlines()`
+  全量行界：`\r`/`\n`/`\v`/`\f`/`\x1c-\x1e`/`\u{85}`/`\u{2028}`/`\u{2029}`，
+  `\r\n` 算一个；`\x1f` **不是**行界）。CPython 实测：`'a\x1fb'.splitlines()`
+  → `['a\x1fb']`；`\u{a0}` 两侧都算空白。含 2 单测。
+  `headers.rs` 删掉本地三函数副本改 `use crate::pystr::{...}`（第 46 步的
+  `parse_header_line`/`to_logical_lines` 语义不变）。
+- **`identity.rs`**：`IdentityPreset` derive `Clone`；新增
+  - `parse_hosts`：按空白/`,`/`;` 切 → 逐条 `py_strip` → 去空 → 保序去重
+    （镜像 `TokenLineEdit` 的 token 口径：回车/空格提交 `text().strip()`
+    非空、重复 token 丢弃；覆盖层用多行文本框，故多切 `,`/`;`，差异记录在案）；
+  - `hosts_to_text`（`"\n".join`，与 `parse_hosts` 互逆）、`hosts_valid`；
+  - `profile_index_of`（`""`→0、`raw`→1、九家族→2+p、未知→`None`）、
+    `profile_value_of`（越界兜 `""`）、`profile_label_of`（0 特例「跟随全局
+    默认」，其余复用 `profile::label_of` 镜像 `toProfileLabel`）；
+  - `draft_to_identity_preset`（镜像 `preset()`：名称 `py_strip` 空兜
+    「未命名预设」、UA `py_strip`、hosts 逐 token、isEnabled 由调用方给）；
+  - 3 单测（token 规则 / 草稿归一化 / `buildProfileMenu(includeAuto=False)`
+    菜单顺序与 0 特例）。
+- **`ui/settings_page.slint`**：`IdentityEditDraft` 结构（`index`/`name`/
+  `hosts`/`profile`/`userAgent`——字段名用驼峰规避 Slint 连字符字段名
+  codegen 风险）+ 11 属性 + 4 回调；身份预设行加「编辑」按钮、列表尾加
+  「添加预设」按钮；文件尾新增覆盖层（标题按 `index` 分支、名称
+  `LineEdit`、匹配 Host + 「?」帮助开关与逐字 TeachingTip 文案、hosts
+  `TextEdit`、错误行「预设需要至少一个 Host 才能匹配请求」、TLS 指纹
+  `ComboBox`（labels/values 双模型）、User-Agent `LineEdit`、取消/确定）。
+- **`ui/appwindow.slint`**：`IdentityEditDraft` 导入 + 11 属性四回调透传，
+  `identityEditIndex` 默认 **-1** 写根组件（`<=>` 下根组件默认值生效）。
+- **`src/lib.rs`**：
+  - `open_identity_preset_edit(window, config, index)` 两态直写：None=添加
+    （名称/hosts/UA 空、profile `""` 即「跟随全局默认」）；带值=编辑回显
+    `presets[index]`。profile 模型现推 11 项；**未知字面量（如 `chrome120`）
+    追加第 12 项**并原样保留值——Python 侧按钮文本走 `toProfileLabel`、
+    菜单里却没有该项，这里补上避免静默丢值。
+  - `apply_identity_preset_draft(presets, index, draft) -> bool`：index<0
+    追加（`_onAddClicked`）、否则替换并**继承既有 isEnabled**（镜像
+    `preset()` 的 `result["isEnabled"] = self._preset.get(...)`），越界返回
+    false（镜像 `_onEditClicked` 的越界 return）。
+  - `SettingsActions` 增 `identity_preset_add_requested` /
+    `identity_preset_edit_requested` / `identity_preset_edit_closed` /
+    `identity_preset_edit_submit((i64, IdentityPreset))`。
+  - 注册：确定草稿先过 `validate()` 口径——`parse_hosts` 归一化后判空，
+    不通过只置 `identityEditHostsError` 并 return（**不收起、不发事件**），
+    通过后清错、收起覆盖层、回发 `draft_to_identity_preset` 产物。
+  - smoke：覆盖层缺省断言（收起 / 索引 -1 / 模型空）+ invoke 四通路
+    （含拒绝路径与通过路径的状态断言）+ `open_identity_preset_edit` 两态
+    冒烟（含 `chrome120` 追加项）+ `apply_identity_preset_draft` 追加/替换/
+    越界单测。
+
+### 新事实
+
+- **Slint 侧确定按钮不自行收起**（与第 46 步标头覆盖层不一致）：hosts 校验
+  必须 `parse_hosts` 归一化后才能判空，精确镜像 `validate()` 只能放 Rust
+  侧，收起责任随之移到 Rust。第 46 步的标头覆盖层仍是 Slint 自行收起
+  （`== ""` 廉价判定），两处不一致已记录，不回改。
+- **profile 双模型（labels + values）**：`identityEditProfile`（磁盘字面量）
+  为权威值，`ComboBox` 只负责显示与选择；`selected` 里回写
+  `identityEditProfileValues[self.current-index]`。
+- **`QT_QPA_PLATFORM=offscreen` 必须来自 `/root/gd3-env.sh`**：漏 source 时
+  第一次创建 `qapp` fixture 会 `Fatal Python error: Aborted`（exit 134），
+  不是代码问题。
+
+### 验证
+
+- `cargo fmt --all --check` 通过（先 `cargo fmt --all` 修了 6 处换行）。
+- `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+- `timeout 1200 cargo test -p gd3-ui`：**53 → 55 passed**，0 failed。
+- `timeout 2400 cargo test -p gd3-core -p gd3-net -p gd3-servers`：
+  **236 passed, 0 failed**（19 个 test binary）。
+- Python 全量：`pytest -q --continue-on-collection-errors` →
+  **3 failed, 1347 passed, 8 skipped, 35 errors**，失败集合
+  （`test_android_config_parity` / `test_github_probe::testProxySiteGetsNoCredentials` /
+  `test_runtime_install::test_delete_raises_when_a_path_cannot_be_deleted`）
+  与基线完全相同，无新增。本步只动 `gd3-ui`（未接进 Python 侧），
+  不涉及影子开关，故无需双模式回归。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. `HeadersEditor` 的 cURL 粘贴解析（`parseCurl`）与重复行高亮。
+2. `categoryRulesCard` 写路径的 `correct` 过滤。
+3. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
