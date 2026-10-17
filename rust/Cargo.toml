@@ -17,3 +17,9 @@ regex = "1.13"
 [profile.release]
 lto = true
 codegen-units = 1
+# 构建机只有 939MB 内存 + 2 核：默认 debug=2 的调试信息让 gd3-ui 的测试二进制
+# 链接一次要 >16 分钟（链接器在 swap 上抖动）。关掉调试信息、关掉 incremental
+# （incremental 目录在磁盘紧张时是最大可回收项，且我们总是跑全量测试构建）。
+[profile.dev]
+debug = 0
+incremental = false

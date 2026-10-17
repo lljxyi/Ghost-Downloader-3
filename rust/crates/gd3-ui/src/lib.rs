@@ -14,6 +14,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+pub mod actions;
 pub mod card;
 pub mod card_menu;
 pub mod category;
@@ -929,6 +930,200 @@ pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions
     window.on_taskOpenFolder(move |task_id| (open_folder.open_folder)(&task_id));
     let open_drawer = actions.clone();
     window.on_taskOpenDrawer(move |task_id| (open_drawer.open_drawer)(&task_id));
+}
+
+// ---------------------------------------------------------------------------
+// 第 60 步：卡片任务级回调直接接服务层（P0 收口）
+// ---------------------------------------------------------------------------
+//
+// 第 51/57 步把回调接到了 `TaskActions`，但那只是「把 taskId 交给调用方」；
+// 语义（按状态分派、删除前落盘配置、校验三条短路）调用方还得再算一遍。
+// 这一节把 `actions.rs` 的语义**装到窗口上**：注册即通路，调用方只提供事实
+// （`TaskFacts`）与服务实现。
+
+/// 一个任务的运行时事实：`tasks.jsonl` 里没有、只能问调用方的那部分。
+///
+/// 与 `card::CardRuntime` / `drawer::DrawerRuntime` 同一原则——本 crate 不碰
+/// 文件系统、不读配置、不查 store。
+#[derive(Clone, Debug, Default)]
+pub struct TaskFacts {
+    /// `task.status`
+    pub status: gd3_core::task::TaskStatus,
+    /// `task.isSeeding`（类属性）
+    pub is_seeding: bool,
+    /// `task.url`（「复制下载链接」用）
+    pub url: String,
+    /// `task.outputPath`（打开文件 / 在文件夹中显示用）
+    pub output_path: String,
+    /// `taskService.checksumProgress(task) is not None`
+    pub checksum_in_progress: bool,
+    /// `isFolder(outputPath)`
+    pub is_folder: bool,
+    /// `isExisting(outputPath)`
+    pub output_exists: bool,
+    /// `ALGORITHMS = sorted(hashlib.algorithms_available)`——平台相关，调用方给。
+    pub algorithms: Vec<String>,
+    /// `task.checksums` 的键集。
+    pub checksums: Vec<String>,
+}
+
+/// `Box<dyn Fn(&str) -> Option<TaskFacts>>`：按 taskId 取事实。
+///
+/// 抽成别名是被 `clippy::type_complexity` 逼的（与 `DrawerTextAction` 同一处理）。
+pub type TaskFactsLookup = Box<dyn Fn(&str) -> Option<TaskFacts>>;
+/// `Box<dyn Fn(&str, Vec<CardMenuEntry>)>`：校验菜单落点（弹菜单归调用方）。
+pub type TaskChecksumMenu = Box<dyn Fn(&str, Vec<card_menu::CardMenuEntry>)>;
+/// `Box<dyn Fn(&str, &str)>`：卡片状态行（`TaskCard._setStatus`）。
+pub type TaskStatusHint = Box<dyn Fn(&str, &str)>;
+
+/// 任务级回调的服务层装配（第 60 步）。
+///
+/// 与 [`TaskActions`] 的关系：同一个窗口上两者的回调**按名互斥**（Slint 生成的
+/// 回调是单槽，后注册者生效）。`TaskCommands` 覆盖
+/// `taskToggle` / `taskPause` / `taskDelete` / `taskChecksum` /
+/// `taskOpenFile` / `taskOpenFolder` / `taskOpenDrawer` 七路；
+/// `searchChanged` / `filterModeChanged` / `categoryFilterChanged` /
+/// `sortFieldChanged` / `sortOrderChanged` / `taskSelectFiles` 仍归 `TaskActions`。
+pub struct TaskCommands {
+    pub service: Rc<dyn actions::TaskService>,
+    pub hooks: Rc<dyn actions::UiHooks>,
+    /// 按 taskId 取事实；`None` = 任务已经不在了（回调直接丢弃）。
+    pub facts: TaskFactsLookup,
+    /// 校验菜单的落点：`ShowMenu` 分支把菜单树交给调用方去弹——锚点（校验按钮
+    /// 的屏幕位置）只有视图知道，本 crate 不算几何。
+    pub checksum_menu: TaskChecksumMenu,
+    /// 卡片状态行（`TaskCard._setStatus`）：校验按钮的「文件不存在，无法校验」走这里。
+    pub status_hint: TaskStatusHint,
+    /// 删除确认框的勾选初值（`cfg.shouldDeleteFilesOnRemove.value`）。
+    pub delete_files_default: Box<dyn Fn() -> bool>,
+    /// 待确认删除的 taskId。Qt 的 `MessageBox.exec()` 是阻塞的，Slint 侧消息框是
+    /// 异步的：点「删除」先记下 id，点「确定」时再取。
+    pending_delete: std::cell::RefCell<Option<String>>,
+}
+
+impl TaskCommands {
+    pub fn new(
+        service: Rc<dyn actions::TaskService>,
+        hooks: Rc<dyn actions::UiHooks>,
+        facts: TaskFactsLookup,
+        checksum_menu: TaskChecksumMenu,
+        status_hint: TaskStatusHint,
+        delete_files_default: Box<dyn Fn() -> bool>,
+    ) -> Self {
+        Self {
+            service,
+            hooks,
+            facts,
+            checksum_menu,
+            status_hint,
+            delete_files_default,
+            pending_delete: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// 是否正有一个删除确认框等着回话（测试与调用方分派用）。
+    pub fn has_pending_delete(&self) -> bool {
+        self.pending_delete.borrow().is_some()
+    }
+}
+
+/// 把任务级七路回调装到窗口上（见 [`TaskCommands`] 的回调清单）。
+pub fn install_task_commands(window: &AppWindow, commands: Rc<TaskCommands>) {
+    // 暂停/继续/做种：按状态分派（`_onToggleClicked`）。
+    let toggle = commands.clone();
+    window.on_taskToggle(move |task_id| {
+        let Some(facts) = (toggle.facts)(&task_id) else {
+            return;
+        };
+        actions::apply_toggle(&*toggle.service, &task_id, facts.status, facts.is_seeding);
+    });
+
+    // 「暂停」按钮是显式一路（`task_page.py` 的暂停按钮直调 `pause`）。
+    let pause = commands.clone();
+    window.on_taskPause(move |task_id| (pause.service).pause(&task_id));
+
+    // 删除：先弹确认框（勾选初值取 cfg），确认结果走 [`resolve_delete_dialog`]。
+    let delete = commands.clone();
+    let weak = window.as_weak();
+    window.on_taskDelete(move |task_id| {
+        let spec = actions::delete_confirm_dialog((delete.delete_files_default)());
+        *delete.pending_delete.borrow_mut() = Some(task_id.to_string());
+        if let Some(window) = weak.upgrade() {
+            show_dialog(&window, &spec);
+        }
+    });
+
+    // 校验：三条短路（`_onChecksumClicked`）。
+    let checksum = commands.clone();
+    window.on_taskChecksum(move |task_id| {
+        let Some(facts) = (checksum.facts)(&task_id) else {
+            return;
+        };
+        let outcome = card_menu::checksum_click(
+            facts.checksum_in_progress,
+            facts.is_folder,
+            facts.output_exists,
+            || {
+                card_menu::checksum_menu(&card_menu::ChecksumMenuInput {
+                    algorithms: &facts.algorithms,
+                    checksums: &facts.checksums,
+                })
+            },
+        );
+        if let Some(text) = actions::apply_checksum(&*checksum.service, &task_id, &outcome) {
+            (checksum.status_hint)(&task_id, text);
+        } else if let card_menu::ChecksumOutcome::ShowMenu(entries) = outcome {
+            (checksum.checksum_menu)(&task_id, entries);
+        }
+    });
+
+    // 打开文件 / 在文件夹中显示：路径来自事实（`openFile` / `revealInFolder`）。
+    let open_file = commands.clone();
+    window.on_taskOpenFile(move |task_id| {
+        if let Some(facts) = (open_file.facts)(&task_id) {
+            (open_file.hooks).open_file(&facts.output_path);
+        }
+    });
+    let open_folder = commands.clone();
+    window.on_taskOpenFolder(move |task_id| {
+        if let Some(facts) = (open_folder.facts)(&task_id) {
+            (open_folder.hooks).reveal_in_folder(&facts.output_path);
+        }
+    });
+
+    // 详情 → 抽屉（`_openDrawer`）。
+    let open_drawer = commands.clone();
+    window.on_taskOpenDrawer(move |task_id| (open_drawer.hooks).open_drawer(&task_id));
+}
+
+/// 删除确认框的回话落点（由调用方的 `dialogButtonClicked` 分派）。
+///
+/// 镜像 `_onDeleteClicked` 的后半段：
+/// `if dialog.exec(): cfg.set(shouldDeleteFilesOnRemove, checked); taskService.delete(task, checked)`。
+///
+/// - `accepted == false`（取消/关闭）→ 什么都不做，返回 `None`；
+/// - `accepted == true` → 勾选值取窗口上的 `dialogCheckboxChecked`（`<=>` 双向绑定，
+///   用户在框里改的就是它），删任务并返回该值——**调用方要把它写回
+///   `cfg.shouldDeleteFilesOnRemove`**（Python 侧就是 `cfg.set`）。
+///
+/// 勾选值必须在 `hide_dialog` **之前**读：`hide_dialog` 会把复选框复位成
+/// `false`（镜像 Qt 每次 `exec()` 都是新对话框对象）。
+pub fn resolve_delete_dialog(
+    window: &AppWindow,
+    commands: &TaskCommands,
+    accepted: bool,
+) -> Option<bool> {
+    let task_id = commands.pending_delete.borrow_mut().take()?;
+    let delete_files = window.get_dialogCheckboxChecked();
+    hide_dialog(window);
+    if !accepted {
+        return None;
+    }
+    Some(actions::apply_delete(
+        &*commands.service,
+        &task_id,
+        delete_files,
+    ))
 }
 
 /// 抽屉动作集（第 53 步）：五路回调 → 调用方语义。
@@ -2982,6 +3177,272 @@ mod smoke {
         assert_eq!(
             clicks.borrow().last(),
             Some(&CardClick::StartChecksum("sha256".into()))
+        );
+    }
+
+    /// 第 60 步冒烟：任务级七路回调直接落到服务层。
+    ///
+    /// 断言的粒度是**调用序列**，与 `actions.rs` 的单测同一口径；这里额外验证
+    /// 「注册即通路」（`invoke_*` 打得进来）与删除确认框的异步两段式
+    /// （`taskDelete` 只挂起 + 弹框，`dialogButtonClicked` 才真删）。
+    #[test]
+    fn task_commands_dispatch_headless() {
+        use crate::actions::{TaskService, UiHooks};
+        use crate::card_menu::CardMenuEntry;
+        use crate::window::DIALOG_OK;
+        use gd3_core::task::TaskStatus;
+        use slint::ComponentHandle;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+
+        /// 同一对象同时扮演服务与钩子，日志分开记，便于按序断言。
+        #[derive(Default)]
+        struct Rec {
+            service: RefCell<Vec<String>>,
+            hooks: RefCell<Vec<String>>,
+            hints: RefCell<Vec<String>>,
+            menus: RefCell<Vec<usize>>,
+        }
+
+        impl TaskService for Rec {
+            fn pause(&self, task_id: &str) {
+                self.service.borrow_mut().push(format!("pause({task_id})"));
+            }
+            fn start(&self, task_id: &str) {
+                self.service.borrow_mut().push(format!("start({task_id})"));
+            }
+            fn start_seeding(&self, task_id: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("startSeeding({task_id})"));
+            }
+            fn stop_seeding(&self, task_id: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("stopSeeding({task_id})"));
+            }
+            fn delete(&self, task_id: &str, delete_files: bool) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("delete({task_id}, {delete_files})"));
+            }
+            fn redownload(&self, task_id: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("redownload({task_id})"));
+            }
+            fn move_to_front(&self, task_id: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("moveToFront({task_id})"));
+            }
+            fn set_category(&self, task_id: &str, category_id: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("setCategory({task_id}, {category_id})"));
+            }
+            fn start_checksum(&self, task_id: &str, algorithm: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("startChecksum({task_id}, {algorithm})"));
+            }
+            fn cancel_checksum(&self, task_id: &str) {
+                self.service
+                    .borrow_mut()
+                    .push(format!("cancelChecksum({task_id})"));
+            }
+        }
+
+        impl UiHooks for Rec {
+            fn copy_url(&self, url: &str) {
+                self.hooks.borrow_mut().push(format!("setUrls({url})"));
+            }
+            fn open_drawer(&self, task_id: &str) {
+                self.hooks.borrow_mut().push(format!("drawer({task_id})"));
+            }
+            fn edit_task(&self, task_id: &str) {
+                self.hooks
+                    .borrow_mut()
+                    .push(format!("editDialog({task_id})"));
+            }
+            fn open_file(&self, path: &str) {
+                self.hooks.borrow_mut().push(format!("openFile({path})"));
+            }
+            fn reveal_in_folder(&self, path: &str) {
+                self.hooks
+                    .borrow_mut()
+                    .push(format!("revealInFolder({path})"));
+            }
+        }
+
+        let window = crate::create_headless();
+        let rec: Rc<Rec> = Rc::new(Rec::default());
+
+        // 事实表：t1 完成且做种中、t2 完成未做种、t3 运行中、t4 暂停、
+        // t5 校验中、t6 输出不存在、t7 可校验。
+        let mut table: HashMap<String, crate::TaskFacts> = HashMap::new();
+        let facts = |id: &str, status: TaskStatus| crate::TaskFacts {
+            status,
+            output_path: format!("/dl/{id}.bin"),
+            output_exists: true,
+            algorithms: vec!["md5".into(), "sha256".into()],
+            checksums: vec!["md5".into()],
+            ..crate::TaskFacts::default()
+        };
+        table.insert(
+            "t1".into(),
+            crate::TaskFacts {
+                is_seeding: true,
+                ..facts("t1", TaskStatus::Completed)
+            },
+        );
+        table.insert("t2".into(), facts("t2", TaskStatus::Completed));
+        table.insert("t3".into(), facts("t3", TaskStatus::Running));
+        table.insert("t4".into(), facts("t4", TaskStatus::Paused));
+        table.insert(
+            "t5".into(),
+            crate::TaskFacts {
+                checksum_in_progress: true,
+                ..facts("t5", TaskStatus::Completed)
+            },
+        );
+        table.insert(
+            "t6".into(),
+            crate::TaskFacts {
+                output_exists: false,
+                ..facts("t6", TaskStatus::Completed)
+            },
+        );
+        table.insert("t7".into(), facts("t7", TaskStatus::Completed));
+        let table = Rc::new(table);
+
+        let service: Rc<dyn TaskService> = rec.clone();
+        let hooks: Rc<dyn UiHooks> = rec.clone();
+        let commands = Rc::new(crate::TaskCommands::new(
+            service,
+            hooks,
+            Box::new({
+                let table = table.clone();
+                move |id: &str| table.get(id).cloned()
+            }),
+            Box::new({
+                let rec = rec.clone();
+                move |_id: &str, entries: Vec<CardMenuEntry>| {
+                    rec.menus.borrow_mut().push(entries.len())
+                }
+            }),
+            Box::new({
+                let rec = rec.clone();
+                move |id: &str, text: &str| rec.hints.borrow_mut().push(format!("{id}:{text}"))
+            }),
+            Box::new(|| false),
+        ));
+        crate::install_task_commands(&window, commands.clone());
+
+        // 调用方的 `dialogButtonClicked` 分派（本 crate 不占这个槽，见 `TaskCommands`）。
+        let resolved: Rc<RefCell<Vec<Option<bool>>>> = Rc::new(RefCell::new(Vec::new()));
+        let weak = window.as_weak();
+        let cmds = commands.clone();
+        let slot = resolved.clone();
+        window.on_dialogButtonClicked(move |index| {
+            if let Some(window) = weak.upgrade() {
+                let accepted = crate::dialog_button_text(&window, index as usize)
+                    .map(|text| text == DIALOG_OK)
+                    .unwrap_or(false);
+                let out = crate::resolve_delete_dialog(&window, &cmds, accepted);
+                slot.borrow_mut().push(out);
+            }
+        });
+
+        // ---- 暂停/继续/做种：四路分派 ----
+        window.invoke_taskToggle("t1".into());
+        window.invoke_taskToggle("t2".into());
+        window.invoke_taskToggle("t3".into());
+        window.invoke_taskToggle("t4".into());
+        // 未知任务：静默丢弃，不打服务层。
+        window.invoke_taskToggle("gone".into());
+        assert_eq!(
+            *rec.service.borrow(),
+            vec![
+                "stopSeeding(t1)".to_string(),
+                "startSeeding(t2)".to_string(),
+                "pause(t3)".to_string(),
+                "start(t4)".to_string(),
+            ]
+        );
+
+        // ---- 显式暂停 ----
+        window.invoke_taskPause("t3".into());
+        assert_eq!(rec.service.borrow().last(), Some(&"pause(t3)".to_string()));
+
+        // ---- 删除：先挂起 + 弹框，确认后才删 ----
+        assert!(!window.get_dialogVisible());
+        window.invoke_taskDelete("t2".into());
+        assert!(commands.has_pending_delete());
+        assert!(window.get_dialogVisible());
+        assert_eq!(window.get_dialogTitle(), "删除任务");
+        assert_eq!(window.get_dialogCheckboxLabel(), "同时删除已下载的文件");
+        assert!(
+            !window.get_dialogCheckboxChecked(),
+            "初值取 cfg，缺省 false"
+        );
+        assert!(
+            !rec.service
+                .borrow()
+                .iter()
+                .any(|c| c.starts_with("delete("))
+        );
+        window.set_dialogCheckboxChecked(true);
+        window.invoke_dialogButtonClicked(0); // 「确定」
+        assert!(!commands.has_pending_delete());
+        assert!(!window.get_dialogVisible());
+        assert_eq!(
+            *resolved.borrow(),
+            vec![Some(true)],
+            "返回值 = 调用方要写回 cfg.shouldDeleteFilesOnRemove 的勾选值"
+        );
+        assert_eq!(
+            rec.service.borrow().last(),
+            Some(&"delete(t2, true)".to_string())
+        );
+
+        // 取消：什么都不做，返回 None。
+        window.invoke_taskDelete("t4".into());
+        window.invoke_dialogButtonClicked(1); // 「取消」
+        assert_eq!(*resolved.borrow(), vec![Some(true), None]);
+        assert_eq!(
+            rec.service.borrow().last(),
+            Some(&"delete(t2, true)".to_string()),
+            "取消不该删任务"
+        );
+
+        // ---- 校验三条短路 ----
+        window.invoke_taskChecksum("t5".into());
+        assert_eq!(
+            rec.service.borrow().last(),
+            Some(&"cancelChecksum(t5)".to_string())
+        );
+        window.invoke_taskChecksum("t6".into());
+        assert_eq!(
+            *rec.hints.borrow(),
+            vec!["t6:文件不存在，无法校验".to_string()]
+        );
+        window.invoke_taskChecksum("t7".into());
+        // md5 + sha256 + 「更多」子菜单 = 3 行。
+        assert_eq!(*rec.menus.borrow(), vec![3]);
+
+        // ---- 打开文件 / 文件夹 / 抽屉 ----
+        window.invoke_taskOpenFile("t7".into());
+        window.invoke_taskOpenFolder("t7".into());
+        window.invoke_taskOpenDrawer("t7".into());
+        assert_eq!(
+            *rec.hooks.borrow(),
+            vec![
+                "openFile(/dl/t7.bin)".to_string(),
+                "revealInFolder(/dl/t7.bin)".to_string(),
+                "drawer(t7)".to_string(),
+            ]
         );
     }
 }
