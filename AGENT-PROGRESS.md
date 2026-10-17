@@ -1283,3 +1283,53 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 2. 其余设置组逐键扩；暂停/删除接真实语义（桥接策略 Phase 8 一体
    考虑）。
 3. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 33 步 — SpeedLimitation 限速卡（2026-10-17 06:44）
+
+### 改动
+
+- **src/speed.rs（新）**：镜像 setting_cards.py `SpinBoxSettingCard`
+  division=1/1024 双向语义。配置口径=字节（cfg.py:247-249 键
+  GeneralDownload/SpeedLimitation，缺省 4194304，范围 1024-104857600，
+  实证核对）；显示口径=KB/s（int(bytes/1024)，范围 1-102400，
+  singleStep=512 在显示值上）。
+- **ui/settings_page.slint**：第五张卡（标题「下载限速/当下载任务
+  界面限速开关开启时，所有任务将根据此值进行限速」镜像 .tr）+
+  SpinBox（min1 max102400 step512，`value <=> speedLimitationKb`）+
+  独立 Text 后缀 " KB/s"（std SpinBox 无 suffix 属性）。
+- **ui/appwindow.slint**：窗口级 `in-out speedLimitationKb`（**单位
+  缀名**，防口径混用）+ speedLimitationChanged 回调 + 透传。
+- **lib.rs**：push_settings 补限速键（缺省 4194304→显示 4096）；
+  SettingsActions 增 `speed_limitation: Box<dyn Fn(i64)>` **收配置
+  口径字节**（统一「动作收配置单位」原则，KB→字节换算归 install
+  层 speed::from_display_kb——镜像 Python leaveEvent
+  `cfg.set(item, int(value/division))`）。
+
+### 本步实证
+
+- **Put 块替换吞行再犯**（第 4 次计）：三处连环——smoke 下一测试
+  的 doc 行+`#[test]` 被吞、仍接 dispose 旧字段为孤儿 fn、结构体
+  `}`/重复字段错乱。全部靠 Read 活文件核对后自底向上逐 PUT 修复。
+  教训：多 op 一次提交时行号参照同一旧状态，编辑区间越长越应拆
+  单次单 op 或用更窄锚点。
+- slint 生成回调可从 Rust 侧 `invoke_*` 直接调用（无头可验通路，
+  「无法模拟点按」不再绝对）。
+
+### 验证
+
+- `cargo build` + `cargo fmt --all --check` +
+  `cargo clippy -p gd3-ui --all-targets -- -D warnings` 干净。
+- `timeout 1200 cargo test -p gd3-ui`：**25 → 26 passed**
+  （+1 speed 换算：缺省 4194304→4096、范围两端 round-trip、
+  512→0 不 clamp 镜像锁；smoke 补 8388608→8192 推送 +
+  invoke 102400 KB→104857600 字节）。0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 其余设置组逐键扩（HistoryDownloadFolder/nameConflict 等先验
+   再迁）；暂停/删除接真实语义（Phase 8 桥接一体考虑）。
+2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
