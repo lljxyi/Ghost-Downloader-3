@@ -32,6 +32,7 @@ pub mod proxy;
 pub mod pyshlex;
 pub mod pystr;
 pub mod row;
+pub mod settings_group;
 pub mod sort;
 pub mod speed;
 pub mod window;
