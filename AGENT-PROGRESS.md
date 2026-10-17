@@ -1645,3 +1645,58 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    （DpiScale 0-5 → % 显示 0-500 步 25）；或开始暂停/删除真实
    语义（Phase 8 桥接一体考虑）。
 2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 39 步 — DpiScale 界面缩放卡 + gd3-core 最小 f64 扩展（cfg.py）
+
+- 时间：2026-10-17 08:05（date 实取；代码提交 `75cdd33`）
+
+### 改动
+
+- `gd3-core/src/config.rs`（272 行）：`get_f64`（`get_str(...)?.parse()
+  .ok()`，键缺失/非数字容错 None）+ `set_f64`（shortest repr，整值
+  浮点补 `.0`：`fract()==0 && !text.contains('.')` 追加）；
+  +1 测试 `f64_python_repr_round_trip`（0.25→"0.25"/2.0→"2.0"/
+  5.0→"5.0"/1.75→"1.75"/非数字→None）。
+- `ui/settings_page.slint`（484 行）：`uiScalePercent` in-out
+  （缺省 0）+ `uiScaleChanged(int)` 回调 + PercentSpinBox 卡
+  （min0 max500 step25 + " %" Text；文案「界面缩放/改变应用程
+  序界面的缩放比例， 0% 为自动」；头注释 32-39 步）。
+- `ui/appwindow.slint`（193 行）：同名透传。
+- `src/lib.rs`（968 行）：push
+  `set_uiScalePercent(get_f64*100.0 round as i32)`；
+  `SettingsActions` 增 `dpi_scale: Box<dyn Fn(f64)>` 收配置口径
+  0-5 浮点；install `(dpi_scale.dpi_scale)(percent as f64/100.0)`
+  镜像 Python leaveEvent `cfg.set(int(spinBox.value()/division))`、
+  division=1/100。
+
+### 键位实证（cfg.py:296）
+
+- `Personalization/DpiScale`：Range(0, 5) 缺省 0、restart=True。
+- **UserConfig.json 实证**：值全为 python str 串（仅有 str/bool/i64
+  类型）→ 浮点项磁盘口径 `str(float)`：整值补 `.0`（"2.0"），
+  DpiScale 0.25 存 "0.25"；`get_f64` 容错解析对齐。
+- 显示 % = 配置*100（round 防浮点尾差）、配置写 = %/100 浮点；
+  restart=True 生效重启归引擎桥接步。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 一次通过（首轮 fmt 差 2 处换行，fmt 后过）。
+- `timeout 1200 cargo test -p gd3-ui`：**29 passed**（扩展现有
+  settings smoke：set_f64("Personalization","DpiScale",1.25)→125、
+  缺省 0、invoke uiScaleChanged(75)→0.75 通路断言）。0 failed。
+- `timeout 1200 cargo test -p gd3-core`：lib 40 passed（含
+  f64_repr，config 2→3）+ 集成全绿 0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 40 步候选：剩余复杂卡（clientProfileCard TLS 指纹/UA 预设、
+   HeadersPresetSettingCard、HistoryDownloadFolder、
+   categoryRulesCard）；或设置页动作卡骨架（配对令牌 PrimaryPush
+   复制+重新生成/Chromium 一键安装 pressed）；或直接起手暂停/删除
+   真实语义（Phase 8 桥接一体考虑）。
+2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
