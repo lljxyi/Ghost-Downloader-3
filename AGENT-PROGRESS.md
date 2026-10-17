@@ -1398,3 +1398,79 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 1. 其余设置组复杂卡先验再迁（ProxySettingCard/HistoryDownloadFolder/
    clientProfileCard）；暂停/删除接真实语义（Phase 8 桥接一体考虑）。
 2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 35 步 — ProxySettingCard（GeneralDownload/ProxyServer，cfg.py:251 缺省 "Auto"）
+
+- 时间：2026-10-17 07:30（date 实取；代码提交 `4d10d2d`）
+
+### 改动
+
+- `rust/crates/gd3-ui/src/proxy.rs`（新，182 行）：
+  - `PROTOCOLS = ["socks4","socks5","socks5h","http","https"]`（addItems 序，
+    未知 scheme 落索引 0）；`VALUE_OFF/AUTO/DEFAULT("Auto")`；
+    `CHOICE_OFF:0 / AUTO:1 / CUSTOM:2`；`ProxyFields`（derive Default）。
+  - `validate` 逐字符移植 `ProxyValidator`（cfg.py:71-91）：`^...$` 锚定、
+    可选 `\w+:[\w!@#$%^&*()]+@` 凭据段、host 为 IPv4 点分或域名、端口 1-65535；
+    Auto/Off 恒有效（OnceLock Regex）。
+  - `parse_fields` 镜像 urlsplit（第一个 @ 切凭据、最后一个 `:` 切 host:port）；
+    `build_url` 镜像 `_buildProxyUrl`（凭据仅 user/password 非空才拼 `user:pass@`）；
+    `host_valid/port_valid` 移植行内错误正则（setting_cards.py:28-32）。
+- `ui/settings_page.slint`（+≈275 行内）：6 in-out 属性
+  （proxyChoice/proxyProtocolIndex/proxyHost/proxyPort/proxyUser/proxyPass）
+  + 2 回调（`proxyChoiceChanged(int)`、
+  `proxyFieldsChanged(int,string,string,string,string)`）+ 新卡。
+  - **fluent 风格 std-widgets 不导出 RadioButton（实证）→ 三选单选用
+    ComboBox 镜像**：choiceLabel 显示「不使用代理/自动检测系统代理/
+    使用自定义代理」，互斥语义等价。
+  - 自定义字段 `enabled: proxyChoice == 2`；密码 LineEdit
+    `input-type: password` 镜像 EchoMode.Password（实证 lineedit-base）。
+- `ui/appwindow.slint`：窗口级 6 属性 + 2 回调 + 8 行透传。
+- `src/lib.rs`：`pub mod proxy;`；push 仅在自定义模式解析推送四字段
+  （Auto/Off 下自定义字段保持进程缺省空串）；SettingsActions 增
+  `proxy_changed: Box<dyn Fn(&str)>` **收配置口径字面量**
+  （"Auto"/"Off"/拼装 URL）；install 层：Off/Auto 直取，自定义先
+  `proxy::validate`，无效不调用动作不落盘（**镜像 leaveEvent 语义**）。
+- `Cargo.toml`：`regex.workspace = true`（Cargo.lock 同步）。
+
+### 语义定案
+
+- 配置口径永远是 `GeneralDownload/ProxyServer` 字面量；UI 发
+  choice+四字段，拼装/校验/写决策在 install 层 proxy.rs。
+- **已知轻微分歧**：Python 等到 leaveEvent 才写 custom，本实现每次
+  变化且有效即写（更新鲜，等价安全）。
+- 兼容横幅（依赖功能包 proxySchemes）与 Auto 模式系统代理检测
+  （getproxies）非配置键，**留引擎桥接步**。
+
+### 本步实证（工具坑增量）
+
+- `&url` 借用活不过 match → 分支统一返回 String（.to_string())；
+  win 被 move → 每闭包独立 clone_strong。
+- clippy 4 键修正：未使用 port_regex（删）/derive Default/
+  let-chain 合并（edition 2024）/needless_borrow。
+- **行号时序漂移 3 次自愈**：多文件并行改后行号过期插错位置
+  （253 穿插进闭包、582 插到第三窗口、url_regex 注释被误 CUT）——
+  op 后立即 Read 现场 + CUT 重做，无残留。
+- CUT locator 必须带 `.=M` 形式（裸 `CUT 253` 报 invalid locator）。
+
+### 验证
+
+- `cargo build` + `cargo fmt --all --check` +
+  `cargo clippy -p gd3-ui --all-targets -- -D warnings` 干净。
+- `timeout 1200 cargo test -p gd3-ui`：**27 → 28 passed**（+1
+  round-trip/端口界/错误正则；smoke 补 socks5://u:p@1.2.3.4:1080
+  推送解析 / 缺省 Auto→choice1 / invoke 通路：choice0→"Off"、
+  无效端口 70000 不写配置、有效 http://1.2.3.4:8080 拼装、
+  choice1→"Auto"）。0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 36 步候选：IdentitySettingCard（clientProfileCard，
+   setting_cards.py:467 起 TLS 指纹/UA 预设）、HeadersPresetSettingCard、
+   HistoryDownloadFolder，或浏览器扩展组/Aria2 RPC 组简版键
+   （为 Phase 8 桥接铺路）。
+2. 之后暂停/删除接真实语义（Phase 8 桥接一体考虑）→ 引擎状态桥接
+   → Python UI 停用 + AGENT-DONE。
