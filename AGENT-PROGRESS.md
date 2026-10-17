@@ -677,3 +677,78 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   （与 Python 非 ascii 数字同为 cast error 殊途同归）。
 - 下一步：其余纯变换小块扫尾（如有）；之后 **Phase 7 Slint UI**
   与 `/root/Ghost-Downloader-3/AGENT-DONE`（进度文件完结条件）。
+
+## 第 22 步（2026-10-17 04:33 当期 date；本步含两件事）：纯变换下沉扫尾评估【完成=无新下沉项】+ Phase 7a Slint UI 脚手架【完成】
+
+### A. 剩余纯变换小块扫尾（结论：**无新下沉项，变换层下沉到此收口**）
+
+第 19 轮扫描候选逐条评估（对照 app/ 与 features/ 全量 Python 面）：
+
+1. **http_pack pack.py:144-164 filename 提取**——依赖 email 库
+  （`collapse_rfc2231_value`/`parse_qs`）的重型 stdlib 语义
+  （RFC2231 charset/language 合成、编码参数合并），算法级复刻成本
+  远超其行数价值 → **留 Python**。
+2. **yt_dlp_pack parse_qs 小工具**——`urllib.parse.parse_qs` 变体，
+  边际价值低（其余 yt_dlp 面早已历史排除）→ **留 Python**。
+3. **jack_yao**——纯网络目录拉取逻辑，非纯变换，不属于本阶段口径
+  （Phase 6 只收纯变换）→ **排除**。
+4. **bittorrent/mpegdash**——历史排除项，维持不动。
+5. **UI 伴生（hf setting_cards 等）**——不剥离，随 Phase 7 UI 阶段
+  一并按 Qt→Slint 逐页迁移。
+6. **cfg/UserConfig.json 伴生**——决定随 UI 阶段中期走，不提前。
+
+**判据**：纯变换 + 调用高频/值大 + stdlib 依赖轻。以上候选至少欠
+两条，与「吃对齐成本 > 收益」的既有原则（email/NFKC/behave 系列
+实证过三次）一致。26 个 `GD3_RUST_*` 影子开关为 Phase 6 终态。
+
+### B. Phase 7a：`rust/crates/gd3-ui` Slint UI crate 脚手架【完成，commit 7d7cfd9】
+
+- **slint 选型**：v1.18.1（registry 已缓存），GPL-3.0-only 许可路径
+  （项目 GPLv3 兼容）；默认特性含 femtovg/software renderer/
+  accessibility/system-tray。
+- **脚手架内容**（新 crate `rust/crates/gd3-ui`，workspace members
+  已注册）：
+  - `ui/appwindow.slint`：AppWindow 窗口骨架 + `in property <string>
+    statusText`，竖排容器里一个状态文本 Text。
+  - `build.rs`：`slint_build::compile("ui/appwindow.slint")`。
+  - `src/lib.rs`：`slint::include_modules!()` + 无头平台 +
+    `pub fn create_headless() -> AppWindow` + 无头冒烟测试。
+- **slint 1.18.1 API 实证关键点**（修正初稿 8 个编译错误的结果，
+  registry 源码行级核对）：
+  - `set_platform(platform: Box<dyn Platform + 'static>) ->
+    Result<(), SetPlatformError>`（i-slint-core platform.rs:259）；
+    **1.18 没有 `is_using_platform_set`**——用
+    `let _ = set_platform(Box::new(...))`，`AlreadySet` 即复用信号。
+  - `Platform` 唯一必需方法
+    `create_window_adapter -> Result<Rc<dyn WindowAdapter>,
+    PlatformError>`（platform.rs:30）。
+  - `MinimalSoftwareWindow::new(repaint_buffer_type:
+    RepaintBufferType) -> Rc<Self>`（i-slint-renderer-software
+    minimal_software_window.rs:24，自身已包 Rc，不要再包一层）。
+  - `RepaintBufferType` 变体：`NewBuffer`（#[default]）/`ReusedBuffer`
+    /`SwappedBuffers`（partial_renderer.rs:380）；导出路径
+    `slint::platform::software_renderer::{MinimalSoftwareWindow,
+    RepaintBufferType}`（slint lib.rs:488，feature `renderer-software`
+    默认开）。
+  - 属性 getter 保留 slint 属性原始命名：`get_statusText`/
+    `set_statusText`（snake_case 的 `get_status_text` 不存在）。
+- **系统依赖**：fontconfig 编译缺失败已解（apt 装 pkg-config、
+  libfontconfig1-dev、libfontconfig1）；UTF-8 源码注释注意 build
+  输出本地化噪音无害。
+- **质量门**：`cargo test -p gd3-ui` 1 passed（无头实例化 + 属性
+  读写往返）；`cargo fmt --all --check` 干净；
+  `cargo clippy -p gd3-ui --all-targets -- -D warnings` 干净。
+- **工具链注**：编辑工具 Write/Edit 常规使用；Edit ops 头 `PUT N.=M:`
+  语法在本轮再现解析失败（两次），改用 legacy old_string/new_string
+  通过——后续小改以该形式为主。
+
+### C. Phase 7 后续细切计划（下轮起）
+
+- 顺序：**shell（窗口/系统托盘）→ 任务列表页 → 设置页 → 下载引擎
+  状态桥接**（复用 gd3-core/gd3-net/gd3-servers，状态经 Rust 侧
+  model 推给 Slint）；逐页 strangler，每页独立可回退。
+- 量纲：app/view 共 11211 行、app 全部 19458 行 Qt 代码；`app/
+  engine.py` 74 行、`loader.py` 140 行先接。
+- cfg 与 account 数据伴生迁移放在列表页/设置页落地之后。
+- 每页迁完跑 gd3-ui 冒烟 + fmt/clippy；全部 UI 迁移完 → Python UI
+  文件停用（不是删除），写 `/root/Ghost-Downloader-3/AGENT-DONE` 结案。
