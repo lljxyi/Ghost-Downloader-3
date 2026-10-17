@@ -17,6 +17,7 @@ use std::rc::Rc;
 pub mod filter;
 mod format;
 pub mod row;
+pub mod sort;
 
 slint::include_modules!();
 
@@ -69,9 +70,16 @@ pub fn refresh_task_rows(
     window: &AppWindow,
     records: &[gd3_core::task::TaskRecord],
     filter: filter::TaskFilter<'_>,
+    sort_field: sort::SortField,
+    sort_ascending: bool,
+    waiting_order: &[String],
     is_seeding: impl Fn(&gd3_core::task::TaskRecord) -> bool,
 ) {
-    let rows: Vec<TaskRow> = filter::filtered(records, filter)
+    // 筛选（保序）→ 排序（镜像 task_page.py::_refreshList 末段）→ 成行。
+    // waitingOrder 由调用方给（taskService.waitingOrder()）。
+    let mut refs = filter::filtered(records, filter);
+    sort::sort_refs(&mut refs, sort_field, sort_ascending, waiting_order);
+    let rows: Vec<TaskRow> = refs
         .iter()
         .map(|record| row::to_task_row_with(record, is_seeding(record)))
         .collect();
@@ -97,6 +105,8 @@ pub struct TaskActions {
     pub search: Box<dyn Fn(&str)>,
     pub filter_mode: Box<dyn Fn(&str)>,
     pub category_selected: Box<dyn Fn(i32)>,
+    pub sort_field: Box<dyn Fn(i32)>,
+    pub sort_order: Box<dyn Fn(i32)>,
     pub pause: Box<dyn Fn(&str)>,
     pub delete: Box<dyn Fn(&str)>,
 }
@@ -110,6 +120,10 @@ pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions
     window.on_filterModeChanged(move |route| (filter_mode.filter_mode)(&route));
     let category_selected = actions.clone();
     window.on_categoryFilterChanged(move |index| (category_selected.category_selected)(index));
+    let sort_field = actions.clone();
+    window.on_sortFieldChanged(move |index| (sort_field.sort_field)(index));
+    let sort_order = actions.clone();
+    window.on_sortOrderChanged(move |index| (sort_order.sort_order)(index));
     let pause = actions.clone();
     window.on_taskPause(move |task_id| (pause.pause)(&task_id));
     let delete = actions.clone();
@@ -225,6 +239,9 @@ mod smoke {
                 category: "",
                 search: "",
             },
+            crate::sort::SortField::CreatedAt,
+            false,
+            &[],
             |_| false,
         );
         let model = window.get_tasks();
@@ -240,6 +257,9 @@ mod smoke {
                 category: "",
                 search: "zzz",
             },
+            crate::sort::SortField::CreatedAt,
+            false,
+            &[],
             |_| false,
         );
         assert_eq!(window.get_tasks().row_count(), 0);
@@ -261,6 +281,8 @@ mod smoke {
             }),
             filter_mode: Box::new(|_| {}),
             category_selected: Box::new(|_| {}),
+            sort_field: Box::new(|_| {}),
+            sort_order: Box::new(|_| {}),
             pause: Box::new(|_| {}),
             delete: Box::new(|_| {}),
         });
@@ -294,5 +316,68 @@ mod smoke {
         assert_eq!(model.row_data(1).as_deref(), Some("视频"));
         window.set_categoryIndex(2);
         assert_eq!(window.get_categoryIndex(), 2);
+    }
+
+    /// 排序 ComboBox 索引：缺省字段 0（按添加时间）、顺序 1（倒序）
+    /// round-trip；字段索引 → SortField 的映射在 sort::from_menu_index。
+    #[test]
+    fn sort_combo_indexes_round_trip_headless() {
+        let window = crate::create_headless();
+        assert_eq!(window.get_sortFieldIndex(), 0);
+        assert_eq!(window.get_sortOrderIndex(), 1);
+        window.set_sortFieldIndex(3);
+        window.set_sortOrderIndex(0);
+        assert_eq!(window.get_sortFieldIndex(), 3);
+        assert_eq!(window.get_sortOrderIndex(), 0);
+    }
+
+    /// refresh 串接排序：筛选后按 Name 倒序成行（五个排序分支的纯变换
+    /// 语义由 sort.rs 测试锁定，这里锁「筛选 → 排序 → 装配」链路）。
+    #[test]
+    fn refresh_task_rows_applies_sort_headless() {
+        use gd3_core::task::TaskRecord;
+        use serde_json::json;
+
+        let records: Vec<TaskRecord> = serde_json::from_value(json!([
+            {
+                "name": "b.iso", "url": "https://e/1", "packId": "p",
+                "taskId": "t1", "status": "WAITING", "fileSize": 1024,
+                "createdAt": 300,
+            },
+            {
+                "name": "a.bin", "url": "https://e/2", "packId": "p",
+                "taskId": "t2", "status": "RUNNING", "fileSize": 2048,
+                "createdAt": 100,
+                "steps": [
+                    {"stepIndex": 0, "progress": 10, "speed": 0, "receivedBytes": 8},
+                ],
+            },
+            {
+                "name": "c.m3u8", "url": "https://e/3", "packId": "p",
+                "taskId": "t3", "status": "PAUSED", "fileSize": 4096,
+                "createdAt": 200,
+            },
+        ]))
+        .expect("反序列化失败");
+        let window = crate::create_headless();
+        crate::refresh_task_rows(
+            &window,
+            &records,
+            crate::filter::TaskFilter {
+                mode: crate::filter::FilterMode::All,
+                category: "",
+                search: "",
+            },
+            crate::sort::SortField::Name,
+            false,
+            &[],
+            |_| false,
+        );
+        let model = window.get_tasks();
+        assert_eq!(model.row_count(), 3);
+        let names: Vec<String> = (0..model.row_count())
+            .filter_map(|index| model.row_data(index).map(|row| row.name.to_string()))
+            .collect();
+        assert_eq!(names, ["c.m3u8", "b.iso", "a.bin"]);
     }
 }

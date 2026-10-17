@@ -14,11 +14,15 @@ export component AppWindow inherits Window {
     in property <[string]> categoryNames;
     in property <bool> categoryEnabled: false;
     in-out property <int> categoryIndex: 0;
+    in-out property <int> sortFieldIndex: 0;
+    in-out property <int> sortOrderIndex: 1;
     callback searchChanged(string);
     callback filterModeChanged(string);
     callback taskPause(string);
     callback taskDelete(string);
     callback categoryFilterChanged(int);
+    callback sortFieldChanged(int);
+    callback sortOrderChanged(int);
 
     VerticalBox {
         Text {
@@ -31,11 +35,15 @@ export component AppWindow inherits Window {
             categoryNames: root.categoryNames;
             categoryEnabled: root.categoryEnabled;
             categoryIndex <=> root.categoryIndex;
+            sortFieldIndex <=> root.sortFieldIndex;
+            sortOrderIndex <=> root.sortOrderIndex;
             searchChanged(value) => { root.searchChanged(value); }
             filterModeChanged(value) => { root.filterModeChanged(value); }
             taskPause(taskId) => { root.taskPause(taskId); }
             taskDelete(taskId) => { root.taskDelete(taskId); }
             categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
+            sortFieldChanged(index) => { root.sortFieldChanged(index); }
+            sortOrderChanged(index) => { root.sortOrderChanged(index); }
         }
     }
 }
