@@ -1534,3 +1534,56 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    clientProfileCard/HeadersPresetSettingCard 复杂卡先验）。
 2. 之后暂停/删除接真实语义（Phase 8 桥接一体考虑）→ 引擎状态桥接
    → Python UI 停用 + AGENT-DONE。
+
+## 第 37 步 — 浏览器扩展组简版三卡（cfg.py:268-272）
+
+- 时间：2026-10-17 07:46（date 实取；代码提交 `7046425`）
+
+### 改动
+
+- `ui/settings_page.slint`：3 in-out（browserEnabled/browserDraftTaken/
+  browserPort）+ 3 回调 + 三卡（头注释更新为第 32-37 步）。
+- `ui/appwindow.slint`：同名 3 属性 + 3 回调 + 9 行透传。
+- `src/lib.rs`：push_settings 尾部三组 set；SettingsActions 增
+  `browser_enabled` / `browser_draft_taken` / `browser_port`
+  （收 i64 配置单位 division=1）；install 层三注册。
+
+### 键位实证（cfg.py:268-272）
+
+- `Browser/EnableBrowserExtension` 缺省 True；`Browser/
+  EnableRaiseWindowWhenReceiveMsg` 缺省 False——**键名与 UI 文案
+  「接管下载时进入草稿模式」不同源**（映射 shouldDraftTakenDownload
+  → 这个键），注记；`Browser/Port` RangeConfigItem 缺省 14370、
+  RangeValidator(1024, 65535)、singleStep=1、division=1。
+- **动作卡欠账清单**（本组未迁，留动作骨架步）：配对令牌
+  PrimaryPushSettingCard（复制令牌+重新生成 ToolButton）、
+  storeInstallCard HyperlinkCard（FireFox/Edge/Chrome 三链接）、
+  chromiumInstallCard PrimaryPush（一键安装+导出 CRX）。
+
+### 本步实证
+
+- 替换脚本路线第二步：9 处锚点全部唯一命中一次通过；两个 slint
+  全量重写。零 Edit 事故，路线稳定复现。
+- 无新 widget 类型（Switch/Switch/SpinBox 全复用已实证模式）。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 一次通过。
+- `timeout 1200 cargo test -p gd3-ui`：**28 passed**（扩展现有
+  settings smoke：三键有值推送 Enabled=F/Draft=T/Port=15370、
+  缺省容错 14370 等、invoke_browserDraftTakenChanged 通路断言）。
+  0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 38 步候选：关联设置组（association，sys!=darwin 的 Switch
+   们：browserUrlSchemeCard 等）先验；或设置页动作卡骨架（配对
+   令牌/Chromium 一键安装的 pressed 动作）；或 GeneralDownload
+   组复杂卡（clientProfileCard/HeadersPresetSettingCard/History）
+   先验。之后暂停/删除接真实语义（Phase 8 桥接一体考虑）→ 引擎
+   状态桥接 → Python UI 停用 + AGENT-DONE。
