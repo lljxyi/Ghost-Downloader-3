@@ -1768,3 +1768,68 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    （依赖 categoryService 数据，或与引擎桥接步并轨）；或直接起手
    暂停/删除真实语义（Phase 8 桥接一体考虑）。
 2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 41 步 — 模拟身份全局默认卡（cfg.py Network/ClientProfile）
+
+- 时间：2026-10-17 08:35（date 实取；代码提交 `b3110ba`）
+
+### 改动
+
+- `src/profile.rs`（新，~95 行）：镜像 `clientProfile =
+  ConfigItem("Network","ClientProfile","auto",
+  ClientProfileValidator())` 与 IdentitySettingCard 内
+  `buildProfileMenu(includeAuto=True)` 菜单序。ComboBox 11 项 =
+  auto「自动（匹配来源）」/ raw「不模拟（原样发送）」/
+  profileFamilies() 实测九家族「最新」（chrome/edge/firefox/
+  firefox-android/opera/safari/safari-ios/safari-ipad/okhttp，
+  家族字面量即选项值）。`index_of` 未知字面量→0（对齐
+  ClientProfileValidator.correct 兜 "auto"，空串同显 auto）；
+  `value_of` 越界兜 auto 不复刻越界崩溃面；+1 round-trip 单测。
+- `ui/settings_page.slint`（python 脚本 4 处锚点全中）：
+  `clientProfileIndex` 属性 + `clientProfileChanged(int)` 回调 +
+  卡（「模拟身份/TLS 指纹与 User-Agent 预设（全局默认，未被
+  预设匹配时使用）」；头注释 32-41 步）。
+- `ui/appwindow.slint`：同名透传。
+- `src/lib.rs`（python 脚本 9 处锚点全中）：push
+  `set_clientProfileIndex(get_str→index_of)`；SettingsActions 增
+  `client_profile: Box<dyn Fn(&str)>` 收 profile 字面量；install
+  层 value_of 换算（镜像 `_onPick`）；smoke：有值
+  firefox-android→索引 5、缺省 auto→0、invoke 3→"edge"。
+
+### 键位与对接实证
+
+- registry：Python 侧 `buildRegistry` 由 wreq Emulation 枚举反举
+  生成九家族共 131 版本；Rust 侧 gd3-net engine.rs
+  `resolve_emulation` 已备 PROFILE_NAMES（每家族最新 1-2 项），
+  引擎接口即字符串 profile 字面量——本步落盘串两边解析等容。
+- **欠账清单**：identityPresets 列表编辑（PresetRowWidget 添加/
+  编辑/删除/开关 + 编辑对话框）、headersPresets/HeadersCard、
+  特定版本菜单展开（子菜单版本选择）。
+
+### 工具坑增量
+
+- 初稿又混出一个坏 token：round-trip 测试里伪 API 行
+  （伪 API 名 `rank_hint_for`，非真实代码被断言引用即编译错）；
+  先修再过。生成 Rust 测试
+  断言同样是坏 token 高发区，post-write 必查。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui
+  --all-targets -- -D warnings` 一次通过。
+- `timeout 1200 cargo test -p gd3-ui`：**29 → 30 passed**
+ （+profile 菜单序 round-trip；smoke 补有值/缺省/invoke 三段
+  断言）。0 failed。
+- 坏 token 扫描：现场 CLEAN（仅 AGENT-PROGRESS 历史引用行）。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 42 步候选：headersPresets/HeadersCard（currentHeadersPreset
+   Range 0-99 + BASE_HEADERS）、categoryRulesCard（或与引擎桥接
+   并轨）、identityPresets 列表镜像层；或直接起手暂停/删除真实
+   语义（Phase 8 桥接一体考虑）。
+2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
