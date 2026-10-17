@@ -64,6 +64,27 @@ pub fn bili_playurl_gate(
     Ok(output.unbind())
 }
 
+/// `fetchSubtitles` 字典变换的桥（`GD3_RUST_BILI_SUBTITLES` 影子模式）。
+///
+/// 成功 → 字典列表（键序 lan/lan_doc/subtitle_url/isAi）；
+/// AttributeError/TypeError 按原型直接抛出（文案逐字一致）。
+#[pyfunction]
+#[pyo3(signature = (payload))]
+pub fn bili_subtitle_list(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+    let value: serde_json::Value = depythonize(payload)?;
+    let items = match bili::subtitle_list(&value) {
+        Ok(items) => items,
+        Err(bili::SubtitleError::AttributeError(message)) => {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(message));
+        }
+        Err(bili::SubtitleError::TypeError(message)) => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(message));
+        }
+    };
+    let output = pythonize::pythonize(py, &items)?;
+    Ok(output.unbind())
+}
+
 /// 镜像 `buildFnval(qn)`。
 #[pyfunction]
 #[pyo3(signature = (qn, include_hdr, include_dolby))]
