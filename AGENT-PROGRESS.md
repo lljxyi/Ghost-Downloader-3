@@ -886,3 +886,69 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
   且 confirm 的 review diff 显示的顺序（add 在后）不代表文件
   实际行序。
 
+
+## 第 26 步（2026-10-17 05:21；Phase 7b 列表页筛选语义 + 交互回调）【完成】
+
+### 筛选语义 Rust 侧镜像（filter.rs，纯变换）
+
+- `FilterMode{All,Active,Completed}` + `from_route`（镜像
+  `ROUTE_TO_FILTER`，task_page.py:45-47 三字面量 all/active/
+  completed；未知字面量容错回 All）。
+- `matches(TaskStatus)`：ACTIVE = RUNNING ∪ WAITING ∪ PAUSED、
+  COMPLETED = COMPLETED ∪ FAILED（镜像 FILTER_TO_STATUSES，40-41
+  行）；All 全过。
+- `TaskFilter<'a>{mode, category, search}` + `filtered()`：
+  category 非空 → `category == filter`（Python 精确相等，None 不等于
+  任何字符串）；search 非空 → name/url 小写化后子串匹配；条件叠加
+  mode ∩ category ∩ search；**保持 records 原顺序**（Python 列表推导
+  语义），纯变换不动排序——排序（SortField 五种）本次未迁，后续步接。
+- 测试 3 个：五态 × 三模式状态集合表、路由字面量、组合筛选保序。
+
+### UI 契约（task_page.slint / appwindow.slint）
+
+- TaskPage 增 `filterMode: "all"`、`searchPlaceholder: "搜索任务"`；
+  回调 `searchChanged/filterModeChanged/taskPause/taskDelete(string)`。
+- 三个段按钮（全部/进行中/已完成）clicked 发路由字面量；LineEdit
+  `edited + accepted` 双触发 `searchChanged`；**Slint 只发字段面量，
+  执行全在调用方**（与「兜底不在核心层」同一分层原则）。
+- filterMode 属性由调用方回写（供后续段高亮）；Text 调试行当前显示
+  该属性，段高亮视觉在后续步展开（Qt 侧是 SegmentedToggleToolWidget）。
+- AppWindow 同名四回调透传至根。
+
+### 装配（lib.rs）
+
+- `refresh_task_rows(window, records, TaskFilter, is_seeding)`：
+  筛选 → `row::to_task_row_with` → `set_task_rows`。
+- `TaskActions{search, filter_mode, pause, delete: Box<dyn Fn(&str)>}`
+  + `install_task_actions(&AppWindow, Rc<TaskActions>)`：经生成回调
+  `on_searchChanged/on_filterModeChanged/on_taskPause/on_taskDelete`
+  注册（生成名保留 slint camelCase，build 产物 appwindow.rs 实证）。
+- 冒烟 2 个：ACTIVE 筛选后仅剩可运行行 + 搜索不命中空列表；四回调
+  注册不 panic（无头无法模拟点按，真实触发留屏上联调）。
+- **14 passed**（9 → 14：+3 filter 纯变换、+2 冒烟）；fmt --all
+  --check 干净、clippy -p gd3-ui --all-targets -D warnings 干净。
+
+### 工具坑（本步实证）
+
+- 本步再度踩「Edit 正文行漏 `+` 前缀」——ops 里 context 式续行会被
+  解析成新 op 报 `unknown operation ///`；每行都要 `+` 开头。
+- 一轮 install_task_actions 的整块替换把行序打乱（旧两行 + 新两行
+  交错，`delete` 在绑定前使用），**编译期才暴露**；重读活文件定位
+  后用精确行号 PUT 修净。再次确认：改完必须 Read 活文件核对行序，
+  review diff 不显示交错。
+- 文件尾部发现历史遗留的孤立 `}`（上轮 PUT 误删收括号残留），测试
+  编译意外闭符报错后删除；`CUT` 单行用 `CUT N.=N`（裸 `CUT N` 报
+  invalid locator）。
+- 空数组断言 `assert_eq!(expr, [])` 类型推断失败（E0282），改
+  `Vec::<&str>::new()`。
+- 闭包参数 `taskId` 非 snake_case 警告，与 `-D warnings` 冲突：改名
+  `task_id`（slint 生成回调签名不受影响，参数名是 Rust 侧自由变量）。
+
+### 下一步（Phase 7b 续）
+
+1. 分类筛选菜单（categoryFilter 属性，伴生 cfg.isCategoryEnabled +
+   分类列表数据源），补齐 _refreshList 的 category 入口。
+2. 段高亮/卡片视觉（TaskRow 展开进度环、状态色，对齐 task_cards.py）。
+3. 暂停/删除动作接 task_service（桥接层：TaskActions 的 pause/delete
+   落到 gd3-core 的暂停/删除语义 + 磁盘回写），然后设置页 → 引擎
+   状态桥接。
