@@ -20,6 +20,7 @@ pub mod card_menu;
 pub mod category;
 pub mod close_mode;
 pub mod conflict;
+pub mod draft;
 pub mod drawer;
 pub mod facts;
 pub mod filter;

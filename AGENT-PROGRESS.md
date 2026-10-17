@@ -3382,3 +3382,40 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   2. `ui/setting_card_row.slint` + `ui/settings_group.slint` 数据驱动渲染，
      接 `settings_group` 的折叠/搜索/排序，出无头冒烟。
 - 卡点：无
+
+## 第 63 步：任务草稿状态机 draft.rs（P2 起点）（2026-10-17 23:10）
+- 做了什么：新增 `rust/crates/gd3-ui/src/draft.rs`（994 行，15 个单测），
+  镜像 `app/services/task_draft.py::TaskDraft` 的信号顺序 + `app/view/dialogs/
+  task_draft.py` 的纯函数：
+  - `DraftStore`：`set_urls` / `confirm` / `clear` / `refresh` / `add_parsed_tasks`
+    / `set_base_options` / `set_url_category` / `update` / `on_parsed` /
+    `on_parse_failed`；用「返回 `Vec<DraftEvent>`」替代 Python 的 `Signal`。
+  - 纯函数：`parse_url_lines`、`append_unique_urls`、`clipboard_urls`、
+    `draft_stats`（镜像 `card_groups.py::updateStats`）、`error_url_display`
+    （>48 字符截 45+"..."）、`import_name_filters`（`;;` 连接）、`file_uri`
+    （`Path.as_uri()` 口径）、`draft_group_height`。
+  - `DraftParser` trait 注入假解析器（Rust 侧没有 coroutineRunner），测试可控
+    提交/取消/迟到回调。
+- 实证结论：
+  - **信号顺序**：`setUrls` = busy → 逐条 failed → items；`refresh` = busy →
+    failed → items；`clear` = **itemsCleared 先于 busy**；`confirm` = 逐条
+    taskConfirmed → 取消未记选项的项 → **busy 先于 itemsCleared**（与 clear
+    相反）。原模块头把 confirm 写成「itemsCleared + busy」，已改正。
+  - `confirm` 会 `self._items.clear()`，但 Python 靠回调闭包捕获的 item 对象
+    继续持有 `confirmedOptions`。Rust 侧没有对象引用，若只按 parseId 在
+    `items` 里找，「确认后解析回来再建任务」会**静默丢任务**（测试当场抓到：
+    `on_parsed` 返回空）。修法：新增 `pending_confirm: parseId ->
+    (options, autoStart)`，`on_parsed`/`on_parse_failed` 先查这张表。
+  - `addParsedTasks` 即使一项都没处理（全是已解析的重复项），末尾仍无条件发
+    `parsingBusyChanged` + `itemsChanged`（:154-156）；只有 `tasks` 为空才
+    提前 return。原测试断言「空事件」是**测试写错**，已改。
+  - `setUrls` 的 `difflib.SequenceMatcher` 等价性：输入已按首次出现去重
+    （:100-101），两侧元素唯一 → 匹配块恰好是交集，因此「按新顺序取旧项、
+    缺失则新建」观测等价（只在取消调用次序上有差异）。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error（全工作区）。
+  - `cargo test -p gd3-ui --lib`：**159 → 177 passed**（18 个 draft 测试）。
+- 下一步：第 64 步 `plan_task.rs`（计划任务摘要，100 行）+ `batch_url.rs`
+  （批量 URL 解析，184 行）语义层。
+- 卡点：无
