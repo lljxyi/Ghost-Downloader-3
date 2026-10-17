@@ -20,6 +20,9 @@ export component AppWindow inherits Window {
     in-out property <int> maxTaskNum: 3;
     in-out property <int> preBlockNum: 8;
     in-out property <bool> categoryEnabled: false;
+    // 第 33 步：限速值窗口属性用显示口径 KB/s（单位名缀入属性名，
+    // 字节 ⇄ KB 换算归 Rust speed.rs 镜像层，不进 slint）。
+    in-out property <int> speedLimitationKb: 4096;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -41,6 +44,7 @@ export component AppWindow inherits Window {
     callback maxTaskNumChanged(int);
     callback preBlockNumChanged(int);
     callback categoryEnabledChanged(bool);
+    callback speedLimitationChanged(int);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -78,6 +82,8 @@ export component AppWindow inherits Window {
             maxTaskNumChanged(value) => { root.maxTaskNumChanged(value); }
             preBlockNumChanged(value) => { root.preBlockNumChanged(value); }
             categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
+            speedLimitationKb <=> root.speedLimitationKb;
+            speedLimitationChanged(kb) => { root.speedLimitationChanged(kb); }
         }
     }
 }

@@ -15,11 +15,13 @@ export component SettingsPage inherits Rectangle {
     in-out property <int> maxTaskNum: 3;
     in-out property <int> preBlockNum: 8;
     in-out property <bool> categoryEnabled: false;
+    in-out property <int> speedLimitationKb: 4096;
 
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
     callback preBlockNumChanged(int);
     callback categoryEnabledChanged(bool);
+    callback speedLimitationChanged(int);
 
     background: transparent;
 
@@ -68,6 +70,26 @@ export component SettingsPage inherits Rectangle {
             Switch {
                 checked <=> root.categoryEnabled;
                 toggled => { root.categoryEnabledChanged(self.checked); }
+            }
+        }
+        // 第 33 步：SpeedLimitation 卡。SpinBox 显示 KB/s（配置存字
+        // 节，1/1024 换算在 Rust speed.rs 镜像层）；std SpinBox 无
+        // suffix 属性，后缀走独立 Text。
+        HorizontalBox {
+            Text {
+                text: "下载限速\n当下载任务界面限速开关开启时，所有任务将根据此值进行限速";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 1;
+                maximum: 102400;
+                step-size: 512;
+                value <=> root.speedLimitationKb;
+                edited(value) => { root.speedLimitationChanged(value); }
+            }
+            Text {
+                text: " KB/s";
+                vertical-alignment: center;
             }
         }
     }

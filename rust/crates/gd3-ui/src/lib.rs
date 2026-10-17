@@ -18,6 +18,7 @@ pub mod filter;
 mod format;
 pub mod row;
 pub mod sort;
+pub mod speed;
 
 slint::include_modules!();
 
@@ -122,6 +123,14 @@ pub fn push_settings(
             .get_bool("Category", "EnableCategory")
             .unwrap_or(false),
     );
+    // 第 33 步：限速值。配置存字节（GeneralDownload/SpeedLimitation，
+    // 缺省 4194304=cfg.py），窗口属性用显示口径 KB/s（1/1024 换算
+    // 在 speed.rs 镜像层）。
+    window.set_speedLimitationKb(speed::to_display_kb(
+        config
+            .get_i64("GeneralDownload", "SpeedLimitation")
+            .unwrap_or(speed::DEFAULT_BYTES),
+    ) as i32);
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -130,6 +139,9 @@ pub struct SettingsActions {
     pub max_task_num: Box<dyn Fn(i32)>,
     pub pre_block_num: Box<dyn Fn(i32)>,
     pub category_enabled: Box<dyn Fn(bool)>,
+    /// 限速值动作收**配置口径字节**（显示 KB/s → 字节换算在 install
+    /// 层完成，与其它动作统一「动作收配置单位」）。
+    pub speed_limitation: Box<dyn Fn(i64)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -141,6 +153,13 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_preBlockNumChanged(move |value| (pre_block_num.pre_block_num)(value));
     let category = actions.clone();
     window.on_categoryEnabledChanged(move |value| (category.category_enabled)(value));
+    // 第 33 步：SpinBox 发显示口径 KB/s；动作收配置口径字节
+    // （Python 端 cfg.set(int(value/division)) 的镜像，换算在
+    // speed.rs from_display_kb）。
+    let speed = actions.clone();
+    window.on_speedLimitationChanged(move |kb| {
+        (speed.speed_limitation)(speed::from_display_kb(kb as i64))
+    });
 }
 
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
@@ -372,8 +391,8 @@ mod smoke {
         assert_eq!(window.get_categoryIndex(), 2);
     }
 
-    /// 设置页装配（第 32 步先验四键）：UserConfig → 窗口属性缺省
-    /// 容错与 install 注册冒烟（无头无法模拟 Spin/Switch 点按）。
+    /// 设置页装配（第 32 步四键 + 第 33 步限速）：UserConfig → 窗口
+    /// 属性缺省容错与 install 注册冒烟（含 KB/s→字节回调换算验证）。
     #[test]
     fn settings_page_push_and_install_headless() {
         use gd3_core::config::UserConfig;
@@ -384,6 +403,7 @@ mod smoke {
         config.set_str("GeneralDownload", "DownloadFolder", "/data/ghost");
         config.set_i64("GeneralDownload", "MaxTaskNum", 5);
         config.set_bool("Category", "EnableCategory", true);
+        config.set_i64("GeneralDownload", "SpeedLimitation", 8_388_608);
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -391,6 +411,8 @@ mod smoke {
         // PreBlockNum 缺键 → Python 缺省 8。
         assert_eq!(window.get_preBlockNum(), 8);
         assert!(window.get_categoryEnabled());
+        // 第 33 步：限速值字节 → 显示 KB/s（8388608/1024=8192）。
+        assert_eq!(window.get_speedLimitationKb(), 8192);
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -399,9 +421,12 @@ mod smoke {
         assert_eq!(window.get_maxTaskNum(), 3);
         assert_eq!(window.get_preBlockNum(), 8);
         assert!(!window.get_categoryEnabled());
+        // 限速值缺省 4194304 → 显示 4096 KB/s。
+        assert_eq!(window.get_speedLimitationKb(), 4096);
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let speed_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -410,8 +435,21 @@ mod smoke {
             max_task_num: Box::new(|_| {}),
             pre_block_num: Box::new(|_| {}),
             category_enabled: Box::new(|_| {}),
+            // 第 33 步：限速动作收配置口径字节；用 invocable 回调
+            // 验证显示 KB/s → 字节换算通路（slint 生成 API 回调可
+            // 从 Rust invoke）。
+            speed_limitation: Box::new({
+                let h = speed_hits.clone();
+                move |bytes| h.borrow_mut().push(bytes)
+            }),
         });
         crate::install_settings_actions(&window, actions);
+        window.invoke_speedLimitationChanged(102400);
+        assert_eq!(
+            speed_hits.borrow().last().copied(),
+            Some(104_857_600),
+            "显示 KB/s 上限应换算回配置字节上限"
+        );
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }
