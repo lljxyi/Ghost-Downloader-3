@@ -256,6 +256,7 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(ed2k::ed2k_parse_link, module)?)?;
     module.add_function(wrap_pyfunction!(hls::m3u8_probe, module)?)?;
     module.add_function(wrap_pyfunction!(ed2k::ed2k_parse_progress, module)?)?;
+    module.add_function(wrap_pyfunction!(bili::bili_playurl_gate, module)?)?;
     module.add(
         "Ed2kInvalidLinkError",
         module.py().get_type::<ed2k::Ed2kInvalidLinkError>(),

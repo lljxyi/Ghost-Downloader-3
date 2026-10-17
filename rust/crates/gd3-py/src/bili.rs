@@ -35,6 +35,35 @@ pub fn bili_parse_dash(
     ))
 }
 
+/// 镜像 `playurlGate(playPayload, qn)`：返回
+/// `("ok", dash, acceptQuality)` / `("fallback",)` / `("error", message)`；
+/// 根值非 dict / 列码不可哈希之类 Python 特有错误按原型抛
+/// `AttributeError` / `TypeError`（文案逐字一致，无翻译层）。
+#[pyfunction]
+#[pyo3(signature = (play_payload, qn))]
+pub fn bili_playurl_gate(
+    py: Python<'_>,
+    play_payload: &Bound<'_, PyAny>,
+    qn: i64,
+) -> PyResult<Py<PyAny>> {
+    let payload: serde_json::Value = depythonize(play_payload)?;
+    let output = match bili::playurl_gate(&payload, qn) {
+        bili::PlayurlGate::Ok {
+            dash,
+            accept_quality,
+        } => pythonize::pythonize(py, &("ok", dash, accept_quality))?,
+        bili::PlayurlGate::Fallback => pythonize::pythonize(py, &("fallback",))?,
+        bili::PlayurlGate::Error(message) => pythonize::pythonize(py, &("error", message))?,
+        bili::PlayurlGate::AttributeError(message) => {
+            return Err(pyo3::exceptions::PyAttributeError::new_err(message));
+        }
+        bili::PlayurlGate::TypeError(message) => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(message));
+        }
+    };
+    Ok(output.unbind())
+}
+
 /// 镜像 `buildFnval(qn)`。
 #[pyfunction]
 #[pyo3(signature = (qn, include_hdr, include_dolby))]
