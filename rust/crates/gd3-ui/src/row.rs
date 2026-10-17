@@ -23,23 +23,32 @@ use crate::format::{to_readable_size, to_readable_time};
 use gd3_core::task::{TaskRecord, TaskStatus};
 
 /// 镜像 `toSizeText`：completed 且 fileSize>0 → 纯大小；否则「已收/总量」，
-/// fileSize=0 时总量显示 "--"。
-pub fn to_size_text(record: &TaskRecord, received: i64) -> Option<String> {
-    if record.status == TaskStatus::Completed {
-        return if record.file_size > 0 {
-            Some(to_readable_size(record.file_size as f64))
+/// fileSize<=0 时总量显示 "--"。
+///
+/// 抽成「status + fileSize + received」三元组是为了让 `card::info_fields`
+/// 复用同一份口径——Python 侧卡片信息行（`SIZE_FIELD` 的 `{None: toSizeText}`）
+/// 与任务抽屉的大小行本来就是同一个函数。
+pub fn size_text(status: TaskStatus, file_size: i64, received: i64) -> Option<String> {
+    if status == TaskStatus::Completed {
+        return if file_size > 0 {
+            Some(to_readable_size(file_size as f64))
         } else {
             None
         };
     }
-    if record.file_size > 0 {
+    if file_size > 0 {
         return Some(format!(
             "{}/{}",
             to_readable_size(received as f64),
-            to_readable_size(record.file_size as f64)
+            to_readable_size(file_size as f64)
         ));
     }
     Some(format!("{}/--", to_readable_size(received as f64)))
+}
+
+/// `TaskRecord` 版包装（既有调用点与测试沿用）。
+pub fn to_size_text(record: &TaskRecord, received: i64) -> Option<String> {
+    size_text(record.status, record.file_size, received)
 }
 
 /// 镜像 `_toStatusText`：running → 「速度/s · 已收 / 总量 · 时间」拼接；

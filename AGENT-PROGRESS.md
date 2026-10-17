@@ -2546,3 +2546,108 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 
 1. `lib.rs` 把 `rules_to_json` 接到 cfg 写路径（`GD3_RUST_CONFIG` 式影子开关）。
 2. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
+
+## 2026-10-17 12:01 第 50 步
+
+### 做了什么
+
+镜像 `app/view/cards/task_cards.py` 的**卡片派生层**，新建
+`rust/crates/gd3-ui/src/card.rs`（~750 行，含 8 个测试）+ 金文件
+`tests/fixtures/card.jsonl`（44 条）+ 生成脚本
+`tests/fixtures/generate_card_fixture.py`。
+
+Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.states`
+两张 `{status: callable}` 表 + `refresh()` 里
+`formats.get(task.status) or formats.get(None)` 的分发。本步把这两张表与分发
+**摊平成函数**，逐条对齐：
+
+- `to_eta_text` ← `toEtaText`（`fileSize>0 and speed>0` → `int((总量-已收)/速度)`，
+  `int()` 向零截断故用 `as i64`；已收超总量时得负数，单测钉了 `-3s`）；
+- `info_fields` ← `TaskCard.infoFields` 三段（`speed`/`eta` 只在 RUNNING 出现，
+  `size` 走 `{None: toSizeText}` 全状态出现）；`size` 复用 `row::size_text`，
+  为此把 `row::to_size_text(record, received)` 抽成
+  `row::size_text(status, file_size, received)` + 薄包装（既有调用点不动）；
+- `error_text` ← `toLocalizedError` 的**无译文层**：`translate(message) or message`
+  取 message，再 `format_map(params)` 单遍替换 `{key}`；缺参数保留字面
+  （Python 抛 `KeyError`，我方构造器恒带全参，走不到）；
+- `status_line` ← `_refreshForStatus`（RUNNING 隐藏；COMPLETED 三分支
+  「文件不存在」（告警色）/「完成于 {text}」/「任务已经完成」；FAILED 走
+  `error_text` 兜底「下载过程中发生错误，请稍后重试」；PAUSED/WAITING 固定文案）
+  + `MultiFileTaskCard` 覆盖（`files>1` 且非「文件不存在」且状态 ∈
+  {WAITING, COMPLETED} → 改写成「{已选}/{总数} 个文件」）；
+- `progress_state` ← `_createProgressBar`（`fileSize ∈ {0, -1}` → 不确定进度条）
+  + `_refreshForStatus` 的 `show`/`hide`/`setError`/`pause`；
+- `toggle_button` / `select_files_button` / `checksum_button` /
+  `open_file_button` ← 四个 `ButtonSpec.states`。
+
+分层边界（与「IO/译文/本地时区留在调用方」的既有约定一致）：`output_exists`
+（`isExisting`）、`completed_at_text`（`datetime.fromtimestamp(...).strftime`
+**本地时区**，`gd3-ui` 无 chrono）、`can_pause`/`can_seed`/`is_seeding`/
+`has_output_file`（`Task` 运行时/类属性，`tasks.jsonl` 里没有）全由调用方给。
+
+### 两处口径修正（本步踩到并修掉）
+
+1. **进度条可见性是三态不是布尔**：Python `_refreshForStatus` 只在 RUNNING 里
+   `show()`、COMPLETED 里 `hide()`，FAILED 与 PAUSED/WAITING 分支**根本不碰**
+   可见性（沿用上一次的值）。故金文件记动作 `show`/`hide`/`keep`，Rust 侧用
+   `ProgressVisibility` 枚举 + `visible()`（`!= Hide`）兜底无状态重渲染。
+   生成脚本里 `_last()` 对无参调用返回空元组 `()`（falsy），一度把所有 case
+   都判成 `keep`——改用 `_visibility()` 判 `is not None` 后
+   RUNNING→show / COMPLETED→hide / 其余→keep 全部对上。
+2. **`ButtonState.icon` 是「生效图标」不是「覆盖值」**：Python 是
+   `setIcon(state.icon if state.icon is not None else spec.icon)`，永远调
+   `setIcon`。故 Rust 侧改成 `&'static str`（不再 `Option`），并导出四个 spec
+   图标常量 `TOGGLE_ICON="PLAY"` / `SELECT_FILES_ICON="LIBRARY"` /
+   `CHECKSUM_ICON="FINGERPRINT"` / `OPEN_FILE_ICON="LINK"`（取自
+   `ButtonSpec(...)` 实参），`ButtonState::DEFAULT` 换成
+   `ButtonState::default_with(icon)`。
+
+### 金文件做法
+
+与第 48/49 步一致：**桩替换 widget，跑真方法**。
+
+- `_FakeMixin + TaskCard` / `_FakeMixin + MultiFileTaskCard` 两个桩类，
+  **不调用 `__init__`**（跳过 QWidget 初始化），类属性 `infoFields` /
+  `buttons` / `nameFormats` 仍是真的；
+- 所有 widget 换成 `Stub`（`__getattr__` 记录 `(method, args)`），事后回放；
+- `_createProgressBar` **跑真方法**：monkeypatch 模块级
+  `IndeterminateProgressBar` / `ProgressBar` 为带 `kind` 标记的桩，
+  `fileSize ∈ {UNKNOWN, NOT_SUPPORTED}` 这个分支由真代码判定，脚本不抄；
+- `Task` / `TaskFile` / `TaskStep` / `TaskError` 全是真对象，于是 `task.canPause`
+  （遍历 steps 找 RUNNING）、`task.lastError`（倒序两轮）、
+  `task.currentSnapshot()` 都由真代码算出；
+- `_NoPauseStep(TaskStep)` 子类把 `canPause` 置 False（无注解 → 不是 dataclass
+  字段），`isExisting` 逐例 monkeypatch 固定文件系统事实。
+
+44 条用例覆盖：五状态基本盘 / RUNNING 的总量未知与不支持与速度为零与不可暂停
+与进度截断（42.9→42、99.99→99）/ PAUSED / FAILED 五种错误文案与 lastError
+两轮倒序 / COMPLETED 十种（无完成时间、有完成时间、文件不存在、无输出文件、
+做种中、可做种未做种、可做种但文件不存在、总量为零、总量不支持、进度 100）/
+多文件八种（2 选 1、3 选 2、运行中、暂停、失败、完成全选、完成文件不存在、
+单元素列表）/ 文件列表为空与 None / 字段无影响七种。
+
+### 验证
+
+- 金文件 `card.jsonl` 44 条，连跑两次生成脚本 md5 相同
+  （`846d8df4ccb97f570f6233dc4a3aff05`）。
+- `cargo fmt --all --check` 通过。
+- `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+- `cargo test -p gd3-ui`：**71 passed**（63 → 71）。
+- `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**237 passed**（不变）。
+- Python 全量：`pytest -q --continue-on-collection-errors` →
+  **3 failed, 1347 passed, 8 skipped, 35 errors**，与基线完全相同。
+  本步只动 Rust（未接进 Python 侧），不涉及影子开关，故无需双模式回归。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 把派生层接到 `TaskRow`：`ui/task_page.slint` 的 `TaskRow` 补
+   `speedText`/`etaText`/`sizeText`/`statusLine`/`statusWarn`/`progress*`/
+   `toggleIcon`/`toggleEnabled`/`openFileEnabled`/`selectFilesVisible`/
+   `checksum*`，`appwindow.slint` 加 `taskOpenFile`/`taskOpenFolder` 回调，
+   `row::to_task_row` 改为 `(record, &CardTask)` 两参数。
+2. 之后：任务抽屉 `task_drawer.py` 派生层 → 暂停/删除真实语义 →
+   引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。

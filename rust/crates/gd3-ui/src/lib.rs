@@ -14,6 +14,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+pub mod card;
 pub mod category;
 pub mod close_mode;
 pub mod conflict;
