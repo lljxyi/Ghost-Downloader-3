@@ -2162,3 +2162,97 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    「重名拒绝」镜像）；或暂停/删除真实语义（Phase 8 桥接一体化
    评估）。
 2. 之后：引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
+
+## 第 46 步：标头预设添加/编辑覆盖层（app/view/dialogs/headers_preset_edit.py）
+
+- 时间：2026-10-17 10:43（date 实取）
+
+### 改动
+
+- `src/headers.rs`（+195 行）：
+  - `split_lines` 全量镜像 CPython `str.splitlines()` 行界（`\r`、
+    `\n`、`\v`、`\f`、`\x1c-\x1e`、`\u{85}`、`\u{2028}`、`\u{2029}`，
+    `\r\n` 视为单个）——`str::lines` 只认 `\n`/`\r\n`，粘贴文本
+    里的老式行尾会漏切；
+  - `py_isspace`/`py_strip` 镜像 CPython `isspace()`/`strip()` 口径
+    （`\x1c-\x1f` 在 Python 为空白、Rust `char::is_whitespace` 不含）；
+  - `parse_header_line` 镜像 `parseHeaderLine`（headers_editor.py:33-40）：
+    `find(':')` 缺失即丢、名称 strip 空或含空白字符即丢、值 strip
+    （空值合法）；
+  - `to_logical_lines` 镜像 `toLogicalLines`：CRLF 归一化 + 行尾
+    `\`/`^` 续行接空格 + 逐行 strip 去空；
+  - `parse_header_pairs` / `headers_to_text` 互逆（编辑回显与提交
+    共用一套行口径）；`draft_to_header_preset` 镜像 `preset()`
+    （名称 py_strip 空兜「未命名预设」）；`HeaderPreset` derive
+    `Clone`（smoke 采集需要）；
+  - 4 单测：`parse_header_pairs_mirrors_editor_rules`、
+    `to_logical_lines_mirrors_cpython_splitlines_and_strip`（期望值
+    由 `.venv` CPython 实测得出，含 `\x1b`/`\x0c`/`\x1c`/`\u{2028}`/
+    `\u{85}`/`\r\n`/续行/纯空白 → `[]`）、
+    `draft_to_header_preset_mirrors_dialog_preset`、
+    `headers_to_text_round_trips_with_parse`。
+- `ui/settings_page.slint`：`HeadersEditDraft` 结构（index -1=添加）+
+  覆盖层五属性（visible/index/name/pairs/nameError）+ 四回调
+  （addRequested/editRequested(int)/closed/accepted(Draft)）+ 行内
+  「编辑预设」/「添加预设」按钮 + 内嵌覆盖层骨架（标题按 index
+  分支、名称 LineEdit、空名提示、标头 TextEdit、取消/确定；确定
+  空名只置 nameError 不回发）。
+- `ui/appwindow.slint`：草稿结构导入 + 五属性四回调透传；
+  `headersEditIndex` 默认值写 **-1**（`<=>` 双向绑定下根组件默认值
+  生效，否则覆盖 settings_page 的 -1）。
+- `src/lib.rs`：`open_headers_preset_edit(window, config, index)` 两态
+  直写（None=添加：名称空 + 起点回显 `currentHeaders()` 即当前选中
+  预设的标头，镜像 `_onAddClicked`；带值=编辑：回显 `presets[index]`）；
+  `SettingsActions` 增 `headers_preset_add_requested` /
+  `headers_preset_edit_requested` / `headers_preset_edit_closed` /
+  `headers_preset_edit_submit((i64, HeaderPreset))`（确定收
+  `draft_to_header_preset` 归一化产物，cfg 写与重推归调用方）；
+  smoke 增覆盖层缺省断言 + invoke 四通路 + `open_headers_preset_edit`
+  两态独立冒烟。
+
+### 新事实（影响后续步骤）
+
+- **slint 1.18.1 fluent 没有 `TextArea`**：`std-widgets.slint` 只导出
+  `TextEdit`（`text`/`placeholder-text`/`read-only`/`edited` 足够）。
+  最初写 `TextArea` 导致 `:886: Parse error`（连带尾行三行游离括号
+  一并清理）。
+- **Slint 无 `trim`**：覆盖层只能判 `name == ""`；空白串由 Rust
+  `draft_to_header_preset` 兜「未命名预设」，与 Python `preset()` 的
+  `text().strip()` 同口径（Python `validate()` 会先拦，属 UI 层差异，
+  已记录）。
+- **双向绑定默认值在根组件生效**：`<=>` 下 AppWindow 的
+  `headersEditIndex` 缺省 0 会覆盖页面里的 -1，缺省值须写根组件。
+
+### 工具坑增量
+
+- 每文件独立 `let x = actions.clone();` 是既有惯例——`headers_act`
+  单变量复用会被前一个 `move` 闭包吃掉。
+- `to_logical_lines` 里 `.map(str::trim)` 类型不匹配（要
+  `Vec<String>`），改 `.map(|line| py_strip(line).to_string())`。
+- clippy `question_mark`：`line.find(':')?` 比 `if let Some` 干净。
+
+### 验证
+
+- `cargo fmt --all --check` 通过。
+- `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+- `timeout 1200 cargo test -p gd3-ui`：**43 → 48 passed**，0 failed。
+- `timeout 2400 cargo test -p gd3-core -p gd3-net -p gd3-servers`：
+  19 个 test binary 全 ok，0 failed。
+- Python 全量：`pytest -q --continue-on-collection-errors` →
+  **3 failed, 1347 passed, 8 skipped, 35 errors**，失败集合
+  （`test_android_config_parity` / `test_github_probe::testProxySiteGetsNoCredentials` /
+  `test_runtime_install::test_delete_raises_when_a_path_cannot_be_deleted`）
+  全部属既有基线，无新增。本步只动 `gd3-ui`（未接进 Python 侧），
+  不涉及影子开关，故无需双模式回归。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 47 步候选：`IdentityPresetEditDialog` 复用同套覆盖层骨架
+   （名称 + hosts 行编辑器 + 「重名拒绝」校验）；或
+   `HeadersEditor` 的 cURL 粘贴解析（`parseCurl`）与重复行高亮。
+2. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 +
+   `AGENT-DONE`。

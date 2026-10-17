@@ -6,7 +6,16 @@
 // 契约：Rust 侧 push_settings 写值串/数字派生值；控件只回发变化
 // （Line/Spin edited、Switch toggled），映射在 Rust 侧 typed set。
 
-import { VerticalBox, HorizontalBox, LineEdit, SpinBox, Switch, ComboBox, Button } from "std-widgets.slint";
+import {
+    VerticalBox,
+    HorizontalBox,
+    LineEdit,
+    SpinBox,
+    Switch,
+    ComboBox,
+    Button,
+    TextEdit,
+} from "std-widgets.slint";
 
 // 第 43 步：身份预设行数据（desc 由 Rust identity.rs 预拼三段）。
 export struct IdentityPresetData {
@@ -33,6 +42,14 @@ export struct CategoryEditDraft {
     icon: string,
     extensions: string,
     folder: string,
+}
+
+// 第 46 步：标头预设编辑草稿（index -1=添加；pairs 为 TextEdit 多行
+// 「名: 值」原样串——拆行/切成 (名, 值) 在 Rust headers.rs）。
+export struct HeadersEditDraft {
+    index: int,
+    name: string,
+    pairs: string,
 }
 
 export component SettingsPage inherits Rectangle {
@@ -112,6 +129,17 @@ export component SettingsPage inherits Rectangle {
     in-out property <int> headersPresetIndex: 0;
     in-out property <int> headersPresetHeaderCount: 0;
     in-out property <bool> headersPresetCanRemove: false;
+    // 第 46 步：标头预设编辑覆盖层（镜像 HeadersPresetEditDialog：
+    // 名称空拒——「预设名称不能为空」提示镜像 InfoBar.warning 文案；
+    // 行编辑器简版为 TextEdit（slint 1.18.1 fluent 未导出 TextArea），每行一条「名: 值」（toLogicalLines/
+    // parseHeaderLine 镜像归 Rust headers.rs）；index -1=添加，镜像
+    // _onAddClicked preset={"name": "", headers: currentHeaders()}；
+    // cURL 粘贴解析与重复行高亮留欠账步）。
+    in-out property <bool> headersEditVisible: false;
+    in-out property <int> headersEditIndex: -1;
+    in-out property <string> headersEditName: "";
+    in-out property <string> headersEditPairs: "";
+    in-out property <bool> headersEditNameError: false;
     // 第 43 步：身份预设列表（cfg.py:334-340 缺省含百度网盘客户端
     // 预设；读盘仅 JSON 反序列化不过 validator.correct。行结构镜像
     // PresetRowWidget：名称+三段描述（Rust identity.rs 预拼）+开关
@@ -176,6 +204,12 @@ export component SettingsPage inherits Rectangle {
     callback clientProfileChanged(int);
     callback headersPresetPicked(int);
     callback headersPresetRemoveRequested(int);
+    // 第 46 步：标头预设添加/编辑动作（入口收 () 或索引；「取消」
+    // 收 ()；「确定」须过名称非空校验才回发——cfg 写与重推归调用方）。
+    callback headersPresetAddRequested();
+    callback headersPresetEditRequested(int);
+    callback headersPresetEditClosed();
+    callback headersPresetEditAccepted(HeadersEditDraft);
     callback identityPresetToggled(int, bool);
     callback identityPresetRemoveRequested(int);
     // 第 44 步：库分类动作（恢复默认收 ()、删除收 categoryId）
@@ -627,6 +661,16 @@ export component SettingsPage inherits Rectangle {
                 enabled: root.headersPresetCanRemove;
                 clicked => { root.headersPresetRemoveRequested(root.headersPresetIndex); }
             }
+            // 第 46 步：编辑=当前选中预设（镜像 _onEditClicked；Python
+            // 端逐行 editButton 走行卡形态，留布局步）。
+            Button {
+                text: "编辑预设";
+                clicked => { root.headersPresetEditRequested(root.headersPresetIndex); }
+            }
+            Button {
+                text: "添加预设";
+                clicked => { root.headersPresetAddRequested(); }
+            }
         }
         // 第 43 步：身份预设行列表（PresetRowWidget 简版：名称+描述+
         // 开关+删除按钮；删除确认框/编辑对话框归调用方与欠账步）。
@@ -777,6 +821,61 @@ export component SettingsPage inherits Rectangle {
                                 extensions: root.categoryEditExtensions,
                                 folder: root.categoryEditFolder,
                             });
+                        }
+                    }
+                }
+            }
+        }
+        // 第 46 步：标头预设编辑覆盖层（镜像 HeadersPresetEditDialog
+        // _initWidget/_initLayout 名称空拒 + HeadersEditor 行编辑器
+        // 简版；粘贴 cURL 文本框与重复行高亮留欠账步）。名称空用
+        // `== ""` 判定（Slint 无 strip/trust trim——空白串由 Rust 层
+        // 兜「未命名预设」，Python 的 text().strip() 口径记录在案）。
+        Rectangle {
+            visible: root.headersEditVisible;
+            background: rgba(0, 0, 0, 0.4);
+            width: 100%;
+            height: 100%;
+            VerticalBox {
+                padding: 24px;
+                Text {
+                    text: root.headersEditIndex == -1 ? "添加预设" : "编辑预设";
+                    font-size: 18px;
+                }
+                LineEdit {
+                    text <=> root.headersEditName;
+                    placeholder-text: "预设名称";
+                }
+                Text {
+                    text: "预设名称不能为空";
+                    visible: root.headersEditNameError;
+                }
+                TextEdit {
+                    text <=> root.headersEditPairs;
+                    placeholder-text: "每行一条「名: 值」";
+                }
+                HorizontalBox {
+                    Button {
+                        text: "取消";
+                        clicked => {
+                            root.headersEditVisible = false;
+                            root.headersPresetEditClosed();
+                        }
+                    }
+                    Button {
+                        text: "确定";
+                        clicked => {
+                            if (root.headersEditName == "") {
+                                root.headersEditNameError = true;
+                            } else {
+                                root.headersEditNameError = false;
+                                root.headersEditVisible = false;
+                                root.headersPresetEditAccepted({
+                                    index: root.headersEditIndex,
+                                    name: root.headersEditName,
+                                    pairs: root.headersEditPairs,
+                                });
+                            }
                         }
                     }
                 }

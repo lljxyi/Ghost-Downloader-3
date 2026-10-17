@@ -5,6 +5,7 @@ import { VerticalBox } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
 import {
     CategoryEditDraft,
+    HeadersEditDraft,
     SettingsPage,
     IdentityPresetData,
     CategoryRowData,
@@ -67,6 +68,11 @@ export component AppWindow inherits Window {
     in-out property <int> headersPresetIndex: 0;
     in-out property <int> headersPresetHeaderCount: 0;
     in-out property <bool> headersPresetCanRemove: false;
+    in-out property <bool> headersEditVisible;
+    in-out property <int> headersEditIndex: -1;
+    in-out property <string> headersEditName;
+    in-out property <string> headersEditPairs;
+    in-out property <bool> headersEditNameError;
     // 第 43 步：身份预设列表（行结构镜像 PresetRowWidget；编辑/添加
     // 留欠账步）。
     in-out property <[IdentityPresetData]> identityPresets;
@@ -131,6 +137,10 @@ export component AppWindow inherits Window {
     callback headersPresetRemoveRequested(int);
     callback identityPresetToggled(int, bool);
     callback identityPresetRemoveRequested(int);
+    callback headersPresetAddRequested();
+    callback headersPresetEditRequested(int);
+    callback headersPresetEditClosed();
+    callback headersPresetEditAccepted(HeadersEditDraft);
     callback categoryResetRequested();
     callback categoryRemoveRequested(string);
     callback categoryAddRequested();
@@ -251,6 +261,15 @@ export component AppWindow inherits Window {
             categoryEditRequested(id) => { root.categoryEditRequested(id); }
             categoryEditClosed() => { root.categoryEditClosed(); }
             categoryEditAccepted(d) => { root.categoryEditAccepted(d); }
+            headersEditVisible <=> root.headersEditVisible;
+            headersEditIndex <=> root.headersEditIndex;
+            headersEditName <=> root.headersEditName;
+            headersEditPairs <=> root.headersEditPairs;
+            headersEditNameError <=> root.headersEditNameError;
+            headersPresetAddRequested() => { root.headersPresetAddRequested(); }
+            headersPresetEditRequested(i) => { root.headersPresetEditRequested(i); }
+            headersPresetEditClosed() => { root.headersPresetEditClosed(); }
+            headersPresetEditAccepted(d) => { root.headersPresetEditAccepted(d); }
             exportCrx() => { root.exportCrx(); }
             urlSchemeEnabled <=> root.urlSchemeEnabled;
             checkUpdateAtStartup <=> root.checkUpdateAtStartup;

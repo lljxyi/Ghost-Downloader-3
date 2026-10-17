@@ -329,6 +329,41 @@ pub fn push_settings(
     );
 }
 
+/// 第 46 步：打开标头预设添加/编辑覆盖层（index None=添加，镜像 _onAddClicked
+/// preset={"name": "", headers: currentHeaders()}——起点用选中预设的
+/// 标头回显；带值=编辑，镜像 _onEditClicked presets[index]）。
+pub fn open_headers_preset_edit(
+    window: &AppWindow,
+    config: &gd3_core::config::UserConfig,
+    index: Option<usize>,
+) {
+    let presets = headers::parse_presets(config.get_str("Network", "HeadersPresets").unwrap_or(""));
+    let selected = index.unwrap_or_else(|| {
+        headers::current_index(
+            config.get_str("Network", "CurrentHeadersPreset"),
+            presets.len(),
+        )
+    });
+    let preset = presets.get(selected);
+    // 添加（index None）名称留空——镜像 _onAddClicked 的 name=""；
+    // 编辑（带 index）回显 presets[index].name。索引越界时 preset 为
+    // None，名称与标头都落空串（越界守卫归调用方）。
+    let name = match (index, preset) {
+        (Some(_), Some(preset)) => preset.name.clone(),
+        _ => String::new(),
+    };
+    window.set_headersEditIndex(index.map(|i| i as i32).unwrap_or(-1));
+    window.set_headersEditName(name.into());
+    window.set_headersEditPairs(
+        preset
+            .map(|p| headers::headers_to_text(&p.headers))
+            .unwrap_or_default()
+            .into(),
+    );
+    window.set_headersEditNameError(false);
+    window.set_headersEditVisible(true);
+}
+
 /// 第 45 步：打开分类添加/编辑表单（直写窗口字段+置可见；`rule`
 /// None=添加镜像 Dialog(category=None)：字段前置空、icon 落 0）。
 pub fn open_category_edit(window: &AppWindow, rule: Option<&category::CategoryRule>) {
@@ -401,6 +436,13 @@ pub struct SettingsActions {
     // 索引调整、删除确认框归调用方，镜像 _onPick/_onRemoveClicked）。
     pub headers_preset_pick: Box<dyn Fn(i64)>,
     pub headers_preset_remove: Box<dyn Fn(i64)>,
+    // 第 46 步：标头预设添加/编辑动作（添加收 ()；编辑收 int 索引
+    // 原样——越界守卫/缺失回退归调用方；「取消」收 ()；「确定」回发
+    // (索引, draft_to_header_preset 归一化预设)，cfg 写与重推归调用方）。
+    pub headers_preset_add_requested: Box<dyn Fn()>,
+    pub headers_preset_edit_requested: Box<dyn Fn(i64)>,
+    pub headers_preset_edit_closed: Box<dyn Fn()>,
+    pub headers_preset_edit_submit: Box<dyn Fn((i64, headers::HeaderPreset))>,
     // 第 43 步：身份预设动作——开关收 (索引, bool)、删除收当前索引
     // （cfg 写、索引边界检查、删除确认框归调用方，镜像
     // _onToggled/_onRemoveClicked；编辑/添加对话框留欠账步）。
@@ -546,6 +588,23 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     let headers_remove = actions.clone();
     window
         .on_headersPresetRemoveRequested(move |i| (headers_remove.headers_preset_remove)(i as i64));
+    // 第 46 步：标头预设添加/编辑入口与确定草稿（确定回发
+    // draft_to_header_preset 归一化预设；cfg 写与重推归调用方）。
+    let headers_add = actions.clone();
+    window.on_headersPresetAddRequested(move || (headers_add.headers_preset_add_requested)());
+    let headers_edit = actions.clone();
+    window.on_headersPresetEditRequested(move |i| {
+        (headers_edit.headers_preset_edit_requested)(i as i64)
+    });
+    let headers_closed = actions.clone();
+    window.on_headersPresetEditClosed(move || (headers_closed.headers_preset_edit_closed)());
+    let headers_submit = actions.clone();
+    window.on_headersPresetEditAccepted(move |d| {
+        (headers_submit.headers_preset_edit_submit)((
+            d.index as i64,
+            headers::draft_to_header_preset(&d.name, &d.pairs),
+        ))
+    });
     // 第 43 步：身份预设注册（索引越界检查归调用方，镜像 Python
     // `if index < 0 or index >= len(presets): return` 守卫）。
     let identity_toggle = actions.clone();
@@ -1027,6 +1086,9 @@ mod smoke {
         assert_eq!(window.get_headersPresetIndex(), 0);
         assert_eq!(window.get_headersPresetHeaderCount(), 8);
         assert!(!window.get_headersPresetCanRemove());
+        // 第 46 步：缺省容错（编辑覆盖层收起、索引 -1=添加）。
+        assert!(!window.get_headersEditVisible());
+        assert_eq!(window.get_headersEditIndex(), -1);
         // 第 43 步：缺省容错（缺键 → 百度网盘客户端预设单行，启用）。
         let identity_rows = window.get_identityPresets();
         assert_eq!(identity_rows.row_count(), 1);
@@ -1073,6 +1135,12 @@ mod smoke {
         // 第 42 步：标头预设动作命中记录。
         let headers_pick_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let headers_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 46 步：标头预设添加/编辑动作命中记录。
+        let headers_add_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let headers_edit_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        let headers_close_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let headers_submit_hits: Rc<RefCell<Vec<(i64, crate::headers::HeaderPreset)>>> =
+            Rc::new(RefCell::new(Vec::new()));
         // 第 43 步：身份预设动作命中记录。
         let identity_toggle_hits: Rc<RefCell<Vec<(i64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
         let identity_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1162,6 +1230,23 @@ mod smoke {
             headers_preset_remove: Box::new({
                 let h = headers_remove_hits.clone();
                 move |i| h.borrow_mut().push(i)
+            }),
+            // 第 46 步：添加/编辑入口与确定草稿（采集调用发生即可）。
+            headers_preset_add_requested: Box::new({
+                let h = headers_add_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            headers_preset_edit_requested: Box::new({
+                let h = headers_edit_hits.clone();
+                move |i| h.borrow_mut().push(i)
+            }),
+            headers_preset_edit_closed: Box::new({
+                let h = headers_close_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            headers_preset_edit_submit: Box::new({
+                let h = headers_submit_hits.clone();
+                move |pair| h.borrow_mut().push(pair)
             }),
             // 第 43 步：身份预设动作（开关收 (索引, bool) 验证通路）。
             identity_preset_toggle: Box::new({
@@ -1297,6 +1382,34 @@ mod smoke {
         assert_eq!(headers_pick_hits.borrow().last().copied(), Some(1));
         window.invoke_headersPresetRemoveRequested(0);
         assert_eq!(headers_remove_hits.borrow().last().copied(), Some(0));
+        // 第 46 步：添加/编辑 invoke 通路；确定草稿 → draft_to_header_
+        // preset 归一化预设（名称 strip + 逐行 parseHeaderLine 拆对，
+        // 无冒号/名称含空白行镜像丢弃）。
+        window.invoke_headersPresetAddRequested();
+        assert_eq!(headers_add_hits.borrow().len(), 1);
+        window.invoke_headersPresetEditRequested(0);
+        assert_eq!(headers_edit_hits.borrow().last().copied(), Some(0));
+        window.invoke_headersPresetEditAccepted(crate::HeadersEditDraft {
+            index: 0,
+            name: "  A2  ".into(),
+            pairs: "accept-encoding: deflate, br, gzip\r\nx-a: 1\nc:\n".into(),
+        });
+        let (submitted_i, submitted_p) = headers_submit_hits.borrow().last().cloned().unwrap();
+        assert_eq!(submitted_i, 0);
+        assert_eq!(submitted_p.name, "A2");
+        assert_eq!(
+            submitted_p.headers,
+            vec![
+                (
+                    "accept-encoding".to_string(),
+                    "deflate, br, gzip".to_string()
+                ),
+                ("x-a".to_string(), "1".to_string()),
+                ("c".to_string(), String::new()),
+            ]
+        );
+        window.invoke_headersPresetEditClosed();
+        assert_eq!(headers_close_hits.borrow().len(), 1);
         // 第 43 步：身份预设 invoke 通路（开关 (索引, bool)、删除索引）。
         window.invoke_identityPresetToggled(1, false);
         assert_eq!(
@@ -1387,6 +1500,38 @@ mod smoke {
         );
         assert_eq!(window.get_categoryEditIconIndex(), 0);
         assert_eq!(window.get_categoryEditFolder(), "");
+    }
+
+    /// 第 46 步：open_headers_preset_edit 两态直写（添加=空名+当前
+    /// 选中预设的标头起点；编辑=带 index 的带值回显）。
+    #[test]
+    fn open_headers_preset_edit_form_states_headless() {
+        use gd3_core::config::UserConfig;
+
+        let window = crate::create_headless();
+        let mut config = UserConfig::new();
+        config.set_str(
+            "Network",
+            "HeadersPresets",
+            r#"[{"name": "A", "headers": {"x-a": "1"}},
+                {"name": "B", "headers": {"y-b": "2", "z-c": "3"}}]"#,
+        );
+        config.set_str("Network", "CurrentHeadersPreset", "1");
+        // 添加（镜像 _onAddClicked：名称空 + currentHeaders() 起点）。
+        crate::open_headers_preset_edit(&window, &config, None);
+        assert!(window.get_headersEditVisible());
+        assert_eq!(window.get_headersEditIndex(), -1);
+        assert_eq!(window.get_headersEditName(), "");
+        assert_eq!(
+            window.get_headersEditPairs(),
+            "y-b: 2\nz-c: 3\n",
+            "添加起点应为选中预设 B 的标头回显"
+        );
+        // 编辑（镜像 _onEditClicked：预设[index] 带值回显）。
+        crate::open_headers_preset_edit(&window, &config, Some(0));
+        assert_eq!(window.get_headersEditIndex(), 0);
+        assert_eq!(window.get_headersEditName(), "A");
+        assert_eq!(window.get_headersEditPairs(), "x-a: 1\n");
     }
 
     /// 段高亮：filterMode → 派生选中态。缺省 all；未知字面量全不

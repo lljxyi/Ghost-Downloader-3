@@ -29,6 +29,7 @@ pub const BASE_HEADERS: [(&str, &str); 8] = [
 
 pub const DEFAULT_PRESET_NAME: &str = "默认";
 
+#[derive(Clone)]
 pub struct HeaderPreset {
     pub name: String,
     pub headers: Vec<(String, String)>,
@@ -92,6 +93,121 @@ pub fn current_index(raw: Option<&str>, len: usize) -> usize {
     value.clamp(0, len as i64 - 1) as usize
 }
 
+/// CPython `str.isspace()` 口径：Unicode White_Space 之外，
+/// \x1c-\x1f（信息分隔符）也算空白——Rust `char::is_whitespace`
+/// 不含这四个码位。
+fn py_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
+/// 镜像 CPython `str.strip()`（两端 py_isspace 字符）。
+fn py_strip(text: &str) -> &str {
+    text.trim_matches(py_isspace)
+}
+
+/// 镜像 HeadersEditor.parseHeaderLine（headers_editor.py:33-40）：
+/// partition(":")——分隔符缺失、名称 strip 后为空或含空白字符的
+/// 行丢弃（HTTP/2 伪头/请求行不是标头——原样发出会破坏请求）；值
+/// strip（空值合法）。
+fn parse_header_line(line: &str) -> Option<(String, String)> {
+    let idx = line.find(':')?;
+    let name = py_strip(&line[..idx]).to_string();
+    if name.is_empty() || name.chars().any(py_isspace) {
+        return None;
+    }
+    Some((name, py_strip(&line[idx + 1..]).to_string()))
+}
+
+/// 镜像 CPython `str.splitlines()` 的行界集合（\r、\n、\v、\f、
+/// \x1c-\x1e、\x85、U+2028/U+2029；\r\n 视为单个行界）——
+/// Rust `str::lines` 只认 \n/\r\n，粘贴文本里的老式行尾会漏切。
+fn split_lines(text: &str) -> Vec<String> {
+    fn is_boundary(c: char) -> bool {
+        matches!(
+            c,
+            '\n' | '\r'
+                | '\x0b'
+                | '\x0c'
+                | '\x1c'
+                | '\x1d'
+                | '\x1e'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        )
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_boundary(c) {
+            if c == '\r' && chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            lines.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// 镜像 HeadersEditor.toLogicalLines（headers_editor.py:28-31）：CRLF
+/// 归一化、行尾续行的反斜杠/「^」接空格，逐行 strip 去空。
+fn to_logical_lines(text: &str) -> Vec<String> {
+    let merged = text
+        .replace("\r\n", "\n")
+        .replace("\\\n", " ")
+        .replace("^\n", " ");
+    split_lines(&merged)
+        .iter()
+        .map(|line| py_strip(line).to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// 第 46 步：编辑覆盖层的标头文本 → (名, 值) 列表（HeadersEditor 行
+/// 部件的简版镜像——逐行 parseHeaderLine；cURL 块解析与重复行高亮
+/// 留欠账步）。
+pub fn parse_header_pairs(text: &str) -> Vec<(String, String)> {
+    to_logical_lines(text)
+        .iter()
+        .filter_map(|line| parse_header_line(line))
+        .collect()
+}
+
+/// 镜像 HeadersPresetEditDialog.preset()（headers_preset_edit.py:58-62）：
+/// 名称 strip 空兜「未命名预设」；标头成对列表原样。空串在覆盖层
+/// 校验拒绝（不回发）；空白串放行由本层兜底（Python text().strip()
+/// 为空同样兜未命名预设——同口径）。
+pub fn draft_to_header_preset(name: &str, pairs: &str) -> HeaderPreset {
+    let name = py_strip(name);
+    HeaderPreset {
+        name: if name.is_empty() {
+            "未命名预设".to_string()
+        } else {
+            name.to_string()
+        },
+        headers: parse_header_pairs(pairs),
+    }
+}
+
+/// 编辑覆盖层回显文本（「名: 值」逐行）——HeadersEditor 行部件的
+/// 简版镜像；与 parse_header_pairs 互逆。
+pub fn headers_to_text(pairs: &[(String, String)]) -> String {
+    let mut text = String::new();
+    for (name, value) in pairs {
+        text.push_str(name);
+        text.push_str(": ");
+        text.push_str(value);
+        text.push('\n');
+    }
+    text
+}
+
 /// 仅测试用的 (k, v) 转换小助手。
 #[cfg(test)]
 trait ToPair {
@@ -147,5 +263,84 @@ mod tests {
         assert_eq!(current_index(Some("2"), 3), 2);
         // 空预设列表不会出现（correct 兜底），夹取防越界。
         assert_eq!(current_index(Some("5"), 0), 0);
+    }
+    #[test]
+    fn parse_header_pairs_mirrors_editor_rules() {
+        let text = "accept-encoding: deflate, br, gzip\r\nx-a: 1\n\n  \nc:\nno-colon\nb c: 5";
+        let pairs = parse_header_pairs(text);
+        // 合法行保留（含空值/值含逗号分号）；无冒号、名称含空白
+        // （「b c: 5」如请求行）丢弃——与 parseHeaderLine 一致。
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "accept-encoding".to_string(),
+                    "deflate, br, gzip".to_string()
+                ),
+                ("x-a".to_string(), "1".to_string()),
+                ("c".to_string(), String::new()),
+            ]
+        );
+        // 续行镜像：反斜杠行尾接空格（「^」同规则——不重复测）。
+        let merged = parse_header_pairs("user-agent: A\\\nx-b: 2");
+        assert_eq!(
+            merged,
+            vec![("user-agent".to_string(), "A x-b: 2".to_string())]
+        );
+    }
+
+    #[test]
+    fn to_logical_lines_mirrors_cpython_splitlines_and_strip() {
+        // 期望值由 .venv CPython 3.13 的
+        // headers_editor.toLogicalLines 逐条实测得出。
+        for (input, want) in [
+            ("a: 1\rb: 2", vec!["a: 1", "b: 2"]),
+            ("a: 1\u{b}b: 2", vec!["a: 1", "b: 2"]),
+            ("a: 1\u{c}b: 2", vec!["a: 1", "b: 2"]),
+            ("a: 1\u{1c}b: 2", vec!["a: 1", "b: 2"]),
+            ("a: 1\u{2028}b: 2", vec!["a: 1", "b: 2"]),
+            ("a: 1\u{85}b: 2", vec!["a: 1", "b: 2"]),
+            ("a: 1\r\nb: 2", vec!["a: 1", "b: 2"]),
+            ("x: 1\\\ny: 2", vec!["x: 1 y: 2"]),
+            ("x: 1^\ny: 2", vec!["x: 1 y: 2"]),
+            ("  \n\t\n", Vec::<&str>::new()),
+        ] {
+            assert_eq!(to_logical_lines(input), want, "input {input:?}");
+        }
+        // 行内 \x1f 不是行界、但被 strip 掉；名含空白/空名丢行。
+        let lines = to_logical_lines("a b: 1\nc: 2\n: x\n d :  e \n\u{1f}");
+        assert_eq!(lines, vec!["a b: 1", "c: 2", ": x", "d :  e"]);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| parse_header_line(line))
+                .collect::<Vec<_>>(),
+            vec![
+                None,
+                Some(("c".to_string(), "2".to_string())),
+                None,
+                Some(("d".to_string(), "e".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn draft_to_header_preset_mirrors_dialog_preset() {
+        let preset = draft_to_header_preset("  A  ", "x-a: 1");
+        assert_eq!(preset.name, "A");
+        assert_eq!(preset.headers, vec![("x-a".to_string(), "1".to_string())]);
+        // 空白串兜「未命名预设」（空串在校验层拒绝、不回发）。
+        let blank = draft_to_header_preset(" ", "");
+        assert_eq!(blank.name, "未命名预设");
+        assert!(blank.headers.is_empty());
+    }
+
+    #[test]
+    fn headers_to_text_round_trips_with_parse() {
+        let pairs = vec![
+            ("upgrade-insecure-requests".to_string(), "1".to_string()),
+            ("sec-fetch-dest".to_string(), "document".to_string()),
+        ];
+        assert_eq!(parse_header_pairs(&headers_to_text(&pairs)), pairs);
     }
 }
