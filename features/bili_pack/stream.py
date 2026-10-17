@@ -248,6 +248,28 @@ async def fetchBuvid(client) -> str:
         return ""
 
 
+def subtitleList(payload) -> list[dict]:
+    """`fetchSubtitles` 的字幕字典变换层（纯函数，影子开关 `GD3_RUST_BILI_SUBTITLES`）。
+
+    原生分支与 fetchSubtitles 原实现的 rawList 链 + 列表推导逐行一致；
+    AttributeError/TypeError 由调用方 fetchSubtitles 的 try/except 吞掉返回 []。
+    """
+    from .rust_subtitles import isEnabled as rustSubtitlesEnabled, subtitleList as rustSubtitleList
+
+    if rustSubtitlesEnabled():
+        return rustSubtitleList(payload)
+    rawList = ((payload.get("data") or {}).get("subtitle") or {}).get("subtitles") or []
+    return [
+        {
+            "lan": s["lan"],
+            "lan_doc": s.get("lan_doc", s["lan"]),
+            "subtitle_url": s.get("subtitle_url", ""),
+            "isAi": s.get("type", 0) == 1,
+        }
+        for s in rawList if s.get("lan") and s.get("subtitle_url")
+    ]
+
+
 async def fetchSubtitles(client, page: BiliPage) -> list[dict]:
     try:
         params: dict = {"cid": page.cid}
@@ -257,16 +279,8 @@ async def fetchSubtitles(client, page: BiliPage) -> list[dict]:
         response = await client.get(url)
         response.raise_for_status()
         payload = await response.json()
-        rawList = ((payload.get("data") or {}).get("subtitle") or {}).get("subtitles") or []
-        return [
-            {
-                "lan": s["lan"],
-                "lan_doc": s.get("lan_doc", s["lan"]),
-                "subtitle_url": s.get("subtitle_url", ""),
-                "isAi": s.get("type", 0) == 1,
-            }
-            for s in rawList if s.get("lan") and s.get("subtitle_url")
-        ]
+        # 消疑层（影子模式，默认关）：字幕字典变换已下沉到 subtitleList
+        return subtitleList(payload)
     except Exception:
         logger.opt(exception=True).debug("Failed to fetch subtitles for cid={}", page.cid)
         return []
