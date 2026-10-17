@@ -1474,3 +1474,63 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    （为 Phase 8 桥接铺路）。
 2. 之后暂停/删除接真实语义（Phase 8 桥接一体考虑）→ 引擎状态桥接
    → Python UI 停用 + AGENT-DONE。
+
+## 第 36 步 — Aria2 RPC 兼容组四简版卡（cfg.py:277-280）
+
+- 时间：2026-10-17 07:40（date 实取；代码提交 `531870e`）
+
+### 改动
+
+- `ui/settings_page.slint`：4 in-out（aria2Enabled/aria2RpcPort/
+  aria2RpcToken/aria2EmulateFingerprint）+ 4 回调 + 四卡
+  （头注释更新为第 32-36 步）。
+- `ui/appwindow.slint`：同名 4 属性 + 4 回调 + 12 行透传。
+- `src/lib.rs`：
+  - push_settings 尾部四组 set（缺省=cfg.py 口径：F/16800/""/F）。
+  - SettingsActions 增 `aria2_enabled` / `aria2_rpc_port`
+    （收 i64 配置单位，division=1 直接透传）/ `aria2_rpc_token`
+    （收原样串，Python 端 cfg.set 不 trim）/ `aria2_emulate_fingerprint`。
+  - install 层四注册（RPC 监听真启停等对齐留引擎桥接步）。
+
+### 键位实证（cfg.py:277-280）
+
+- `isAria2RpcEnabled` 缺省 False；`aria2RpcPort` RangeConfigItem
+  缺省 16800、RangeValidator(1024, 65535)、singleStep=1、division=1
+  显示=配置值；`aria2RpcToken` ConfigItem 缺省 ""（无校验/不 trim）；
+  `aria2RpcEmulateFingerprint` 缺省 False。
+- 令牌卡镜像 LineEditSettingCard（setting_cards.py:118-145）：
+  placeholder「可选」、PasswordLineEdit → `input-type: password`、
+  editingFinished 落盘——**已知轻微分歧**（同代理卡）：slint
+  edited+accepted 均回发、install 层每次写（更新鲜，等价安全；
+  slint LineEdit 无失焦 finishing 事件）。
+
+### 本步实证
+
+- >80 行文件按运营提示走「全量重写（两个 slint）+ 替换脚本
+  （lib.rs，9 处锚点全部唯一命中一次通过）」，**本步零 Edit 事故**
+  （对标此前 Edit ops 连环坑，实测脚本路线稳定）。
+- 无新 widget 类型：SpinBox/Switch/LineEdit(password) 均复用已实证
+  模式；settings_page.slint 后缀惯例（本卡无单位后缀）。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 一次通过。
+- `timeout 1200 cargo test -p gd3-ui`：**28 passed**（本步扩展现有
+  settings smoke 而非新增测试函数：四键有值推送 Enabled=T/Port=
+  10800/Token="secret"/Emulate=T、缺省容错 16800 等、令牌
+  invoke_aria2RpcTokenChanged 通路断言）。0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 37 步候选：浏览器扩展组五卡（browserPairTokenCard/
+   chromiumInstallCard PrimaryPush 需动作骨架、browserPortCard
+   SpinBox 1764-65527 先验、browserEnableCard Switch、草稿模式
+   Switch），或 GeneralDownload 组收尾（HistoryDownloadFolder/
+   clientProfileCard/HeadersPresetSettingCard 复杂卡先验）。
+2. 之后暂停/删除接真实语义（Phase 8 桥接一体考虑）→ 引擎状态桥接
+   → Python UI 停用 + AGENT-DONE。
