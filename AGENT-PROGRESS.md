@@ -2081,3 +2081,84 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    /CategoryEditDialog → Slint Dialog，含名称校验与 categories
    重推镜像）；或暂停/删除真实语义（Phase 8 桥接一体化评估）。
 2. 之后：引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
+
+## 第 45 步：分类添加/编辑对话框骨架（app/view/dialogs/category_edit.py）
+
+- 时间：2026-10-17 09:35（date 实取；代码提交 `ccd9dda`）
+
+### 改动
+
+- `src/category.rs`（+99 行）：
+  - `ICON_CHOICES` 25 项逐字（category_edit.py:17-23）；push 推
+    `[string]` 模型供 ComboBox；
+  - `draft_to_rule` 镜像 `CategoryEditDialog.category()`（93-110）：
+    名称 strip 空兜「未命名分类」；扩展名逐 token strip→去点→
+    小写、空 token 丢弃、**不去重**（TokenLineEdit tokens 口径：
+    回车/空格逐 token 实证 token_line_edit.py:99-108——每输入一段
+    提交一个 token；简版改为逗号分隔 LineEdit）；folder strip 空
+    兜 None；icon 兜 DOCUMENT（与 fromDict 同口径）；CategoryRule
+    derive Clone（smoke 命中 vec 需要）；
+  - **差异记录**：Qt 侧「显示名未改动则保留原文名」依赖
+    QCoreApplication.translate 翻译层，Rust 无译文层直接采用所
+    填名称（注释自述）；
+  - 2 单测：draft 归一化（含不去重口径）+ ICON_CHOICES 长度/端点。
+- `ui/settings_page.slint`（python 脚本 6 处锚点全中）：
+  `CategoryEditDraft` 结构（id 空串=添加镜像 Dialog(category=None)）
+  + 覆盖层七属性（choices/visible/id/name/iconIndex/extensions/
+  folder）+ 四回调（add/editRequested/closed/accepted(Draft)）+
+  行内「编辑」按钮 + 尾行「添加分类」按钮 + 内嵌覆盖层骨架（
+  标题「添加分类/编辑分类」按 id 分支；占位文案逐字含「{default}」
+  字面量）。
+- `ui/appwindow.slint`：草稿结构导入 + 七属性四回调透传。
+- `src/lib.rs`（锚点 7 组）：push 推送 ICON_CHOICES；
+  `open_category_edit` 直写两态助手（带值 findData 预选镜像——
+  未知 icon 落首项；None=添加置空置可见）；SettingsActions 增
+  `category_add_requested`/`category_edit_requested`/`category_edit_
+  closed`/`category_edit_submit`（确定收 draft_to_rule 归一化产物，
+  cfg 写与 categoriesChanged 重推归调用方）；smoke 增 choices 25
+  项/覆盖层收起缺省断言 + invoke 添加/编辑/确定（归一化产物逐
+  字段断言）/取消通路 + open_category_edit 两态独立冒烟（含未知
+  icon 落首项）。
+
+### 新事实（影响后续步骤）
+
+- **Slint 字面量花括号坑**：`{...}` 即插值；转义 `\{` 实测不被
+  识别（报 Unknown unqualified identifier 'default'），`\u{7b}`/
+  `\u{7d}` 可行——占位文案「{default}」以 unicode 转义书写。
+- **内嵌覆盖层形态**：MessageBoxBase 弹窗骨架暂以内嵌
+  Rectangle（rgba 背景 + 100% 宽高）替代，弹窗/焦点管理留布局步；
+  HeadersPresetEditDialog/IdentityPresetEditDialog 同套骨架复用
+  留下一步。
+- smoke invoke 段的窗口是未 push 的全新实例——行模型断言须在有
+  值推送窗口内做，invoke 段用字面 id（E0716 row_data 临时值
+  同段修）。
+
+### 工具坑增量
+
+- category.rs 函数注释 `//!` 混用报 E0753（inner doc only before
+  items），统一 `///`。
+- 覆盖层插入首版多一个闭合括号 → parse error at 787，删一行复原。
+- heredoc 写 python 补丁脚本因三引号内容含特殊序列失败（且
+  主脚本已先行执行）——补丁改用 Write 工具落盘脚本文件，避免
+  shell heredoc 承载复杂字面量。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui
+  --all-targets -- -D warnings` 通过。
+- `timeout 1200 cargo test -p gd3-ui`：**40 → 43 passed**
+  （category.rs 2 单测 + open_category_edit 冒烟并入）。0 failed。
+- post-write diff 复核：category.rs/slint×2/lib.rs 与设计一致，
+  无夹带；坏 token 扫描零命中。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 46 步候选：HeadersPresetEditDialog/IdentityPresetEditDialog
+   同套覆盖层骨架复用（名称+headers/hosts 行编辑器；名称校验与
+   「重名拒绝」镜像）；或暂停/删除真实语义（Phase 8 桥接一体化
+   评估）。
+2. 之后：引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
