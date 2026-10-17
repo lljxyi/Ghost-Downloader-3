@@ -46,6 +46,22 @@ pub fn set_task_rows(window: &AppWindow, rows: Vec<TaskRow>) {
     window.set_tasks(model);
 }
 
+/// 推流路径：`Vec<TaskRecord>` → TaskRow 文案 → model 装配。
+///
+/// `is_seeding` 由调用方给定（isSeeding 是运行时属性、不在记录里），
+/// 这里只做「快照 → 文案 → 行」的桥。
+pub fn push_task_records(
+    window: &AppWindow,
+    records: &[gd3_core::task::TaskRecord],
+    is_seeding: impl Fn(&gd3_core::task::TaskRecord) -> bool,
+) {
+    let rows: Vec<TaskRow> = records
+        .iter()
+        .map(|record| row::to_task_row_with(record, is_seeding(record)))
+        .collect();
+    set_task_rows(window, rows);
+}
+
 #[cfg(test)]
 mod smoke {
     use slint::Model;
@@ -88,5 +104,40 @@ mod smoke {
         let second = model.row_data(1).expect("次行缺失");
         assert_eq!(second.taskId, "tsk_2");
         assert_eq!(second.statusText, "正在下载");
+    }
+
+    /// 端到端推流：TaskRecord（磁盘同态 JSON 构造）→ push_task_records
+    /// → Slint model 逐行核对文案。
+    #[test]
+    fn push_task_records_shapes_records_into_rows_headless() {
+        use gd3_core::task::TaskRecord;
+        use serde_json::json;
+
+        let records: Vec<TaskRecord> = serde_json::from_value(json!([
+            {
+                "name": "a.bin", "url": "https://example/1", "packId": "pack",
+                "taskId": "tsk_a", "status": "RUNNING", "fileSize": 4096,
+                "steps": [
+                    {"stepIndex": 0, "progress": 30, "speed": 512, "receivedBytes": 384},
+                    {"stepIndex": 1, "progress": 70, "speed": 512, "receivedBytes": 128},
+                ],
+            },
+            {
+                "name": "b.iso", "url": "https://example/2", "packId": "pack",
+                "taskId": "tsk_b", "status": "COMPLETED", "fileSize": 1048576,
+            },
+        ]))
+        .expect("TaskRecord 数组反序列化失败");
+        let window = crate::create_headless();
+        crate::push_task_records(&window, &records, |record| record.task_id == "tsk_b");
+        let model = window.get_tasks();
+        assert_eq!(model.row_count(), 2);
+        let first = model.row_data(0).expect("首行缺失");
+        assert_eq!(first.taskId, "tsk_a");
+        assert_eq!(first.statusText, "1.00 KB/s · 512.00 B / 4.00 KB · 3s");
+        assert_eq!(first.progressText, "512.00 B/4.00 KB");
+        let second = model.row_data(1).expect("次行缺失");
+        assert_eq!(second.statusText, "做种中");
+        assert_eq!(second.progressText, "1.00 MB");
     }
 }

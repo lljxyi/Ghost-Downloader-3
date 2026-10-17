@@ -222,26 +222,55 @@ wc -l /root/baseline-failures.txt
 跑测试时**别只 `tail -1`**：摘要行会被 `ResourceWarning` 之类的东西挤掉，
 要留失败明细就用 `2>&1 | grep -E '^(FAILED|ERROR)|passed|failed'`。
 
-### 2. 改文件别用「反复 Edit 猜行号」
+### 2. 改文件：超过 80 行禁止用 Edit（硬规则，不是建议）
 
-Edit 工具的行号锚点很容易失效，本项目里已经多次因此整回合中止
-（错误码 `MUTATION_RETRY_BUDGET_EXHAUSTED`）。优先级：
+**对超过 80 行的文件，禁止使用 Edit 工具。** 只能二选一：
 
-1. **整块重写文件**（最稳）；
-2. 用脚本做**精确字符串替换 + 唯一性断言**，例如：
+- **A. 整块重写**（Write 整个文件，最稳）；
+- **B. 精确字符串替换脚本**（带唯一性断言，见下方模板）。
+
+小文件（≤80 行）可以用 Edit，但**每改一处必须立刻重读文件**再算下一处行号。
+
+#### 为什么是硬规则
+
+截至第 23 步，Edit 锚点失效已经造成 **11 个回合整回合中止**
+（错误码 `MUTATION_RETRY_BUDGET_EXHAUSTED`），波及
+`hls.rs`（2 次）、`ed2k.rs`、`github.rs`、`ftp.rs`、`hf.rs`、
+`gd3-py/src/lib.rs`、`gd3-net/src/lib.rs`、`AGENT-PROGRESS.md`。
+
+每中止一次 = 一个回合白费 + 上下文重建 + 可能触发一次模型切换。
+这是本项目目前**唯一持续的效率损耗**，所以不再作为建议。
+
+#### 替换脚本模板（复制即用）
 
 ```bash
 python3 - <<'PY'
 from pathlib import Path
-p = Path("some/file.rs")
+
+p = Path("rust/crates/gd3-net/src/foo.rs")
 text = p.read_text(encoding="utf-8")
-old = "精确的原文片段"
-assert text.count(old) == 1, f"锚点匹配 {text.count(old)} 次"
-p.write_text(text.replace(old, "新内容"), encoding="utf-8")
+
+edits = [
+    ("旧片段1", "新片段1"),
+    ("旧片段2", "新片段2"),
+]
+
+for i, (old, new) in enumerate(edits, 1):
+    n = text.count(old)
+    assert n == 1, f"第 {i} 处锚点匹配 {n} 次，中止"
+    text = text.replace(old, new)
+
+p.write_text(text, encoding="utf-8")
+print("OK")
 PY
 ```
 
-3. 实在要用 Edit，就**每次改完立刻重读文件**再算下一处行号。
+要点：
+
+1. **一个脚本改多处**，减少工具调用次数；
+2. `assert n == 1` 是关键——锚点不唯一就立刻停下，而不是猜；
+3. 改完马上跑 `cargo fmt && cargo test`，不要攒着；
+4. 新建文件用 Write，不要用 Edit 从空文件开始。
 
 ### 3. 进度笔记是硬要求
 

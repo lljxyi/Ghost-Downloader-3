@@ -859,3 +859,30 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    records 构造到 getter round-trip。
 2. 列表页交互回调逐个接：暂停/删除/分类筛选。
 3. 之后设置页 → 引擎状态桥接。
+
+## 第 25 步（2026-10-17 05:00；Phase 7b 推流路径）【完成】
+
+### records → rows → model 装配一条龙（push_task_records）
+
+- **src/lib.rs** 新增 `pub fn push_task_records(&AppWindow,
+  &[TaskRecord], is_seeding: impl Fn(&TaskRecord) -> bool)`：
+  `gd3_core::task::TaskRecord` → `row::to_task_row_with` →
+  `set_task_rows` 的端到端推流桥梁，`is_seeding` 决策留给调用方
+  （isSeeding 是运行时属性，维持第 24 步分层不变）。
+- smoke 新增端到端测试
+  `push_task_records_shapes_records_into_rows_headless`：磁盘同态
+  JSON 构造 RUNNING（steps 512+512/384+128）+ COMPLETED 两条记录
+  → push（tsk_b 判做种）→ getter 逐行核对 statusText=
+  "1.00 KB/s · 512.00 B / 4.00 KB · 3s" / "做种中"、progressText=
+  "512.00 B/4.00 KB" / "1.00 MB"。**9 passed**（8→9）。
+- 质量门：`cargo fmt --all`（小改）、clippy -D warnings 干净、
+  `timeout 1200 cargo test -p gd3-ui` 9 passed。
+
+### 工具坑（本步实证）
+
+- **CUT/PUT 行号定位必须先 Read 拿准确行号**：凭旧 review 快照
+  猜「块尾 } 在 105.106」实际删到的是测试尾部两条 assert，
+  被迫两轮回滚修正。教训：写 ops 前一律 Read 尾部拿活行号，
+  且 confirm 的 review diff 显示的顺序（add 在后）不代表文件
+  实际行序。
+
