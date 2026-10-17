@@ -2874,3 +2874,162 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
      `isExisting` 走文件系统、`completedAt` 走本地时区）。
   3. 按 `VPS-MIGRATION.md` 的 P0→P6 表继续。
 - 卡点：无
+
+## 第 54 步（commit `1c6d21f`）
+- 做了什么：
+  - 新 `gd3-core/src/queue.rs`（282 行，7 个单测）：镜像
+    `app/services/task_service.py` 的 `TaskQueue`。
+    - `wait`（去重追加）/ `cancel`（waiting 移除首个 + running retain）/
+      `run`（已有键**就地改 workId 保持插入位**）/ `done` / `work_id_of` /
+      `is_running` / `is_waiting` / `waiting_order` / `move_to_front` /
+      `running_count` / `running_ids` / `next_waiting`。
+    - `move_to_front` 的目标顺序取**等待队列自身顺序**（不是参数顺序），
+      全删后 `splice(0..0, targets)`。
+    - `overflow_ids(max)` = `running[max..]`（`max >= len` 给空）。
+    - `next_to_dispatch(&mut self, max)`：**会从 `waiting` 头部弹出**，
+      `while running.len() + popped.len() < max`（`run()` 由调用方在拿到 id
+      之后才调，所以要用 popped 长度补占位）。
+    - `rebalance(&mut self, max, can_pause)`：遍历 `overflow_ids` 快照 →
+      `cancel` + `wait`（追加尾部）→ 返回 moved。**不自己 pump**（`workId`
+      只有调用方拿得到）。
+  - `gd3-core/src/lib.rs`：`pub mod queue;`（字母序在 `m3u8` 与 `pair_token`
+    之间）+ `pub use queue::TaskQueue;`。
+  - 金文件 `gd3-core/tests/fixtures/task_queue.jsonl`（**18 条**）+
+    `generate_task_queue_fixture.py`（跑真 `TaskQueue`，14 种 op；`pump` /
+    `rebalance` 用本地函数照抄 `_pump` / `_rebalance` 循环体 + 假派发器
+    `queue.run(tid, f"w{n}")`；每 case 记 `results` + `final{waiting, running}`）。
+  - `gd3-core/tests/queue.rs`：`Replay { queue, serial }` 逐 op 回放 +
+    `snapshot()` 末态比对 + `EXPECTED_CASES = 18`；另加
+    `next_to_dispatch_pops_from_head_within_limit`。
+  - `gd3-ui/src/card.rs`：`pub enum ToggleAction { StopSeeding, StartSeeding,
+    Pause, Start }` + `pub fn toggle_action(status, is_seeding)`
+    （`isSeeding` 优先于 `COMPLETED` 的短路链，镜像 `_onToggleClicked`）。
+  - 金文件 `gd3-ui/tests/fixtures/toggle.jsonl`（**10 条** = 5 状态 ×
+    2 `isSeeding`）+ `generate_toggle_fixture.py`（把真 `_onToggleClicked` 绑到
+    `FakeCard` 上跑，`FakeService` 记录被调方法名，`refresh()` 计数）。
+  - 金文件实测：`WAITING/PAUSED/FAILED × false → start`；`RUNNING × false →
+    pause`；`COMPLETED × false → startSeeding`；**所有 `isSeeding=true` →
+    stopSeeding**。
+- 决策与理由：
+  - **`next_to_dispatch` 必须「弹出」而非「只读」**——初版写成纯读
+    （`waiting.iter().take(room)`），金文件 `pump-under-limit` 立刻暴露：
+    Python `_pump` 每轮 `nextWaiting()` 会真把 id 从 `_waiting` 摘掉。这是
+    金文件抓出的**第二处真实语义偏差**。
+  - **`rebalance` 只做「退回等待队列」不做随后的 `_pump`**——`_pump` 需要
+    `workId`，只有调用方拿得到，所以 `rebalance` 返回 moved、调用方自己接着
+    `next_to_dispatch`。
+  - **`toggle_action` 放在 `card.rs`**——它是 `_onToggleClicked` 的分派逻辑，
+    与 `toggle_button` 同源；不接服务层，只返回枚举。
+  - **单测里构造「运行中」必须走 `next_waiting` + `run` 两步**——直接 `run()`
+    不会把 id 从 `waiting` 里摘掉（Python 亦然），第一版单测因此把
+    `next_to_dispatch` 的期望算错。
+- 验证：
+  - `cargo fmt --all --check` 通过。
+  - `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**246 passed**（237 → 246）。
+  - `cargo test -p gd3-ui`：**88 passed**（87 → 88）。
+  - Python 全量：**3 failed, 1347 passed, 8 skipped, 35 errors**，= 基线。
+- 下一步：
+  1. 引擎状态桥接：`CardRuntime` / `DrawerRuntime` 的供给方（`isExisting` 走
+     文件系统、`completedAt` 走本地时区、`canPause` 走 steps 遍历）。
+  2. 暂停/删除/继续的真实语义（`toggle_action` → 服务层调用）。
+  3. 按 `VPS-MIGRATION.md` 的 P0→P6 表继续。
+- 卡点：无
+
+## 第 55 步（commit 待填）
+- 做了什么：
+  - 新 `gd3-core/src/path.rs`（126 行，4 个单测）：镜像 `pathlib.PurePosixPath`
+    的两条口径。
+    - `posix_join(folder, name)`：镜像 `str(Path(folder) / name)`——空组件与
+      `.` 组件丢弃、重复斜杠压成一个、**恰好两个**前导斜杠保留（`//Downloads/n`）、
+      `..` 不消解。`std::path::Path::join` 一条都不管，所以手写。
+    - `posix_stem(name)`：镜像 `PurePosixPath(name).stem`（`a.tar.gz` → `a.tar`）。
+      跟本项目的 `filename::split_stem_ext`（`("a", ".tar.gz")`）不是一回事。
+    - **仅覆盖 POSIX 口径**——迁移目标是 Linux，`tasks.jsonl` 里的 `outputFolder`
+      也是 Python `PosixPath` 写出来的。
+  - `gd3-core/src/lib.rs`：`pub mod path;` + `pub use path::posix_join;`。
+  - `gd3-core/src/task.rs`：
+    - 新 `pub fn short_type_name(type_name: &str) -> &str`（全名取最后一段，
+      裸类名原样返回——旧 `tasks.jsonl` 只存裸类名）。
+    - `impl TaskRecord` 增 `is_output_folder()` / `output_path()` / `short_type_name()`。
+      `output_path()` 镜像 `Task.outputPath = str(outputFolder / name)`，唯一被
+      覆盖的是 `BilibiliTask`（`isOutputFolder` 时取 `outputFolder / Path(name).stem`）。
+  - 新 `gd3-ui/src/facts.rs`（523 行，11 个单测）：任务运行时事实的供给方。
+    - 类属性登记表：`TaskKind{can_seed, has_output_file}`、
+      `SEEDING_TASKS = ["BTTask","ED2kTask"]`、
+      `StepPauseRule{Always,Never,RangeRequests,NotLive}`、
+      `NEVER_PAUSE_STEPS`（6）、`RANGE_PAUSE_STEPS`（10）。
+    - `task_kind` / `step_pause_rule` / `task_is_live` / `step_can_pause` /
+      `can_pause`（取**第一个 RUNNING 步骤**，无 RUNNING 则 `True`）。
+    - `is_existing(path)`（`fs::metadata().is_ok()`）/ `completed_at_text`
+      （`completed_at == 0` → `None`，镜像 `elif task.completedAt:` 的假值判断）。
+    - `LiveFacts{is_seeding, last_error}` / `DrawerEnv{utc_offset_seconds,
+      category_enabled, category_name, expected_checksum}` /
+      `card_runtime` / `drawer_runtime`。
+  - 金文件（`gd3-ui/tests/fixtures/`，脚本 `generate_facts_fixture.py` 531 行）：
+    - `task_registry.jsonl`：**29 行**（9 个 Task 含基类 + 20 个 TaskStep 含基类），
+      md5 `590ad13d0ffa1f31e73d0cca15427866`。
+    - `task_facts.jsonl`：**60 条**，md5 `ab1adc51679548022dc94dfb10e197ce`。
+  - `facts.rs` 的两个金文件比对测试：
+    - `registry_matches_python_fixture`：逐条比对全名 + 裸类名两种 tag；再反向断言
+      `SEEDING_TASKS` / `NEVER_PAUSE_STEPS` / `RANGE_PAUSE_STEPS` 里的名字在
+      Python 登记表里仍存在（Python 删类 → 报红）；断言 tasks==9 / steps==20。
+    - `facts_match_python_fixture`：60 条，比对 `can_pause`/`can_seed`/
+      `has_output_file`/`completed_at_text`/`record.output_path()`，外加
+      `drawer_runtime` 的三个同源字段；断言 cases==60。
+  - `lib.rs` 新增端到端冒烟 `facts_runtime_drives_task_rows_headless`：
+    `facts::card_runtime` → `push_task_records` → 断言三行内容
+    （做种包 COMPLETED 输出存在 → PLAY + 三按钮可点 + 「完成于 …」；
+     `HttpTaskStep` 缺 `canUseRangeRequests` → PAUSE 禁用；
+     输出不存在 → 「文件不存在」+ warn + 按钮禁用）。临时文件落在
+    `std::env::temp_dir()/gd3-facts-e2e`。
+- 决策与理由：
+  - **`posix_join` / `posix_stem` 手写，不用 `std::path::Path`**——实测 CPython：
+    `Path("")/"n"` → `n`、`Path(".")/"n"` → `n`、`Path("a//b")/"n"` → `a/b/n`、
+    `Path("//Downloads")/"n"` → `//Downloads/n`、`Path("///x")/"n"` → `/x/n`、
+    `Path("/a/../b")/"n"` → `/a/../b/n`。`Path::join` 一条都不管。
+  - **`posix_stem` 的入参是最后一段组件**，不是整条路径：`Path("a/b.txt").stem`
+    里 `name == "b.txt"`；`.` 与 `..` 在 `name` 阶段已被 `pathlib` 消掉
+    （`Path(".").name == ""`）。实测补了 `..a` → `.`、`a.b.` → `a.b.`、
+    `.a.b` → `.a`、`...` → `...` 四个反直觉用例（初版把 `..a` 的期望写错，
+    被单测抓出来）。
+  - **类属性登记表用手抄 + 金文件钉死**：`canPause` 有 4 种形态（`True` 类属性 /
+    `False` 类属性 / 读 `canUseRangeRequests` 的 property / 读 `not task.isLive`
+    的 property）。生成脚本用 `inspect.getattr_static(cls, "canPause")` 拿原样，
+    property 再读 `fget.__code__.co_names` 判断读的是哪个字段；**都不匹配就让脚本
+    炸掉**，不静默算成 `always`。
+  - **`has_output_file` 恒为 `true`**——`Task._registry` 全量导出显示无任何子类
+    覆盖 `hasOutputFile`；留字段是为了跟 Python 形状对齐。
+  - **`last_error` / `is_seeding` 只能由调用方给**——`step.error` 是 `repr=False`，
+    `fromDict` 之后恒为 `None`（不落盘）；`isSeeding` 是 `init=False` 的进程内状态。
+  - **`task_facts.jsonl` 的 record 由真对象 `toDict()` 出来、expected 由真属性算出**
+    ——脚本不抄算法；`base_record()` 内部走一遍 `fromDict` + `toDict`，把
+    `updateStatus()` 对 `status`/`completedAt`/`fileSize` 的改写一并固化。
+  - **`BTTask` / `FtpTask` 不构造实例**——前者 `__post_init__` 要求 `files` 非 None
+    并求和（实测 `TypeError: 'NoneType' object is not iterable`），后者要求
+    `connectionInfo` 且会 `addStep`。改用 `phantom_task(models, record)`：
+    `object.__new__(cls)` 只填 `name`/`outputFolder`/`completedAt`/`status`/
+    `isLive`/`files`/`steps`，绕开 `__init__`/`__post_init__`，读的仍是**真属性**。
+  - **`M3U8TaskStep` 的 live 用例必须先 `fromDict`（步骤 WAITING）再手工置 RUNNING**
+    ——`M3U8Task.__post_init__` 会把「live + RUNNING」归一成 COMPLETED。
+  - **不出「所有步骤 COMPLETED」的用例**——`updateStatus()` 会往 `completedAt` 写
+    `int(time())`，金文件不稳定。
+  - **`bili-output` 用例的名字必须带扩展名**（`"My Show.mp4"` / `"a.tar.gz"`）——
+    否则多文件 `Path(name).stem` 与单文件 `outputFolder / name` 两条分支结果相同。
+  - **`isExisting` 不进金文件**——取决于跑测试的机器，由 `is_existing_reports_the_
+    filesystem` 单测（`"/"` / 不存在路径 / `""`）覆盖。
+  - **`utcOffset` 作为用例字段显式给出**——生成脚本 `os.environ["TZ"]="UTC"` +
+    `time.tzset()` 让默认偏移恒 0，非零偏移用例（`3600` / `-18000`）用
+    `timezone(timedelta(seconds=off))` 显式算。
+- 验证：
+  - `cargo fmt --all --check` 通过。
+  - `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**250 passed**（246 → 250，
+    +4 个 `path.rs` 单测）。
+  - `cargo test -p gd3-ui`：**100 passed**（88 → 100：`facts.rs` 11 个单测 +
+    1 个端到端冒烟）。
+  - Python 全量：**3 failed, 1347 passed, 8 skipped, 35 errors**，= 基线。
+- 下一步：
+  1. 暂停/删除/继续的真实语义（`toggle_action` → 服务层调用）。
+  2. 按 `VPS-MIGRATION.md` 的 P0→P6 表继续（P1 设置页剩余卡片）。
+- 卡点：无

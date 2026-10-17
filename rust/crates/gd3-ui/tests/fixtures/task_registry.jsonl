@@ -1,0 +1,29 @@
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "BilibiliTask", "type": "bili_pack.task.BilibiliTask"}
+{"canSeed": true, "hasOutputFile": true, "kind": "task", "name": "BTTask", "type": "bittorrent_pack.task.BTTask"}
+{"canSeed": true, "hasOutputFile": true, "kind": "task", "name": "ED2kTask", "type": "ed2k_pack.task.ED2kTask"}
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "FtpTask", "type": "ftp_pack.task.FtpTask"}
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "HttpTask", "type": "http_pack.task.HttpTask"}
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "HuggingFaceTask", "type": "huggingface_pack.task.HuggingFaceTask"}
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "M3U8Task", "type": "m3u8_pack.task.M3U8Task"}
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "YouTubeTask", "type": "yt_dlp_pack.task.YouTubeTask"}
+{"kind": "step", "name": "BilibiliAudioStep", "rule": "range", "type": "bili_pack.task.BilibiliAudioStep"}
+{"kind": "step", "name": "BilibiliCoverStep", "rule": "range", "type": "bili_pack.task.BilibiliCoverStep"}
+{"kind": "step", "name": "BilibiliMergeStep", "rule": "never", "type": "bili_pack.task.BilibiliMergeStep"}
+{"kind": "step", "name": "BilibiliSubtitleStep", "rule": "never", "type": "bili_pack.task.BilibiliSubtitleStep"}
+{"kind": "step", "name": "BilibiliVideoStep", "rule": "range", "type": "bili_pack.task.BilibiliVideoStep"}
+{"kind": "step", "name": "BTTaskStep", "rule": "always", "type": "bittorrent_pack.task.BTTaskStep"}
+{"kind": "step", "name": "BTTorrentFileStep", "rule": "never", "type": "bittorrent_pack.task.BTTorrentFileStep"}
+{"kind": "step", "name": "ED2kTaskStep", "rule": "always", "type": "ed2k_pack.task.ED2kTaskStep"}
+{"kind": "step", "name": "FFmpegResourceStep", "rule": "range", "type": "ffmpeg_pack.task.FFmpegResourceStep"}
+{"kind": "step", "name": "FFmpegStep", "rule": "never", "type": "ffmpeg_pack.task.FFmpegStep"}
+{"kind": "step", "name": "FtpStep", "rule": "range", "type": "ftp_pack.task.FtpStep"}
+{"kind": "step", "name": "HttpTaskStep", "rule": "range", "type": "http_pack.task.HttpTaskStep"}
+{"kind": "step", "name": "HuggingFaceStep", "rule": "range", "type": "huggingface_pack.task.HuggingFaceStep"}
+{"kind": "step", "name": "M3U8TaskStep", "rule": "notLive", "type": "m3u8_pack.task.M3U8TaskStep"}
+{"kind": "step", "name": "YouTubeCoverStep", "rule": "range", "type": "yt_dlp_pack.task.YouTubeCoverStep"}
+{"kind": "step", "name": "YouTubeExtractStep", "rule": "never", "type": "yt_dlp_pack.task.YouTubeExtractStep"}
+{"kind": "step", "name": "YouTubeMergeStep", "rule": "never", "type": "yt_dlp_pack.task.YouTubeMergeStep"}
+{"kind": "step", "name": "YouTubeResourceStep", "rule": "range", "type": "yt_dlp_pack.task.YouTubeResourceStep"}
+{"kind": "step", "name": "YouTubeSubtitleStep", "rule": "range", "type": "yt_dlp_pack.task.YouTubeSubtitleStep"}
+{"kind": "step", "name": "TaskStep", "rule": "always", "type": "app.models.task.TaskStep"}
+{"canSeed": false, "hasOutputFile": true, "kind": "task", "name": "Task", "type": "app.models.task.Task"}

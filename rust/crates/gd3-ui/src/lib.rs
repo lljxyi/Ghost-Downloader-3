@@ -19,6 +19,7 @@ pub mod category;
 pub mod close_mode;
 pub mod conflict;
 pub mod drawer;
+pub mod facts;
 pub mod filter;
 mod format;
 pub mod headers;
@@ -1312,6 +1313,98 @@ mod smoke {
         crate::close_task_drawer(&window);
         assert!(!window.get_drawerVisible());
         assert_eq!(window.get_drawerTaskId(), "");
+    }
+
+    /// 第 55 步端到端：`facts::card_runtime` 供事实 → `push_task_records` 成行。
+    ///
+    /// 锁的是「记录 → 运行时事实（类属性登记表 + 文件系统 + 活状态）→ Slint
+    /// 行」整条链；单点语义由 `facts.rs` 的两份金文件与 `card.rs` 覆盖。
+    #[test]
+    fn facts_runtime_drives_task_rows_headless() {
+        use crate::facts::LiveFacts;
+        use gd3_core::task::TaskRecord;
+        use serde_json::json;
+
+        // 造一个真实存在的输出文件，让 `isExisting(outputPath)` 走到真。
+        let folder = std::env::temp_dir().join("gd3-facts-e2e");
+        std::fs::create_dir_all(&folder).expect("临时目录创建失败");
+        std::fs::write(folder.join("movie.bin"), b"x").expect("临时文件写入失败");
+        let folder = folder.to_string_lossy().into_owned();
+
+        let records: Vec<TaskRecord> = serde_json::from_value(json!([
+            {
+                // 做种包 + COMPLETED + 输出文件存在 → 可做种、三个按钮都可点。
+                "name": "movie.bin", "url": "magnet:?xt=1", "packId": "bittorrent",
+                "taskId": "t_bt", "status": "COMPLETED", "fileSize": 4096,
+                "outputFolder": folder, "completedAt": 1_700_000_000,
+                "type": "bittorrent_pack.task.BTTask",
+            },
+            {
+                // `HttpTaskStep.canPause` 读 `canUseRangeRequests`（缺省 False）
+                // → RUNNING 卡的暂停按钮禁用。
+                "name": "r.bin", "url": "https://e/2", "packId": "http",
+                "taskId": "t_http", "status": "RUNNING", "fileSize": 8192,
+                "outputFolder": folder,
+                "steps": [{
+                    "stepIndex": 0, "status": "RUNNING", "progress": 40,
+                    "speed": 2048, "receivedBytes": 3277,
+                    "type": "http_pack.task.HttpTaskStep",
+                }],
+                "type": "http_pack.task.HttpTask",
+            },
+            {
+                // 输出文件不存在 → `file_missing()` → 「文件不存在」+ 三个按钮全禁用。
+                "name": "gone.bin", "url": "https://e/3", "packId": "http",
+                "taskId": "t_missing", "status": "COMPLETED", "fileSize": 1024,
+                "outputFolder": folder, "completedAt": 1_700_000_000,
+                "type": "http_pack.task.HttpTask",
+            },
+        ]))
+        .expect("TaskRecord 数组反序列化失败");
+
+        let window = crate::create_headless();
+        crate::push_task_records(&window, &records, |record| {
+            crate::facts::card_runtime(record, &LiveFacts::default(), 0)
+        });
+
+        let model = window.get_tasks();
+        assert_eq!(model.row_count(), 3);
+
+        // 做种包：COMPLETED 无做种 → 播放图标；输出存在 → 按钮可点。
+        let bt = model.row_data(0).expect("首行缺失");
+        assert_eq!(bt.taskId, "t_bt");
+        assert_eq!(bt.status, "COMPLETED");
+        assert_eq!(bt.toggleIcon, "PLAY");
+        assert!(bt.toggleEnabled);
+        assert!(bt.checksumEnabled);
+        assert!(bt.openFileEnabled);
+        assert!(!bt.progressVisible);
+        // completedAt 走 `facts` 的时区参数（这里偏移 0）。
+        assert_eq!(bt.statusLine, "完成于 2023-11-14 22:13:20");
+        assert!(!bt.statusWarn);
+
+        // 非做种包 + RUNNING：暂停按钮被 `canUseRangeRequests=False` 禁用。
+        let http = model.row_data(1).expect("次行缺失");
+        assert_eq!(http.taskId, "t_http");
+        assert_eq!(http.toggleIcon, "PAUSE");
+        assert!(!http.toggleEnabled);
+        assert!(!http.statusLineVisible);
+        assert!(http.progressVisible);
+        assert_eq!(http.progressValue, 40);
+        assert_eq!(http.speedText, "2.00 KB/s");
+        assert_eq!(http.etaText, "2s");
+        assert_eq!(http.sizeText, "3.20 KB/8.00 KB");
+        // 非 COMPLETED → 校验/打开文件都不可点。
+        assert!(!http.checksumEnabled);
+        assert!(!http.openFileEnabled);
+
+        // 输出文件不存在：`is_existing` 真的查了文件系统。
+        let missing = model.row_data(2).expect("末行缺失");
+        assert_eq!(missing.taskId, "t_missing");
+        assert_eq!(missing.statusLine, "文件不存在");
+        assert!(missing.statusWarn);
+        assert!(!missing.checksumEnabled);
+        assert!(!missing.openFileEnabled);
     }
 
     /// 第 53 步：抽屉五路回调注册即通路（逐路 `invoke_*` 断言动作被按

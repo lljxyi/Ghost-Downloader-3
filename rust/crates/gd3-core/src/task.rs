@@ -170,6 +170,14 @@ pub struct TaskRecord {
     pub type_name: Option<String>,
 }
 
+/// `type` 标签的最后一段。
+///
+/// Python `_typeByName` 用全名查登记表，查不到时按 `cls.__name__` 兜底
+/// （`app/models/serialization.py`），等价于「只认最后一段」。
+pub fn short_type_name(type_name: &str) -> &str {
+    type_name.rsplit('.').next().unwrap_or(type_name)
+}
+
 fn is_selected() -> bool {
     true
 }
@@ -207,6 +215,34 @@ impl TaskRecord {
             .iter()
             .find(|file| file.index == file_index)
             .is_some_and(|file| file.selected)
+    }
+
+    /// `Task.isOutputFolder`：`len(files or []) > 1`。
+    pub fn is_output_folder(&self) -> bool {
+        self.files.as_ref().is_some_and(|files| files.len() > 1)
+    }
+
+    /// `Task.outputPath`：`str(Path(outputFolder) / name)`。
+    ///
+    /// 走 `path::posix_join` 而不是 `Path::join`——`pathlib` 会丢空组件与
+    /// `.`、保留恰好两个前导斜杠，`Path::join` 不会。
+    ///
+    /// `BilibiliTask` **覆盖**了它：多文件（`isOutputFolder`）时取
+    /// `outputFolder / Path(name).stem`——分集任务下载到以任务名（去掉扩展名）
+    /// 命名的目录里。
+    pub fn output_path(&self) -> String {
+        if self.is_output_folder() && self.short_type_name() == Some("BilibiliTask") {
+            return crate::path::posix_join(
+                &self.output_folder,
+                crate::path::posix_stem(&self.name),
+            );
+        }
+        crate::path::posix_join(&self.output_folder, &self.name)
+    }
+
+    /// `type` 标签的最后一段（旧文件可能只存裸类名）。
+    pub fn short_type_name(&self) -> Option<&str> {
+        self.type_name.as_deref().map(short_type_name)
     }
 
     /// 把 Step 的字节数与完成情况汇总回 TaskFile。
