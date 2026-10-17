@@ -408,6 +408,38 @@ pub fn open_file_button(task: &CardTask) -> ButtonState {
     }
 }
 
+/// `_onToggleClicked` 的四路分派结果（第 54 步）。
+///
+/// Python 侧是**按顺序**判的短路链，顺序本身有语义：
+/// `isSeeding` 优先于 `COMPLETED`，所以「已完成且正在做种」的卡片点一下是
+/// **停止做种**，不是开始做种。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToggleAction {
+    /// `isSeeding` → `taskService.stopSeeding()`
+    StopSeeding,
+    /// `status == COMPLETED` → `taskService.startSeeding()`
+    StartSeeding,
+    /// `status == RUNNING` → `taskService.pause()`
+    Pause,
+    /// 其余（WAITING / PAUSED / FAILED）→ `taskService.start()`
+    Start,
+}
+
+/// 镜像 `TaskCard._onToggleClicked` 的状态分派。
+///
+/// 只做分派，不动任务也不刷新卡片——那两件事要服务层与视图，归调用方。
+pub fn toggle_action(status: TaskStatus, is_seeding: bool) -> ToggleAction {
+    if is_seeding {
+        ToggleAction::StopSeeding
+    } else {
+        match status {
+            TaskStatus::Completed => ToggleAction::StartSeeding,
+            TaskStatus::Running => ToggleAction::Pause,
+            TaskStatus::Waiting | TaskStatus::Paused | TaskStatus::Failed => ToggleAction::Start,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,5 +854,52 @@ mod tests {
         let mut folder = task(TaskStatus::Completed);
         folder.has_output_file = false;
         assert!(open_file_button(&folder).enabled);
+    }
+
+    /// `_onToggleClicked` 的四路分派（`toggle.jsonl`）：金文件跑真
+    /// `TaskCard._onToggleClicked`，记录被调用的服务方法名。
+    #[test]
+    fn toggle_action_matches_python_fixture() {
+        fn status_of(name: &str) -> TaskStatus {
+            match name {
+                "WAITING" => TaskStatus::Waiting,
+                "RUNNING" => TaskStatus::Running,
+                "PAUSED" => TaskStatus::Paused,
+                "COMPLETED" => TaskStatus::Completed,
+                "FAILED" => TaskStatus::Failed,
+                other => panic!("未知状态：{other}"),
+            }
+        }
+
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/toggle.jsonl");
+        let text = std::fs::read_to_string(&path).expect("toggle.jsonl 缺失");
+        let mut cases = 0;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let case: Value = serde_json::from_str(line).expect("toggle.jsonl 行不是合法 JSON");
+            let status = status_of(case["status"].as_str().expect("缺 status"));
+            let is_seeding = case["isSeeding"].as_bool().expect("缺 isSeeding");
+            let calls: Vec<String> = case["calls"]
+                .as_array()
+                .expect("缺 calls")
+                .iter()
+                .map(|value| value.as_str().expect("calls 元素不是字符串").to_string())
+                .collect();
+            let expected = match toggle_action(status, is_seeding) {
+                ToggleAction::StopSeeding => "stopSeeding",
+                ToggleAction::StartSeeding => "startSeeding",
+                ToggleAction::Pause => "pause",
+                ToggleAction::Start => "start",
+            };
+            assert_eq!(
+                calls,
+                vec![expected.to_string()],
+                "status={status:?} isSeeding={is_seeding}"
+            );
+            // `_onToggleClicked` 末尾无条件 `self.refresh()` 一次。
+            assert_eq!(case["refreshed"], 1);
+            cases += 1;
+        }
+        assert_eq!(cases, 10, "toggle.jsonl 用例数变了");
     }
 }

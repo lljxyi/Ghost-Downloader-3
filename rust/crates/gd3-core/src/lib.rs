@@ -12,6 +12,7 @@ pub mod hls;
 pub mod http_pack;
 pub mod m3u8;
 pub mod pair_token;
+pub mod queue;
 pub mod store;
 pub mod task;
 pub mod task_error;
@@ -22,6 +23,7 @@ pub use container::{
 };
 pub use filename::{DEFAULT_MAX_FILENAME_LENGTH, split_stem_ext, to_safe_filename};
 pub use ghd::PartRecord;
+pub use queue::TaskQueue;
 pub use store::{LoadOutcome, load_records, save_records, to_line};
 pub use task::{Progress, TaskFile, TaskRecord, TaskStatus, TaskStep};
 pub use task_error::{CANCELLED_MESSAGE, TaskError};

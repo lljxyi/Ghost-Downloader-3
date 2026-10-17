@@ -1,0 +1,10 @@
+{"status": "WAITING", "isSeeding": false, "calls": ["start"], "refreshed": 1}
+{"status": "WAITING", "isSeeding": true, "calls": ["stopSeeding"], "refreshed": 1}
+{"status": "RUNNING", "isSeeding": false, "calls": ["pause"], "refreshed": 1}
+{"status": "RUNNING", "isSeeding": true, "calls": ["stopSeeding"], "refreshed": 1}
+{"status": "PAUSED", "isSeeding": false, "calls": ["start"], "refreshed": 1}
+{"status": "PAUSED", "isSeeding": true, "calls": ["stopSeeding"], "refreshed": 1}
+{"status": "COMPLETED", "isSeeding": false, "calls": ["startSeeding"], "refreshed": 1}
+{"status": "COMPLETED", "isSeeding": true, "calls": ["stopSeeding"], "refreshed": 1}
+{"status": "FAILED", "isSeeding": false, "calls": ["start"], "refreshed": 1}
+{"status": "FAILED", "isSeeding": true, "calls": ["stopSeeding"], "refreshed": 1}
