@@ -19,6 +19,7 @@ pub mod conflict;
 pub mod filter;
 mod format;
 pub mod headers;
+pub mod identity;
 pub mod profile;
 pub mod proxy;
 pub mod row;
@@ -257,6 +258,20 @@ pub fn push_settings(
             .unwrap_or(0) as i32,
     );
     window.set_headersPresetCanRemove(headers_presets.len() > 1);
+    // 第 43 步：身份预设列表（cfg.py:334-340 实证：缺键 → 百度网盘
+    // 客户端预设；读盘仅 JSON 反序列化不过 validator.correct，镜像在
+    // identity.rs；行结构镜像 PresetRowWidget——名称/三段描述/开关）。
+    let identity_presets = identity::parse_presets(config.get_str("Network", "IdentityPresets"));
+    window.set_identityPresets(slint::ModelRc::new(slint::VecModel::from(
+        identity_presets
+            .iter()
+            .map(|preset| IdentityPresetData {
+                name: preset.name.as_str().into(),
+                desc: identity::row_desc(preset).into(),
+                enabled: preset.is_enabled,
+            })
+            .collect::<Vec<_>>(),
+    )));
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
     // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
     // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
@@ -338,6 +353,11 @@ pub struct SettingsActions {
     // 索引调整、删除确认框归调用方，镜像 _onPick/_onRemoveClicked）。
     pub headers_preset_pick: Box<dyn Fn(i64)>,
     pub headers_preset_remove: Box<dyn Fn(i64)>,
+    // 第 43 步：身份预设动作——开关收 (索引, bool)、删除收当前索引
+    // （cfg 写、索引边界检查、删除确认框归调用方，镜像
+    // _onToggled/_onRemoveClicked；编辑/添加对话框留欠账步）。
+    pub identity_preset_toggle: Box<dyn Fn(i64, bool)>,
+    pub identity_preset_remove: Box<dyn Fn(i64)>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
     pub url_scheme_enabled: Box<dyn Fn(bool)>,
@@ -467,6 +487,16 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     let headers_remove = actions.clone();
     window
         .on_headersPresetRemoveRequested(move |i| (headers_remove.headers_preset_remove)(i as i64));
+    // 第 43 步：身份预设注册（索引越界检查归调用方，镜像 Python
+    // `if index < 0 or index >= len(presets): return` 守卫）。
+    let identity_toggle = actions.clone();
+    window.on_identityPresetToggled(move |i, checked| {
+        (identity_toggle.identity_preset_toggle)(i as i64, checked)
+    });
+    let identity_remove = actions.clone();
+    window.on_identityPresetRemoveRequested(move |i| {
+        (identity_remove.identity_preset_remove)(i as i64)
+    });
     // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
     // 开机启动注册归引擎桥接步）。
     let url_scheme = actions.clone();
@@ -762,6 +792,16 @@ mod smoke {
                 {"name":"B","headers":{"y-b":"2","z-c":"3"}}]"#,
         );
         config.set_str("Network", "CurrentHeadersPreset", "1");
+        // 第 43 步：身份预设（JSON 列表两项：完整百度预设 + 精简项）。
+        config.set_str(
+            "Network",
+            "IdentityPresets",
+            r#"[{"name":"百度","clientProfile":"chrome",
+                 "userAgent":"pan.baidu.com","hosts":["h1","h2","h3","h4"],
+                 "isEnabled":false},
+                {"name":"B","clientProfile":"raw","userAgent":"",
+                 "hosts":[]}]"#,
+        );
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -809,6 +849,21 @@ mod smoke {
         assert_eq!(window.get_headersPresetIndex(), 1);
         assert_eq!(window.get_headersPresetHeaderCount(), 2);
         assert!(window.get_headersPresetCanRemove());
+        // 第 43 步：有值推送（行模型逐行核对：名称/描述/开关）。
+        let identity_rows = window.get_identityPresets();
+        assert_eq!(identity_rows.row_count(), 2);
+        assert_eq!(identity_rows.row_data(0).as_ref().unwrap().name, "百度");
+        assert_eq!(
+            identity_rows.row_data(0).as_ref().unwrap().desc,
+            "h1, h2, h3 · Chrome（最新） · pan.baidu.com"
+        );
+        assert!(!identity_rows.row_data(0).as_ref().unwrap().enabled);
+        assert_eq!(identity_rows.row_data(1).as_ref().unwrap().name, "B");
+        assert_eq!(
+            identity_rows.row_data(1).as_ref().unwrap().desc,
+            "不模拟（原样发送）"
+        );
+        assert!(identity_rows.row_data(1).as_ref().unwrap().enabled);
         // 第 38 步：有值推送（urlScheme=F / 更新=F / 自启=T /
         // CloseMode="Quit"→索引 2 / 剪贴板=F）。
         assert!(!window.get_urlSchemeEnabled());
@@ -871,6 +926,18 @@ mod smoke {
         assert_eq!(window.get_headersPresetIndex(), 0);
         assert_eq!(window.get_headersPresetHeaderCount(), 8);
         assert!(!window.get_headersPresetCanRemove());
+        // 第 43 步：缺省容错（缺键 → 百度网盘客户端预设单行，启用）。
+        let identity_rows = window.get_identityPresets();
+        assert_eq!(identity_rows.row_count(), 1);
+        assert_eq!(
+            identity_rows.row_data(0).as_ref().unwrap().name,
+            "百度网盘客户端"
+        );
+        assert_eq!(
+            identity_rows.row_data(0).as_ref().unwrap().desc,
+            "*.pcs.baidu.com · 不模拟（原样发送） · pan.baidu.com"
+        );
+        assert!(identity_rows.row_data(0).as_ref().unwrap().enabled);
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -890,6 +957,9 @@ mod smoke {
         // 第 42 步：标头预设动作命中记录。
         let headers_pick_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let headers_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 43 步：身份预设动作命中记录。
+        let identity_toggle_hits: Rc<RefCell<Vec<(i64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
+        let identity_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -966,6 +1036,15 @@ mod smoke {
             }),
             headers_preset_remove: Box::new({
                 let h = headers_remove_hits.clone();
+                move |i| h.borrow_mut().push(i)
+            }),
+            // 第 43 步：身份预设动作（开关收 (索引, bool) 验证通路）。
+            identity_preset_toggle: Box::new({
+                let h = identity_toggle_hits.clone();
+                move |i, v| h.borrow_mut().push((i, v))
+            }),
+            identity_preset_remove: Box::new({
+                let h = identity_remove_hits.clone();
                 move |i| h.borrow_mut().push(i)
             }),
             // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
@@ -1067,6 +1146,14 @@ mod smoke {
         assert_eq!(headers_pick_hits.borrow().last().copied(), Some(1));
         window.invoke_headersPresetRemoveRequested(0);
         assert_eq!(headers_remove_hits.borrow().last().copied(), Some(0));
+        // 第 43 步：身份预设 invoke 通路（开关 (索引, bool)、删除索引）。
+        window.invoke_identityPresetToggled(1, false);
+        assert_eq!(
+            identity_toggle_hits.borrow().last().copied(),
+            Some((1, false))
+        );
+        window.invoke_identityPresetRemoveRequested(0);
+        assert_eq!(identity_remove_hits.borrow().last().copied(), Some(0));
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

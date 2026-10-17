@@ -53,6 +53,32 @@ pub fn index_of(value: &str) -> i64 {
     }
 }
 
+/// profile 字面量 → 显示串（option_cards.py:23-34 `toProfileLabel`
+/// 全分支镜像）：auto/raw/家族「最新」；特定版本字面量（如
+/// chrome120）按尾部数字+下划线段拆「chrome 120」（"." 替换 "_"）。
+/// 第 43 步身份预设行描述复用。
+pub fn label_of(value: &str) -> String {
+    match value {
+        "" | "auto" => COMBO_ITEMS[0].into(),
+        "raw" => COMBO_ITEMS[1].into(),
+        other => FAMILY_LABELS
+            .iter()
+            .find(|(name, _)| *name == other)
+            .map_or_else(
+                || {
+                    let head = other.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_');
+                    let version = other[head.len()..].replace('_', ".");
+                    if version.is_empty() {
+                        other.into()
+                    } else {
+                        format!("{head} {version}")
+                    }
+                },
+                |(_, label)| format!("{label}（最新）"),
+            ),
+    }
+}
+
 /// 索引 → profile 字面量：镜像 `_onPick`（auto/raw/家族字面量）。
 /// 越界兜底 auto（与 cfg.py ClientProfileValidator.correct 一致，
 /// 不复刻 UI 越界崩溃面）。
@@ -88,6 +114,14 @@ mod tests {
         assert_eq!(value_of(10), "okhttp");
         assert_eq!(value_of(-1), "auto");
         assert_eq!(value_of(11), "auto");
+        // 第 43 步：toProfileLabel 显示串全分支（含特定版本拆分）。
+        assert_eq!(label_of("auto"), COMBO_ITEMS[0]);
+        assert_eq!(label_of(""), COMBO_ITEMS[0]);
+        assert_eq!(label_of("raw"), COMBO_ITEMS[1]);
+        assert_eq!(label_of("edge"), "Edge（最新）");
+        assert_eq!(label_of("chrome120"), "chrome 120");
+        assert_eq!(label_of("chrome120_1"), "chrome 120.1");
+        assert_eq!(label_of("weird"), "weird");
         // 全表 round-trip：索引→字面量→索引恒等。
         for i in 0..COMBO_ITEMS.len() as i64 {
             assert_eq!(index_of(value_of(i)), i);

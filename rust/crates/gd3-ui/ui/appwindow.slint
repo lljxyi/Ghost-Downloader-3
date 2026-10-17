@@ -3,7 +3,7 @@
 
 import { VerticalBox } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
-import { SettingsPage } from "settings_page.slint";
+import { SettingsPage, IdentityPresetData } from "settings_page.slint";
 
 export component AppWindow inherits Window {
     title: "Ghost-Downloader-3";
@@ -62,6 +62,9 @@ export component AppWindow inherits Window {
     in-out property <int> headersPresetIndex: 0;
     in-out property <int> headersPresetHeaderCount: 0;
     in-out property <bool> headersPresetCanRemove: false;
+    // 第 43 步：身份预设列表（行结构镜像 PresetRowWidget；编辑/添加
+    // 留欠账步）。
+    in-out property <[IdentityPresetData]> identityPresets;
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版五键
     // （cfg.py 缺省 T/T/F/"Ask"/T；CloseMode 映射归 close_mode.rs）。
     in-out property <bool> urlSchemeEnabled: true;
@@ -112,6 +115,8 @@ export component AppWindow inherits Window {
     callback clientProfileChanged(int);
     callback headersPresetPicked(int);
     callback headersPresetRemoveRequested(int);
+    callback identityPresetToggled(int, bool);
+    callback identityPresetRemoveRequested(int);
     callback copyPairToken();
     callback regeneratePairToken();
     callback openStoreUrl(string);
@@ -208,6 +213,9 @@ export component AppWindow inherits Window {
             headersPresetCanRemove <=> root.headersPresetCanRemove;
             headersPresetPicked(i) => { root.headersPresetPicked(i); }
             headersPresetRemoveRequested(i) => { root.headersPresetRemoveRequested(i); }
+            identityPresets <=> root.identityPresets;
+            identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
+            identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
             exportCrx() => { root.exportCrx(); }
             urlSchemeEnabled <=> root.urlSchemeEnabled;
             checkUpdateAtStartup <=> root.checkUpdateAtStartup;
