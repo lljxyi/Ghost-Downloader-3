@@ -15,6 +15,7 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
 pub mod actions;
+pub mod batch_url;
 pub mod card;
 pub mod card_menu;
 pub mod category;
@@ -28,6 +29,7 @@ mod format;
 pub mod headers;
 pub mod identity;
 pub mod menu_view;
+pub mod plan;
 pub mod profile;
 pub mod proxy;
 pub mod pyshlex;

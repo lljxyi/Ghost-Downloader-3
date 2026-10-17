@@ -3419,3 +3419,40 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 - 下一步：第 64 步 `plan_task.rs`（计划任务摘要，100 行）+ `batch_url.rs`
   （批量 URL 解析，184 行）语义层。
 - 卡点：无
+
+## 第 64 步：计划任务 + 批量 URL 语义层（P2）（2026-10-17 23:35）
+- 做了什么：两个新模块（`lib.rs` 加 `pub mod plan;` / `pub mod batch_url;`）：
+  - `plan.rs`（409 行，12 测试）：`PlanAction`（IntEnum 0..3）、`Plan`
+    （`set`/`clear`/`trigger`）、`PlanCommand`（交给外壳层执行，UI 不做副作用）、
+    `PlanDialogState`（缺省勾选关机、路径行可见性、`validate`）、
+    `plan_button_clicked`（镜像 `task_page.py:481-494` 的勾选/接受/拒绝/取消
+    四条路径，返回 `PlanButtonOutcome`）。
+  - `batch_url.rs`（约 500 行，15 测试）：`expand_template` / `expand_range`
+    完整镜像模板语法（`[1-100]`、`[001-050]` 补零、`[1-10:2]` 步长、`[a-z]`
+    字母、`{mp4,mkv}` 枚举、笛卡尔积顺序）、`preview`（前 10 条 + `⋯` + 最后
+    一条、`共 N 个链接`、`yesButton` 可用性、空模板全清）。
+- 实证结论：
+  - **Python `re.split` 带捕获组会返回 token，Rust `regex::split` 不返回捕获组**。
+    第一版直接照抄 `TOKEN_PATTERN.split` 导致 token 全被丢掉（`http://e/img/.jpg`），
+    测试当场抓到。改成手写 `split_tokens`（逐 match 取前后文本 + token），与
+    Python 输出逐条对齐。
+  - `Plan.trigger()` **先 `clear()` 再执行动作**（`plan.py:38-52`）；`clear()`
+    只在注册过 `onCleared` 时回调。`trigger` 未满足条件时**保留**状态。
+  - `validate()` 只拦「打开文件 + strip 后空路径」；`selectedFilePath()` 返回
+    strip 后文本。
+  - `_expandRange` 的补零宽度取**起点**长度（`01-100` → `01..99, 100`，
+    不截断）；`[x-y]` 是**合法字母范围**（原测试把它当字面量是写错的），
+    真正当字面量的是 `[1-x]` 这类数字/字母混用。
+  - 交叉验证：把 `batch_url.py` 的纯函数段（`RANGE_PATTERN` 到 class 之前）
+    抠出来用 Python 跑同一批 12 个模板 + 17 个 range 用例，输出与 Rust 侧
+    **逐条一致**（含 `None` 分支）。
+  - 保守偏离（已写进模块头）：非 ASCII 数字（`١-٣`）不当数字处理；单字符非
+    ASCII 字母（`é`）Python 会 `ValueError`，Rust 返回 `None` 不 panic。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error（全工作区）。
+  - `cargo test -p gd3-ui --lib`：**177 → 204 passed**（27 个新测试）。
+- 下一步：第 65 步 `file_select.rs`（252 行）+ `name_conflict.rs`（82 行）
+  语义层（文件选择对话框 / 重名提示队列）。
+- 卡点：无（`PySide6` 未装在 venv 里，`app/view/dialogs/*` 无法直接 import，
+  纯函数段靠「抠源码 exec」交叉验证）
