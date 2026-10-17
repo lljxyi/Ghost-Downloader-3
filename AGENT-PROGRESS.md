@@ -2439,3 +2439,110 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 
 1. `categoryRulesCard` 写路径的 `correct` 过滤。
 2. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
+
+## 第 49 步（Phase 7c）：分类规则写路径（`rules_to_json` / `correct` / `CategoryService` 五方法）
+
+### 做了什么
+
+- **`gd3-core/src/config.rs`**：`fn json_string` → **`pub fn py_json_string`**，
+  并**修掉 `\b`(0x08) / `\f`(0x0c) 的字节偏差**：CPython
+  `json.encoder.ESCAPE_DCT` 里这两个走短转义 `\\b` / `\\f`，旧实现给的是
+  `\u0008` / `\u000c`。这是 `UserConfig.json` 值串 writer 的真实偏差
+  （配置文件里出现退格/换页就写错），顺手修掉；3 处内部调用改为
+  `py_json_string(...)`，doc 注释按 `ESCAPE_DCT` 重写（`< 0x20` → `\uXXXX`
+  小写四位，`>= 0x20` 原样含 `\x7f` / `\u2028` / `\u2029` / CJK / emoji）。
+  提成 `pub` 是因为 `category.rs` 的写路径要复用同一转义口径，不复制第二份。
+- **新金文件 `rust/crates/gd3-core/tests/fixtures/json_escape.jsonl`（28 条）**
+  + `generate_json_escape_fixture.py`（脚本内 `assert json.loads(expected) == case`
+  自检）。语料覆盖 `"` / `\` / `\b` / `\f` / `\n` / `\r` / `\t` / `\x00`-`\x1f`
+  全段抽样 / `\x7f` / `\u2028` / `\u2029` / CJK / emoji。
+- **`config.rs` 测试 `py_json_string_matches_python_dumps_fixture`**：逐条
+  比字节 + `serde_json::from_str::<String>` round-trip + `count == 28`
+  防「金文件被清空仍全绿」。
+- **新金文件 `rust/crates/gd3-ui/tests/fixtures/category_rules.jsonl`
+  （23 条 = 5 `dump` + 11 `correct` + 7 `draft`）**
+  + `generate_category_fixture.py`：
+  - `dump`：跑真 `CategoryListValidator().correct()` + `json.dumps(ensure_ascii=False)`，
+    输入是 `[asdict(Category.fromDict(p)) for p in CATEGORY_PRESETS]` 等 5 组
+    （八预设 / 空表 / 转义与 Unicode / 控制字符与行分隔符 / folder 空串形态）。
+    不构造 `CategoryService` 实例，免得 `_load` 真读写 cfg。
+  - `correct`：11 条 `CategoryListValidator().correct` 输入/输出对
+    （非 list、含非 dict 项、`name` 非 str、`icon`/`extensions` 类型错放行等）。
+  - `draft`：**直接构造真 `CategoryEditDialog`**（`QT_QPA_PLATFORM=offscreen`
+    + `QWidget` parent 且 `resize(800, 600)`——`MessageBoxBase.__init__` 要
+    `parent.width()`，`parent=None` 直接 `AttributeError`），设 `nameEdit` /
+    `setTokens` / `folderEdit` / `iconCombo.setCurrentIndex(findData(...))`
+    后调真 `category()`。extensions 输入是原始文本，脚本按 `,` 切分后
+    `setTokens`（与 Slint 逗号分隔口径对齐）。
+  - 连跑两次 md5 相同（`6d62d1f76bc069fcbb5e78b436663625`）。
+- **`gd3-ui/src/category.rs`**：
+  - `CategoryRule` derive 补 `PartialEq, Eq`；`from_dict` 的 `.trim()`、
+    `draft_to_rule` 的 `trim()` / `token.trim()` 全部改 **`pystr::py_strip`**
+    （修 `\x1c`-`\x1f` 分歧：Python 算空白、Rust `char::is_whitespace` 不算）。
+  - 新增 `rules_to_json(&[CategoryRule]) -> String`：键序
+    `categoryId/name/icon/extensions/folder`（dataclass 字段序）、分隔符
+    `", "` / `": "`、`None` → `null`、`Some("")` → `""`（`asdict` 只把
+    `None` 变 `null`）。
+  - 新增 `correct_rule_list(&Value) -> Value`：镜像 `CategoryListValidator.correct`
+    （非 list / 任一项非 dict / 任一项 `name` 非 str → 整表 `[]`；其余原样）。
+  - 新增 `add_category` / `update_category -> bool`（按 id 首个匹配替换，
+    未命中静默不写盘）/ `remove_category -> bool`（`retain`，重复 id 一起删）/
+    `reset_categories()` / `reorder_categories -> bool`（`HashMap` 建 id→rule、
+    后者覆盖前者、长度不等整体放弃）。
+  - `draft_to_rule` 的 icon 改为 **只接受 `ICON_CHOICES` 里的值，其余（含空串）
+    兜 `DOCUMENT`**——金文件第 7 条 `NOT_AN_ICON` 暴露的偏差：Qt 侧
+    `iconCombo.setCurrentIndex(findData(未知))` 返回 -1 → `currentData()` 是
+    `None` → `or "DOCUMENT"` 兜底。读侧 `from_dict` **不**过滤未知图标
+    （与 Python `fromDict` 一致），两条路径口径不同是 Python 本身如此。
+  - 测试新增 `write_path_matches_python_fixture`（`dump` 逐字节 +
+    `correct` 恒等 + 往返 `parse_rules`（跳过空表与 `folder == Some("")`）+
+    条数断言 `(5, 11, 7)`）与 `service_write_methods_mirror_category_service`。
+
+### 关键决策
+
+- **`rules_to_json` 手写而非 `serde_json::to_string`**：serde_json 分隔符不带
+  空格，与 `json.dumps` 默认 `", "` / `": "` 不同；键序按字段序硬编码更直接。
+- **`correct` 单独暴露、不塞进 `rules_to_json`**：强类型 `CategoryRule` 恒过
+  `validate`（只要求 list/dict/`name` 是 str），塞进去是无效间接层；单独暴露
+  + 金文件 11 条断言可以在关口语义被改时报警。
+- **不实现 `apply_category_rule(rules, index, rule)`，改镜像 `CategoryService`
+  五个真实方法**：Python 编辑路径按 `categoryId` 匹配（`updateCategory` 未命中
+  静默不写盘），不是按 index——按 index 会造出不存在的语义。
+- **`reorder` 逐字镜像 `byId` 字典语义**（重复 id 后者覆盖、长度不等放弃），
+  包括「重复 id 会让同一项出现两次、被挤掉的项丢失」这个 Python 也有的怪行为。
+- **`\b`/`\f` 修正是本步的附带收获**：不是为金文件而改，是 `UserConfig.json`
+  落盘字节的真实偏差；既然 `category.rs` 要复用同一个 writer，就不能带着已知
+  偏差复用。
+
+### 新事实
+
+- CPython `json.dumps(ensure_ascii=False)` 只对 `< 0x20` 做转义，且 `\b`/`\f`
+  用短转义；`\x7f`、`\u2028`、`\u2029` 一律原样输出。
+- `MessageBoxBase` 子类在无头环境构造必须给 `QWidget` parent 且 parent 有
+  非零尺寸，否则 `parent.width()` 直接抛 `AttributeError`。
+- 金文件含裸 `\u2028`/`\u2029` → Python 侧核对必须 `split("\n")`，
+  `str.splitlines()` 会多切；Rust `str::lines()` 只切 `\n`，安全。
+- `Category.fromDict` 对**非字符串**扩展名是 `str(ext).strip()`，会留下
+  `"123"` / `"none"`；Rust 侧按空串丢弃（已在 doc 注释记录，磁盘格式由本侧
+  写入时恒为字符串，只有手改配置文件才会碰到）。
+
+### 验证
+
+- `cargo fmt --all --check` 通过。
+- `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+- `cargo test -p gd3-ui`：**63 passed**（61 → 63）。
+- `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**237 passed**
+  （236 → 237）。
+- 两份金文件连跑两次生成脚本 md5 相同。
+- Python 全量：`pytest -q --continue-on-collection-errors` →
+  **3 failed, 1347 passed, 8 skipped, 35 errors**，失败集合与基线完全相同。
+  本步只动 Rust（未接进 Python 侧），不涉及影子开关，故无需双模式回归。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. `lib.rs` 把 `rules_to_json` 接到 cfg 写路径（`GD3_RUST_CONFIG` 式影子开关）。
+2. 之后：暂停/删除真实语义 → 引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。

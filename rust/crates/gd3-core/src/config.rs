@@ -78,14 +78,14 @@ impl UserConfig {
             }
             out.push('\n');
             out.push_str("    "); // indent 层 1（4 空格）
-            out.push_str(&self::json_string(group));
+            out.push_str(&py_json_string(group));
             out.push_str(": {\n");
             let entry_count = entries.len();
             for (entry_index, (key, value)) in entries.iter().enumerate() {
                 out.push_str("        "); // indent 层 2
-                out.push_str(&self::json_string(key));
+                out.push_str(&py_json_string(key));
                 out.push_str(": ");
-                out.push_str(&self::json_string(value));
+                out.push_str(&py_json_string(value));
                 if entry_index + 1 < entry_count {
                     out.push(',');
                 }
@@ -164,16 +164,25 @@ impl UserConfig {
     }
 }
 
-/// 手写 JSON 字符串转义，镜像 `json.dumps(..., ensure_ascii=False)`：
-/// 控制字符 `\uXXXX`（小写十六进制）、`"`/`\` 反斜杠转义、换行 `\n`、
-/// 制表 `\t`、回车 `\r`、非 ASCII 原样。
-fn json_string(text: &str) -> String {
+/// 手写 JSON 字符串转义，镜像 `json.dumps(..., ensure_ascii=False)`。
+///
+/// 口径来自 CPython 的 `json.encoder.ESCAPE_DCT`：`"` / `\` 反斜杠转义，
+/// `\b`(0x08) / `\f`(0x0c) / `\n` / `\r` / `\t` 五个**短转义**，其余
+/// `< 0x20` 的控制字符走 `\uXXXX`（小写十六进制、四位补零）；`>= 0x20`
+/// 的一律原样（含 `\x7f`、`\u{2028}`、`\u{2029}`、CJK、emoji——只有
+/// `ensure_ascii=True` 才会转义非 ASCII）。
+///
+/// 金文件 `tests/fixtures/json_escape.jsonl`（28 条，CPython 生成）
+/// 钉住逐字节一致。
+pub fn py_json_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for ch in text.chars() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -268,5 +277,29 @@ mod tests {
         assert_eq!(config.get_f64("Personalization", "NoSuchKey"), None);
         config.set_str("Personalization", "DpiScale", "weird");
         assert_eq!(config.get_f64("Personalization", "DpiScale"), None);
+    }
+
+    /// 转义 writer 与 CPython `json.dumps(..., ensure_ascii=False)` 逐字节
+    /// 一致（金文件 28 条：`\b`/`\f` 短转义、其余控制字符 `\uXXXX`、
+    /// `\x7f`/`\u{2028}`/emoji 原样）；并自检解回原值（round-trip）。
+    #[test]
+    fn py_json_string_matches_python_dumps_fixture() {
+        let text = std::fs::read_to_string("tests/fixtures/json_escape.jsonl")
+            .expect("json_escape.jsonl 缺失");
+        let mut count = 0usize;
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let case: serde_json::Value =
+                serde_json::from_str(line).expect("金文件行不是合法 JSON");
+            let input = case["input"].as_str().expect("input 必须是字符串");
+            let expected = case["expected"].as_str().expect("expected 必须是字符串");
+            assert_eq!(py_json_string(input), expected, "输入：{input:?}");
+            // 解回原值：writer 产出的必须是合法 JSON 且语义无损。
+            let decoded: String =
+                serde_json::from_str(expected).expect("期望串应是合法 JSON 字符串");
+            assert_eq!(decoded, input, "金文件自检：{expected}");
+            count += 1;
+        }
+        // 防「金文件被清空仍全绿」。
+        assert_eq!(count, 28, "金文件条数变化需同步更新断言");
     }
 }

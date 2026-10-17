@@ -1,0 +1,28 @@
+{"input": "", "expected": "\"\""}
+{"input": "abc", "expected": "\"abc\""}
+{"input": "a b c", "expected": "\"a b c\""}
+{"input": "a\"b", "expected": "\"a\\\"b\""}
+{"input": "a\\b", "expected": "\"a\\\\b\""}
+{"input": "a/b", "expected": "\"a/b\""}
+{"input": "\\\\", "expected": "\"\\\\\\\\\""}
+{"input": "\"\"", "expected": "\"\\\"\\\"\""}
+{"input": "\n", "expected": "\"\\n\""}
+{"input": "\r", "expected": "\"\\r\""}
+{"input": "\t", "expected": "\"\\t\""}
+{"input": "\b", "expected": "\"\\b\""}
+{"input": "\f", "expected": "\"\\f\""}
+{"input": "\u0000", "expected": "\"\\u0000\""}
+{"input": "\u0001", "expected": "\"\\u0001\""}
+{"input": "\u000b", "expected": "\"\\u000b\""}
+{"input": "\u001f", "expected": "\"\\u001f\""}
+{"input": "", "expected": "\"\""}
+{"input": "中文", "expected": "\"中文\""}
+{"input": "😀", "expected": "\"😀\""}
+{"input": " ", "expected": "\" \""}
+{"input": " ", "expected": "\" \""}
+{"input": " ", "expected": "\" \""}
+{"input": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f", "expected": "\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\""}
+{"input": "前缀\n后缀\t\"引号\"\\反斜杠", "expected": "\"前缀\\n后缀\\t\\\"引号\\\"\\\\反斜杠\""}
+{"input": "D:\\下载\\{default}", "expected": "\"D:\\\\下载\\\\{default}\""}
+{"input": "cat_video", "expected": "\"cat_video\""}
+{"input": "\u001c\u001d\u001e\u001f", "expected": "\"\\u001c\\u001d\\u001e\\u001f\""}
