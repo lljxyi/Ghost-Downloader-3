@@ -3289,3 +3289,96 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   3. 之后按 P1 推进设置页剩余卡片（`setting_cards.py` 949 / `setting_card_group.py`
      290 / `card_groups.py` 191）。
 - 卡点：磁盘（已回收 8G，重建中）
+
+## 2026-10-17 19:42 第 61 步：设置页分组容器语义层（折叠/搜索/排序）
+- 做了什么：
+  - **磁盘回收**：`find rust/target/debug/deps -maxdepth 1 -type f
+    ! -newermt "2026-10-17 18:10" ! -name libgd3_py.so -delete` 删掉 5024 个
+    profile 切换前的 debug=2 残留（16.18 GB），`/` 从 94%（2.3G 可用）回到
+    **52%（19G 可用）**。删后 `cargo test -p gd3-ui --no-run` **2.59s 直接
+    Finished**，证明 cargo 未引用任何被删产物，无需重建。
+  - 新增 `rust/crates/gd3-ui/src/settings_group.rs`（429 行，含 11 个单测）：
+    镜像 `setting_card_group.py` `CollapsibleSettingCardGroup` +
+    `setting_page.py` 的 `setSearchText` / `_restoreOrder` / `_saveOrder` /
+    `updateArrows`。
+    - 常量 `GROUP_*`（8 个 key：general/category/association/browser/aria2rpc/
+      personalization/software/about）+ `PAGE_GROUPS` 创建顺序 + `group_title`
+      （`.tr` 字面量，未知 key 返回空串不编造）。
+    - `is_collapsed` / `toggle_expand`（展开 append、折叠 remove，保持顺序）/
+      `restore_order`（stored 有效 key 在前 → 其余按创建顺序 → about 强制最后）/
+      `save_order`（`current + 过期 key` 追加保留）/ `update_arrows`。
+    - `CardText` / `GroupCards` / `GroupSearch` + `normalize_search`
+      （`strip().lower()`）/ `matches_card` / `search_group` / `search_all`。
+- 实证结论（写进模块头）：
+  - 折叠态存 `UI/ExpandedSettingGroups`（cfg.py:322，StringList 缺省 `[]`），
+    **列表里没有 key 就是折叠**。
+  - **搜索只改视觉展开态，不写 cfg**：`expand = (text and hasMatch) or key in
+    expanded`，清空搜索后回到 cfg 口径。页面空态判据是「任一分组可见」。
+  - 可折叠卡（Proxy/Identity/HeadersPreset）的搜索文本取**头部**标题/副标题
+    （`isSearchMatch` 把 `CollapsibleSettingCard` 换成 `card.card`）。
+  - 拖拽排序写回**不丢弃过期 key**（追加尾部），下次启动 `_restoreOrder` 才过滤。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 warning（8m37s）。
+  - `cargo test -p gd3-ui`：**134 → 145 passed**。
+  - 其中 2 个测试首轮写错了期望（`ghost downloader` 只命中 software 组第一张卡；
+    `剪贴板` 会命中 software 组导致断言前提失效），改测试不改实现——实现与
+    Python 源码逐条对应。
+- 下一步：
+  1. `settings_spec.rs`：把 `setting_page.py::_initCards` 的**全部卡片清单**
+     （分组归属 + 顺序 + 控件类型 + 标题/副标题 + 配置键 + 默认值/范围/候选文案）
+     做成声明式表，补上 Slint 侧尚缺的卡：应用主题、语言、数据存储模式、
+     关于组四卡（了解作者/提供反馈+查看日志/功能包/关于+版本行）、
+     关联组的功能包文件类型与协议卡。
+  2. `ui/setting_card_row.slint` + `ui/settings_group.slint`：数据驱动渲染
+     （替代现在 settings_page.slint 里手写的一排 HorizontalBox），接
+     `settings_group.rs` 的折叠/搜索/排序，出无头冒烟。
+  3. 之后按 P0 收口 → P2。
+- 卡点：无（磁盘已回收 16 GB）
+
+## 2026-10-17 22:53 第 62 步：设置页卡片清单声明式表（settings_spec.rs，47 张卡）
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/settings_spec.rs`（1293 行，含 12 个单测），
+    把 `setting_page.py::_initCards`（:83-388）的**全部卡片**抽成一张可断言的表：
+    `ConfigKey{section,key}` / `Control`（Switch / Range{min,max,step,unit,scale} /
+    Combo{literals,labels} / Button / Folder / Custom）/ `CardSpec{id,group,title,
+    content,control,config,default_config,platforms}` / `Platforms` 位标志。
+  - 分组常量复用 `settings_group`（general / category / association / browser /
+    aria2rpc / personalization / software / about），顺序与 `_initLayout` 一致。
+  - 派生函数：`card_by_id` / `cards_in_group(group, platform)` / `visible_cards` /
+    `search_groups(platform)`（喂 `settings_group::search_all`）/
+    `combo_index`（未命中回 0）/ `combo_literal`（越界回首项）/
+    `Scale::{to_display,to_config}`（One / BytesPerKb / FractionToPercent）/
+    `about_content` / `author_content` / `pack_association_card`。
+  - `lib.rs` 加 `pub mod settings_spec;`。
+- 实证结论（写进模块头注释）：
+  - `RangeConfigItem` 的范围是**配置口径**；`SpinBoxSettingCard` 用 `division`
+    换算成显示口径（`setRange(int(r[0]*division), int(r[1]*division))`），
+    `PercentSpinBoxSettingCard` 固定 ×100、`decimals=0`。表里存**显示口径**。
+  - **`setSingleStep()` 不吸附网格**：`setValue()` 直接写值（setting_cards.py:63-70），
+    所以 `speedLimitation` 缺省 4194304 字节 → 4096 KB/s 在 min=1/step=512 下
+    不是网格点。原先的「缺省值必须在 step 网格上」断言是**测试写错**，已删并注明理由。
+  - 下拉卡缺省：`themeMode` Auto=索引 2（候选 `[Light, Dark, Auto]`）、
+    `language` Auto=索引 8（9 项，`LANGUAGE_TEXTS` 无 AUTO 项 → 标签回退
+    「使用系统设置」）、`nameConflict` `keepBoth`=0、`closeMode` `Ask`=0、
+    `backgroundEffect` win32 `[Acrylic,Mica,MicaAlt,Aero,None]` 缺省 Mica、
+    darwin `[Acrylic,None]` 缺省 Acrylic、**Linux/Android 上该键不存在**。
+  - 平台分支：`association` 组整体只在非 darwin 创建（setting_page.py:64-65）；
+    `closeMode` / `storage_mode` 仅非 Android；Dock/菜单栏速度三卡仅 darwin。
+  - 搜索口径 = 标题 + 副标题**子串**（`isSearchMatch`），所以搜「代理」在 general
+    组命中**两张**：`use_system_dns`（副标题「兼容 TUN、VPN 和代理等网络环境」）
+    与 `proxy`。原测试期望只有 `[10]` 是错的，改成 `[9, 10]`。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error（全工作区）。
+  - `cargo test -p gd3-ui --lib`：**145 → 159 passed**（12 个 `settings_spec` 测试）。
+  - 运维踩坑：一次 `cargo test` 在 `Compiling gd3-ui` 卡满 900s（EXIT=124），
+    检查无 rustc 残留进程、内存 267M/939M 空闲 → 判定为上一次超时杀掉 rustc 后
+    incremental 产物半写导致的退化；重跑 3 分钟完成。**结论：超时后先重跑一次，
+    不要立刻怀疑测试代码。**
+- 下一步：
+  1. 补齐表里还缺的卡：aria2 组四卡（启用/端口/令牌/模拟指纹）、浏览器组三张
+     动作卡（配对令牌/商店安装/Chromium 一键安装）。
+  2. `ui/setting_card_row.slint` + `ui/settings_group.slint` 数据驱动渲染，
+     接 `settings_group` 的折叠/搜索/排序，出无头冒烟。
+- 卡点：无
