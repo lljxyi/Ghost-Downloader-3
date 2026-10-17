@@ -1185,3 +1185,52 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 1. 暂停/删除接 gd3-core 真实语义（bridging 层决策：调用方是谁、
    Rust UI 直执还是桥回 Python 服务）。
 2. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 31 步 — UserConfig.json 存取下沉 gd3-core（config.rs）
+
+### 改动
+
+- **rust/crates/gd3-core/src/config.rs（新，~236 行）**：镜像
+  qfluentwidgets `Config.save` 的磁盘格式（协议不变）。磁盘外形
+  `{group: {key: "python repr 字符串"}}`——项值经 validator format
+  后全为字符串：bool→`"True"/"False"`（**不是** JSON true/false）、
+  int→`"3"`、list→`str([...])`。手写 JSON writer 逐字节镜像
+  `json.dump(..., indent=4, ensure_ascii=False)`（无尾随换行；
+  serde_json pretty 是 2 空格 + 小写布尔，不兼容）。API：
+  `load/from_json/save/to_json_text`（非对象组、非字符串值容错跳
+  过）+ typed `get/set_str/bool/i64`（缺组自建、缺键/非数字回 None）。
+- **fixtures**：`tests/fixtures/user_config_sample.json` +
+  `user_config_expected_save.json` 均由 `.venv` Python json.dumps
+  (indent=4, ensure_ascii=False) 生成，测试逐字节对照 + 幂等 + 
+  磁盘 round-trip + 未触及键原样保留断言。
+
+### 本步实证
+
+- **python repr 口径贯穿**：bool 值串是 `"True"/"False"`；parse 失
+  败（如 `"3.0"` float 项）typed 回 None 不猜。
+- **键序不名誉**：toDict 走 `dir()` 字母序存初档，之后文件自身顺序
+  往返；Rust 写盘放 BTreeMap 稳定排序（语义键集不变，Python 端可
+  读回——UserConfig.json 只有 Python 自己消费，不做顺序镜像）。
+- **分层**：只做存取与值串镜像，**不做几十项配置盘点**——设置页
+  用到哪项、先验哪项，避免双源漂移浪费。
+- Edit 工具小坑续记：`PUT 7.`/`PUT 7` 都是 invalid locator，
+  正确形式 `PUT <7:`（`<N` 独立locator，不是数字后缀）。
+
+### 验证
+
+- `cargo test -p gd3-core`：全绿（config::tests 2 passed，lib 
+  整体 39 passed + 12/2/2/5/1/2/9 集成测试）。0 failed。
+- `cargo fmt --all --check`、`cargo clippy -p gd3-core --all-targets
+  -- -D warnings` 干净。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 设置页（Rust UI）：先验最小键集（GeneralDownload 下载路径/
+   并发数/速度限额、Category 开关等）→ 设置页 slint 骨架 + 
+   typed 装配。
+2. 暂停/删除接真实语义（方案待定：引擎桥接放 Phase 8 一体考虑）。
+3. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
