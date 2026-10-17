@@ -1333,3 +1333,68 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 1. 其余设置组逐键扩（HistoryDownloadFolder/nameConflict 等先验
    再迁）；暂停/删除接真实语义（Phase 8 桥接一体考虑）。
 2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 34 步 — GeneralDownload 组剩余简版六键（2026-10-17 07:02）
+
+### 改动
+
+- **src/conflict.rs（新，49 行）**：镜像 qfluentwidgets
+  `ComboBoxSettingCard`（setting_card.py:401-448 实证：addItem 按
+  zip(texts, options) 序，索引 i <=> options[i]；Change 时存
+  **字面量**）。`OPTIONS=["keepBoth","overwrite","ask"]`、
+  缺省 keepBoth；`index_of_option`（未知→0）/
+  `option_of_index`（越界→keepBoth）——Rust 镜像层容错，
+  不复刻 Python 未知字面量 KeyError 崩溃（同 filter.rs
+  from_route 惯例）。
+- **ui/settings_page.slint**：六新属性+六回调+五张新卡——
+  自动提速 Switch、最小再分配大小 SpinBox（min64 max102400
+  step64 + \\" KB\\" 独立后缀 Text）、保留修改时间 Switch、
+  验证 SSL Switch、同名文件 ComboBox（model
+  [\\"保留两者\\",\\"覆盖\\",\\"询问\\"]，current-index 双链、映射归
+  Rust）、使用系统 DNS Switch。**卡序与 Python _initCards
+  组内顺序不一一对应（注记，全量重排留主题/布局步）。**
+- **ui/appwindow.slint**：窗口级 6 in-out + 6 回调 + 12 行
+  透传。
+- **lib.rs**：push_settings 尾部 6 组 set（NameConflict 经
+  `conflict::index_of_option`）；SettingsActions 增 6 动作
+  （统一「动作收配置单位」：reassign_size 收 i64 配置值、
+  name_conflict 收配置字面量，索引→字面量换算归 install
+  层 `conflict::option_of_index`）。
+
+### 键位实证（cfg.py）
+
+- `AutoSpeedUp` 缺省 True；`MaxReassignSize` 缺省 512 范围
+  64-102400（\\" KB\\" 后缀、singleStep=64、division=1 显示=配置值）；
+  `PreserveLastModified` 缺省 F；SSL 键名字面**shouldVerifySsl**
+  （小写 s 起）缺省 F；`NameConflict` 选项见上缺省 keepBoth；
+  Network 组 `ShouldUseSystemDns` 缺省 True（UI 归组 GeneralDownload）。
+
+### 本步实证
+
+- **Put 块替换吞行第 5 次**：多 fn 三处连环（孤儿 fn/缺
+  `}`/重复 doc）。修复后又因「删多余 `}`」误删限速卡闭括号，
+  编译报 `expected '}'` at 1:1 + 重复属性——**awk 累计深度
+  扫描（open 50 close 49）定位**：第 110 行注释前补回
+  `        }`。教训：删除前先数括号归属，勿信 review 的
+  del/add 展示顺序。
+- 一次 Edit 多 op 的行号错位风险再次确认：改走单次单 op 或
+  自底向上。
+
+### 验证
+
+- `cargo build` + `cargo fmt --all --check` +
+  `cargo clippy -p gd3-ui --all-targets -- -D warnings` 干净。
+- `timeout 1200 cargo test -p gd3-ui`：**26 → 27 passed**
+  （+1 conflict 映射：round-trip/未知字面量/越界索引兜底；
+  smoke 补六 setter 有值推送/缺省容错/invoke_nameConflictChanged(2)=>\\"ask\\"）。
+  0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 其余设置组复杂卡先验再迁（ProxySettingCard/HistoryDownloadFolder/
+   clientProfileCard）；暂停/删除接真实语义（Phase 8 桥接一体考虑）。
+2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
