@@ -1581,3 +1581,390 @@ mod account_tests {
         );
     }
 }
+
+/// `fetchPlayurl` 的默认错误文案（`message` 缺失 / 假值时的兜底）。
+pub const PLAYURL_DEFAULT_ERROR: &str = "获取 Bilibili 音视频流失败";
+
+/// `fetchPlayurl` 取流响应判定层的产出。
+///
+/// Python 侧 `playurlGate(playPayload, qn)` 返回
+/// `'fallback' | ('error', message) | ('ok', dash, acceptQuality)`；
+/// `AttributeError` / `TypeError` 单独成变体（桥侧按原型抛出，文案逐字一致）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlayurlGate {
+    Ok {
+        /// `dash = pageData.get("dash") or {}`（缺省/假值归一化为 `{}`）。
+        dash: Value,
+        accept_quality: Vec<Value>,
+    },
+    Fallback,
+    /// `ValueError(message)`——`message or 默认`：消息值原样（可以是任何 JSON 值）。
+    Error(Value),
+    AttributeError(String),
+    TypeError(String),
+}
+
+/// JSON 值对应的 Python 类型名（`AttributeError`/`TypeError` 文案用）。
+fn py_json_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(number) => {
+            if number.is_f64() {
+                "float"
+            } else {
+                "int"
+            }
+        }
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// `x.get(...)` 的 AttributeError 文案。
+fn get_error(value: &Value) -> PlayurlGate {
+    PlayurlGate::AttributeError(format!(
+        "'{}' object has no attribute 'get'",
+        py_json_type(value)
+    ))
+}
+
+/// `list(x)` 不可迭代时的 TypeError 文案。
+fn not_iterable(value: &Value) -> PlayurlGate {
+    PlayurlGate::TypeError(format!("'{}' object is not iterable", py_json_type(value)))
+}
+
+/// `x in {None, 0}`：None / 数字 0 / `False` 通过；
+/// list/dict 不可哈希 → `TypeError: unhashable type: …`（成员测试先于相等比较）。
+fn code_in_none_zero(code: Option<&Value>) -> Result<bool, PlayurlGate> {
+    match code {
+        None | Some(Value::Null) => Ok(true),
+        Some(Value::Number(number)) => Ok(number.as_f64().map(|f| f == 0.0).unwrap_or(false)),
+        Some(Value::Bool(b)) => Ok(!b),
+        Some(Value::Array(_)) => Err(PlayurlGate::TypeError(
+            "unhashable type: 'list'".to_string(),
+        )),
+        Some(Value::Object(_)) => Err(PlayurlGate::TypeError(
+            "unhashable type: 'dict'".to_string(),
+        )),
+        Some(_) => Ok(false),
+    }
+}
+
+/// `fetchPlayurl` 响应判定层（`features/bili_pack/stream.py::playurlGate` 的镜像）。
+///
+/// 顺序严格对齐 Python（这里每一步都可能先抛）：
+/// `code in {None, 0}` → qn 兜底 / `message or 默认` →
+/// `pageData or {}` → `dash or {}` → `list(video or [])` 非空 →
+/// qn 兜底 → `list(accept_quality or [])`。
+pub fn playurl_gate(play_payload: &Value, qn: i64) -> PlayurlGate {
+    let root = match play_payload {
+        Value::Object(map) => map,
+        other => return get_error(other),
+    };
+
+    match code_in_none_zero(root.get("code")) {
+        Err(error) => return error,
+        Ok(false) => {
+            if qn != 80 {
+                return PlayurlGate::Fallback;
+            }
+            let message = or_default(root.get("message")).cloned();
+            return PlayurlGate::Error(
+                message.unwrap_or_else(|| Value::from(PLAYURL_DEFAULT_ERROR)),
+            );
+        }
+        Ok(true) => {}
+    }
+
+    // pageData = playPayload.get("data") or {}
+    let page_map: Option<&serde_json::Map<String, Value>> = match root.get("data") {
+        Some(value) if truthy(value) => match value {
+            Value::Object(map) => Some(map),
+            other => return get_error(other),
+        },
+        _ => None,
+    };
+
+    // dash = pageData.get("dash") or {}
+    let dash: Option<&serde_json::Map<String, Value>> = match page_map.and_then(|m| m.get("dash")) {
+        Some(value) if truthy(value) => match value {
+            Value::Object(map) => Some(map),
+            other => return get_error(other),
+        },
+        _ => None,
+    };
+
+    // videoStreams = list(dash.get("video") or []) → 非空与否
+    let has_streams = match dash.and_then(|m| m.get("video")) {
+        None | Some(Value::Null) => false,
+        Some(value) if !truthy(value) => false,
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(other) => return not_iterable(other),
+    };
+    if !has_streams && qn != 80 {
+        return PlayurlGate::Fallback;
+    }
+
+    // acceptQuality = list(pageData.get("accept_quality") or [])
+    let accept_quality: Vec<Value> = match page_map.and_then(|m| m.get("accept_quality")) {
+        None => Vec::new(),
+        Some(value) if !truthy(value) => Vec::new(),
+        Some(Value::Array(a)) => a.to_vec(),
+        Some(Value::String(s)) => s.chars().map(|c| Value::String(c.to_string())).collect(),
+        Some(Value::Object(o)) => o.keys().map(|key| Value::from(key.as_str())).collect(),
+        Some(other) => return not_iterable(other),
+    };
+
+    PlayurlGate::Ok {
+        dash: match dash {
+            Some(map) => Value::Object(map.clone()),
+            None => Value::Object(serde_json::Map::new()),
+        },
+        accept_quality,
+    }
+}
+
+#[cfg(test)]
+mod playurl_gate_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn dash_ok(dash: Value, quality: Vec<Value>) -> PlayurlGate {
+        PlayurlGate::Ok {
+            dash,
+            accept_quality: quality,
+        }
+    }
+
+    #[test]
+    fn ok_full_keeps_dash_and_quality() {
+        let payload = json!({
+            "code": 0,
+            "data": {
+                "dash": {"video": [{"id": 80}], "audio": [{"id": 30280}]},
+                "accept_quality": [120, 80],
+            },
+        });
+        assert_eq!(
+            playurl_gate(&payload, 120),
+            dash_ok(
+                json!({"video": [{"id": 80}], "audio": [{"id": 30280}]}),
+                vec![json!(120), json!(80)]
+            )
+        );
+    }
+
+    #[test]
+    fn ok_normalizes_falsy_dash_and_quality() {
+        // dash/accept_quality 缺失或假值 → {} / []（qn=80 不走兜底）
+        assert_eq!(playurl_gate(&json!({}), 80), dash_ok(json!({}), vec![]));
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": serde_json::Value::Null}), 80),
+            dash_ok(json!({}), vec![])
+        );
+        assert_eq!(
+            playurl_gate(
+                &json!({"code": 0, "data": {"dash": serde_json::Value::Null}}),
+                80
+            ),
+            dash_ok(json!({}), vec![])
+        );
+        assert_eq!(
+            playurl_gate(
+                &json!({"code": 0, "data": {"dash": {}, "accept_quality": 0}}),
+                80
+            ),
+            dash_ok(json!({}), vec![])
+        );
+    }
+
+    #[test]
+    fn ok_code_zero_variants() {
+        // `code in {None, 0}`：0 / 0.0 / False / 缺失 / None 都通过
+        for code in [
+            None,
+            Some(json!(0)).as_ref(),
+            Some(json!(0.0)).as_ref(),
+            Some(json!(false)).as_ref(),
+        ] {
+            let mut payload = json!({"data": {"dash": {"video": [1]}}});
+            if let Some(value) = code.cloned() {
+                payload["code"] = value;
+            }
+            assert!(
+                matches!(playurl_gate(&payload, 80), PlayurlGate::Ok { .. }),
+                "{code:?}"
+            );
+        }
+        // 非零 → qn≠80 兜底，qn=80 报错
+        assert_eq!(
+            playurl_gate(&json!({"code": 5, "message": "m"}), 120),
+            PlayurlGate::Fallback
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 5, "message": "m"}), 80),
+            PlayurlGate::Error(json!("m"))
+        );
+    }
+
+    #[test]
+    fn code_error_message_or_default() {
+        assert_eq!(
+            playurl_gate(&json!({"code": 1}), 80),
+            PlayurlGate::Error(json!(PLAYURL_DEFAULT_ERROR))
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 1, "message": ""}), 80),
+            PlayurlGate::Error(json!(PLAYURL_DEFAULT_ERROR))
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 1, "message": false}), 80),
+            PlayurlGate::Error(json!(PLAYURL_DEFAULT_ERROR))
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": "0", "message": "风控"}), 80),
+            PlayurlGate::Error(json!("风控"))
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 1, "message": 123}), 80),
+            PlayurlGate::Error(json!(123))
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": true, "message": "m"}), 80),
+            PlayurlGate::Error(json!("m"))
+        );
+    }
+
+    #[test]
+    fn code_unhashable_list_dict() {
+        assert_eq!(
+            playurl_gate(&json!({"code": []}), 120),
+            PlayurlGate::TypeError("unhashable type: 'list'".into())
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": {}}), 120),
+            PlayurlGate::TypeError("unhashable type: 'dict'".into())
+        );
+        // 可哈希的假值字符串按 == 判定失败，不可哈希则先于比较抛出
+        assert_eq!(
+            playurl_gate(&json!({"code": ""}), 120),
+            PlayurlGate::Fallback
+        );
+    }
+
+    #[test]
+    fn root_not_dict_is_attribute_error() {
+        let cases: Vec<(Value, &str)> = vec![
+            (json!(5), "int"),
+            (json!(1.5), "float"),
+            (json!("plain"), "str"),
+            (json!([1]), "list"),
+            (json!(null), "NoneType"),
+            (json!(true), "bool"),
+        ];
+        for (payload, kind) in cases {
+            assert_eq!(
+                playurl_gate(&payload, 80),
+                PlayurlGate::AttributeError(format!("'{kind}' object has no attribute 'get'")),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn truthy_non_dict_data_or_dash_is_attribute_error() {
+        for bad in [json!(5), json!(1.5), json!("x"), json!([1]), json!(true)] {
+            assert!(
+                matches!(
+                    playurl_gate(&json!({"code": 0, "data": bad}), 80),
+                    PlayurlGate::AttributeError(_)
+                ),
+                "{bad:?}"
+            );
+            assert!(
+                matches!(
+                    playurl_gate(&json!({"code": 0, "data": {"dash": bad}}), 80),
+                    PlayurlGate::AttributeError(_)
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_streams_presence_and_fallback() {
+        // 空/缺省 → qn≠80 兜底；qn=80 放行（空 dash 交给后续 parseDash 报错）
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": {"dash": {"video": []}}}), 120),
+            PlayurlGate::Fallback
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": {}}), 120),
+            PlayurlGate::Fallback
+        );
+        assert!(matches!(
+            playurl_gate(&json!({"code": 0, "data": {"dash": {"video": []}}}), 80),
+            PlayurlGate::Ok { ref dash, .. } if dash.get("video").is_some()
+        ));
+        // str/dict 可迭代（Python list(str)=字符、list(dict)=键）
+        assert!(matches!(
+            playurl_gate(&json!({"code": 0, "data": {"dash": {"video": "ab"}}}), 120),
+            PlayurlGate::Ok { .. }
+        ));
+        assert!(matches!(
+            playurl_gate(
+                &json!({"code": 0, "data": {"dash": {"video": {"a": 1}}}}),
+                120
+            ),
+            PlayurlGate::Ok { .. }
+        ));
+        // 不可迭代 → TypeError（逐类型）
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": {"dash": {"video": 5}}}), 120),
+            PlayurlGate::TypeError("'int' object is not iterable".into())
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": {"dash": {"video": 1.5}}}), 120),
+            PlayurlGate::TypeError("'float' object is not iterable".into())
+        );
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": {"dash": {"video": true}}}), 120),
+            PlayurlGate::TypeError("'bool' object is not iterable".into())
+        );
+    }
+
+    #[test]
+    fn accept_quality_list_semantics() {
+        // list(str)=字符、list(dict)=键、list(bool/num) 抛 TypeError
+        assert_eq!(
+            playurl_gate(
+                &json!({"code": 0, "data": {"dash": {"video": [1]}, "accept_quality": "xy"}}),
+                80
+            ),
+            dash_ok(json!({"video": [1]}), vec![json!("x"), json!("y")])
+        );
+        assert_eq!(
+            playurl_gate(
+                &json!({"code": 0, "data": {"dash": {"video": [1]}, "accept_quality": {"k": 1}}}),
+                80
+            ),
+            dash_ok(json!({"video": [1]}), vec![json!("k")])
+        );
+        assert_eq!(
+            playurl_gate(
+                &json!({"code": 0, "data": {"dash": {"video": [1]}, "accept_quality": 5}}),
+                80
+            ),
+            PlayurlGate::TypeError("'int' object is not iterable".to_string())
+        );
+        // 兜底优先于 accept_quality 的求值错误
+        assert_eq!(
+            playurl_gate(&json!({"code": 0, "data": {"accept_quality": 5}}), 120),
+            PlayurlGate::Fallback
+        );
+    }
+}
