@@ -1916,3 +1916,90 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    引擎桥接并轨）。
 2. 之后：暂停/删除真实语义（Phase 8 桥接一体）→ 引擎状态桥接
    → Python UI 停用 + AGENT-DONE。
+
+## 第 43 步：身份预设列表镜像层（cfg.py Network/IdentityPresets）
+
+- 时间：2026-10-17 09:07（date 实取；代码提交 `f43a171`）
+
+### 改动
+
+- `src/identity.rs`（新，~175 行）：
+  - **读盘口径实证（qfluentwidgets QConfig.load →
+    deserializeFrom）**：只走 serializer 反序列化，**不过
+    validator.correct**——合法过滤仅在 qconfig.set 写路径生效。
+    镜像：缺键 → 百度网盘客户端预设（cfg.py:335-340 逐字：
+    name=百度网盘客户端 / clientProfile=raw / userAgent=
+    pan.baidu.com / hosts=[*.pcs.baidu.com] / isEnabled=T）；
+    JSON 解析失败/非数组 → `[]`（JsonConfigSerializer fallback
+    `list()`）；逐项 `preset.get(...)` 容错取字段，isEnabled
+    缺省 True（列表内为 JSON 原生 bool，非第 40/42 步的 JSON
+    串包顶层 str）；
+  - `row_desc` 镜像 PresetRowWidget.descLayout 三段：hosts 前 3
+    个 ", " 连接 / profile 显示名 / UA 截断（>24 取 21+"..."），
+    仅非空段出现；Slint 侧以「 · 」间隔、禁用行 opacity 0.4
+    （_refreshOpacity 镜像）；
+  - 4 单测：缺键兜百度预设+描述串、读盘不做 valid 过滤（含
+    精简项与 4 hosts 只取前 3）、坏 JSON→空+isEnabled 非 bool
+    兜 T、UA 截断长度。
+- `src/profile.rs`：增 `label_of` 全分支镜像 toProfileLabel
+  （option_cards.py:23-34）：auto/raw/家族「最新」+特定版本
+  字面量拆分（尾部数字+下划线段，"_"→"."，chrome120→
+  「chrome 120」、chrome120_1→「chrome 120.1」）+分支断言。
+- `ui/settings_page.slint`（python 脚本 4 处锚点全中）：
+  `IdentityPresetData` 结构 + `identityPresets` 行模型 +
+  `identityPresetToggled(int,bool)`/`identityPresetRemoveRequested
+  (int)` 回调 + 行列表卡（VerticalBox for 循环行：名称+描述+
+  Switch+「删除」按钮；头注释 32-43 步）。
+- `ui/appwindow.slint`：结构导入 + 三行透传。
+- `src/lib.rs`（python 脚本 9 组锚点全中）：push 解析推送行
+  模型；SettingsActions 增 `identity_preset_toggle`/
+  `identity_preset_remove`（索引边界检查与删除确认框归调用
+  方，镜像 _onToggled/_onRemoveClicked 的越界守卫）；smoke 补
+  有值逐行断言（百度/chrome/hosts 4 取 3/禁用行）、缺省
+  （缺键→百度预设单行启用）、invoke 开关 (1,false) 与删除 (0)。
+
+### 新事实（影响后续步骤）
+
+- **第 42 步口径隔断（记录，不改）**：headersPresets 的
+  parse_presets 做了 correct 式过滤+兜底（比读盘实际多一层），
+  identityPresets 按读盘真实口径不做过滤。两者差异在第 42 步
+  注释内自述（「无合法项兜默认」），语义不冲突且更安全；如需
+  严格对齐可在回调桥接步统一。
+- 与第 41 步模拟身份卡同源（IdentitySettingCard 折叠卡 =
+  全局默认下拉 + 预设行列表），Rust 侧现为两卡并列，合并成
+  折叠卡留布局/主题步。
+
+### 工具坑增量
+
+- label_of 首版错用家族字面量拼「最新」显示（edge→「edge
+  （最新）」），FAMILY_LABELS 第二元才是显示名，测试即抓即修。
+- trim_end_matches 闭包需显式 `c: char` 类型标注（E0282）。
+- clippy：doc 注释列表后接段落需空 `//!` 行（同第 42 步）+
+  `useless_vec`（测试用 `vec![...]` 改字面量数组）。
+- **commit message 内混入伪词**（"HALF"——应为「第 2 元显示
+  名」），在 f43a171 提交串内残留；代码无恙，不追加修补提交
+  （历史不可改写、无实质影响），记录在案。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui
+  --all-targets -- -D warnings` 通过。
+- `timeout 1200 cargo test -p gd3-ui`：**33 → 37 passed**
+  （identity.rs 4 单测 + profile.rs label_of 分支断言并入）。
+  0 failed。
+- post-write diff 复核：slint/lib.rs/profile.rs 各锚点与设计
+  一致，无夹带。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 44 步候选：headers/identity 预设「添加/编辑」对话框骨架
+   （PresetEditDialog/HeadersPresetEditDialog → Slint Dialog，
+   含行编辑器与名称校验 InfoBar 镜像）、categoryRulesCard
+   （或与引擎桥接并轨）、currentHeaders 读取随 Phase 8 任务造
+   （NewTaskCard）并轨。
+2. 之后：暂停/删除真实语义（Phase 8 桥接一体）→ 引擎状态桥接
+   → Python UI 停用 + AGENT-DONE。
