@@ -952,3 +952,67 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
 3. 暂停/删除动作接 task_service（桥接层：TaskActions 的 pause/delete
    落到 gd3-core 的暂停/删除语义 + 磁盘回写），然后设置页 → 引擎
    状态桥接。
+
+## 第 27 步（2026-10-17 05:37；Phase 7b 分类筛选切片）【完成】
+
+### 分类筛选菜单的 Rust 侧镜像（filter.rs）
+
+- `CategoryRef{category_id, name}`：Python `Category`（category_service
+  .py:102）只取 UI 菜单消费的两字段（展示名经 toCategoryName）。
+- `menu_names()`：ComboBox 的 [string] 模型 = 「全部分类」表头
+  （allAction，task_page.py:_rebuildCategoryFilterMenu）+ 各分类名，
+  **索引序即菜单序**。
+- `category_id_at(index)`：0 → ""（表头）、其余取
+  `categories[index-1].categoryId`、越界/负值防御性回 ""。
+- `sanitize_category_filter(current)`：镜像 `_rebuildCategoryFilterMenu`
+  尾容错——当前过滤值不在合法集合（含 ""）内 → 回落 ""（分类被删
+  场景），调用方需据此重刷。
+- 测试：表头+两分类序列、索引映射 0/正/越界/负、失效清理三种。
+
+### UI 契约（task_page.slint / appwindow.slint）
+
+- TaskPage 增 `categoryNames: [string]`、`categoryEnabled: false`、
+  `categoryIndex`（in-out，选中态由调用方回写管理）；回调
+  `categoryFilterChanged(int)`。
+- ComboBox `current-index <=> categoryIndex`、
+  `visible: categoryEnabled`、`selected => categoryFilterChanged(
+  self.current-index)`——**std ComboBox base 只支持 [string] 模型**
+  （combobox-base.slint:5 model:[string] + 16 selected(string) +
+  10 current-index），发索引而非 struct 是经实证的取舍；索引映射
+  全在 Rust 侧 helper，Slint 保持哑管道。
+- AppWindow 属性透传 + categoryIndex `<=>` 双向 + 回调透传。
+
+### 装配（lib.rs）
+
+- `set_category_names(window, Vec<String>)`：**生成 setter 要
+  `ModelRc<SharedString>`，`ModelRc<VecModel<String>>` 直接塞会
+  E0308**——helper 内 String→SharedString 转换（生成名实证
+  set_categoryNames 保留 camelCase）。
+- TaskActions 增 `category_selected: Box<dyn Fn(i32)>`（第五动作，
+  回调参数 i32 是 Copy，**不能 `&index`**——E0308 实证）。
+- smoke：menu_names → set_category_names → get_categoryNames 3 行
+  且第 2 行「视频」、set/get_categoryIndex round-trip。
+- **16 passed**（14 → 16：+1 filter 分类测试、+1 分类冒烟）；fmt
+  --all --check、clippy -p gd3-ui --all-targets -D warnings 干净。
+
+### 工具坑（本步实证，Edit ops 三连坑）
+
+- **PUT N.=N: 尾行被吞**：替换范围含首尾，`+` 正文里若不把被替换
+  行重抄一遍，该行就真没了——本轮先后吞掉「已完成的收 }」（slint
+  工具栏）、filterMode 属性行、TaskPage { 开行、let 绑定行等。
+  教训：**PUT 整块替换时，凡想保留的行必须在 + 正文里显式重写**；
+  写完 Read 活文件核对，review diff 依旧会漏交错/漏吞行。
+- 大块替换（46 行）后 review 只显示局部 hunk、加删计数对不上——
+  文件实际被写成正确内容，但只能靠全文件 Read 复核认可。
+- 交错残骸：一条 PUT 插入新块 + 旧块尾部同时存留（旧测试尾部
+  5 行悬挂、双 `}`、`let pause` 重复），编译报 E0308 后逐个用
+  精确行号 CUT/PUT 清除；`CUT` 单行 `CUT N.=N` 稳定可用。
+
+### 下一步（Phase 7b 续）
+
+1. 段高亮/卡片视觉：TaskRow 展开进度环/状态色，对齐 task_cards.py；
+   filterMode 段按钮高亮（Qt SegmentedToggleToolWidget 等价物）。
+2. 暂停/删除接任务动作真实语义（bridging 层：TaskActions 的
+   pause/delete 落 gd3-core），列表排序（SortField 五种 + 升降序）
+   可顺路先行（纯变换、零 UI 依赖）。
+3. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
