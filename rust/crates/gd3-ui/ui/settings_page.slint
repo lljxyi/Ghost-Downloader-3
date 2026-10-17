@@ -1,7 +1,8 @@
-// 设置页（Phase 7c，第 32-36 步）：镜像 setting_page.py GeneralDownload
-// 组、「启用下载分类」与 Aria2 RPC 兼容组。控件与标题副标题镜像 .tr
-// 字面量；执行（落盘/生效）全在调用方。限速值 KB/s ⇄ 字节 1/1024 换
-// 算在 Rust speed.rs；代理卡拼装/校验镜像在 Rust proxy.rs。
+// 设置页（Phase 7c，第 32-37 步）：镜像 setting_page.py GeneralDownload
+// 组、「启用下载分类」、Aria2 RPC 兼容组与浏览器扩展组简版卡。控件与
+// 标题副标题镜像 .tr 字面量；执行（落盘/生效）全在调用方。限速值
+// KB/s ⇄ 字节 1/1024 换算在 Rust speed.rs；代理卡拼装/校验镜像在
+// Rust proxy.rs。
 // 契约：Rust 侧 push_settings 写值串/数字派生值；控件只回发变化
 // （Line/Spin edited、Switch toggled），映射在 Rust 侧 typed set。
 
@@ -45,6 +46,15 @@ export component SettingsPage inherits Rectangle {
     in-out property <int> aria2RpcPort: 16800;
     in-out property <string> aria2RpcToken: "";
     in-out property <bool> aria2EmulateFingerprint: false;
+    // 第 37 步：浏览器扩展组简版三键（cfg.py:268-272 实证）：
+    // EnableBrowserExtension 默认 T / EnableRaiseWindowWhenReceiveMsg
+    // 默认 F（UI 文案是「接管下载时进入草稿模式」，键名与文案不同源，
+    // 注记）/ Browser/Port 缺省 14370 范围 1024-65535。配对令牌
+    // PrimaryPush/商店链接 HyperlinkCard/Chromium 一键安装 PrimaryPush
+    // 为动作卡留动作骨架步。
+    in-out property <bool> browserEnabled: true;
+    in-out property <bool> browserDraftTaken: false;
+    in-out property <int> browserPort: 14370;
 
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
@@ -63,6 +73,9 @@ export component SettingsPage inherits Rectangle {
     callback aria2RpcPortChanged(int);
     callback aria2RpcTokenChanged(string);
     callback aria2EmulateFingerprintChanged(bool);
+    callback browserEnabledChanged(bool);
+    callback browserDraftTakenChanged(bool);
+    callback browserPortChanged(int);
 
     background: transparent;
 
@@ -332,6 +345,41 @@ export component SettingsPage inherits Rectangle {
             Switch {
                 checked <=> root.aria2EmulateFingerprint;
                 toggled => { root.aria2EmulateFingerprintChanged(self.checked); }
+            }
+        }
+        // 第 37 步：浏览器扩展组简版三卡（PrimaryPush/HyperlinkCard
+        // 动作卡留动作骨架步）。
+        HorizontalBox {
+            Text {
+                text: "启用浏览器扩展";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.browserEnabled;
+                toggled => { root.browserEnabledChanged(self.checked); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "接管下载时进入草稿模式\n自动接管浏览器下载时先进入草稿，方便您调整下载路径和文件名";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.browserDraftTaken;
+                toggled => { root.browserDraftTakenChanged(self.checked); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "服务端口\n浏览器扩展连接使用的端口";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 1024;
+                maximum: 65535;
+                step-size: 1;
+                value <=> root.browserPort;
+                edited(value) => { root.browserPortChanged(value); }
             }
         }
     }

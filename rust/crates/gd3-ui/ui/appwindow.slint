@@ -45,6 +45,11 @@ export component AppWindow inherits Window {
     in-out property <int> aria2RpcPort: 16800;
     in-out property <string> aria2RpcToken: "";
     in-out property <bool> aria2EmulateFingerprint: false;
+    // 第 37 步：浏览器扩展组简版三键（cfg.py:268-272 缺省 T/F/14370；
+    // 草稿模式键名 EnableRaiseWindowWhenReceiveMsg 注记见 settings_page）。
+    in-out property <bool> browserEnabled: true;
+    in-out property <bool> browserDraftTaken: false;
+    in-out property <int> browserPort: 14370;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -79,6 +84,9 @@ export component AppWindow inherits Window {
     callback aria2RpcPortChanged(int);
     callback aria2RpcTokenChanged(string);
     callback aria2EmulateFingerprintChanged(bool);
+    callback browserEnabledChanged(bool);
+    callback browserDraftTakenChanged(bool);
+    callback browserPortChanged(int);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -146,6 +154,12 @@ export component AppWindow inherits Window {
             aria2RpcPortChanged(v) => { root.aria2RpcPortChanged(v); }
             aria2RpcTokenChanged(t) => { root.aria2RpcTokenChanged(t); }
             aria2EmulateFingerprintChanged(v) => { root.aria2EmulateFingerprintChanged(v); }
+            browserEnabled <=> root.browserEnabled;
+            browserDraftTaken <=> root.browserDraftTaken;
+            browserPort <=> root.browserPort;
+            browserEnabledChanged(v) => { root.browserEnabledChanged(v); }
+            browserDraftTakenChanged(v) => { root.browserDraftTakenChanged(v); }
+            browserPortChanged(v) => { root.browserPortChanged(v); }
         }
     }
 }

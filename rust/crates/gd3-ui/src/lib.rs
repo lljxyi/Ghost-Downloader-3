@@ -199,6 +199,21 @@ pub fn push_settings(
             .get_bool("Aria2Rpc", "EmulateFingerprint")
             .unwrap_or(false),
     );
+    // 第 37 步：浏览器扩展组简版三键（cfg.py:268-272 实证：
+    // EnableBrowserExtension 缺省 T / EnableRaiseWindowWhenReceiveMsg
+    // 缺省 F——UI 文案「接管下载时进入草稿模式」同一键 / Port 缺省
+    // 14370 范围 1024-65535）。
+    window.set_browserEnabled(
+        config
+            .get_bool("Browser", "EnableBrowserExtension")
+            .unwrap_or(true),
+    );
+    window.set_browserDraftTaken(
+        config
+            .get_bool("Browser", "EnableRaiseWindowWhenReceiveMsg")
+            .unwrap_or(false),
+    );
+    window.set_browserPort(config.get_i64("Browser", "Port").unwrap_or(14_370) as i32);
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -228,6 +243,10 @@ pub struct SettingsActions {
     pub aria2_rpc_port: Box<dyn Fn(i64)>,
     pub aria2_rpc_token: Box<dyn Fn(&str)>,
     pub aria2_emulate_fingerprint: Box<dyn Fn(bool)>,
+    // 第 37 步：浏览器扩展组动作（端口收 i64 配置单位 division=1）。
+    pub browser_enabled: Box<dyn Fn(bool)>,
+    pub browser_draft_taken: Box<dyn Fn(bool)>,
+    pub browser_port: Box<dyn Fn(i64)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -315,6 +334,13 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_aria2RpcTokenChanged(move |t| (aria2_rpc_token.aria2_rpc_token)(&t));
     let aria2_emulate = actions.clone();
     window.on_aria2EmulateFingerprintChanged(move |v| (aria2_emulate.aria2_emulate_fingerprint)(v));
+    // 第 37 步：浏览器扩展组注册（WS 监听真启停等对齐留引擎桥接步）。
+    let browser_enabled = actions.clone();
+    window.on_browserEnabledChanged(move |v| (browser_enabled.browser_enabled)(v));
+    let browser_draft = actions.clone();
+    window.on_browserDraftTakenChanged(move |v| (browser_draft.browser_draft_taken)(v));
+    let browser_port = actions.clone();
+    window.on_browserPortChanged(move |v| (browser_port.browser_port)(v as i64));
 }
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
@@ -573,6 +599,9 @@ mod smoke {
         config.set_i64("Aria2Rpc", "Port", 10800);
         config.set_str("Aria2Rpc", "Token", "secret");
         config.set_bool("Aria2Rpc", "EmulateFingerprint", true);
+        config.set_bool("Browser", "EnableBrowserExtension", false);
+        config.set_bool("Browser", "EnableRaiseWindowWhenReceiveMsg", true);
+        config.set_i64("Browser", "Port", 15370);
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -603,6 +632,10 @@ mod smoke {
         assert_eq!(window.get_aria2RpcPort(), 10800);
         assert_eq!(window.get_aria2RpcToken(), "secret");
         assert!(window.get_aria2EmulateFingerprint());
+        // 第 37 步：有值推送（浏览器组三键同态）。
+        assert!(!window.get_browserEnabled());
+        assert!(window.get_browserDraftTaken());
+        assert_eq!(window.get_browserPort(), 15370);
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -631,6 +664,10 @@ mod smoke {
         assert_eq!(window.get_aria2RpcPort(), 16800);
         assert_eq!(window.get_aria2RpcToken(), "");
         assert!(!window.get_aria2EmulateFingerprint());
+        // 第 37 步：缺省容错（Enabled=T / Draft=F / Port=14370）。
+        assert!(window.get_browserEnabled());
+        assert!(!window.get_browserDraftTaken());
+        assert_eq!(window.get_browserPort(), 14370);
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -638,6 +675,7 @@ mod smoke {
         let name_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let proxy_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let token_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let draft_hits: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -677,6 +715,13 @@ mod smoke {
                 move |s| h.borrow_mut().push(s.into())
             }),
             aria2_emulate_fingerprint: Box::new(|_| {}),
+            // 第 37 步：浏览器扩展组动作（草稿模式收 bool 验证通路）。
+            browser_enabled: Box::new(|_| {}),
+            browser_draft_taken: Box::new({
+                let h = draft_hits.clone();
+                move |v| h.borrow_mut().push(v)
+            }),
+            browser_port: Box::new(|_| {}),
         });
         crate::install_settings_actions(&window, actions);
         window.invoke_speedLimitationChanged(102400);
@@ -715,6 +760,9 @@ mod smoke {
             token_hits.borrow().last().map(|s| s.as_str()),
             Some("t0ken")
         );
+        // 第 37 步：草稿模式 invoke 通路（Switch toggled → bool）。
+        window.invoke_browserDraftTakenChanged(true);
+        assert!(draft_hits.borrow().last().copied().unwrap_or(false));
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }
