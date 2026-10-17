@@ -97,6 +97,52 @@ pub fn set_category_names(window: &AppWindow, names: Vec<String>) {
     window.set_categoryNames(model);
 }
 
+/// 设置页（第 32 步先验四键）装配：UserConfig typed 读 → 窗口属性。
+/// 键缺省/非数字取 Python 缺省口径（cfg.py），不猜。
+pub fn push_settings(
+    window: &AppWindow,
+    config: &gd3_core::config::UserConfig,
+    default_download_folder: &str,
+) {
+    window.set_downloadFolder(
+        config
+            .get_str("GeneralDownload", "DownloadFolder")
+            .unwrap_or(default_download_folder)
+            .to_string()
+            .into(),
+    );
+    window.set_maxTaskNum(config.get_i64("GeneralDownload", "MaxTaskNum").unwrap_or(3) as i32);
+    window.set_preBlockNum(
+        config
+            .get_i64("GeneralDownload", "PreBlockNum")
+            .unwrap_or(8) as i32,
+    );
+    window.set_categoryEnabled(
+        config
+            .get_bool("Category", "EnableCategory")
+            .unwrap_or(false),
+    );
+}
+
+/// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
+pub struct SettingsActions {
+    pub folder: Box<dyn Fn(&str)>,
+    pub max_task_num: Box<dyn Fn(i32)>,
+    pub pre_block_num: Box<dyn Fn(i32)>,
+    pub category_enabled: Box<dyn Fn(bool)>,
+}
+
+pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
+    let folder = actions.clone();
+    window.on_downloadFolderChanged(move |text| (folder.folder)(&text));
+    let max_task_num = actions.clone();
+    window.on_maxTaskNumChanged(move |value| (max_task_num.max_task_num)(value));
+    let pre_block_num = actions.clone();
+    window.on_preBlockNumChanged(move |value| (pre_block_num.pre_block_num)(value));
+    let category = actions.clone();
+    window.on_categoryEnabledChanged(move |value| (category.category_enabled)(value));
+}
+
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
 /// 分层：Slint 只发 taskId/路由字面量；真正的暂停/删除/筛选语义都在
@@ -324,6 +370,50 @@ mod smoke {
         assert_eq!(model.row_data(1).as_deref(), Some("视频"));
         window.set_categoryIndex(2);
         assert_eq!(window.get_categoryIndex(), 2);
+    }
+
+    /// 设置页装配（第 32 步先验四键）：UserConfig → 窗口属性缺省
+    /// 容错与 install 注册冒烟（无头无法模拟 Spin/Switch 点按）。
+    #[test]
+    fn settings_page_push_and_install_headless() {
+        use gd3_core::config::UserConfig;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut config = UserConfig::new();
+        config.set_str("GeneralDownload", "DownloadFolder", "/data/ghost");
+        config.set_i64("GeneralDownload", "MaxTaskNum", 5);
+        config.set_bool("Category", "EnableCategory", true);
+        let window = crate::create_headless();
+        crate::push_settings(&window, &config, "/default/download");
+        assert_eq!(window.get_downloadFolder(), "/data/ghost");
+        assert_eq!(window.get_maxTaskNum(), 5);
+        // PreBlockNum 缺键 → Python 缺省 8。
+        assert_eq!(window.get_preBlockNum(), 8);
+        assert!(window.get_categoryEnabled());
+
+        // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
+        let window = crate::create_headless();
+        crate::push_settings(&window, &UserConfig::new(), "/default/download");
+        assert_eq!(window.get_downloadFolder(), "/default/download");
+        assert_eq!(window.get_maxTaskNum(), 3);
+        assert_eq!(window.get_preBlockNum(), 8);
+        assert!(!window.get_categoryEnabled());
+
+        let window = crate::create_headless();
+        let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let actions = Rc::new(crate::SettingsActions {
+            folder: Box::new({
+                let h = hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
+            max_task_num: Box::new(|_| {}),
+            pre_block_num: Box::new(|_| {}),
+            category_enabled: Box::new(|_| {}),
+        });
+        crate::install_settings_actions(&window, actions);
+        window.set_downloadFolder("/edited/path".into());
+        assert_eq!(window.get_downloadFolder(), "/edited/path");
     }
 
     /// 段高亮：filterMode → 派生选中态。缺省 all；未知字面量全不

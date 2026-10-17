@@ -1,0 +1,74 @@
+// 设置页（Phase 7c 骨架，第 32 步）：先验四键最小集——下载路径 /
+// 最大任务数 / 预分配线程数 / 启用下载分类。控件与标题副标题镜像
+// app/view/pages/setting_page.py 的 .tr 字面量；执行（落盘/生效）全
+// 在调用方。限速值（SpeedLimitation，KB/s ⇄ 字节 1/1024 换算）留单独
+// 步先验，避免一步塞太多换算语义。
+//
+// 契约：Rust 侧 push_settings 写值串/数字派生值；控件只回发变化
+// （Line/Spin edited、Switch toggled），映射在 Rust 侧 typed set。
+
+import { VerticalBox, HorizontalBox, LineEdit, SpinBox, Switch } from "std-widgets.slint";
+
+export component SettingsPage inherits Rectangle {
+    // in-out 供 SpinBox/Switch 自身编辑态直写，AppWindow 推送覆盖。
+    in-out property <string> downloadFolder: "";
+    in-out property <int> maxTaskNum: 3;
+    in-out property <int> preBlockNum: 8;
+    in-out property <bool> categoryEnabled: false;
+
+    callback downloadFolderChanged(string);
+    callback maxTaskNumChanged(int);
+    callback preBlockNumChanged(int);
+    callback categoryEnabledChanged(bool);
+
+    background: transparent;
+
+    VerticalBox {
+        // SettingCard 最小同构：标题+副标题+右侧控件。图标留主题步。
+        HorizontalBox {
+            Text {
+                text: "下载路径\n文件默认保存位置";
+                vertical-alignment: center;
+            }
+            LineEdit {
+                text: root.downloadFolder;
+                edited(text) => { root.downloadFolderChanged(text); }
+                accepted(text) => { root.downloadFolderChanged(text); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "最大任务数\n最多能同时进行的任务数量";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 1;
+                maximum: 10;
+                value <=> root.maxTaskNum;
+                edited(value) => { root.maxTaskNumChanged(value); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "预分配线程数\n线程越多，下载越快。线程数大于 64 时，有触发反爬导致文件损坏的风险";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 1;
+                maximum: 256;
+                value <=> root.preBlockNum;
+                edited(value) => { root.preBlockNumChanged(value); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "启用下载分类\n根据扩展名将下载任务归类，便于筛选与分发到指定文件夹";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.categoryEnabled;
+                toggled => { root.categoryEnabledChanged(self.checked); }
+            }
+        }
+    }
+}

@@ -3,6 +3,7 @@
 
 import { VerticalBox } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
+import { SettingsPage } from "settings_page.slint";
 
 export component AppWindow inherits Window {
     title: "Ghost-Downloader-3";
@@ -14,13 +15,20 @@ export component AppWindow inherits Window {
     // filterMode：Rust 侧写「路由字面量」；段高亮在 TaskPage 内由
     // filterMode 派生后经 `<=>` 链回读到 AppWindow 供测试读取。
     in property <string> filterMode: "all";
+    // 设置页四键（第 32 步先验集）。
+    in-out property <string> downloadFolder: "";
+    in-out property <int> maxTaskNum: 3;
+    in-out property <int> preBlockNum: 8;
+    in-out property <bool> categoryEnabled: false;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
     in-out property <bool> highlightActive: root.filterMode == "active";
     in-out property <bool> highlightCompleted: root.filterMode == "completed";
     in property <[string]> categoryNames;
-    in property <bool> categoryEnabled: false;
+    // categoryEnabled 与设置页「启用下载分类」是同一配置键
+    // （cfg.isCategoryEnabled；task_page.py:93/241 仅消费可见性）——
+    // 窗口级单一份：SettingsPage 双链写、TaskPage 单向消费。
     in-out property <int> categoryIndex: 0;
     in-out property <int> sortFieldIndex: 0;
     in-out property <int> sortOrderIndex: 1;
@@ -29,6 +37,10 @@ export component AppWindow inherits Window {
     callback taskPause(string);
     callback taskDelete(string);
     callback categoryFilterChanged(int);
+    callback downloadFolderChanged(string);
+    callback maxTaskNumChanged(int);
+    callback preBlockNumChanged(int);
+    callback categoryEnabledChanged(bool);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -56,6 +68,16 @@ export component AppWindow inherits Window {
             categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
             sortFieldChanged(index) => { root.sortFieldChanged(index); }
             sortOrderChanged(index) => { root.sortOrderChanged(index); }
+        }
+        SettingsPage {
+            downloadFolder <=> root.downloadFolder;
+            maxTaskNum <=> root.maxTaskNum;
+            preBlockNum <=> root.preBlockNum;
+            categoryEnabled <=> root.categoryEnabled;
+            downloadFolderChanged(value) => { root.downloadFolderChanged(value); }
+            maxTaskNumChanged(value) => { root.maxTaskNumChanged(value); }
+            preBlockNumChanged(value) => { root.preBlockNumChanged(value); }
+            categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
         }
     }
 }
