@@ -14,6 +14,9 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+mod format;
+pub mod row;
+
 slint::include_modules!();
 
 /// 无头平台：不依赖任何显示服务（测试/裸构建机都跑得起来）。

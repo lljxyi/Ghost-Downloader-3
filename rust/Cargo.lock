@@ -1672,6 +1672,8 @@ dependencies = [
 name = "gd3-ui"
 version = "0.1.0"
 dependencies = [
+ "gd3-core",
+ "serde_json",
  "slint",
  "slint-build",
 ]
