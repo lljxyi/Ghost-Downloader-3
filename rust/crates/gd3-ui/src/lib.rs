@@ -15,6 +15,7 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
 pub mod card;
+pub mod card_menu;
 pub mod category;
 pub mod close_mode;
 pub mod conflict;
