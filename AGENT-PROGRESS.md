@@ -425,3 +425,46 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
 - 下一步：ed2k `parseProgress`（kelpie.py::336，纯 JSON 变换，小）；或 bili `fetchPlayurl`（量大）；
   mpegdash 评估。之后 Phase 7 Slint UI 与 `/root/Ghost-Downloader-3/AGENT-DONE`。
 - 卡点：无（android 目录仍未回来，34 errors 口径不变）。
+## 第 19 步：ed2k `parseProgress` 下沉（GD3_RUST_ED2K_PROGRESS，默认关）【完成】
+
+- 核心层（`1f3eb84` + parity 修正 `d24afca`）：
+  `rust/crates/gd3-core/src/ed2k.rs` 的 `parse_progress`/
+  `parse_sources`/`parse_source`/`field_of`/`py_type_name`/
+  `type_error_subscript`，字段全部 `serde_json::Value` 原样透传，
+  sources 分解 6 元组；单测 3 个。
+- 桥（`f54891f`）：`gd3_py.ed2k_parse_progress(message)` → 11 元组，
+  KeyError/TypeError 原型直接抛出（PyKeyError/PyTypeError），
+  str(e) 与 Python 一致，无翻译层。
+- 适配器 + 接线（`dc4ba08`）：
+  `features/ed2k_pack/kelpie/rust_progress.py`（kelpie 子包内，
+  `isEnabled()`/`FIELD_NAMES`/`parseProgress` 拼回 Progress/Source 数据类）；
+  `kelpie.py::parseProgress` 函数内延迟 import + `isEnabled()` 分流，
+  原生分支原样保留。
+- parity（`e94076c`）：金文件 `ed2k_progress.jsonl`（40 条，
+  `generate_ed2k_progress_fixture.py` 用 Python 原实现生成），
+  ok 路径 repr 逐字节、error 路径 type/str 逐字节三方对表，
+  mismatch 收集器一次报全。
+- 核心层 parity 修正（实证 CPython 3.13）：
+  1. 字段求值顺序：10 字段先于 `sources`（原实现关键字求值顺序），
+     `{'hash':'h'}` → KeyError 'size'、`{'sources':[1]}` → KeyError 'hash'；
+  2. str 元素/非空字符串 sources/dict sources 的下标文案补
+     `, not 'str'` 尾巴（`string indices must be integers, not 'str'`）。
+- NaN/Infinity 决策：语料剔除。serde_json 值模型不可表达
+  （Number::from_f64→None→Value::Null），且线上不可达——
+  kelpie 引擎侧用严格 JSON 序列化（serde 遇 NaN 直接报错），
+  progress 的 rate 字段实际均为 int。
+- 质量门：fmt/clippy/test 全绿；maturin 重建 OK；
+  双模式全量回归（--ignore=android_pack_import -p no:randomly）：
+  关 → 3 failed / 1210 passed / 8 skipped / 34 errors；
+  开（23 开关）→ 3 failed / 1207 passed / 11 skipped / 34 errors；
+  FAILED+ERROR 集合 diff 为空，失败 3 条为既有基线
+  （android_config_parity / github_probe / runtime_install）。
+- 插曲：一次开模式全量在 2400s 超时（疑似 listeners 端口偶发挂住，
+  与本轮改动无关——该用例独立复跑 1 passed），重跑即恢复，未追。
+- 开关清单（23 个）：GD3_RUST_PERSIST HTTP ARIA2 BROWSER FILENAME
+  PROBE HF_TREE GITHUB PROBE_SIZE BILI_PARSE HF_URL BILI_URL
+  BILI_PAGES BILI_VIEW BILI_SIGN GITHUB_PROBE HF_HEAD ED2K_LINK
+  HTTP_MATCH M3U8_OUTPUT M3U8_PARSE ED2K_PROGRESS
+  （+ BILI_GITHUB 等历史项见各自步骤）。
+- 下一步：bili `fetchPlayurl`（量大）或 mpegdash 评估；
+  之后 Phase 7 Slint UI 与 AGENT-DONE。
