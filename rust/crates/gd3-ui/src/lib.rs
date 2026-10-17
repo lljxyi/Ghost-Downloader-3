@@ -25,6 +25,7 @@ pub mod filter;
 mod format;
 pub mod headers;
 pub mod identity;
+pub mod menu_view;
 pub mod profile;
 pub mod proxy;
 pub mod pyshlex;
@@ -1158,6 +1159,111 @@ pub fn install_shell_actions(window: &AppWindow, actions: std::rc::Rc<ShellActio
     window.on_canDropPayload(move |data| (can_drop.can_drop)(&DropPayload::from_transfer(&data)));
     let drop = actions.clone();
     window.on_dropPayload(move |data| (drop.drop)(&DropPayload::from_transfer(&data)));
+}
+
+/// 菜单动作集（第 59 步）：点中一项 / 关闭。
+///
+/// 与 [`ShellActions`] 同一原则：只回传「点了哪一项的什么意图」
+/// （[`menu_view::CardMenuView::click`] 解析出的 [`card_menu::CardClick`]），
+/// 真服务调用（剪贴板、建编辑框、`moveToFront` …）在调用方。
+pub struct CardMenuActions {
+    pub activated: Box<dyn Fn(&card_menu::CardClick)>,
+    pub dismissed: Box<dyn Fn()>,
+}
+
+/// `menu_view::MenuRow` → Slint 的 `CardMenuRowData`。
+///
+/// `icon: None` 写成空串（Slint 没有 Option 属性，`""` = 没有图标位）。
+pub fn card_menu_rows(rows: &[menu_view::MenuRow]) -> slint::ModelRc<CardMenuRowData> {
+    let items: Vec<CardMenuRowData> = rows
+        .iter()
+        .map(|row| CardMenuRowData {
+            kind: row.kind.code(),
+            depth: i32::from(row.depth),
+            text: row.text.as_str().into(),
+            icon: row.icon.as_deref().unwrap_or("").into(),
+            checked: row.checked,
+            checkable: row.checkable,
+            expanded: row.expanded,
+        })
+        .collect();
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
+
+/// 把视图摊平后的行与面板高度写进 UI（展开/收起后重画用）。
+pub fn render_card_menu(window: &AppWindow, view: &menu_view::CardMenuView) {
+    let rows = view.rows();
+    window.set_cardMenuHeight(menu_view::panel_height(&rows));
+    window.set_cardMenuRows(card_menu_rows(&rows));
+}
+
+/// 弹卡片右键菜单（镜像 `createContextMenu()` + `menu.exec(globalPos)`）。
+///
+/// 每次弹都新建视图与回调：Qt 侧 `createContextMenu()` 也是每次造一个新
+/// `RoundMenu`，子菜单展开态不跨次残留。
+///
+/// 点击分派（`cardMenuActivated`）：
+/// 1. 子菜单行 → [`menu_view::CardMenuView::toggle`] 切换展开并重画，菜单继续开着；
+/// 2. 动作行 → 收起菜单 + 回调 [`CardMenuActions::activated`]；
+/// 3. 分隔符 / 越界 → 什么都不做（Slint 侧已经不给分隔符发事件，这里兜底）。
+pub fn show_card_menu(
+    window: &AppWindow,
+    view: menu_view::CardMenuView,
+    x: i32,
+    y: i32,
+    actions: std::rc::Rc<CardMenuActions>,
+) {
+    render_card_menu(window, &view);
+    window.set_cardMenuX(x);
+    window.set_cardMenuY(y);
+    window.set_cardMenuOpened(true);
+
+    let state = std::rc::Rc::new(std::cell::RefCell::new(view));
+    let weak = window.as_weak();
+    let activated = actions.clone();
+    window.on_cardMenuActivated(move |index| {
+        if index < 0 {
+            return;
+        }
+        let row = index as usize;
+        // 子菜单行：切换展开态后重画，菜单不关。
+        let toggled = state.borrow_mut().toggle(row);
+        if toggled {
+            if let Some(window) = weak.upgrade() {
+                render_card_menu(&window, &state.borrow());
+            }
+            return;
+        }
+        let click = state.borrow().click(row);
+        if click.is_none() {
+            // 分隔符 / 越界：Qt 侧点了没反应，菜单也不关。
+            return;
+        }
+        if let Some(window) = weak.upgrade() {
+            hide_card_menu(&window);
+        }
+        if let Some(click) = click {
+            (activated.activated)(&click);
+        }
+    });
+
+    let dismissed = actions;
+    let weak = window.as_weak();
+    window.on_cardMenuDismissed(move || {
+        if let Some(window) = weak.upgrade() {
+            hide_card_menu(&window);
+        }
+        (dismissed.dismissed)();
+    });
+}
+
+/// 收起卡片菜单并清掉行列表（镜像 `menu.close()`）。
+pub fn hide_card_menu(window: &AppWindow) {
+    window.set_cardMenuOpened(false);
+    window.set_cardMenuHeight(0);
+    window.set_cardMenuRows(slint::ModelRc::new(slint::VecModel::from(Vec::<
+        CardMenuRowData,
+    >::new())));
 }
 
 #[cfg(test)]
@@ -2724,6 +2830,158 @@ mod smoke {
         assert_eq!(
             crate::window::drop_decision(&empty, |_| true),
             crate::window::DropDecision::Ignore
+        );
+    }
+
+    /// 第 59 步：右键菜单覆盖层的装配（摊平行 → Slint model → 点击回传）。
+    ///
+    /// 钉住四件事：行字段映射（含 `icon: None` → 空串）、面板高度、
+    /// 子菜单就地展开（菜单不关）、动作行收起菜单并回传 [`CardClick`]。
+    #[test]
+    fn card_menu_overlay_assembly_headless() {
+        use crate::card_menu::{CardClick, MenuCategory};
+        use crate::menu_view::CardMenuView;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let window = crate::create_headless();
+        let categories = vec![
+            MenuCategory {
+                id: "cat_video".into(),
+                name: "视频".into(),
+                icon: "VIDEO".into(),
+            },
+            MenuCategory {
+                id: "cat_other".into(),
+                name: "杂项".into(),
+                icon: "NOT_A_REAL_ICON".into(),
+            },
+        ];
+        let icons = vec!["VIDEO".to_string(), "TAG".to_string()];
+        let view = CardMenuView::new(crate::card_menu::context_menu(
+            &crate::card_menu::ContextMenuInput {
+                can_edit: true,
+                status: gd3_core::task::TaskStatus::Running,
+                category_enabled: true,
+                categories: &categories,
+                known_icons: &icons,
+            },
+        ));
+
+        let clicks: Rc<RefCell<Vec<CardClick>>> = Rc::new(RefCell::new(Vec::new()));
+        let dismissals = Rc::new(RefCell::new(0));
+        let make_actions = || {
+            let clicks = clicks.clone();
+            let dismissals = dismissals.clone();
+            Rc::new(crate::CardMenuActions {
+                activated: Box::new(move |click: &CardClick| {
+                    clicks.borrow_mut().push(click.clone());
+                }),
+                dismissed: Box::new(move || {
+                    *dismissals.borrow_mut() += 1;
+                }),
+            })
+        };
+
+        crate::show_card_menu(&window, view.clone(), 320, 240, make_actions());
+        assert!(window.get_cardMenuOpened());
+        assert_eq!(window.get_cardMenuX(), 320);
+        assert_eq!(window.get_cardMenuY(), 240);
+        assert_eq!(
+            window.get_cardMenuHeight(),
+            crate::menu_view::panel_height(&view.rows()),
+            "面板高度必须与摊平行高度之和一致"
+        );
+
+        let rows = window.get_cardMenuRows();
+        assert_eq!(rows.row_count(), 7);
+        let detail = rows.row_data(0).expect("首行缺失");
+        assert_eq!(detail.kind, 0);
+        assert_eq!(detail.text, crate::card_menu::MENU_DETAIL);
+        assert_eq!(detail.icon, "INFO");
+        assert_eq!(detail.depth, 0);
+        assert!(!detail.checkable);
+        assert!(!detail.checked);
+        let separator = rows.row_data(1).expect("分隔符缺失");
+        assert_eq!(separator.kind, 1);
+        assert_eq!(separator.text, "", "分隔符没有文案");
+        assert_eq!(separator.icon, "", "`None` 图标写成空串");
+        let submenu = rows.row_data(6).expect("子菜单行缺失");
+        assert_eq!(submenu.kind, 2);
+        assert_eq!(submenu.text, crate::card_menu::MENU_MOVE_TO_CATEGORY);
+        assert!(!submenu.expanded);
+
+        // 点分隔符：Qt 侧点了没反应，菜单不关、无动作。
+        window.invoke_cardMenuActivated(1);
+        assert!(window.get_cardMenuOpened());
+        assert!(clicks.borrow().is_empty());
+
+        // 点子菜单行：就地展开并重画，菜单继续开着。
+        window.invoke_cardMenuActivated(6);
+        assert!(window.get_cardMenuOpened());
+        assert!(clicks.borrow().is_empty());
+        let rows = window.get_cardMenuRows();
+        assert_eq!(rows.row_count(), 11, "展开后多 4 行");
+        assert!(rows.row_data(6).expect("子菜单行").expanded);
+        let uncategorized = rows.row_data(7).expect("未分类行缺失");
+        assert_eq!(uncategorized.depth, 1);
+        assert_eq!(uncategorized.text, crate::card_menu::MENU_UNCATEGORIZED);
+        assert_eq!(
+            rows.row_data(9).expect("分类行缺失").text,
+            "视频",
+            "分类显示名"
+        );
+        assert_eq!(
+            rows.row_data(10).expect("分类行缺失").icon,
+            "TAG",
+            "非法图标名在 card_menu 侧已兜底"
+        );
+
+        // 点展开后的分类项：收起菜单 + 回传 SetCategory。
+        window.invoke_cardMenuActivated(9);
+        assert!(!window.get_cardMenuOpened());
+        assert_eq!(window.get_cardMenuRows().row_count(), 0);
+        assert_eq!(window.get_cardMenuHeight(), 0);
+        assert_eq!(
+            clicks.borrow().as_slice(),
+            [CardClick::SetCategory("cat_video".into())]
+        );
+
+        // 再弹一次：展开态不残留（每次都是新视图，与 Qt 造新 RoundMenu 一致）。
+        crate::show_card_menu(&window, view.clone(), 10, 10, make_actions());
+        assert_eq!(window.get_cardMenuRows().row_count(), 7);
+
+        // 点面板外：收起 + 回调 dismissed。
+        window.invoke_cardMenuDismissed();
+        assert!(!window.get_cardMenuOpened());
+        assert_eq!(*dismissals.borrow(), 1);
+        assert_eq!(clicks.borrow().len(), 1, "关闭不产生动作");
+
+        // 校验菜单：所有动作行可勾选，已算过的算法打勾。
+        let algorithms: Vec<String> = ["md5", "sha256"].iter().map(|s| s.to_string()).collect();
+        let checksums = vec!["md5".to_string()];
+        let view = CardMenuView::new(crate::card_menu::checksum_menu(
+            &crate::card_menu::ChecksumMenuInput {
+                algorithms: &algorithms,
+                checksums: &checksums,
+            },
+        ));
+        crate::show_card_menu(&window, view, 0, 0, make_actions());
+        let rows = window.get_cardMenuRows();
+        assert_eq!(rows.row_count(), 3);
+        let md5 = rows.row_data(0).expect("MD5 行缺失");
+        assert!(md5.checkable);
+        assert!(md5.checked);
+        assert_eq!(md5.icon, "", "两参 `Action(text, parent)` 没有图标");
+        assert!(!rows.row_data(1).expect("SHA256 行").checked);
+        assert_eq!(rows.row_data(2).expect("更多行").kind, 2);
+
+        // 点算法项：回传 StartChecksum(algorithm) 并收起菜单。
+        window.invoke_cardMenuActivated(1);
+        assert!(!window.get_cardMenuOpened());
+        assert_eq!(
+            clicks.borrow().last(),
+            Some(&CardClick::StartChecksum("sha256".into()))
         );
     }
 }

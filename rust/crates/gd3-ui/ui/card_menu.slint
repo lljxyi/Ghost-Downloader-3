@@ -1,0 +1,162 @@
+// Ghost-Downloader-3 Slint 卡片右键菜单组件（Phase 7c 第 59 步）。
+//
+// Qt 侧是 `RoundMenu`（独立弹出窗口 + `addMenu` 子弹出窗口）；Slint 侧没有
+// 多窗口弹出，改成**一个覆盖层 + 缩进展开**：
+//
+//   CardMenuPopup   整屏覆盖层（点空白关闭）+ 定位面板 + 行列表
+//
+// 行数据由 `menu_view::CardMenuView::rows()` 摊平好，面板高度由
+// `menu_view::panel_height()` 算好（Slint 布局无法把子项高度之和回传给父元素）。
+// 这里只做**形状**，不判断任何业务语义：所有非分隔符行点击都回传摊平后的
+// 行号，展开/收起与动作分派都在 Rust 侧。
+//
+// 未镜像（Qt 侧有、Slint 侧暂缺）：
+// - 阴影/圆角/内边距的像素级还原（`RoundMenu` 的 Mica 材质）；
+// - 悬停即展开子菜单（Qt 的弹出行为），这里改为点击展开；
+// - 图标位只显示 `FluentIcon` 的**成员名**，真实图标资源留到主题对齐步。
+
+// 一行的类型编码（与 `menu_view::MenuRowKind::code` 一致）。
+export struct CardMenuRowData {
+    // 0 动作 / 1 分隔符 / 2 子菜单
+    kind: int,
+    // 缩进层级：顶层 0，子菜单项 1
+    depth: int,
+    text: string,
+    // `FluentIcon` 成员名；`""` = 没有图标
+    icon: string,
+    checked: bool,
+    checkable: bool,
+    expanded: bool,
+}
+
+export component CardMenuPopup inherits Rectangle {
+    in property <bool> opened: false;
+    // 锚点（像素）：右键位置。`CardMenuPopup` 会把它夹在父元素内。
+    in property <int> anchorX: 0;
+    in property <int> anchorY: 0;
+    // 面板高度（像素），由 `menu_view::panel_height` 给。
+    in property <int> panelHeight: 0;
+    in property <[CardMenuRowData]> rows;
+    // 非分隔符行被点击：参数是**摊平后的行号**。
+    callback activated(int);
+    // 点面板外任意位置。
+    callback dismissed;
+
+    visible: root.opened;
+    // 不遮罩：Qt 的 `RoundMenu` 是弹出窗口，背景仍是原界面。
+    background: transparent;
+
+    // 点面板外关闭（Qt 里是失焦关闭）。
+    TouchArea {
+        clicked => {
+            root.dismissed();
+        }
+    }
+
+    panel := Rectangle {
+        // 夹在父元素内：先靠右/下对齐再取锚点，避免菜单出屏。
+        x: max(4px, min(root.anchorX * 1px, parent.width - self.width - 4px));
+        y: max(4px, min(root.anchorY * 1px, parent.height - self.height - 4px));
+        width: 220px;
+        height: root.panelHeight * 1px;
+        background: white;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #dcdcdc;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #33000000;
+        drop-shadow-offset-y: 4px;
+        clip: true;
+
+        // 面板吞掉点击，避免点在行间空隙时被外层的「点空白关闭」收走。
+        TouchArea {}
+
+        VerticalLayout {
+            // 与 `menu_view::PANEL_PADDING` 同步。
+            padding: 4px;
+            spacing: 0px;
+
+            for r[i] in root.rows : Rectangle {
+                // 与 `menu_view::PANEL_ROW_ACTION_HEIGHT` /
+                // `PANEL_ROW_SEPARATOR_HEIGHT` 同步（`panel_height` 测试钉住）。
+                height: r.kind == 1 ? 9px : 30px;
+                background: (row-touch.has-hover && r.kind != 1) ? #f0f0f0 : transparent;
+                border-radius: 4px;
+
+                // 分隔符：1px 细线。
+                if r.kind == 1 : Rectangle {
+                    x: 8px;
+                    y: (parent.height - self.height) / 2;
+                    width: parent.width - 16px;
+                    height: 1px;
+                    background: #e0e0e0;
+                }
+
+                if r.kind != 1 : HorizontalLayout {
+                    padding-left: 8px + 16px * r.depth;
+                    padding-right: 8px;
+                    spacing: 8px;
+
+                    // 勾选框（只有校验算法项有；`checked` 决定打勾）。
+                    Rectangle {
+                        width: 14px;
+                        height: 14px;
+                        border-radius: 3px;
+                        border-width: r.checkable ? 1px : 0px;
+                        border-color: #b0b0b0;
+                        background: r.checked ? #0067c0 : transparent;
+                        visible: r.checkable;
+                        Text {
+                            text: "✓";
+                            font-size: 11px;
+                            color: white;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            visible: r.checked;
+                        }
+                    }
+
+                    // 图标位：只显示成员名（真实资源留到主题对齐步）。
+                    Text {
+                        text: r.icon;
+                        font-size: 10px;
+                        color: #666;
+                        width: 40px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        visible: r.icon != "";
+                    }
+
+                    Text {
+                        text: r.text;
+                        font-size: 13px;
+                        color: #1a1a1a;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                    }
+
+                    // 子菜单指示：折叠 `›`、展开 `⌄`。
+                    Text {
+                        text: r.expanded ? "⌄" : "›";
+                        font-size: 12px;
+                        color: #888;
+                        width: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        visible: r.kind == 2;
+                    }
+                }
+
+                // 分隔符不响应点击（Qt 的 `addSeparator()` 也不可点）。
+                row-touch := TouchArea {
+                    clicked => {
+                        if r.kind != 1 {
+                            root.activated(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

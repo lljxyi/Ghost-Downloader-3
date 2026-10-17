@@ -3165,3 +3165,127 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
      右键菜单 / 卡片高度）。
   2. 之后按 P1 推进设置页剩余卡片。
 - 卡点：无
+
+## 2026-10-17 16:03 第 58 步（commit `6a3f81f`）
+- 做了什么：任务卡片的**交互层** `rust/crates/gd3-ui/src/card_menu.rs`（720 行，
+  含 `mod tests`）——把 `task_cards.py` 里「只在鼠标与菜单里发生」的判定摊平。
+  - `CardClick`（7 变体 `OpenDrawer`/`CopyUrl`/`EditTask`/`MoveToFront`/
+    `Redownload`/`SetCategory(id)`/`StartChecksum(alg)`）+ `dispatch()`
+    返回 `(sink, call)`，与金文件的 `invoke.calls[0]` 同义；
+  - `CardMenuAction`/`CardMenuSubmenu`/`CardMenuEntry`（动作 / 分隔符 / 子菜单）；
+  - `ContextMenuInput` + `context_menu()`（镜像 `createContextMenu()` 的
+    `addAction` 顺序：任务详情 → 分隔符 → 复制下载链接 →
+    [`canEdit and status != COMPLETED`] 编辑任务参数... → 移到最前 → 重新下载 →
+    [`cfg.isCategoryEnabled.value`] 子菜单「移动到分类」= 未分类 → 分隔符 → 每分类）；
+  - `ChecksumMenuInput` + `checksum_menu()`（`COMMON_ALGORITHMS` 进顶层、其余进
+    「更多」，`checked = algorithm in task.checksums`，文案 `algorithm.upper()`，
+    **无图标**，`更多` 无条件 `addMenu`）；
+  - `ChecksumOutcome` + `checksum_click(in_progress, is_folder, output_exists, menu)`：
+    三条短路（校验中 → `cancelChecksum`；目录或文件不存在 →
+    `_setStatus("文件不存在，无法校验")`；否则弹菜单），菜单用 `impl FnOnce()`
+    惰性构造（对应 Python 的局部变量只在最后一条分支里建）；
+  - `can_drag()` = `COMPLETED and hasOutputFile and isExisting(outputPath)`；
+  - `ReleaseGesture`/`ReleaseInput`/`release_gesture()`（名字区 → 打开文件、
+    信息区 → 抽屉、其余 → 选择，`checked = extend or not selection_mode or not is_checked`）；
+  - `double_click_opens_file()`、`category_menu_icon()`（`getattr(FluentIcon, name,
+    FluentIcon.TAG)` 的 TAG 兜底）、常量 `MENU_*`/`ICON_*`/`COMMON_ALGORITHMS`。
+  - 金文件 `tests/fixtures/card_menu.jsonl`：**133 条**，md5
+    `feaadabeec516549f134aa33eb7b5f9b`（两次跑 `cmp` 字节相同，确定性已验证）。
+    分布：`context-menu` 16 / `checksum-click` 5 / `can-drag` 16 / `release` 96。
+  - 另出 `tests/fixtures/fluent_icons.json`（**174** 个 `FluentIcon` 成员名）。
+  - 生成脚本 `tests/fixtures/generate_card_menu_fixture.py`（579 行）：不实例化
+    `TaskCard.__init__`，改用 `task_cards.CardWidget.__init__(self)` 建真 QObject，
+    `Action`/`RoundMenu` 换记录型替身并**真跑 `triggered` 回调**。
+- 决策与理由：
+  - **`Action` 是 `singledispatchmethod`，按第一个位置参数类型分派**：
+    `Action(text: str, parent)` 与 `Action(icon, text, parent)` 两种重载，
+    `task_cards.py` 两种都用。按固定三参写桩会把算法名当图标、把卡片当文本，
+    金文件里出现 `<_Card>`；改成 `__init__(self, *args)` 按
+    `isinstance(first, str)` 分流。
+  - **「点一项菜单会造成什么」是调用序列，不是单个调用**：`_onEditClicked` =
+    `featureService.createEditDialog` → `refresh()` → `taskService.checksumProgress`。
+    替身改成**一个按发生顺序排列的共享日志** `_CALL_LOG`（每条带 `sink` 标签
+    `task`/`feature`/`clipboard`/`drawer`），而不是每个服务各记一份。
+  - **`_fake_card` 把 `self.window()` 桩成返回字符串 `"window"`**：真 Qt 里无父
+    窗口时返回卡片自身，会让金文件出现 `<_Card>` 这种实现细节。
+  - **`_plain()` 不用 `repr`**（带内存地址，金文件不稳定），改 `<ClassName>`，
+    并加 `os.PathLike → str` 前置分支。
+  - **`ALGORITHMS = sorted(hashlib.algorithms_available)` 是平台相关的**
+    （OpenSSL 版本决定），算法表由金文件带出、Rust 侧当输入收
+    （`checksum_menu(algorithms, …)`），不硬编码；只有
+    `COMMON_ALGORITHMS = ("md5","sha1","sha256","sha512")` 是仓库常量。
+  - **`FluentIcon` 成员表单独输出成 `fluent_icons.json`**，Rust 侧镜像
+    `getattr(FluentIcon, name, FluentIcon.TAG)` 的 TAG 兜底。
+  - **Rust 侧 `CardClick` 只描述意图**，真服务调用留装配层——与第 57 步
+    `BarButtonData.index` 同一原则。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy -p gd3-ui --all-targets -- -D warnings`
+    0 error。
+  - `cargo test -p gd3-ui`：**115 → 128 passed**（新增 4 个 `card_menu::tests::*`，
+    其中 `matches_python_card_menu_fixture` 逐条重算 133 条：项数 / 类型 / 文案 /
+    图标 / `checked` / `invoke.calls[0]` 的 sink+call+args，`assert_menu` 递归比对）。
+- 下一步：Slint 侧装配（`menu_view.rs` + `ui/card_menu.slint` + 无头冒烟）。
+- 卡点：无
+
+## 2026-10-17 17:39 第 59 步：卡片右键菜单的 Slint 装配（摊平视图 + 覆盖层）
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/menu_view.rs`（444 行，含 `mod tests`）：
+    `MenuRowKind`（`code()` = Slint 侧 0 动作 / 1 分隔符 / 2 子菜单）、
+    `MenuRow`（kind/depth/text/icon/checked/checkable/expanded/path）、
+    `CardMenuView`（`entries` + `expanded: Vec<Vec<usize>>`）→ `rows()` 摊平、
+    `toggle(row)`、`click(row) -> Option<CardClick>`、`entry_at(path)` 逐级解析；
+    行高常量 `PANEL_ROW_ACTION_HEIGHT=30` / `PANEL_ROW_SEPARATOR_HEIGHT=9` /
+    `PANEL_PADDING=4` + `panel_height(rows)`。
+  - 新增 `rust/crates/gd3-ui/ui/card_menu.slint`（160 行）：`CardMenuRowData`
+    struct + `CardMenuPopup`（`opened`/`anchorX`/`anchorY`/`panelHeight`/`rows` +
+    `activated(int)`/`dismissed`）；外层 TouchArea 点空白关闭、面板 TouchArea
+    吞点击；动作行 30px、分隔符 1px 线、勾选框 `checked` 打勾、子菜单 `›`/`⌄`、
+    `depth * 16px` 缩进。
+  - `ui/appwindow.slint`：加 `import { CardMenuPopup, CardMenuRowData }`、
+    5 个属性 + 2 个回调，覆盖层插在消息框之后、拖放区之前（z 序：菜单在对话框
+    之上，拖放区仍在最顶）。
+  - `lib.rs`：`pub mod menu_view;` + `CardMenuActions`（`activated(&CardClick)` /
+    `dismissed`）+ `card_menu_rows()` / `render_card_menu()` /
+    `show_card_menu(window, view, x, y, actions)` / `hide_card_menu()`；
+    点击分派：子菜单行 → `toggle` + 重画且**不关**，动作行 → 收起 + 回调，
+    分隔符/越界 → 什么都不做（菜单也不关）。
+  - 新增无头冒烟 `smoke::card_menu_overlay_assembly_headless`：装配 → 断言行字段
+    映射（`icon: None` → `""`、`kind`/`depth`/`checkable`）与 `panelHeight` →
+    点分隔符无反应 → 点子菜单行展开（7 → 11 行，`depth=1`，非法图标已兜底
+    `TAG`）→ 点分类行收起并回传 `SetCategory("cat_video")` → 再弹一次展开态不残留
+    → `dismissed` 收起且不产生动作 → 校验菜单 3 行（MD5 打勾、无图标、`更多` 是
+    子菜单）→ 点算法行回传 `StartChecksum("sha256")`。
+- 决策与理由：
+  - **子菜单从「弹出窗口」改成「缩进 + 点击展开」，是刻意偏离**：Slint 没有多
+    弹出窗口，Qt 的 `addMenu` 子菜单悬停即展开。语义上「能点到的动作集合」完全
+    一致（折叠只影响可见性），展开态记在 `CardMenuView.expanded`。
+  - **面板高度由 Rust 算**：Slint 布局无法把「子项高度之和」回传给父元素，
+    所以 `panel_height()` 按行高常量求和后推给 `CardMenuPopup.panelHeight`；
+    slint 侧行高写死同像素值，两处互相注释引用，`panel_height_matches_row_kinds`
+    测试钉住总和口径。
+  - **锚点/高度用 `<int>` 像素而不是 `<length>`**：值全部来自 Rust 侧像素算术，
+    走 int 边界避免 `f32` 换算，Slint 侧 `* 1px`。
+  - **分隔符行不回调**：Qt 的 `addSeparator()` 不可点。Slint 侧 `if r.kind != 1`
+    才发 `activated`，Rust 侧再兜一层（`click()` 返回 `None` → 不关菜单）。
+  - **每次 `show_card_menu` 都新建视图与回调**：Qt 侧 `createContextMenu()` 每次
+    造新 `RoundMenu`，子菜单展开态不跨次残留。
+  - **`expanded` 用路径而不是摊平下标**：展开会改变行号，路径稳定。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error（全工作区）。
+  - `cargo test -p gd3-ui`：**128 passed**（第 58 步的 4 个 `card_menu` 测试 +
+    本步 8 个 `menu_view` 测试 + 1 个无头冒烟）。
+- 运维提示（本轮踩到）：**磁盘满了**。`cargo test -p gd3-core -p gd3-net
+  -p gd3-servers -p gd3-ui` 链接 `gd3-net` 的 `hf_head` 测试二进制时
+  `ld terminated with signal 7 [Bus error]` + `No space left on device`，
+  `/` 100%（40G）。删掉 `rust/target/debug/incremental`（7.9G）后回到 85%，
+  但被写坏的 `i-slint-compiler`/`slint` 产物导致重建，全量测试要重跑。
+  后续建议：每次开工前看一眼 `df -h /`，`target/debug/incremental` 是最大的
+  可安全回收项。
+- 下一步：
+  1. 等重建完成后补跑 `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+     与 Python 全量，确认无新增失败。
+  2. P0 收口：`toggle_action` 接服务层（暂停/继续/删除的真调用）。
+  3. 之后按 P1 推进设置页剩余卡片（`setting_cards.py` 949 / `setting_card_group.py`
+     290 / `card_groups.py` 191）。
+- 卡点：磁盘（已回收 8G，重建中）

@@ -13,6 +13,7 @@ import { LineEdit } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
 import { DrawerChecksumRow, DrawerFileRow, DrawerInfoRow, TaskDrawer } from "task_drawer.slint";
 import { BarButtonData, NavButton, NavItemData, ShellInfoBar, ShellMessageDialog } from "app_shell.slint";
+import { CardMenuPopup, CardMenuRowData } from "card_menu.slint";
 import {
     CategoryEditDraft,
     HeadersEditDraft,
@@ -261,12 +262,23 @@ export component AppWindow inherits Window {
     in-out property <string> dialogCheckboxLabel: "";
     in-out property <bool> dialogCheckboxChecked: false;
     in property <[BarButtonData]> dialogButtons;
+    // 卡片右键菜单（`RoundMenu`）：行列表由 `menu_view::MenuRow` 摊平，
+    // 面板高度由 `menu_view::panel_height` 算好（Slint 布局无法回传子项高度和）。
+    // 锚点/高度用 int 像素：值全部来自 Rust 侧的像素算术，避免 f32 边界换算。
+    in-out property <bool> cardMenuOpened: false;
+    in property <int> cardMenuX: 0;
+    in property <int> cardMenuY: 0;
+    in property <int> cardMenuHeight: 0;
+    in property <[CardMenuRowData]> cardMenuRows;
     callback navItemClicked(string);
     callback searchEdited(string);
     callback infoBarButtonClicked(int);
     callback infoBarClosed();
     callback dialogButtonClicked(int);
     callback dialogCheckboxToggled(bool);
+    // 摊平后的行号：子菜单行由 Rust 侧切换展开，其余解析成 `CardClick`。
+    callback cardMenuActivated(int);
+    callback cardMenuDismissed();
     // 拖放：`data-transfer` 在 Slint 里不透明，只能由宿主语言读
     // （`DataTransfer::has_file_paths` / `file_paths` / `plain_text`）。
     // 判定仍走 `window::drop_decision` / `drop_urls`。
@@ -591,6 +603,24 @@ export component AppWindow inherits Window {
             }
             checkboxToggled(checked) => {
                 root.dialogCheckboxToggled(checked);
+            }
+        }
+
+        // ---- 卡片右键菜单（`RoundMenu`）----
+        // 覆盖层铺满窗口：点空白关闭，面板吞点击。
+        CardMenuPopup {
+            width: 100%;
+            height: 100%;
+            opened: root.cardMenuOpened;
+            anchorX: root.cardMenuX;
+            anchorY: root.cardMenuY;
+            panelHeight: root.cardMenuHeight;
+            rows: root.cardMenuRows;
+            activated(index) => {
+                root.cardMenuActivated(index);
+            }
+            dismissed => {
+                root.cardMenuDismissed();
             }
         }
 
