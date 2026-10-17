@@ -14,6 +14,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+pub mod close_mode;
 pub mod conflict;
 pub mod filter;
 mod format;
@@ -214,6 +215,32 @@ pub fn push_settings(
             .unwrap_or(false),
     );
     window.set_browserPort(config.get_i64("Browser", "Port").unwrap_or(14_370) as i32);
+    // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
+    // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
+    // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
+    // 生效归桥接步）/ CloseMode 缺省 "Ask" / ClipboardListener 缺省
+    // T——CloseMode 镜像 ComboBoxSettingCard 存枚举值字面量）。
+    window.set_urlSchemeEnabled(
+        config
+            .get_bool("Browser", "UrlSchemeRegistered")
+            .unwrap_or(true),
+    );
+    window.set_checkUpdateAtStartup(
+        config
+            .get_bool("Software", "CheckUpdateAtStartUp")
+            .unwrap_or(true),
+    );
+    window.set_runAtLogin(config.get_bool("Software", "AutoRun").unwrap_or(false));
+    window.set_closeModeIndex(close_mode::index_of_option(
+        config
+            .get_str("Software", "CloseMode")
+            .unwrap_or(close_mode::DEFAULT_OPTION),
+    ) as i32);
+    window.set_clipboardListener(
+        config
+            .get_bool("Software", "ClipboardListener")
+            .unwrap_or(true),
+    );
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -247,6 +274,13 @@ pub struct SettingsActions {
     pub browser_enabled: Box<dyn Fn(bool)>,
     pub browser_draft_taken: Box<dyn Fn(bool)>,
     pub browser_port: Box<dyn Fn(i64)>,
+    // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
+    // 换算在 install 层 close_mode.rs）。
+    pub url_scheme_enabled: Box<dyn Fn(bool)>,
+    pub check_update_at_startup: Box<dyn Fn(bool)>,
+    pub run_at_login: Box<dyn Fn(bool)>,
+    pub close_mode: Box<dyn Fn(&str)>,
+    pub clipboard_listener: Box<dyn Fn(bool)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -341,6 +375,20 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_browserDraftTakenChanged(move |v| (browser_draft.browser_draft_taken)(v));
     let browser_port = actions.clone();
     window.on_browserPortChanged(move |v| (browser_port.browser_port)(v as i64));
+    // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
+    // 开机启动注册归引擎桥接步）。
+    let url_scheme = actions.clone();
+    window.on_urlSchemeEnabledChanged(move |v| (url_scheme.url_scheme_enabled)(v));
+    let check_update = actions.clone();
+    window.on_checkUpdateAtStartupChanged(move |v| (check_update.check_update_at_startup)(v));
+    let run_at_login = actions.clone();
+    window.on_runAtLoginChanged(move |v| (run_at_login.run_at_login)(v));
+    let close_mode = actions.clone();
+    window.on_closeModeChanged(move |i| {
+        (close_mode.close_mode)(close_mode::option_of_index(i as i64))
+    });
+    let clipboard = actions.clone();
+    window.on_clipboardListenerChanged(move |v| (clipboard.clipboard_listener)(v));
 }
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
@@ -602,6 +650,11 @@ mod smoke {
         config.set_bool("Browser", "EnableBrowserExtension", false);
         config.set_bool("Browser", "EnableRaiseWindowWhenReceiveMsg", true);
         config.set_i64("Browser", "Port", 15370);
+        config.set_bool("Browser", "UrlSchemeRegistered", false);
+        config.set_bool("Software", "CheckUpdateAtStartUp", false);
+        config.set_bool("Software", "AutoRun", true);
+        config.set_str("Software", "CloseMode", "Quit");
+        config.set_bool("Software", "ClipboardListener", false);
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -636,6 +689,13 @@ mod smoke {
         assert!(!window.get_browserEnabled());
         assert!(window.get_browserDraftTaken());
         assert_eq!(window.get_browserPort(), 15370);
+        // 第 38 步：有值推送（urlScheme=F / 更新=F / 自启=T /
+        // CloseMode="Quit"→索引 2 / 剪贴板=F）。
+        assert!(!window.get_urlSchemeEnabled());
+        assert!(!window.get_checkUpdateAtStartup());
+        assert!(window.get_runAtLogin());
+        assert_eq!(window.get_closeModeIndex(), 2);
+        assert!(!window.get_clipboardListener());
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -668,6 +728,13 @@ mod smoke {
         assert!(window.get_browserEnabled());
         assert!(!window.get_browserDraftTaken());
         assert_eq!(window.get_browserPort(), 14370);
+        // 第 38 步：缺省容错（urlScheme=T / 更新=T / 自启=F /
+        // CloseMode="Ask"→索引 0 / 剪贴板=T）。
+        assert!(window.get_urlSchemeEnabled());
+        assert!(window.get_checkUpdateAtStartup());
+        assert!(!window.get_runAtLogin());
+        assert_eq!(window.get_closeModeIndex(), 0);
+        assert!(window.get_clipboardListener());
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -676,6 +743,7 @@ mod smoke {
         let proxy_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let token_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let draft_hits: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
+        let close_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -722,6 +790,16 @@ mod smoke {
                 move |v| h.borrow_mut().push(v)
             }),
             browser_port: Box::new(|_| {}),
+            // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
+            // 索引⇄字面量通路）。
+            url_scheme_enabled: Box::new(|_| {}),
+            check_update_at_startup: Box::new(|_| {}),
+            run_at_login: Box::new(|_| {}),
+            close_mode: Box::new({
+                let h = close_hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
+            clipboard_listener: Box::new(|_| {}),
         });
         crate::install_settings_actions(&window, actions);
         window.invoke_speedLimitationChanged(102400);
@@ -763,6 +841,13 @@ mod smoke {
         // 第 37 步：草稿模式 invoke 通路（Switch toggled → bool）。
         window.invoke_browserDraftTakenChanged(true);
         assert!(draft_hits.borrow().last().copied().unwrap_or(false));
+        // 第 38 步：CloseMode invoke 通路（索引 1→"Background"，镜像
+        // qconfig.set(item, EnumSerializer.serialize)）。
+        window.invoke_closeModeChanged(1);
+        assert_eq!(
+            close_hits.borrow().last().map(|s| s.as_str()),
+            Some("Background")
+        );
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

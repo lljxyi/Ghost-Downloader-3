@@ -50,6 +50,13 @@ export component AppWindow inherits Window {
     in-out property <bool> browserEnabled: true;
     in-out property <bool> browserDraftTaken: false;
     in-out property <int> browserPort: 14370;
+    // 第 38 步：关联 urlScheme 静态卡 + 软件组简版五键
+    // （cfg.py 缺省 T/T/F/"Ask"/T；CloseMode 映射归 close_mode.rs）。
+    in-out property <bool> urlSchemeEnabled: true;
+    in-out property <bool> checkUpdateAtStartup: true;
+    in-out property <bool> runAtLogin: false;
+    in-out property <int> closeModeIndex: 0;
+    in-out property <bool> clipboardListener: true;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -87,6 +94,11 @@ export component AppWindow inherits Window {
     callback browserEnabledChanged(bool);
     callback browserDraftTakenChanged(bool);
     callback browserPortChanged(int);
+    callback urlSchemeEnabledChanged(bool);
+    callback checkUpdateAtStartupChanged(bool);
+    callback runAtLoginChanged(bool);
+    callback closeModeChanged(int);
+    callback clipboardListenerChanged(bool);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -160,6 +172,16 @@ export component AppWindow inherits Window {
             browserEnabledChanged(v) => { root.browserEnabledChanged(v); }
             browserDraftTakenChanged(v) => { root.browserDraftTakenChanged(v); }
             browserPortChanged(v) => { root.browserPortChanged(v); }
+            urlSchemeEnabled <=> root.urlSchemeEnabled;
+            checkUpdateAtStartup <=> root.checkUpdateAtStartup;
+            runAtLogin <=> root.runAtLogin;
+            closeModeIndex <=> root.closeModeIndex;
+            clipboardListener <=> root.clipboardListener;
+            urlSchemeEnabledChanged(v) => { root.urlSchemeEnabledChanged(v); }
+            checkUpdateAtStartupChanged(v) => { root.checkUpdateAtStartupChanged(v); }
+            runAtLoginChanged(v) => { root.runAtLoginChanged(v); }
+            closeModeChanged(i) => { root.closeModeChanged(i); }
+            clipboardListenerChanged(v) => { root.clipboardListenerChanged(v); }
         }
     }
 }
