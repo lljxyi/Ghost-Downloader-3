@@ -10,6 +10,7 @@
 mod bili;
 mod browser;
 mod ed2k;
+mod ftp;
 mod github;
 mod hf;
 mod hls;
@@ -258,6 +259,7 @@ fn gd3_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(ed2k::ed2k_parse_progress, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_playurl_gate, module)?)?;
     module.add_function(wrap_pyfunction!(bili::bili_subtitle_list, module)?)?;
+    module.add_function(wrap_pyfunction!(ftp::ftp_source, module)?)?;
     module.add(
         "Ed2kInvalidLinkError",
         module.py().get_type::<ed2k::Ed2kInvalidLinkError>(),
