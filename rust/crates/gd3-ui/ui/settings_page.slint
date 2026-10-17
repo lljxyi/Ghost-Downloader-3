@@ -1,7 +1,7 @@
-// 设置页（Phase 7c，第 32-35 步）：镜像 setting_page.py GeneralDownload
-// 组与「启用下载分类」。控件与标题副标题镜像 .tr 字面量；执行（落盘/
-// 生效）全在调用方。限速值 KB/s ⇄ 字节 1/1024 换算在 Rust speed.rs；
-// 代理卡拼装/校验镜像在 Rust proxy.rs。
+// 设置页（Phase 7c，第 32-36 步）：镜像 setting_page.py GeneralDownload
+// 组、「启用下载分类」与 Aria2 RPC 兼容组。控件与标题副标题镜像 .tr
+// 字面量；执行（落盘/生效）全在调用方。限速值 KB/s ⇄ 字节 1/1024 换
+// 算在 Rust speed.rs；代理卡拼装/校验镜像在 Rust proxy.rs。
 // 契约：Rust 侧 push_settings 写值串/数字派生值；控件只回发变化
 // （Line/Spin edited、Switch toggled），映射在 Rust 侧 typed set。
 
@@ -35,6 +35,16 @@ export component SettingsPage inherits Rectangle {
     in-out property <string> proxyPort: "";
     in-out property <string> proxyUser: "";
     in-out property <string> proxyPass: "";
+    // 第 36 步：Aria2 RPC 兼容组（cfg.py:277-280 实证）：
+    // Enabled 默认 F / Port 缺省 16800 范围 1024-65535（division=1
+    // 显示=配置值）/ Token 默认 ""（无校验）/ EmulateFingerprint 默认
+    // F。Python 端令牌 LineEdit 仅 editingFinished（回车/失焦）落盘，
+    // 这里 edited+accepted 均回发、install 层每次写（更新鲜，等价
+    // 安全，同代理卡注记；见 lib.rs）。
+    in-out property <bool> aria2Enabled: false;
+    in-out property <int> aria2RpcPort: 16800;
+    in-out property <string> aria2RpcToken: "";
+    in-out property <bool> aria2EmulateFingerprint: false;
 
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
@@ -49,6 +59,10 @@ export component SettingsPage inherits Rectangle {
     callback useSystemDnsChanged(bool);
     callback proxyChoiceChanged(int);
     callback proxyFieldsChanged(int, string, string, string, string);
+    callback aria2EnabledChanged(bool);
+    callback aria2RpcPortChanged(int);
+    callback aria2RpcTokenChanged(string);
+    callback aria2EmulateFingerprintChanged(bool);
 
     background: transparent;
 
@@ -269,6 +283,55 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
                 }
+            }
+        }
+        // 第 36 步：Aria2 RPC 兼容组四卡（镜像 SwitchSettingCard/
+        // SpinBoxSettingCard/LineEditSettingCard；令牌 LineEdit
+        // input-type=password 镜像 PasswordLineEdit）。
+        HorizontalBox {
+            Text {
+                text: "启用 Aria2 RPC 兼容";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.aria2Enabled;
+                toggled => { root.aria2EnabledChanged(self.checked); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "监听端口\nAria2 RPC 默认端口为 16800";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 1024;
+                maximum: 65535;
+                step-size: 1;
+                value <=> root.aria2RpcPort;
+                edited(value) => { root.aria2RpcPortChanged(value); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "令牌\n若设置，客户端需传入 token 才可创建任务";
+                vertical-alignment: center;
+            }
+            LineEdit {
+                placeholder-text: "可选";
+                text <=> root.aria2RpcToken;
+                input-type: password;
+                edited(text) => { root.aria2RpcTokenChanged(text); }
+                accepted(text) => { root.aria2RpcTokenChanged(text); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "模拟浏览器指纹\n为通过 Aria2 RPC 接收的任务附加浏览器 TLS 指纹与请求头";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.aria2EmulateFingerprint;
+                toggled => { root.aria2EmulateFingerprintChanged(self.checked); }
             }
         }
     }

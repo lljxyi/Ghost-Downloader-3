@@ -182,6 +182,23 @@ pub fn push_settings(
         window.set_proxyUser(fields.user.as_str().into());
         window.set_proxyPass(fields.pass.as_str().into());
     }
+    // 第 36 步：Aria2 RPC 组（cfg.py:277-280 实证：Enabled 缺省 F /
+    // Port 缺省 16800 范围 1024-65535 / Token 缺省 "" /
+    // EmulateFingerprint 缺省 F）。
+    window.set_aria2Enabled(config.get_bool("Aria2Rpc", "Enabled").unwrap_or(false));
+    window.set_aria2RpcPort(config.get_i64("Aria2Rpc", "Port").unwrap_or(16_800) as i32);
+    window.set_aria2RpcToken(
+        config
+            .get_str("Aria2Rpc", "Token")
+            .unwrap_or("")
+            .to_string()
+            .into(),
+    );
+    window.set_aria2EmulateFingerprint(
+        config
+            .get_bool("Aria2Rpc", "EmulateFingerprint")
+            .unwrap_or(false),
+    );
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -205,6 +222,12 @@ pub struct SettingsActions {
     // 模式收拼装并校验后的 URL（拼装/校验在 install 层 proxy.rs 镜像
     // ProxyValidator；无效 URL 不落盘，镜像 leaveEvent 语义）。
     pub proxy_changed: Box<dyn Fn(&str)>,
+    // 第 36 步：Aria2 RPC 组动作（端口收 i64 配置单位 division=1、
+    // 令牌收原样串——Python 端 cfg.set 不 trim）。
+    pub aria2_enabled: Box<dyn Fn(bool)>,
+    pub aria2_rpc_port: Box<dyn Fn(i64)>,
+    pub aria2_rpc_token: Box<dyn Fn(&str)>,
+    pub aria2_emulate_fingerprint: Box<dyn Fn(bool)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -283,6 +306,15 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
             (proxy_fields.proxy_changed)(&url);
         }
     });
+    // 第 36 步：Aria2 RPC 组注册（对齐留引擎桥接步）。
+    let aria2_enabled = actions.clone();
+    window.on_aria2EnabledChanged(move |v| (aria2_enabled.aria2_enabled)(v));
+    let aria2_rpc_port = actions.clone();
+    window.on_aria2RpcPortChanged(move |v| (aria2_rpc_port.aria2_rpc_port)(v as i64));
+    let aria2_rpc_token = actions.clone();
+    window.on_aria2RpcTokenChanged(move |t| (aria2_rpc_token.aria2_rpc_token)(&t));
+    let aria2_emulate = actions.clone();
+    window.on_aria2EmulateFingerprintChanged(move |v| (aria2_emulate.aria2_emulate_fingerprint)(v));
 }
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
@@ -537,6 +569,10 @@ mod smoke {
             "ProxyServer",
             "socks5://u:p@1.2.3.4:1080",
         );
+        config.set_bool("Aria2Rpc", "Enabled", true);
+        config.set_i64("Aria2Rpc", "Port", 10800);
+        config.set_str("Aria2Rpc", "Token", "secret");
+        config.set_bool("Aria2Rpc", "EmulateFingerprint", true);
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -562,6 +598,11 @@ mod smoke {
         assert_eq!(window.get_proxyPort(), "1080");
         assert_eq!(window.get_proxyUser(), "u");
         assert_eq!(window.get_proxyPass(), "p");
+        // 第 36 步：有值推送（Aria2 组四键同态）。
+        assert!(window.get_aria2Enabled());
+        assert_eq!(window.get_aria2RpcPort(), 10800);
+        assert_eq!(window.get_aria2RpcToken(), "secret");
+        assert!(window.get_aria2EmulateFingerprint());
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -584,12 +625,19 @@ mod smoke {
         // 控件旧值（进程启动即缺省空串）。
         assert_eq!(window.get_proxyChoice(), 1);
         assert_eq!(window.get_proxyHost(), "");
+        // 第 36 步：缺省容错（Enabled=F / Port=16800 / Token="" /
+        // EmulateFingerprint=F）。
+        assert!(!window.get_aria2Enabled());
+        assert_eq!(window.get_aria2RpcPort(), 16800);
+        assert_eq!(window.get_aria2RpcToken(), "");
+        assert!(!window.get_aria2EmulateFingerprint());
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let speed_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let name_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let proxy_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let token_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -621,6 +669,14 @@ mod smoke {
                 let h = proxy_hits.clone();
                 move |s| h.borrow_mut().push(s.into())
             }),
+            // 第 36 步：Aria2 组动作（令牌收原样串验证通路）。
+            aria2_enabled: Box::new(|_| {}),
+            aria2_rpc_port: Box::new(|_| {}),
+            aria2_rpc_token: Box::new({
+                let h = token_hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
+            aria2_emulate_fingerprint: Box::new(|_| {}),
         });
         crate::install_settings_actions(&window, actions);
         window.invoke_speedLimitationChanged(102400);
@@ -652,6 +708,13 @@ mod smoke {
         );
         window.invoke_proxyChoiceChanged(1);
         assert_eq!(proxy_hits.borrow().last().map(|s| s.as_str()), Some("Auto"));
+        // 第 36 步：令牌 invoke 通路（edited/accepted 回发、install 层
+        // 每次写——Python editingFinished 语义的更新鲜镜像）。
+        window.invoke_aria2RpcTokenChanged("t0ken".into());
+        assert_eq!(
+            token_hits.borrow().last().map(|s| s.as_str()),
+            Some("t0ken")
+        );
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

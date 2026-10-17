@@ -40,6 +40,11 @@ export component AppWindow inherits Window {
     in-out property <string> proxyPort: "";
     in-out property <string> proxyUser: "";
     in-out property <string> proxyPass: "";
+    // 第 36 步：Aria2 RPC 兼容组（cfg.py:277-280 缺省 F/16800/""/F）。
+    in-out property <bool> aria2Enabled: false;
+    in-out property <int> aria2RpcPort: 16800;
+    in-out property <string> aria2RpcToken: "";
+    in-out property <bool> aria2EmulateFingerprint: false;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -70,6 +75,10 @@ export component AppWindow inherits Window {
     callback useSystemDnsChanged(bool);
     callback proxyChoiceChanged(int);
     callback proxyFieldsChanged(int, string, string, string, string);
+    callback aria2EnabledChanged(bool);
+    callback aria2RpcPortChanged(int);
+    callback aria2RpcTokenChanged(string);
+    callback aria2EmulateFingerprintChanged(bool);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -129,6 +138,14 @@ export component AppWindow inherits Window {
             proxyPass <=> root.proxyPass;
             proxyChoiceChanged(c) => { root.proxyChoiceChanged(c); }
             proxyFieldsChanged(p, h, t, u, w) => { root.proxyFieldsChanged(p, h, t, u, w); }
+            aria2Enabled <=> root.aria2Enabled;
+            aria2RpcPort <=> root.aria2RpcPort;
+            aria2RpcToken <=> root.aria2RpcToken;
+            aria2EmulateFingerprint <=> root.aria2EmulateFingerprint;
+            aria2EnabledChanged(v) => { root.aria2EnabledChanged(v); }
+            aria2RpcPortChanged(v) => { root.aria2RpcPortChanged(v); }
+            aria2RpcTokenChanged(t) => { root.aria2RpcTokenChanged(t); }
+            aria2EmulateFingerprintChanged(v) => { root.aria2EmulateFingerprintChanged(v); }
         }
     }
 }
