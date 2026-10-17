@@ -11,6 +11,7 @@ pub mod github;
 pub mod hls;
 pub mod http_pack;
 pub mod m3u8;
+pub mod pair_token;
 pub mod store;
 pub mod task;
 pub mod task_error;

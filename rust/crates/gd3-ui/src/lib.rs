@@ -215,6 +215,15 @@ pub fn push_settings(
             .unwrap_or(false),
     );
     window.set_browserPort(config.get_i64("Browser", "Port").unwrap_or(14_370) as i32);
+    // 第 40 步：配对令牌（cfg.py:269 BrowserExtensionPairToken 缺省
+    // ""。镜像 PrimaryPushSettingCard setContent——启动时空令牌自动
+    // 补生成留引擎桥接步，先推当前值）。
+    window.set_pairToken(
+        config
+            .get_str("Browser", "BrowserExtensionPairToken")
+            .unwrap_or("")
+            .into(),
+    );
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
     // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
     // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
@@ -280,6 +289,15 @@ pub struct SettingsActions {
     pub browser_enabled: Box<dyn Fn(bool)>,
     pub browser_draft_taken: Box<dyn Fn(bool)>,
     pub browser_port: Box<dyn Fn(i64)>,
+    // 第 40 步：浏览器扩展动作卡（复制令牌/重新生成/一键安装/导出
+    // CRX 收 ()，商店链接收 URL 原样串）。剪贴板写入、扩展解包、
+    // 拉起浏览器归平台/引擎桥接步；重新生成的 cfg 写口径由
+    // gd3-core pair_token::generate 兜（token_urlsafe(16) 等价）。
+    pub pair_token_copy: Box<dyn Fn()>,
+    pub pair_token_regenerate: Box<dyn Fn()>,
+    pub store_url_open: Box<dyn Fn(String)>,
+    pub chromium_install: Box<dyn Fn()>,
+    pub chromium_crx_export: Box<dyn Fn()>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
     pub url_scheme_enabled: Box<dyn Fn(bool)>,
@@ -385,6 +403,17 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_browserDraftTakenChanged(move |v| (browser_draft.browser_draft_taken)(v));
     let browser_port = actions.clone();
     window.on_browserPortChanged(move |v| (browser_port.browser_port)(v as i64));
+    // 第 40 步：浏览器扩展动作卡注册（对齐留调用方/引擎桥接步）。
+    let pair_token_copy = actions.clone();
+    window.on_copyPairToken(move || (pair_token_copy.pair_token_copy)());
+    let pair_token_regen = actions.clone();
+    window.on_regeneratePairToken(move || (pair_token_regen.pair_token_regenerate)());
+    let store_url = actions.clone();
+    window.on_openStoreUrl(move |url| (store_url.store_url_open)(url.to_string()));
+    let chromium_install = actions.clone();
+    window.on_chromiumInstall(move || (chromium_install.chromium_install)());
+    let chromium_crx = actions.clone();
+    window.on_exportCrx(move || (chromium_crx.chromium_crx_export)());
     // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
     // 开机启动注册归引擎桥接步）。
     let url_scheme = actions.clone();
@@ -670,6 +699,7 @@ mod smoke {
         config.set_str("Software", "CloseMode", "Quit");
         config.set_bool("Software", "ClipboardListener", false);
         config.set_f64("Personalization", "DpiScale", 1.25);
+        config.set_str("Browser", "BrowserExtensionPairToken", "p41rt0kenal");
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -704,6 +734,8 @@ mod smoke {
         assert!(!window.get_browserEnabled());
         assert!(window.get_browserDraftTaken());
         assert_eq!(window.get_browserPort(), 15370);
+        // 第 40 步：有值推送（配对令牌原样串）。
+        assert_eq!(window.get_pairToken(), "p41rt0kenal");
         // 第 38 步：有值推送（urlScheme=F / 更新=F / 自启=T /
         // CloseMode="Quit"→索引 2 / 剪贴板=F）。
         assert!(!window.get_urlSchemeEnabled());
@@ -754,6 +786,8 @@ mod smoke {
         assert!(window.get_clipboardListener());
         // 第 39 步：缺省容错（DpiScale=0 → 0%「自动」）。
         assert_eq!(window.get_uiScalePercent(), 0);
+        // 第 40 步：缺省容错（BrowserExtensionPairToken 缺省 ""）。
+        assert_eq!(window.get_pairToken(), "");
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -764,6 +798,11 @@ mod smoke {
         let draft_hits: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
         let close_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let dpi_hits: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 40 步：动作卡命中记录。
+        let token_copy_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let token_regen_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let store_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let chromium_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -810,6 +849,24 @@ mod smoke {
                 move |v| h.borrow_mut().push(v)
             }),
             browser_port: Box::new(|_| {}),
+            // 第 40 步：动作卡 invoke 通路验证。
+            pair_token_copy: Box::new({
+                let h = token_copy_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            pair_token_regenerate: Box::new({
+                let h = token_regen_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            store_url_open: Box::new({
+                let h = store_hits.clone();
+                move |u| h.borrow_mut().push(u)
+            }),
+            chromium_install: Box::new({
+                let h = chromium_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            chromium_crx_export: Box::new(|| {}),
             // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
             // 索引⇄字面量通路）。
             url_scheme_enabled: Box::new(|_| {}),
@@ -881,6 +938,21 @@ mod smoke {
             Some(0.75),
             "显示 % 应换算回配置 0-5 浮点"
         );
+        // 第 40 步：动作卡 invoke 通路（复制/重新生成各 1 次、商店
+        // URL 原样串、一键安装 1 次）。
+        window.invoke_copyPairToken();
+        assert_eq!(token_copy_hits.borrow().len(), 1);
+        window.invoke_regeneratePairToken();
+        assert_eq!(token_regen_hits.borrow().len(), 1);
+        window.invoke_openStoreUrl(
+            "https://addons.mozilla.org/firefox/addon/ghost-downloader/".into(),
+        );
+        assert_eq!(
+            store_hits.borrow().last().map(|s| s.as_str()),
+            Some("https://addons.mozilla.org/firefox/addon/ghost-downloader/")
+        );
+        window.invoke_chromiumInstall();
+        assert_eq!(chromium_hits.borrow().len(), 1);
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }
