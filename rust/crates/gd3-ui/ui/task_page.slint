@@ -24,6 +24,29 @@ export struct TaskRow {
     progress: float,
 }
 
+// 段按钮（Python SegmentedToggleToolWidget 最小同构）：选中段高亮，
+// 点击只发路由字面量（图标/tooltip 等视觉细节留主题对齐步）。
+component SegmentItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked();
+
+    height: 28px;
+    border-radius: 6px;
+    // 第 30 步临时色，主题对齐步再换。
+    background: self.selected ? #E2E6ED : transparent;
+    horizontal-stretch: 0;
+
+    Text {
+        text: root.label;
+        vertical-alignment: center;
+        font-size: 13px;
+    }
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
 export component TaskPage inherits Rectangle {
     in property <[TaskRow]> tasks;
     in property <string> searchText: "";
@@ -31,6 +54,12 @@ export component TaskPage inherits Rectangle {
     in property <[string]> categoryNames;
     in property <bool> categoryEnabled: false;
     in-out property <int> categoryIndex: 0;
+    // 段高亮（第 30 步）：由 AppWindow 层按 filterMode 统一派生后
+    // 单向传入（双链初值竞态实证会互相覆盖）。slint 侧不做未知
+    // 字面量容错（全不选中），容错语义在 filter.rs 镜像层。
+    in property <bool> highlightAll;
+    in property <bool> highlightActive;
+    in property <bool> highlightCompleted;
     in property <string> searchPlaceholder: "搜索任务";
     // 排序（镜像 Python sortMenu：缺省 CREATED_AT + 倒序）。索引即
     // 菜单显示序，映射在 Rust 侧 sort::from_menu_index。
@@ -49,16 +78,19 @@ export component TaskPage inherits Rectangle {
 
     VerticalBox {
         HorizontalBox {
-            Button {
-                text: "全部";
+            SegmentItem {
+                label: "全部";
+                selected: root.highlightAll;
                 clicked => { root.filterModeChanged("all"); }
             }
-            Button {
-                text: "进行中";
+            SegmentItem {
+                label: "进行中";
+                selected: root.highlightActive;
                 clicked => { root.filterModeChanged("active"); }
             }
-            Button {
-                text: "已完成";
+            SegmentItem {
+                label: "已完成";
+                selected: root.highlightCompleted;
                 clicked => { root.filterModeChanged("completed"); }
             }
             ComboBox {

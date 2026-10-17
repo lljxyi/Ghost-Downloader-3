@@ -11,6 +11,14 @@ export component AppWindow inherits Window {
 
     in property <string> statusText: "Ghost-Downloader-3 (Slint)";
     in property <[TaskRow]> tasks;
+    // filterMode：Rust 侧写「路由字面量」；段高亮在 TaskPage 内由
+    // filterMode 派生后经 `<=>` 链回读到 AppWindow 供测试读取。
+    in property <string> filterMode: "all";
+    // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
+    // 传入：窗口层派生 → TaskPage 消费）。
+    in-out property <bool> highlightAll: root.filterMode == "all";
+    in-out property <bool> highlightActive: root.filterMode == "active";
+    in-out property <bool> highlightCompleted: root.filterMode == "completed";
     in property <[string]> categoryNames;
     in property <bool> categoryEnabled: false;
     in-out property <int> categoryIndex: 0;
@@ -32,6 +40,10 @@ export component AppWindow inherits Window {
         }
         TaskPage {
             tasks: root.tasks;
+            filterMode: root.filterMode;
+            highlightAll: root.highlightAll;
+            highlightActive: root.highlightActive;
+            highlightCompleted: root.highlightCompleted;
             categoryNames: root.categoryNames;
             categoryEnabled: root.categoryEnabled;
             categoryIndex <=> root.categoryIndex;

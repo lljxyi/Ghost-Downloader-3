@@ -326,6 +326,24 @@ mod smoke {
         assert_eq!(window.get_categoryIndex(), 2);
     }
 
+    /// 段高亮：filterMode → 派生选中态。缺省 all；未知字面量全不
+    /// 选中（slint 不做容错——容错语义在 filter.rs from_route 镜像层）。
+    #[test]
+    fn filter_mode_segment_highlight_follows_route_headless() {
+        let window = crate::create_headless();
+        assert!(window.get_highlightAll());
+        assert!(!window.get_highlightActive());
+        assert!(!window.get_highlightCompleted());
+        window.set_filterMode("active".into());
+        assert!(!window.get_highlightAll());
+        assert!(window.get_highlightActive());
+        assert!(!window.get_highlightCompleted());
+        window.set_filterMode("weird".into());
+        assert!(!window.get_highlightAll());
+        assert!(!window.get_highlightActive());
+        assert!(!window.get_highlightCompleted());
+    }
+
     /// 排序 ComboBox 索引：缺省字段 0（按添加时间）、顺序 1（倒序）
     /// round-trip；字段索引 → SortField 的映射在 sort::from_menu_index。
     #[test]
