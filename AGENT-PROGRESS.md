@@ -1234,3 +1234,52 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    typed 装配。
 2. 暂停/删除接真实语义（方案待定：引擎桥接放 Phase 8 一体考虑）。
 3. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 32 步 — 设置页骨架（先验四键）(2026-10-17 06:33)
+
+### 改动
+
+- **ui/settings_page.slint（新，74 行）**：SettingsPage 四键——
+  下载路径（LineEdit，edited+accepted 双触发）、最大任务数
+  （SpinBox min1 max10）、预分配线程数（SpinBox min1 max256）、
+  启用下载分类（Switch）。标题/副标题双行 Text 镜像
+  setting_page.py .tr 字面量；控件只回发变化
+  （downloadFolderChanged/maxTaskNumChanged/preBlockNumChanged/
+  categoryEnabledChanged），落盘/生效全在调用方。
+- **ui/appwindow.slint**：import SettingsPage + 四 in-out 属性 +
+  四回调 + SettingsPage 实例 `<=>` 透传。
+- **lib.rs**：`push_settings(window, config, default_download_folder)`
+  typed 读 + `SettingsActions`（folder/max_task_num/pre_block_num/
+  category_enabled）+ `install_settings_actions` + 冒烟
+  `settings_page_push_and_install_headless`。
+
+### 本步实证（新坑）
+
+- **重复声明不可覆盖**：categoryEnabled 在窗口层声了两次（设置页
+  in-out + 任务页原有 in）→ slint 编译错 `Cannot override property
+  'categoryEnabled'`。修复=合并为窗口级单一份 in-out：
+  Python 端两者本来就是**同一配置键** `cfg.isCategoryEnabled`
+  （cfg.py:261 Category/EnableCategory；task_page.py:93/241 只消费
+  可见性），设置页 `<=>` 双链写、TaskPage 单向消费。
+- **键位以 cfg.py 为准**（四处实证核对）：GeneralDownload/
+  GeneralDownload/{DownloadFolder,MaxTaskNum,PreBlockNum}+Category/EnableCategory；缺省
+  MaxTaskNum=3、PreBlockNum=8、EnableCategory=False、
+  DownloadFolder=str(DOWNLOAD_DIR)（Android 分支除外，调用方传）。
+
+### 验证
+
+- `cargo build -p gd3-ui` 编译通过；`cargo fmt --all --check`、
+  `cargo clippy -p gd3-ui --all-targets -- -D warnings` 干净。
+- `timeout 1200 cargo test -p gd3-ui`：**24 → 25 passed**
+  （+1 settings 冒烟：有值推送、空配置容错、install 注册）。0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. SpeedLimitation 卡（KB/s ⇄ 字节 1/1024 换算语义）单独步先验。
+2. 其余设置组逐键扩；暂停/删除接真实语义（桥接策略 Phase 8 一体
+   考虑）。
+3. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
