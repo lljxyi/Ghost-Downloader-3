@@ -32,6 +32,14 @@ export component AppWindow inherits Window {
     in-out property <bool> verifySsl: false;
     in-out property <int> nameConflictIndex: 0;
     in-out property <bool> useSystemDns: true;
+    // 第 35 步：ProxyServer（cfg.py 缺省 Auto；choice 0 Off/1 Auto/
+    // 2 自定义，映射与拼装/校验归 Rust proxy.rs + install 层）。
+    in-out property <int> proxyChoice: 1;
+    in-out property <int> proxyProtocolIndex: 0;
+    in-out property <string> proxyHost: "";
+    in-out property <string> proxyPort: "";
+    in-out property <string> proxyUser: "";
+    in-out property <string> proxyPass: "";
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -60,6 +68,8 @@ export component AppWindow inherits Window {
     callback verifySslChanged(bool);
     callback nameConflictChanged(int);
     callback useSystemDnsChanged(bool);
+    callback proxyChoiceChanged(int);
+    callback proxyFieldsChanged(int, string, string, string, string);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -111,6 +121,14 @@ export component AppWindow inherits Window {
             verifySslChanged(v) => { root.verifySslChanged(v); }
             nameConflictChanged(v) => { root.nameConflictChanged(v); }
             useSystemDnsChanged(v) => { root.useSystemDnsChanged(v); }
+            proxyChoice <=> root.proxyChoice;
+            proxyProtocolIndex <=> root.proxyProtocolIndex;
+            proxyHost <=> root.proxyHost;
+            proxyPort <=> root.proxyPort;
+            proxyUser <=> root.proxyUser;
+            proxyPass <=> root.proxyPass;
+            proxyChoiceChanged(c) => { root.proxyChoiceChanged(c); }
+            proxyFieldsChanged(p, h, t, u, w) => { root.proxyFieldsChanged(p, h, t, u, w); }
         }
     }
 }

@@ -1,7 +1,7 @@
-// 设置页（Phase 7c，第 32-34 步）：镜像 setting_page.py GeneralDownload
+// 设置页（Phase 7c，第 32-35 步）：镜像 setting_page.py GeneralDownload
 // 组与「启用下载分类」。控件与标题副标题镜像 .tr 字面量；执行（落盘/
 // 生效）全在调用方。限速值 KB/s ⇄ 字节 1/1024 换算在 Rust speed.rs；
-//
+// 代理卡拼装/校验镜像在 Rust proxy.rs。
 // 契约：Rust 侧 push_settings 写值串/数字派生值；控件只回发变化
 // （Line/Spin edited、Switch toggled），映射在 Rust 侧 typed set。
 
@@ -26,6 +26,15 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> verifySsl: false;
     in-out property <int> nameConflictIndex: 0;
     in-out property <bool> useSystemDns: true;
+    // 第 35 步：ProxyServer（cfg.py GeneralDownload 缺省 "Auto"）。
+    // choice 0 Off/1 Auto/2 自定义；自定义四字段原样串（拼 URL/
+    // 校验/写入决策归 Rust proxy.rs + install 层）。
+    in-out property <int> proxyChoice: 1;
+    in-out property <int> proxyProtocolIndex: 0;
+    in-out property <string> proxyHost: "";
+    in-out property <string> proxyPort: "";
+    in-out property <string> proxyUser: "";
+    in-out property <string> proxyPass: "";
 
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
@@ -38,6 +47,8 @@ export component SettingsPage inherits Rectangle {
     callback verifySslChanged(bool);
     callback nameConflictChanged(int);
     callback useSystemDnsChanged(bool);
+    callback proxyChoiceChanged(int);
+    callback proxyFieldsChanged(int, string, string, string, string);
 
     background: transparent;
 
@@ -176,6 +187,88 @@ export component SettingsPage inherits Rectangle {
             Switch {
                 checked <=> root.useSystemDns;
                 toggled => { root.useSystemDnsChanged(self.checked); }
+            }
+        }
+        // 第 35 步：ProxySettingCard。fluent 风格 std 无 RadioButton
+        // 导出，三选单选用 ComboBox 镜像（choiceLabel 本就回显选中
+        // 项文本，索引 0 Off/1 Auto/2 自定义，映射归 Rust proxy.rs）。
+        // 兼容横幅（依赖功能包 proxySchemes）与 Auto 模式的系统代理
+        // 检测（getproxies）留引擎桥接步。Python 端自定义字段在
+        // leaveEvent 才落盘，这里每次变化回调、install 层校验有效
+        // 才写（见 lib.rs 注记）。
+        HorizontalBox {
+            Text {
+                text: "代理\n设置下载时希望使用的代理";
+                vertical-alignment: center;
+            }
+            VerticalBox {
+                ComboBox {
+                    model: ["不使用代理", "自动检测系统代理", "使用自定义代理"];
+                    current-index <=> root.proxyChoice;
+                    selected => { root.proxyChoiceChanged(self.current-index); }
+                }
+                HorizontalBox {
+                    ComboBox {
+                        model: ["socks4", "socks5", "socks5h", "http", "https"];
+                        current-index <=> root.proxyProtocolIndex;
+                        enabled: root.proxyChoice == 2;
+                        selected => {
+                            root.proxyFieldsChanged(self.current-index, root.proxyHost,
+                                root.proxyPort, root.proxyUser, root.proxyPass);
+                        }
+                    }
+                    LineEdit {
+                        placeholder-text: "代理 IP 地址";
+                        text <=> root.proxyHost;
+                        enabled: root.proxyChoice == 2;
+                        edited(text) => {
+                            root.proxyFieldsChanged(root.proxyProtocolIndex, text,
+                                root.proxyPort, root.proxyUser, root.proxyPass);
+                        }
+                        accepted(text) => {
+                            root.proxyFieldsChanged(root.proxyProtocolIndex, text,
+                                root.proxyPort, root.proxyUser, root.proxyPass);
+                        }
+                    }
+                    Text {
+                        text: ":";
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        placeholder-text: "端口";
+                        text <=> root.proxyPort;
+                        enabled: root.proxyChoice == 2;
+                        edited(text) => {
+                            root.proxyFieldsChanged(root.proxyProtocolIndex, root.proxyHost,
+                                text, root.proxyUser, root.proxyPass);
+                        }
+                    }
+                }
+                HorizontalBox {
+                    Text {
+                        text: "认证信息: ";
+                        vertical-alignment: center;
+                    }
+                    LineEdit {
+                        placeholder-text: "用户名（可选）";
+                        text <=> root.proxyUser;
+                        enabled: root.proxyChoice == 2;
+                        edited(text) => {
+                            root.proxyFieldsChanged(root.proxyProtocolIndex, root.proxyHost,
+                                root.proxyPort, text, root.proxyPass);
+                        }
+                    }
+                    LineEdit {
+                        placeholder-text: "密码（可选）";
+                        text <=> root.proxyPass;
+                        input-type: password;
+                        enabled: root.proxyChoice == 2;
+                        edited(text) => {
+                            root.proxyFieldsChanged(root.proxyProtocolIndex, root.proxyHost,
+                                root.proxyPort, root.proxyUser, text);
+                        }
+                    }
+                }
             }
         }
     }

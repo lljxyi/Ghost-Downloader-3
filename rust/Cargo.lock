@@ -1673,6 +1673,7 @@ name = "gd3-ui"
 version = "0.1.0"
 dependencies = [
  "gd3-core",
+ "regex",
  "serde_json",
  "slint",
  "slint-build",

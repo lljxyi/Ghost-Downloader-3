@@ -17,6 +17,7 @@ use std::rc::Rc;
 pub mod conflict;
 pub mod filter;
 mod format;
+pub mod proxy;
 pub mod row;
 pub mod sort;
 pub mod speed;
@@ -165,6 +166,22 @@ pub fn push_settings(
             .get_bool("Network", "ShouldUseSystemDns")
             .unwrap_or(true),
     );
+    // 第 35 步：ProxyServer（cfg.py GeneralDownload 缺省 "Auto"）。
+    // choice 由 proxy.rs 镜像派生；自定义四字段仅自定义模式时解析
+    // 推送（Auto/Off 模式下 Python 端卡内自定义字段保持控件旧值，
+    // 进程启动即缺省空）。
+    let proxy_value = config
+        .get_str("GeneralDownload", "ProxyServer")
+        .unwrap_or(proxy::VALUE_DEFAULT);
+    window.set_proxyChoice(proxy::choice_of_value(proxy_value));
+    if proxy::choice_of_value(proxy_value) == proxy::CHOICE_CUSTOM {
+        let fields = proxy::parse_fields(proxy_value);
+        window.set_proxyProtocolIndex(fields.protocol_index);
+        window.set_proxyHost(fields.host.as_str().into());
+        window.set_proxyPort(fields.port.as_str().into());
+        window.set_proxyUser(fields.user.as_str().into());
+        window.set_proxyPass(fields.pass.as_str().into());
+    }
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -184,6 +201,10 @@ pub struct SettingsActions {
     pub verify_ssl: Box<dyn Fn(bool)>,
     pub name_conflict: Box<dyn Fn(&str)>,
     pub use_system_dns: Box<dyn Fn(bool)>,
+    // 第 35 步：代理动作收**配置口径字面量**——Off/Auto 原样，自定义
+    // 模式收拼装并校验后的 URL（拼装/校验在 install 层 proxy.rs 镜像
+    // ProxyValidator；无效 URL 不落盘，镜像 leaveEvent 语义）。
+    pub proxy_changed: Box<dyn Fn(&str)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -220,6 +241,48 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     });
     let use_system_dns = actions.clone();
     window.on_useSystemDnsChanged(move |v| (use_system_dns.use_system_dns)(v));
+    // 第 35 步：代理。Slint 发 choice+字段；install 层换算成配置
+    // 字面量——Off/Auto 直取，自定义模式拼 URL 并以 proxy::validate
+    // 校验，无效 URL 不调用动作（Python 端 leaveEvent 仅在有效时
+    // cfg.set 的镜像）。
+    let proxy = actions.clone();
+    let win = window.clone_strong();
+    let win_fields = window.clone_strong();
+    let proxy_fields = proxy.clone();
+    window.on_proxyChoiceChanged(move |choice| {
+        let value = match choice {
+            proxy::CHOICE_OFF => proxy::VALUE_OFF.to_string(),
+            proxy::CHOICE_AUTO => proxy::VALUE_AUTO.to_string(),
+            _ => {
+                let protocol = proxy::PROTOCOLS
+                    .get(win.get_proxyProtocolIndex() as usize)
+                    .copied()
+                    .unwrap_or(proxy::PROTOCOLS[0]);
+                let url = proxy::build_url(
+                    protocol,
+                    &win.get_proxyHost(),
+                    &win.get_proxyPort(),
+                    &win.get_proxyUser(),
+                    &win.get_proxyPass(),
+                );
+                if !proxy::validate(&url) {
+                    return;
+                }
+                url
+            }
+        };
+        (proxy.proxy_changed)(&value);
+    });
+    window.on_proxyFieldsChanged(move |protocol_index, host, port, user, pass| {
+        let protocol = proxy::PROTOCOLS
+            .get(protocol_index as usize)
+            .copied()
+            .unwrap_or(proxy::PROTOCOLS[0]);
+        let url = proxy::build_url(protocol, &host, &port, &user, &pass);
+        if win_fields.get_proxyChoice() == proxy::CHOICE_CUSTOM && proxy::validate(&url) {
+            (proxy_fields.proxy_changed)(&url);
+        }
+    });
 }
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
@@ -469,6 +532,11 @@ mod smoke {
         config.set_bool("GeneralDownload", "shouldVerifySsl", true);
         config.set_str("GeneralDownload", "NameConflict", "ask");
         config.set_bool("Network", "ShouldUseSystemDns", false);
+        config.set_str(
+            "GeneralDownload",
+            "ProxyServer",
+            "socks5://u:p@1.2.3.4:1080",
+        );
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -486,6 +554,14 @@ mod smoke {
         assert!(window.get_verifySsl());
         assert_eq!(window.get_nameConflictIndex(), 2);
         assert!(!window.get_useSystemDns());
+        // 第 35 步：有值推送——自定义代理 URL 解析（choice=2、协议
+        // socks5=索引 1、凭据拆回四字段）。
+        assert_eq!(window.get_proxyChoice(), 2);
+        assert_eq!(window.get_proxyProtocolIndex(), 1);
+        assert_eq!(window.get_proxyHost(), "1.2.3.4");
+        assert_eq!(window.get_proxyPort(), "1080");
+        assert_eq!(window.get_proxyUser(), "u");
+        assert_eq!(window.get_proxyPass(), "p");
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -504,11 +580,16 @@ mod smoke {
         assert!(!window.get_verifySsl());
         assert_eq!(window.get_nameConflictIndex(), 0);
         assert!(window.get_useSystemDns());
+        // 第 35 步：缺省容错——Auto 模式 → choice=1；自定义字段保持
+        // 控件旧值（进程启动即缺省空串）。
+        assert_eq!(window.get_proxyChoice(), 1);
+        assert_eq!(window.get_proxyHost(), "");
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let speed_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let name_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let proxy_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -535,6 +616,11 @@ mod smoke {
                 move |s| h.borrow_mut().push(s.into())
             }),
             use_system_dns: Box::new(|_| {}),
+            // 第 35 步：代理动作收配置字面量（Off/Auto/有效 URL）。
+            proxy_changed: Box::new({
+                let h = proxy_hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
         });
         crate::install_settings_actions(&window, actions);
         window.invoke_speedLimitationChanged(102400);
@@ -547,6 +633,25 @@ mod smoke {
         // （镜像 qconfig.set(item, itemData(index))）。
         window.invoke_nameConflictChanged(2);
         assert_eq!(name_hits.borrow().last().map(|s| s.as_str()), Some("ask"));
+        // 第 35 步：代理 invoke 通路——choice 0 直接发 "Off"；
+        // 自定义字段无效 URL 不落盘（leaveEvent 镜像），有效才拼装。
+        window.invoke_proxyChoiceChanged(0);
+        assert_eq!(proxy_hits.borrow().last().map(|s| s.as_str()), Some("Off"));
+        let before = proxy_hits.borrow().len();
+        window.set_proxyChoice(2);
+        window.invoke_proxyFieldsChanged(0, "1.2.3.4".into(), "70000".into(), "".into(), "".into());
+        assert_eq!(
+            proxy_hits.borrow().len(),
+            before,
+            "无效端口（70000）不应写配置"
+        );
+        window.invoke_proxyFieldsChanged(3, "1.2.3.4".into(), "8080".into(), "".into(), "".into());
+        assert_eq!(
+            proxy_hits.borrow().last().map(|s| s.as_str()),
+            Some("http://1.2.3.4:8080")
+        );
+        window.invoke_proxyChoiceChanged(1);
+        assert_eq!(proxy_hits.borrow().last().map(|s| s.as_str()), Some("Auto"));
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }
