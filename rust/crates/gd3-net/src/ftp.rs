@@ -2,9 +2,10 @@
 //!
 //! 镜像 `features/ftp_pack/pack.py::parseFtpSource` 的 Python 原生分支：
 //! `urlparse` + `unquote`（errors='replace'）+ `PurePosixPath` 归一化 +
-//! 字段兜底（`port or defaultPort`、username `anonymous`、password
-//! `anon@`）。所有失败都映射为 Python `ValueError`（文案逐字返回，
-//! 桥侧直接抛出）——原生侧信号全部来自 urllib/ipaddress 的精度点。
+//! `port or defaultPort`。userinfo 的空串**原样保留**（`anonymous`/
+//! `anon@` 兜底由 pack.py sink 端 `or` 完成）。所有失败都映射为
+//! Python `ValueError`（文案逐字返回，桥侧直接抛出）——原生侧信号
+//! 全部来自 urllib/ipaddress 的精度点。
 //!
 //! 逐字语义来源（CPython 3.13 源码 + 实测探针，见 parity 测试）：
 //! - `urlsplit`：**仅左端**去 C0+空格（尾部空格保留）、去 `\t\r\n`、
@@ -72,19 +73,13 @@ pub fn parse_ftp_source(url: &str, default_port: i64) -> Result<FtpSource, Strin
         scheme,
         host,
         port,
-        username: unquote(&or_empty(hostinfo.username, "anonymous")),
-        password: unquote(&or_empty(hostinfo.password, "anon@")),
+        // urlparse 的 userinfo 中 partition 结果：空串保留 ''，`anonymous`
+        // /`anon@` 兜底在 pack.py sink 端用 `or` 完成（行为一致：真值原样）。
+        username: unquote(&hostinfo.username),
+        password: unquote(&hostinfo.password),
         source_path,
         has_port,
     })
-}
-
-fn or_empty(value: String, fallback: &str) -> String {
-    if value.is_empty() {
-        fallback.to_string()
-    } else {
-        value
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -554,17 +549,17 @@ mod ftp_tests {
         assert_eq!(s.password, "pw");
         assert_eq!(s.source_path, "/dir/file.txt");
         assert!(s.has_port);
-        // 默认值：无 userinfo/port
+        // userinfo 空串原样保留（anonymous/anon@ 兜底在 pack.py sink 端）
         let s = of("ftp://host");
-        assert_eq!(s.username, "anonymous");
-        assert_eq!(s.password, "anon@");
+        assert_eq!(s.username, "");
+        assert_eq!(s.password, "");
         assert_eq!(s.port, 21);
         assert!(!s.has_port);
         assert_eq!(s.source_path, "/");
         // user@host 空密码
         let s = of("ftp://user@host/");
         assert_eq!(s.username, "user");
-        assert_eq!(s.password, "anon@");
+        assert_eq!(s.password, "");
         // port or defaultPort：显式 0 也回退，hasPort 仍 True
         let s = of("ftp://host:0/x");
         assert_eq!(s.port, 21);
@@ -581,11 +576,11 @@ mod ftp_tests {
 
     #[test]
     fn userinfo_variants() {
-        // 空串也回退默认
-        assert_eq!(of("ftp://:pw@h/x").username, "anonymous");
+        // ':' 首切产生空 username，原样保留
+        assert_eq!(of("ftp://:pw@h/x").username, "");
         assert_eq!(of("ftp://:pw@h/x").password, "pw");
-        assert_eq!(of("ftp://user:@h/x").password, "anon@");
-        assert_eq!(of("ftp://@h/x").username, "anonymous");
+        assert_eq!(of("ftp://user:@h/x").password, "");
+        assert_eq!(of("ftp://@h/x").username, "");
         assert_eq!(of("ftp://h@/x").host, "");
         assert_eq!(of("ftp://h@/x").username, "h");
         // password 取首个 ':' 之后（含残余 ':'）
@@ -738,7 +733,7 @@ mod ftp_tests {
         let s = of("ftp:host/path");
         assert!(s.host.is_empty());
         assert_eq!(s.source_path, "host/path");
-        assert_eq!(s.username, "anonymous");
+        assert_eq!(s.username, "");
         assert_eq!(of("host/x").scheme, "");
         assert_eq!(of("host/x").source_path, "host/x");
         assert_eq!(of("ftp:/x").source_path, "/x");
