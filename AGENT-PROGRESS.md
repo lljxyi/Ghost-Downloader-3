@@ -1016,3 +1016,74 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    pause/delete 落 gd3-core），列表排序（SortField 五种 + 升降序）
    可顺路先行（纯变换、零 UI 依赖）。
 3. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 28 步 — 列表排序切片（SortField 五分支 + 排序 ComboBox×2 + refresh 串接）
+
+### 改动
+
+- **rust/crates/gd3-ui/src/sort.rs（新，~295 行）**：镜像
+  `task_page.py::_refreshList` 末段（614-639 行）五个排序分支。
+  - `SortField{CreatedAt,Name,Size,CompletedAt,QueuePosition}`（Default=
+    CreatedAt）+ `from_menu_index(i32)`：菜单显示序 0=按添加时间/
+    1=按完成时间/2=按名称/3=按大小/4=按队列，越界容错回 CreatedAt。
+  - `sort_refs(&mut Vec<&TaskRecord>, field, ascending, waiting_order)`：
+    - CreatedAt/Name（键 `t.name.lower()`）/Size：直接稳定排序。
+    - CompletedAt：按 completedAt≠0 拆两组，各按 completedAt/createdAt
+      排，desc 拼 pending+completed、asc 反过来（Python 632/636 行）。
+    - QueuePosition：running(原序)/waiting(在队列列表里)/rest 三组；
+      **waiting 恒按传入队列序升排、rest 恒按 createdAt 倒排
+      （Python 写死 reverse=True，不受 ascending 影响）**，仅组间
+      拼接随 ascending 翻转（desc=running+waiting+rest，asc 相反）。
+  - 稳定性：Python `list.sort` reverse 下相等元素保原序 ↔ Rust 稳定
+    sort_by_key + 反比较器等价（clippy 必看：**降序分支会被 `-D
+    warnings` 强制改 `sort_by_key(key+Reverse)`——普通的
+    `sort_by(|a,b| key(b).cmp(&key(a)))` 报 clippy::sort_by_key**）。
+- **ui/task_page.slint / appwindow.slint**：排序两个 ComboBox——
+  字段 `["按添加时间","按完成时间","按名称排序","按大小排序",
+  "按队列顺序"]`、顺序 `["顺序","倒序"]`，缺省 fieldIndex=0、
+  orderIndex=1（Python 缺省 CREATED_AT+倒序）。`[string]` 模型发
+  selected 索引，复用第 27 步 ComboBox 模式；两回调 sortFieldChanged/
+  sortOrderChanged(int) 双向透传。
+- **lib.rs**：`refresh_task_rows` 增 `sort_field/ascending/waiting_order`
+  三参，串接「筛选（保序）→ sort::sort_refs → 成行 → 装配」；
+  TaskActions 增 `sort_field/sort_order: Box<dyn Fn(i32)>`（六动作）；
+  install_task_actions 注册 on_sortFieldChanged/on_sortOrderChanged。
+
+### 验证
+
+- `cargo test -p gd3-ui`：**16 → 22 passed**（sort 纯变换 4 + 冒烟
+  2 新增：sortFieldIndex/sortOrderIndex 缺省与 round-trip、【筛选→
+  Name 倒序→装配】三记录链路）。0 failed。
+- `cargo fmt --all --check`、`cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 干净。
+
+### 本步修的两个测试错误（产品代码一直是对的）
+
+1. 队列测试数据：record helper 的 taskId = `tsk_{name}` **含扩展名**
+   （`tsk_wait2.mp4` 不是 `tsk_wait2`）——队列列表漏文件名后缀导致
+   WAITING 记录查不到 waitingIndex、全部落进 rest 组，输出
+   `run1, rest_new, wait2, wait1, rest_old` 与 torn-down 断言完全吻合。
+2. 升序期望错位：测试曾期望升序时 rest 组重建为 createdAt 升——
+   权威源核对（task_page.py:634）rest 组**恒** `reverse=True`，仅组间
+   拼接翻转；期望改为 `[rest_new, rest_old, wait2, wait1, run1]`。
+
+### 工具坑（续记）
+
+- PUT 整块替换第三次吞行：260.=263 替换注释+队列 vec 时把紧随的
+  `sort_refs(...)` 调用行一起吞掉（del 列表可见、编译期才暴露）。
+  规则再次确认：**PUT 范围内想保留的行必须在 + 正文显式重写**。
+- python 替换脚本 edit 锚点缩进不一致（12 vs 8 空格）→ assert n==1
+  中止、文件零损；修锚点重跑即可——脚本模式的这个安全网很好用。
+- clippy needless_lifetimes：`sort_refs<'a>(&mut Vec<&'a TaskRecord>)`
+  单生命周期可省（elide 后语义不变）。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7b 续）
+
+1. 段高亮/卡片视觉：TaskRow 展开进度环/状态色（对齐 task_cards.py）；
+   filterMode 段按钮高亮。
+2. 暂停/删除接 gd3-core 真实语义（bridging 层）。
+3. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
