@@ -468,3 +468,74 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   （+ BILI_GITHUB 等历史项见各自步骤）。
 - 下一步：bili `fetchPlayurl`（量大）或 mpegdash 评估；
   之后 Phase 7 Slint UI 与 AGENT-DONE。
+
+## 第 20 步：bili `fetchPlayurl` 响应判定层下沉（GD3_RUST_BILI_PLAYURL，默认关）【完成】
+
+（时间戳取自 `date`：2026-10-17 凌晨，与前同日会话）
+
+- 范围决策：只下沉 `playPayload = await response.json()` 之后的**纯判定层**
+  （code 兜底 / qn=80 递归 / message or 默认 / pageData / dash /
+  videoStreams 可迭代 / acceptQuality list()）；网络 I/O（buildClient、
+  412、raise_for_status）、wbi 签名（已下沉 BILI_SIGN）、parseDash
+  （已下沉 BILI_PARSE）不动；字幕 fetch 留 Python（后续 20b 可选）。
+  mpegdash（`_mpdStreams`）判定跳过：需在 Rust 重写整棵 MPD XML
+  解析器且报错面无法逐字对齐，不建议下沉。
+- 核心层（`8a1c228`）：`rust/crates/gd3-net/src/bili.rs` 追加
+  `playurl_gate(playPayload, qn) -> PlayurlGate`
+  （`Ok{dash, accept_quality}` / `Fallback` / `Error(message)` /
+  `AttributeError(msg)` / `TypeError(msg)`），`PLAYURL_DEFAULT_ERROR` 常量
+  「获取 Bilibili 音视频流失败」；语义要点（实证 CPython 3.13）：
+  1. `code in {None, 0}`：None / 0 / 0.0 / False 通过；list/dict 不可哈希
+     → TypeError `unhashable type: 'list'/'dict'`（先于 qn 兜底）；
+     非 0 数字 / 字符串 / 非 False 布尔 → fail。
+  2. 顺序敏感：`message or 默认`（真值原样透传，可为 int）→
+     `pageData or {}`（真值非 dict → AttributeError `'X' object has no
+     attribute 'get'`）→ `dash or {}` 同 → `list(video or [])` 非空判定
+     （str=字符数、dict=键数；真值 int/float/bool → TypeError `'int'
+     object is not iterable`；假值 0/False → 空列表）→ qn 兜底 →
+     `list(accept_quality or [])`。**兜底优先于 accept_quality 求值错误**；
+     `accept_quality != []` 用 `!=` 而非 is_empty。
+  3. tuple 不可达剔除：JSON 序列化不报 tuple；Rust depythonize 把 tuple
+     当 array 报 unhashable `'list'`，Python（可哈希）走兜底——线上
+     payload 只来自 response.json() 无此形态。NaN/Infinity 同理（serde
+     值模型不可表达）。
+  gd3-net lib 单测 8 项（playurl_gate_tests）。
+- 桥（`7af0067`）：`gd3_py.bili_playurl_gate(playPayload, qn)` →
+  `('ok', dash, acceptQuality)` / `('fallback',)` / `('error', message)`
+  元组；AttributeError/TypeError 按原型直接抛出（无 kind 翻译层）。
+- 适配器 + 接线（`ff0915e`）：`features/bili_pack/rust_playurl.py`
+  （isEnabled + playurlGate 元组透传）；`stream.py` 抽模块级纯函数
+  `playurlGate(playPayload, qn)`（原生分支=原行序逐行一致，函数内
+  延迟 import 分流；返回 `('fallback',)`/`('error', message)`，
+  message 由调用方 `raise ValueError` 保非 str 原型）；fetchPlayurl 的
+  判定块替换为 gate 调用（fallback → qn=80 递归；error → ValueError；
+  ok → dash/acceptQuality 接 parseDash），`accept_description` 在
+  return 内用 `(playPayload.get("data") or {})` 重取（gate 已保证此时
+  data 为假值或 dict，安全），`page.subtitles`/fetchSubtitles 留原位。
+- parity（`a407646`）：`tests/test_bili_playurl_rust.py`——沿用 bili
+  「测试内参数化双实现对表」惯例（无 jsonl 金文件）：
+  19 outcome + 10 error 用例（各测试 delenv 保原生分支可达；
+  ok 路径整 tuple 值相等，error 路径比 type+str 逐字）+
+  接线用例（开关开时 stream.playurlGate 走 Rust）+ 默认关断言。
+  关/开模式各 30 passed。曾预判错 4 个语义（tuple 可哈希、dict video
+  计非空、video=0/False 走兜底），按实证修正入库。
+- 质量门：cargo fmt/clippy 干净；cargo test -p gd3-core -p gd3-net
+  -p gd3-servers 全 0 失败（gd3-net lib 56 passed 含 8 个 playurl_gate）。
+  bili 5 个测试子集（parse/rust_parse/pages/sign/url）双模式各
+  127 passed。
+- 双模式全量回归（--ignore=android_pack_import -p no:randomly，
+  开关全 24 个）：
+  关 → **3 failed / 1240 passed / 8 skipped / 34 errors**
+  （1210+30 新增 parity 用例）；
+  开 → 轮间波动 3/4/5 failed / 1235 passed / 11 skipped / 34–35 errors，
+  FAILED+ERROR 名单与关模式 diff **为空**（有一轮 videos 名单多出的
+  TEST 全部属于 `test_engine_listeners.py` 端口家族）。失败 3 条为
+  既有基线（android_config_parity / github_probe / runtime_install）。
+  engine_listeners 偶发核查（独立复跑）：开关全开 1 failed→复跑
+  10 passed；**关掉新开关** 5 连跑 10P/2F+1E/2F/1F+1E/2F+2E——错误率
+  与新开关无关，是本机端口释放既有偶发（同第 19 步记录），未追。
+- 开关清单（24 个）：第 19 步 23 个 + `GD3_RUST_BILI_PLAYURL`
+  （另 `GD3_RUST_HF_FILES` 在代码中有引用，此前清单写作 PROBE_SIZE
+  邻项，注意齐全构建勿漏）。
+- 下一步：bili `fetchSubtitles` 字典变换（20b，可选）；
+  之后 Phase 7 Slint UI 与 `/root/Ghost-Downloader-3/AGENT-DONE`。
