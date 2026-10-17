@@ -14,11 +14,21 @@
 //! - 状态字段文案：COMPLETED=已完成 / FAILED=失败 / PAUSED=已暂停 /
 //!   WAITING=等待中（`self.tr` 原文）。
 //!
+//! 第 51 步起：`to_task_row` 不再自己拼文案，改为**直接消费 `card.rs` 派生层**
+//! （`info_fields` / `status_line` / `progress_state` / 四个 `*_button`）。
+//! 本模块只剩「大小/状态文案」两个共用原语（`size_text` 被 `card::info_fields`
+//! 复用，`to_status_text` 留给任务抽屉的 `DetailCard` 口径）。
+//!
 //! 分层注意：`Task.isSeeding` 是运行时属性、`tasks.jsonl` 记录里没有，
-//! 所以 COMPLETED 的「做种中」由调用方经 `is_seeding` 传入（与
-//! 「兜底不在核心层」同一分层原则）。
+//! 连同 `canPause`/`canSeed`/`hasOutputFile`/`outputPath` 存在性/完成时间/
+//! `lastError` 一起由调用方经 `card::CardRuntime` 传入（与「兜底不在核心层」
+//! 同一分层原则）。
 
 use crate::TaskRow;
+use crate::card::{
+    CardRuntime, CardTask, checksum_button, info_fields, open_file_button, progress_state,
+    select_files_button, status_line, toggle_button,
+};
 use crate::format::{to_readable_size, to_readable_time};
 use gd3_core::task::{TaskRecord, TaskStatus};
 
@@ -86,26 +96,71 @@ pub fn to_status_text(record: &TaskRecord, speed: i64, received: i64, is_seeding
     "等待中".into()
 }
 
-/// 用记录自身的 current_snapshot 装配一行（非做种）。
-pub fn to_task_row(record: &TaskRecord) -> TaskRow {
-    to_task_row_with(record, false)
-}
-
-/// 同上，但由调用方声明做种态（COMPLETED 时影响文案）。
-pub fn to_task_row_with(record: &TaskRecord, is_seeding: bool) -> TaskRow {
-    // 快照 (progress 0-100, speed, received)；progress 供进度条直通。
-    let (progress, speed, received) = record.current_snapshot();
+/// 记录 + 运行时事实 → Slint `TaskRow`（第 51 步：文案全部取自 `card.rs`）。
+///
+/// 逐段镜像 Qt 卡片：
+/// - 信息行三段（speed / eta / size）取 `card::info_fields`，`None` 即隐藏；
+/// - 状态行取 `card::status_line`，`None` 即 `statusLabel.hide()`；
+/// - 进度条取 `card::progress_state`，可见性按 `ProgressVisibility::visible()`
+///   兜底（`Keep` 视为可见）；
+/// - 四个按钮取 `toggle_button` / `select_files_button` / `checksum_button`
+///   / `open_file_button`，`icon` 已是「生效图标」（`spec.icon` 回落后的值）。
+///
+/// `TaskRow` 里没有的字段（`openFolder`/`delete` 恒可见）由 Slint 侧写死——
+/// Python 侧它们的 `states is None`，`_refreshButtons` 直接 `continue`。
+pub fn to_task_row(record: &TaskRecord, runtime: &CardRuntime) -> TaskRow {
+    let task = CardTask::from_record(record, runtime);
+    let fields = info_fields(&task);
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| f.text.clone())
+    };
+    let (speed_text, speed_visible) = split_text(field("speed"));
+    let (eta_text, eta_visible) = split_text(field("eta"));
+    let (size_text, size_visible) = split_text(field("size"));
+    let (line_text, line_visible, line_warn) = match status_line(&task) {
+        Some(line) => (line.text.into(), true, line.warn),
+        None => (slint::SharedString::default(), false, false),
+    };
+    let progress = progress_state(&task);
+    let toggle = toggle_button(&task);
+    let select_files = select_files_button(&task);
+    let checksum = checksum_button(&task);
+    let open_file = open_file_button(&task);
     TaskRow {
         taskId: record.task_id.clone().into(),
         name: record.name.clone().into(),
-        statusText: to_status_text(record, speed, received, is_seeding).into(),
-        // 渲染进度走 progressText 文案；数值 progress 另供进度条绑定。
-        progressText: to_size_text(record, received).unwrap_or_default().into(),
-        // 结构化字段：磁盘同名枚举字面量 + 快照百分比（0-100）。
         status: status_literal(record.status).into(),
-        // slint float 是 f32（E0308 实证），进度直通时收窄；0-100 量级
-        // 无精度损失顾虑。
-        progress: progress as f32,
+        speedText: speed_text,
+        speedVisible: speed_visible,
+        etaText: eta_text,
+        etaVisible: eta_visible,
+        sizeText: size_text,
+        sizeVisible: size_visible,
+        statusLine: line_text,
+        statusLineVisible: line_visible,
+        statusWarn: line_warn,
+        // Python `setValue(int(progress))`：f64 → i32 向零截断。
+        progressValue: progress.value as i32,
+        progressIndeterminate: progress.indeterminate,
+        progressVisible: progress.visibility.visible(),
+        progressError: progress.error,
+        toggleIcon: toggle.icon.into(),
+        toggleEnabled: toggle.enabled,
+        selectFilesVisible: select_files.visible,
+        checksumVisible: checksum.visible,
+        checksumEnabled: checksum.enabled,
+        openFileEnabled: open_file.enabled,
+    }
+}
+
+/// 信息行一段的「文本 + 可见性」拆分：`None` → 空串 + 隐藏。
+fn split_text(field: Option<String>) -> (slint::SharedString, bool) {
+    match field {
+        Some(text) => (text.into(), true),
+        None => (slint::SharedString::default(), false),
     }
 }
 
@@ -193,8 +248,8 @@ mod tests {
         assert_eq!(to_status_text(&running_nosize, 0, 512, false), "0.00 B/s");
     }
 
-    /// 整行装配：快照取选中 step 之和（gd3-core current_snapshot），文案
-    /// 逐位对 Python 先验。
+    /// 整行装配：快照取选中 step 之和（gd3-core current_snapshot），各段文案
+    /// 逐位对 Python 先验（第 51 步起全部经 `card.rs` 派生层）。
     #[test]
     fn task_row_assembles_from_record_snapshot() {
         let r = record(json! ({
@@ -205,15 +260,95 @@ mod tests {
                 {"stepIndex": 1, "progress": 70, "speed": 512, "receivedBytes": 128},
             ],
         }));
-        let row = to_task_row(&r);
+        let row = to_task_row(&r, &CardRuntime::default());
         assert_eq!(row.taskId, "tsk_assemble");
         assert_eq!(row.name, "视频.mp4");
-        // 快照 received=384+128=512、speed=512+512=1024 → 与手工先验一致。
-        assert_eq!(row.statusText, "1.00 KB/s · 512.00 B / 4.00 KB · 3s");
-        assert_eq!(row.progressText, "512.00 B/4.00 KB");
-        // progress = (30+70)/2 = 50（0-100）；status 为枚举字面量。
-        assert_eq!(row.progress, 50.0);
         assert_eq!(row.status, "RUNNING");
+        // 信息行三段：快照 received=384+128=512、speed=512+512=1024。
+        assert_eq!(row.speedText, "1.00 KB/s");
+        assert!(row.speedVisible);
+        assert_eq!(row.etaText, "3s");
+        assert!(row.etaVisible);
+        assert_eq!(row.sizeText, "512.00 B/4.00 KB");
+        assert!(row.sizeVisible);
+        // RUNNING 状态行整段隐藏（`statusLabel.hide()`）。
+        assert_eq!(row.statusLine, "");
+        assert!(!row.statusLineVisible);
+        assert!(!row.statusWarn);
+        // progress = (30+70)/2 = 50；RUNNING 才 show()。
+        assert_eq!(row.progressValue, 50);
+        assert!(!row.progressIndeterminate);
+        assert!(row.progressVisible);
+        assert!(!row.progressError);
+        // 按钮：RUNNING → PAUSE；多文件才显示「选择文件」；校验/打开文件未就绪。
+        assert_eq!(row.toggleIcon, "PAUSE");
+        assert!(row.toggleEnabled);
+        assert!(!row.selectFilesVisible);
+        assert!(row.checksumVisible);
+        assert!(!row.checksumEnabled);
+        assert!(!row.openFileEnabled);
+    }
+
+    /// COMPLETED 分支：状态行文案 / 告警色 / 进度条隐藏 / 按钮可用性。
+    #[test]
+    fn completed_row_uses_card_status_line_and_hides_progress() {
+        let r = record(json! ({
+            "name": "b.iso", "url": "https://example/2", "packId": "pack",
+            "taskId": "tsk_done", "status": "COMPLETED", "fileSize": 1048576,
+        }));
+        let runtime = CardRuntime {
+            completed_at_text: Some("2026-10-17 12:00:00".into()),
+            ..CardRuntime::default()
+        };
+        let row = to_task_row(&r, &runtime);
+        // 信息行：COMPLETED 只剩大小段（speed/eta 的 formats 只有 RUNNING 键）。
+        assert!(!row.speedVisible);
+        assert!(!row.etaVisible);
+        assert_eq!(row.sizeText, "1.00 MB");
+        assert!(row.sizeVisible);
+        // 状态行「完成于 …」，非告警色。
+        assert_eq!(row.statusLine, "完成于 2026-10-17 12:00:00");
+        assert!(row.statusLineVisible);
+        assert!(!row.statusWarn);
+        // COMPLETED 才 hide() 进度条。
+        assert!(!row.progressVisible);
+        // 按钮：canSeed=False → PLAY 但禁用；文件在 → 可打开/可校验。
+        assert_eq!(row.toggleIcon, "PLAY");
+        assert!(!row.toggleEnabled);
+        assert!(row.checksumVisible);
+        assert!(row.checksumEnabled);
+        assert!(row.openFileEnabled);
+
+        // 输出文件不存在 → 「文件不存在」+ 告警色（QColor(200,160,80)）。
+        let missing = CardRuntime {
+            output_exists: false,
+            ..CardRuntime::default()
+        };
+        let row = to_task_row(&r, &missing);
+        assert_eq!(row.statusLine, "文件不存在");
+        assert!(row.statusWarn);
+        assert!(!row.checksumEnabled);
+        assert!(!row.openFileEnabled);
+    }
+
+    /// 多文件任务：WAITING/COMPLETED 的状态行改成「已选/总数 个文件」，
+    /// 且「选择文件」按钮出现、校验按钮隐藏（`MultiFileTaskCard` 覆盖）。
+    #[test]
+    fn multi_file_row_overrides_status_line_with_file_count() {
+        let r = record(json! ({
+            "name": "合集", "url": "https://example/3", "packId": "pack",
+            "taskId": "tsk_multi", "status": "COMPLETED", "fileSize": 2048,
+            "files": [
+                {"index": 0, "relativePath": "a.bin", "size": 1024, "selected": true},
+                {"index": 1, "relativePath": "b.bin", "size": 1024, "selected": false},
+                {"index": 2, "relativePath": "c.bin", "size": 0, "selected": true},
+            ],
+        }));
+        let row = to_task_row(&r, &CardRuntime::default());
+        assert_eq!(row.statusLine, "2/3 个文件");
+        assert!(row.statusLineVisible);
+        assert!(row.selectFilesVisible);
+        assert!(!row.checksumVisible);
     }
 
     /// status_literal：全枚举覆盖（磁盘 TaskStatus.name 同款）。

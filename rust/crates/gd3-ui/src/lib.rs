@@ -52,25 +52,26 @@ pub fn create_headless() -> AppWindow {
 
 /// Rust 侧推送任务行到 UI（Phase 7b 契约）。
 ///
-/// 行文案（statusText/progressText）由调用方负责；这里只做 model 装配。
+/// 行内容由 `row::to_task_row`（→ `card.rs` 派生层）算好；这里只做 model 装配。
 /// （slint 1.18 生成的模型属性 setter 是无返回值的，见 target build 产物实证。）
 pub fn set_task_rows(window: &AppWindow, rows: Vec<TaskRow>) {
     let model = slint::ModelRc::new(slint::VecModel::from(rows));
     window.set_tasks(model);
 }
 
-/// 推流路径：`Vec<TaskRecord>` → TaskRow 文案 → model 装配。
+/// 推流路径：`Vec<TaskRecord>` → 卡片派生层（`card.rs`）→ TaskRow → model 装配。
 ///
-/// `is_seeding` 由调用方给定（isSeeding 是运行时属性、不在记录里），
-/// 这里只做「快照 → 文案 → 行」的桥。
+/// `runtime` 由调用方给定记录里没有的运行时事实（`isSeeding`/`canPause`/
+/// `canSeed`/`hasOutputFile`/输出文件是否存在/完成时间/`lastError`），
+/// 这里只做「记录 → 卡片输入 → 行」的桥。
 pub fn push_task_records(
     window: &AppWindow,
     records: &[gd3_core::task::TaskRecord],
-    is_seeding: impl Fn(&gd3_core::task::TaskRecord) -> bool,
+    runtime: impl Fn(&gd3_core::task::TaskRecord) -> card::CardRuntime,
 ) {
     let rows: Vec<TaskRow> = records
         .iter()
-        .map(|record| row::to_task_row_with(record, is_seeding(record)))
+        .map(|record| row::to_task_row(record, &runtime(record)))
         .collect();
     set_task_rows(window, rows);
 }
@@ -84,7 +85,7 @@ pub fn refresh_task_rows(
     sort_field: sort::SortField,
     sort_ascending: bool,
     waiting_order: &[String],
-    is_seeding: impl Fn(&gd3_core::task::TaskRecord) -> bool,
+    runtime: impl Fn(&gd3_core::task::TaskRecord) -> card::CardRuntime,
 ) {
     // 筛选（保序）→ 排序（镜像 task_page.py::_refreshList 末段）→ 成行。
     // waitingOrder 由调用方给（taskService.waitingOrder()）。
@@ -92,11 +93,10 @@ pub fn refresh_task_rows(
     sort::sort_refs(&mut refs, sort_field, sort_ascending, waiting_order);
     let rows: Vec<TaskRow> = refs
         .iter()
-        .map(|record| row::to_task_row_with(record, is_seeding(record)))
+        .map(|record| row::to_task_row(record, &runtime(record)))
         .collect();
     set_task_rows(window, rows);
 }
-
 /// 分类筛选下拉（ComboBox）的 [string] 模型装配（filter::menu_names
 /// 已含「全部分类」表头；current-index 由调用方回写）。
 ///
@@ -789,6 +789,11 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
 ///
 /// 分层：Slint 只发 taskId/路由字面量；真正的暂停/删除/筛选语义都在
 /// 调用方，由 install_task_actions 注册到 AppWindow。
+///
+/// 第 51 步补上卡片按钮五路：`toggle`（按状态分派暂停/继续/做种，
+/// 镜像 `_onToggleClicked`）、`select_files`、`checksum`、`open_file`、
+/// `open_folder`。它们都只带 taskId，语义（打开哪条路径、是否弹选择框）
+/// 全在调用方。
 pub struct TaskActions {
     pub search: Box<dyn Fn(&str)>,
     pub filter_mode: Box<dyn Fn(&str)>,
@@ -797,9 +802,14 @@ pub struct TaskActions {
     pub sort_order: Box<dyn Fn(i32)>,
     pub pause: Box<dyn Fn(&str)>,
     pub delete: Box<dyn Fn(&str)>,
+    pub toggle: Box<dyn Fn(&str)>,
+    pub select_files: Box<dyn Fn(&str)>,
+    pub checksum: Box<dyn Fn(&str)>,
+    pub open_file: Box<dyn Fn(&str)>,
+    pub open_folder: Box<dyn Fn(&str)>,
 }
 
-/// 把动作集注册到 AppWindow 的五个回调上（on_searchChanged 等生成名
+/// 把动作集注册到 AppWindow 的回调上（on_searchChanged 等生成名
 /// 保留 slint 原命名，见 build 产物 appwindow.rs:9572-9608）。
 pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions>) {
     let search = actions.clone();
@@ -816,6 +826,17 @@ pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions
     window.on_taskPause(move |task_id| (pause.pause)(&task_id));
     let delete = actions.clone();
     window.on_taskDelete(move |task_id| (delete.delete)(&task_id));
+    // 第 51 步：卡片按钮五路（Slint 只发 taskId 字面量）。
+    let toggle = actions.clone();
+    window.on_taskToggle(move |task_id| (toggle.toggle)(&task_id));
+    let select_files = actions.clone();
+    window.on_taskSelectFiles(move |task_id| (select_files.select_files)(&task_id));
+    let checksum = actions.clone();
+    window.on_taskChecksum(move |task_id| (checksum.checksum)(&task_id));
+    let open_file = actions.clone();
+    window.on_taskOpenFile(move |task_id| (open_file.open_file)(&task_id));
+    let open_folder = actions.clone();
+    window.on_taskOpenFolder(move |task_id| (open_folder.open_folder)(&task_id));
 }
 
 #[cfg(test)]
@@ -831,6 +852,10 @@ mod smoke {
     }
 
     /// 任务列表行模型：Rust 侧推送 → Slint model 逐行可读。
+    ///
+    /// 第 51 步：`TaskRow` 换成卡片字段集（信息行三段 + 状态行 + 进度条 +
+    /// 四按钮），这里只锁「结构体字面量能进 model 再读回来」，语义断言在
+    /// `row.rs` / `card.rs` 的单测与金文件里。
     #[test]
     fn task_page_rows_round_trip_headless() {
         let window = crate::create_headless();
@@ -840,18 +865,50 @@ mod smoke {
                 crate::TaskRow {
                     taskId: "tsk_1".into(),
                     name: "a.bin".into(),
-                    statusText: "等待中".into(),
-                    progressText: "0.00 B / --".into(),
                     status: "WAITING".into(),
-                    progress: 0.0,
+                    speedText: "".into(),
+                    speedVisible: false,
+                    etaText: "".into(),
+                    etaVisible: false,
+                    sizeText: "0.00 B/--".into(),
+                    sizeVisible: true,
+                    statusLine: "任务正在等待".into(),
+                    statusLineVisible: true,
+                    statusWarn: false,
+                    progressValue: 0,
+                    progressIndeterminate: true,
+                    progressVisible: true,
+                    progressError: false,
+                    toggleIcon: "PLAY".into(),
+                    toggleEnabled: true,
+                    selectFilesVisible: false,
+                    checksumVisible: true,
+                    checksumEnabled: false,
+                    openFileEnabled: false,
                 },
                 crate::TaskRow {
                     taskId: "tsk_2".into(),
                     name: "b.iso".into(),
-                    statusText: "正在下载".into(),
-                    progressText: "1.00 MB / 4.00 MB".into(),
                     status: "RUNNING".into(),
-                    progress: 25.0,
+                    speedText: "1.00 KB/s".into(),
+                    speedVisible: true,
+                    etaText: "3s".into(),
+                    etaVisible: true,
+                    sizeText: "512.00 B/4.00 KB".into(),
+                    sizeVisible: true,
+                    statusLine: "".into(),
+                    statusLineVisible: false,
+                    statusWarn: false,
+                    progressValue: 25,
+                    progressIndeterminate: false,
+                    progressVisible: true,
+                    progressError: false,
+                    toggleIcon: "PAUSE".into(),
+                    toggleEnabled: true,
+                    selectFilesVisible: false,
+                    checksumVisible: true,
+                    checksumEnabled: false,
+                    openFileEnabled: false,
                 },
             ],
         );
@@ -860,16 +917,21 @@ mod smoke {
         let first = model.row_data(0).expect("首行缺失");
         assert_eq!(first.taskId, "tsk_1");
         assert_eq!(first.name, "a.bin");
-        assert_eq!(first.statusText, "等待中");
+        assert_eq!(first.statusLine, "任务正在等待");
+        assert!(first.statusLineVisible);
         assert_eq!(first.status, "WAITING");
-        assert_eq!(first.progress, 0.0);
+        assert_eq!(first.progressValue, 0);
+        assert!(first.progressIndeterminate);
+        assert_eq!(first.toggleIcon, "PLAY");
         let second = model.row_data(1).expect("次行缺失");
         assert_eq!(second.taskId, "tsk_2");
-        assert_eq!(second.statusText, "正在下载");
+        assert_eq!(second.speedText, "1.00 KB/s");
+        assert_eq!(second.progressValue, 25);
+        assert!(!second.statusLineVisible);
     }
 
     /// 端到端推流：TaskRecord（磁盘同态 JSON 构造）→ push_task_records
-    /// → Slint model 逐行核对文案。
+    /// → card.rs 派生层 → Slint model 逐段核对。
     #[test]
     fn push_task_records_shapes_records_into_rows_headless() {
         use gd3_core::task::TaskRecord;
@@ -891,18 +953,31 @@ mod smoke {
         ]))
         .expect("TaskRecord 数组反序列化失败");
         let window = crate::create_headless();
-        crate::push_task_records(&window, &records, |record| record.task_id == "tsk_b");
+        // 运行时事实：只有 tsk_b 在「做种中」。
+        crate::push_task_records(&window, &records, |record| crate::card::CardRuntime {
+            is_seeding: record.task_id == "tsk_b",
+            ..crate::card::CardRuntime::default()
+        });
         let model = window.get_tasks();
         assert_eq!(model.row_count(), 2);
         let first = model.row_data(0).expect("首行缺失");
         assert_eq!(first.taskId, "tsk_a");
-        assert_eq!(first.statusText, "1.00 KB/s · 512.00 B / 4.00 KB · 3s");
-        assert_eq!(first.progressText, "512.00 B/4.00 KB");
+        assert_eq!(first.speedText, "1.00 KB/s");
+        assert_eq!(first.etaText, "3s");
+        assert_eq!(first.sizeText, "512.00 B/4.00 KB");
+        // RUNNING → 状态行隐藏、进度条显示、toggle 变 PAUSE。
+        assert!(!first.statusLineVisible);
+        assert!(first.progressVisible);
+        assert_eq!(first.progressValue, 50);
         assert_eq!(first.status, "RUNNING");
-        assert_eq!(first.progress, 50.0);
+        assert_eq!(first.toggleIcon, "PAUSE");
         let second = model.row_data(1).expect("次行缺失");
-        assert_eq!(second.statusText, "做种中");
-        assert_eq!(second.progressText, "1.00 MB");
+        // COMPLETED 无 completedAt → 「任务已经完成」；做种中 → toggle 变 PAUSE。
+        assert_eq!(second.statusLine, "任务已经完成");
+        assert!(second.statusLineVisible);
+        assert!(!second.progressVisible);
+        assert_eq!(second.sizeText, "1.00 MB");
+        assert_eq!(second.toggleIcon, "PAUSE");
     }
 
     /// 筛选推流：refresh_task_rows 过滤后仅剩选中状态的行（语义由
@@ -938,7 +1013,7 @@ mod smoke {
             crate::sort::SortField::CreatedAt,
             false,
             &[],
-            |_| false,
+            |_| crate::card::CardRuntime::default(),
         );
         let model = window.get_tasks();
         assert_eq!(model.row_count(), 1);
@@ -956,13 +1031,16 @@ mod smoke {
             crate::sort::SortField::CreatedAt,
             false,
             &[],
-            |_| false,
+            |_| crate::card::CardRuntime::default(),
         );
         assert_eq!(window.get_tasks().row_count(), 0);
     }
 
     /// 回调注册冒烟：install_task_actions 把四个动作挂上不 panic
     /// （生成名 on_searchChanged 等保留 slint 命名）。
+    ///
+    /// 第 51 步：卡片按钮五路（toggle / select_files / checksum / open_file /
+    /// open_folder）一并注册，并用 `invoke_*` 逐路打一遍验证回调真的连上。
     #[test]
     fn install_task_actions_registers_handlers_headless() {
         use std::cell::RefCell;
@@ -970,6 +1048,9 @@ mod smoke {
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let record = |tag: &'static str, hits: Rc<RefCell<Vec<String>>>| {
+            Box::new(move |task_id: &str| hits.borrow_mut().push(format!("{tag}:{task_id}")))
+        };
         let actions = Rc::new(crate::TaskActions {
             search: Box::new({
                 let h = hits.clone();
@@ -979,14 +1060,36 @@ mod smoke {
             category_selected: Box::new(|_| {}),
             sort_field: Box::new(|_| {}),
             sort_order: Box::new(|_| {}),
-            pause: Box::new(|_| {}),
-            delete: Box::new(|_| {}),
+            pause: record("pause", hits.clone()),
+            delete: record("delete", hits.clone()),
+            toggle: record("toggle", hits.clone()),
+            select_files: record("select_files", hits.clone()),
+            checksum: record("checksum", hits.clone()),
+            open_file: record("open_file", hits.clone()),
+            open_folder: record("open_folder", hits.clone()),
         });
         crate::install_task_actions(&window, actions);
-        // 无头环境无法模拟点按；注册本身即通路（真实触发屏上联调）。
-        assert!(hits.borrow().is_empty());
+        // 注册即通路：逐路 invoke 一次，断言动作集被按 taskId 打到。
+        window.invoke_taskPause("t1".into());
+        window.invoke_taskDelete("t1".into());
+        window.invoke_taskToggle("t2".into());
+        window.invoke_taskSelectFiles("t2".into());
+        window.invoke_taskChecksum("t2".into());
+        window.invoke_taskOpenFile("t2".into());
+        window.invoke_taskOpenFolder("t2".into());
+        assert_eq!(
+            *hits.borrow(),
+            vec![
+                "pause:t1",
+                "delete:t1",
+                "toggle:t2",
+                "select_files:t2",
+                "checksum:t2",
+                "open_file:t2",
+                "open_folder:t2",
+            ]
+        );
     }
-
     /// 分类筛选 UI：menu_names 装配 [string] 模型 + categoryIndex
     /// 属性可回写（选中态由调用方管理，ComboBox 绑定印证连通）。
     #[test]
@@ -1897,7 +2000,7 @@ mod smoke {
             crate::sort::SortField::Name,
             false,
             &[],
-            |_| false,
+            |_| crate::card::CardRuntime::default(),
         );
         let model = window.get_tasks();
         assert_eq!(model.row_count(), 3);

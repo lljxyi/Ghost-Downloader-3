@@ -1,9 +1,13 @@
-// 任务列表页（Phase 7b 起步）：先固化「行数据契约」，Qt 视觉（卡片/图标/
-// 进度环）逐页迁移时再展开。行字段对齐 app/view/pages/task_page.py +
-// app/view/cards/task_cards.py 的最小展示集。
+// 任务列表页（Phase 7b 起步 + 第 51 步接卡片派生层）。行字段对齐
+// app/view/cards/task_cards.py（`card.rs` 是它的语义镜像）。
 //
-// 文案（状态/进度/速度）由调用方（Rust 或 Python 桥）给出；Slint 侧
-// 不管格式化语义——与「兜底不在核心层」同一分层原则。
+// 文案（状态行/信息行/按钮图标）全部由调用方（`card.rs` + `row.rs`）算好，
+// Slint 侧不管格式化语义——与「兜底不在核心层」同一分层原则。Slint 只做
+// 三件事：按 `*Visible` 显示/隐藏、按 `*Enabled` 启用、点击发 taskId 字面量。
+//
+// 图标：Qt 侧是 FluentIcon 枚举，这里只拿到名字（"PLAY"/"PAUSE"…），
+// 主题对齐步再换成矢量资源；当前用文字占位（VPS-MIGRATION.md 明确「语义
+// 镜像、不追求像素一致」）。
 //
 // 筛选口径（对齐 task_page.py ROUTE_TO_FILTER，45-47 行）：段按钮固定
 // 发出 "all"/"active"/"completed" 字面量；filterMode 属性由调用方
@@ -15,13 +19,34 @@ import { ListView, VerticalBox, HorizontalBox, LineEdit, Button, ComboBox, Progr
 export struct TaskRow {
     taskId: string,
     name: string,
-    statusText: string,
-    progressText: string,
-    // 结构化渲染字段（第 29 步）：status 为磁盘持久化枚举名（
-    // TaskStatus.name 口径，供状态色/控件可见性派发）；progress 为
-    // 0-100 百分比（std ProgressIndicator 契约 0-1，行内 /100 换算）。
+    // 磁盘持久化枚举名（TaskStatus.name 口径），供状态色派发。
     status: string,
-    progress: float,
+    // 信息行三段（`TaskCard.infoFields`：speed / eta / size）。Python 只有
+    // 「有格式化函数且返回非 None」才 show()，故 text 与 visible 一一对应。
+    speedText: string,
+    speedVisible: bool,
+    etaText: string,
+    etaVisible: bool,
+    sizeText: string,
+    sizeVisible: bool,
+    // 状态行（`_refreshForStatus`）。RUNNING 时整段隐藏（Python statusLabel.hide()）。
+    statusLine: string,
+    statusLineVisible: bool,
+    // 「文件不存在」走告警色（QColor(200,160,80)）。
+    statusWarn: bool,
+    // 进度条（`_createProgressBar` + show/hide/setError）。
+    // progressValue 是 Python `setValue(int(progress))` 的整数口径。
+    progressValue: int,
+    progressIndeterminate: bool,
+    progressVisible: bool,
+    progressError: bool,
+    // 四个带 states 的按钮（`_refreshButtons`）。toggleIcon 是生效图标名。
+    toggleIcon: string,
+    toggleEnabled: bool,
+    selectFilesVisible: bool,
+    checksumVisible: bool,
+    checksumEnabled: bool,
+    openFileEnabled: bool,
 }
 
 // 段按钮（Python SegmentedToggleToolWidget 最小同构）：选中段高亮，
@@ -44,6 +69,30 @@ component SegmentItem inherits Rectangle {
     }
     TouchArea {
         clicked => { root.clicked(); }
+    }
+}
+
+// 卡片上的小按钮（PrimaryToolButton / TransparentToolButton 最小同构）。
+component CardButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 24px;
+    width: 52px;
+    border-radius: 4px;
+    background: self.enabled ? #F3F5F8 : #F7F7F7;
+    opacity: self.enabled ? 1.0 : 0.5;
+
+    Text {
+        text: root.label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 11px;
+        color: #3A3A3A;
+    }
+    TouchArea {
+        clicked => { if (root.enabled) { root.clicked(); } }
     }
 }
 
@@ -70,6 +119,13 @@ export component TaskPage inherits Rectangle {
     callback filterModeChanged(string);
     callback taskPause(string);
     callback taskDelete(string);
+    // 第 51 步：卡片按钮。Slint 只发 taskId，语义在调用方
+    // （toggle 按状态分派暂停/继续/做种，镜像 `_onToggleClicked`）。
+    callback taskToggle(string);
+    callback taskSelectFiles(string);
+    callback taskChecksum(string);
+    callback taskOpenFile(string);
+    callback taskOpenFolder(string);
     callback categoryFilterChanged(int);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
@@ -126,14 +182,19 @@ export component TaskPage inherits Rectangle {
 
         ListView {
             for row in root.tasks: Rectangle {
-                height: 32px;
+                height: 56px;
+                border-radius: 6px;
+                background: #FFFFFF;
 
-                HorizontalBox {
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 8px;
+
                     // 状态色点（第 29 步临时色，主题对齐在后续视觉步）。
                     Rectangle {
                         width: 8px;
                         height: 8px;
-                        y: 12px;
                         border-radius: 4px;
                         background: row.status == "RUNNING" ? #3477FF
                             : row.status == "COMPLETED" ? #30BE60
@@ -141,25 +202,89 @@ export component TaskPage inherits Rectangle {
                             : row.status == "PAUSED" ? #FFC107
                             : #858585;
                     }
-                    Text {
-                        vertical-alignment: center;
-                        text: row.name;
+
+                    // 名称 + 信息行（speed / eta）。
+                    VerticalLayout {
+                        horizontal-stretch: 1.0;
+                        Text {
+                            vertical-alignment: center;
+                            text: row.name;
+                            font-size: 13px;
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text {
+                                vertical-alignment: center;
+                                text: row.speedText;
+                                visible: row.speedVisible;
+                                font-size: 11px;
+                                color: #666666;
+                            }
+                            Text {
+                                vertical-alignment: center;
+                                text: row.etaText;
+                                visible: row.etaVisible;
+                                font-size: 11px;
+                                color: #666666;
+                            }
+                        }
                     }
-                    // 进度条：仅 RUNNING 显示（Python 卡片 RUNNING 走
-                    // 进度条、其余走 statusLabel 的同款分发）。
+
+                    // 进度条：RUNNING 才 show()、COMPLETED 才 hide()，
+                    // 其余状态沿用上一次（`ProgressVisibility::visible()`）。
                     ProgressIndicator {
-                        progress: row.progress / 100;
-                        visible: row.status == "RUNNING";
+                        width: 120px;
+                        progress: row.progressValue / 100;
+                        indeterminate: row.progressIndeterminate;
+                        visible: row.progressVisible;
                     }
-                    Text {
-                        vertical-alignment: center;
-                        text: row.statusText;
-                        font-size: 12px;
+
+                    // 大小 + 状态行。
+                    VerticalLayout {
+                        horizontal-stretch: 1.0;
+                        Text {
+                            vertical-alignment: center;
+                            text: row.sizeText;
+                            visible: row.sizeVisible;
+                            font-size: 12px;
+                        }
+                        Text {
+                            vertical-alignment: center;
+                            text: row.statusLine;
+                            visible: row.statusLineVisible;
+                            font-size: 12px;
+                            color: row.statusWarn ? #C8A050 : #666666;
+                        }
                     }
-                    Text {
-                        vertical-alignment: center;
-                        text: row.progressText;
-                        font-size: 12px;
+
+                    CardButton {
+                        label: row.toggleIcon;
+                        enabled: row.toggleEnabled;
+                        clicked => { root.taskToggle(row.taskId); }
+                    }
+                    CardButton {
+                        label: "选择文件";
+                        visible: row.selectFilesVisible;
+                        clicked => { root.taskSelectFiles(row.taskId); }
+                    }
+                    CardButton {
+                        label: "校验";
+                        visible: row.checksumVisible;
+                        enabled: row.checksumEnabled;
+                        clicked => { root.taskChecksum(row.taskId); }
+                    }
+                    CardButton {
+                        label: "打开文件";
+                        enabled: row.openFileEnabled;
+                        clicked => { root.taskOpenFile(row.taskId); }
+                    }
+                    CardButton {
+                        label: "打开文件夹";
+                        clicked => { root.taskOpenFolder(row.taskId); }
+                    }
+                    CardButton {
+                        label: "删除";
+                        clicked => { root.taskDelete(row.taskId); }
                     }
                 }
             }

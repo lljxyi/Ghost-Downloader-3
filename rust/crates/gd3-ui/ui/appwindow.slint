@@ -126,6 +126,13 @@ export component AppWindow inherits Window {
     callback filterModeChanged(string);
     callback taskPause(string);
     callback taskDelete(string);
+    // 第 51 步：卡片按钮回调（toggle / 选择文件 / 校验 / 打开文件 / 打开文件夹）。
+    // Slint 只发 taskId 字面量，语义（按状态分派暂停-继续-做种等）在调用方。
+    callback taskToggle(string);
+    callback taskSelectFiles(string);
+    callback taskChecksum(string);
+    callback taskOpenFile(string);
+    callback taskOpenFolder(string);
     callback categoryFilterChanged(int);
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
@@ -202,6 +209,11 @@ export component AppWindow inherits Window {
             filterModeChanged(value) => { root.filterModeChanged(value); }
             taskPause(taskId) => { root.taskPause(taskId); }
             taskDelete(taskId) => { root.taskDelete(taskId); }
+            taskToggle(taskId) => { root.taskToggle(taskId); }
+            taskSelectFiles(taskId) => { root.taskSelectFiles(taskId); }
+            taskChecksum(taskId) => { root.taskChecksum(taskId); }
+            taskOpenFile(taskId) => { root.taskOpenFile(taskId); }
+            taskOpenFolder(taskId) => { root.taskOpenFolder(taskId); }
             categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
             sortFieldChanged(index) => { root.sortFieldChanged(index); }
             sortOrderChanged(index) => { root.sortOrderChanged(index); }

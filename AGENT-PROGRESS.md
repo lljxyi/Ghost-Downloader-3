@@ -2651,3 +2651,80 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
    `row::to_task_row` 改为 `(record, &CardTask)` 两参数。
 2. 之后：任务抽屉 `task_drawer.py` 派生层 → 暂停/删除真实语义 →
    引擎状态桥接 → Python UI 停用 + `AGENT-DONE`。
+
+## 2026-10-17 12:15 第 51 步（Phase 7c）：把卡片派生层接到 Slint `TaskRow`
+
+### 做了什么
+
+- **`ui/task_page.slint` 的 `TaskRow` 换成卡片字段集**（22 字段）：
+  `taskId` / `name` / `status` / `speedText`+`speedVisible` / `etaText`+
+  `etaVisible` / `sizeText`+`sizeVisible` / `statusLine`+`statusLineVisible`+
+  `statusWarn` / `progressValue`(int)+`progressIndeterminate`+`progressVisible`+
+  `progressError` / `toggleIcon`+`toggleEnabled` / `selectFilesVisible` /
+  `checksumVisible`+`checksumEnabled` / `openFileEnabled`。
+  **删掉**旧的 `statusText` / `progressText` / `progress: float`：
+  - `statusText` 是抽屉口径（`task_drawer.py::_toStatusText`），列表行在 Qt
+    侧是**卡片**，状态行走 `_refreshForStatus`（= `statusLine`），口径不同；
+  - `progressText` 由 `sizeText` 取代（信息行的 SIZE_FIELD）；
+  - `progress: float` → `progressValue: int`，镜像 `setValue(int(progress))`
+    的截断（99.99 → 99）。
+- 新增 `component CardButton`（`PrimaryToolButton`/`TransparentToolButton` 最小
+  同构：`label` + `enabled` + `clicked`）；行内 `ProgressIndicator` 绑
+  `progressValue / 100` + `indeterminate` + `visible`；状态色点按 `status`
+  字面量分派；状态行颜色 `statusWarn ? #C8A050 : #666666`。
+- 新增 5 个回调：`taskToggle` / `taskSelectFiles` / `taskChecksum` /
+  `taskOpenFile` / `taskOpenFolder`（`appwindow.slint` 声明 + 从 `TaskPage`
+  转发）。
+- **`card.rs` 新增 `CardRuntime` + `CardTask::from_record`**：`status`/
+  `fileSize`/快照/文件计数从记录里取，调用方只补记录里没有的运行时事实
+  （`completed_at_text` / `can_pause` / `can_seed` / `is_seeding` /
+  `has_output_file` / `output_exists` / `last_error`），`Default` = 可暂停、
+  不可做种、未做种、有输出文件、文件在、无完成时间、无错误。
+- **`row.rs`：`to_task_row(record, &CardRuntime)` 改为纯装配**，文案全部取自
+  `card::info_fields` / `status_line` / `progress_state` / `toggle_button` /
+  `select_files_button` / `checksum_button` / `open_file_button`；删
+  `to_task_row_with`。`size_text`（被 `card::info_fields` 复用）与
+  `to_status_text`（留给后续任务抽屉）保留。
+- **`lib.rs`**：`push_task_records` / `refresh_task_rows` 的
+  `is_seeding: impl Fn(&TaskRecord) -> bool` 换成
+  `runtime: impl Fn(&TaskRecord) -> CardRuntime`；`TaskActions` 补
+  `toggle`/`select_files`/`checksum`/`open_file`/`open_folder` 五字段 +
+  `install_task_actions` 注册 `on_taskToggle` 等五个生成名。
+
+### 口径决策
+
+- `progressPaused`（Python `progressBar.pause()`）**不进 `TaskRow`**：
+  Slint 的 `ProgressIndicator` 没有「暂停动画」的对应属性，`paused` 仍留在
+  `card::ProgressState` 里供主题对齐步消费。
+- 「打开文件夹」「删除」两个按钮在 `TaskRow` 里**没有可见性字段**：Python
+  侧它们的 `spec.states is None`，`_refreshButtons` 直接 `continue`，恒可见
+  恒可用，Slint 侧写死即可。
+- 冒烟测试里 `TaskRow` 字面量**逐字段写全**（虽然 slint 生成的 struct 有
+  `derive(Default)`）：这条测试的职责就是「字段清单能进 model 再读回来」，
+  用 `..Default::default()` 会让新增字段悄悄漏测。`CardRuntime` 则用
+  `CardRuntime { ..Default::default() }`（`clippy::field_reassign_with_default`
+  也会拦「先 default 再赋值」）。
+
+### 验证
+
+- `cargo fmt --all --check` 通过。
+- `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+- `cargo test -p gd3-ui`：**73 passed**（71 → 73；`row.rs` 的整行装配测试
+  拆成 RUNNING / COMPLETED / 多文件三条）。
+- `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**237 passed**（不变）。
+- Python 全量：`pytest -q --continue-on-collection-errors` →
+  **3 failed, 1347 passed, 8 skipped, 35 errors**，与基线完全相同
+  （本步只动 Rust UI 层，Python 侧没有任何 `gd3_ui` 引用，不涉及影子开关）。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 任务抽屉 `task_drawer.py::DetailCard` 派生层（`_toStatusText` 已有
+   `row::to_status_text`，还差「速度/剩余时间/分享链接/校验和」那几段）。
+2. 暂停/删除/继续的真实语义（`_onToggleClicked` 的状态分派 + 队列推进）。
+3. 引擎状态桥接（`TaskService` 信号 → `push_task_records` 的 `CardRuntime`
+   供给方：`isExisting` 走文件系统、`completedAt` 走本地时区）。
+4. 之后：Python UI 停用 + `AGENT-DONE`。

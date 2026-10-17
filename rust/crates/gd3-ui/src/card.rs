@@ -34,7 +34,7 @@
 //!   （我方 `TaskError` 构造器恒带全参数，走不到这个岔口）。
 
 use crate::format::{to_readable_size, to_readable_time};
-use gd3_core::task::TaskStatus;
+use gd3_core::task::{TaskRecord, TaskStatus};
 use gd3_core::task_error::TaskError;
 
 /// 卡片渲染所需的运行时输入（`Task` 的运行时属性 + 文件系统事实 + 快照）。
@@ -70,6 +70,72 @@ impl CardTask {
     /// 有输出文件但文件不存在才算。
     pub fn file_missing(&self) -> bool {
         self.status == TaskStatus::Completed && self.has_output_file && !self.output_exists
+    }
+}
+
+/// 记录里**没有**的运行时事实：`Task` 的运行时/类属性 + 文件系统 + 本地时间。
+///
+/// 全部由调用方给——`tasks.jsonl` 里没有这些字段，`gd3-ui` 也不做 IO 与
+/// 时区换算（与「兜底/IO 不在核心层」同一分层原则）。
+#[derive(Clone, Debug)]
+pub struct CardRuntime {
+    /// `datetime.fromtimestamp(completedAt).strftime("%Y-%m-%d %H:%M:%S")`。
+    pub completed_at_text: Option<String>,
+    /// `Task.canPause`：有 RUNNING 步骤时取该步骤的 `canPause`，否则 True。
+    pub can_pause: bool,
+    /// `Task.canSeed`（类属性，默认 False）。
+    pub can_seed: bool,
+    /// `Task.isSeeding`（运行时，非持久化）。
+    pub is_seeding: bool,
+    /// `Task.hasOutputFile`（类属性，默认 True）。
+    pub has_output_file: bool,
+    /// `isExisting(task.outputPath)`（文件系统事实）。
+    pub output_exists: bool,
+    /// `Task.lastError`（最后一个 FAILED 步骤的 error，否则任一 error）。
+    pub last_error: Option<TaskError>,
+}
+
+impl Default for CardRuntime {
+    /// Python 侧缺省：可暂停、不可做种、未做种、有输出文件、文件在、
+    /// 无完成时间、无错误。
+    fn default() -> Self {
+        CardRuntime {
+            completed_at_text: None,
+            can_pause: true,
+            can_seed: false,
+            is_seeding: false,
+            has_output_file: true,
+            output_exists: true,
+            last_error: None,
+        }
+    }
+}
+
+impl CardTask {
+    /// 从持久化记录 + 运行时事实装配卡片输入。
+    ///
+    /// `status` / `fileSize` / 快照 / 文件计数全取自记录，调用方只补记录里
+    /// 没有的那几项——避免把同一批字段抄两遍抄错。
+    /// `selected_files` 镜像 `sum(1 for f in task.files if f.selected)`。
+    pub fn from_record(record: &TaskRecord, runtime: &CardRuntime) -> CardTask {
+        let (progress, speed, received) = record.current_snapshot();
+        let files = record.files.as_deref().unwrap_or(&[]);
+        CardTask {
+            status: record.status,
+            file_size: record.file_size,
+            completed_at_text: runtime.completed_at_text.clone(),
+            can_pause: runtime.can_pause,
+            can_seed: runtime.can_seed,
+            is_seeding: runtime.is_seeding,
+            has_output_file: runtime.has_output_file,
+            output_exists: runtime.output_exists,
+            last_error: runtime.last_error.clone(),
+            selected_files: files.iter().filter(|file| file.selected).count(),
+            total_files: files.len(),
+            progress,
+            speed,
+            received,
+        }
     }
 }
 
