@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gd3-core", "crates/gd3-net", "crates/gd3-py", "crates/gd3-servers"]
+members = ["crates/gd3-core", "crates/gd3-net", "crates/gd3-py", "crates/gd3-servers", "crates/gd3-ui"]
 
 [workspace.package]
 version = "0.1.0"

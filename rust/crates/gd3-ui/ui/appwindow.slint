@@ -1,0 +1,20 @@
+// Ghost-Downloader-3 Slint UI（Phase 7a 脚手架。
+// 当前只装一个最小窗口骨架，逐页 strangler 迁移时按 Qt 版一一镜像展开。
+
+import { VerticalBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    title: "Ghost-Downloader-3";
+    min-width: 640px;
+    min-height: 400px;
+
+    in property <string> statusText: "Ghost-Downloader-3 (Slint)";
+
+    VerticalBox {
+        Text {
+            text: root.statusText;
+            font-size: 18px;
+            vertical-alignment: center;
+        }
+    }
+}
