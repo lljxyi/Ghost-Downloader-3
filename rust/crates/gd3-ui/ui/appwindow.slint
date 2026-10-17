@@ -57,6 +57,9 @@ export component AppWindow inherits Window {
     in-out property <bool> runAtLogin: false;
     in-out property <int> closeModeIndex: 0;
     in-out property <bool> clipboardListener: true;
+    // 第 39 步：DpiScale 界面缩放（显示口径 %，0-500 步 25；配置 0-5
+    // 浮点换算归 install 层，磁盘串 python str(float) 口径）。
+    in-out property <int> uiScalePercent: 0;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -99,6 +102,7 @@ export component AppWindow inherits Window {
     callback runAtLoginChanged(bool);
     callback closeModeChanged(int);
     callback clipboardListenerChanged(bool);
+    callback uiScaleChanged(int);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -182,6 +186,8 @@ export component AppWindow inherits Window {
             runAtLoginChanged(v) => { root.runAtLoginChanged(v); }
             closeModeChanged(i) => { root.closeModeChanged(i); }
             clipboardListenerChanged(v) => { root.clipboardListenerChanged(v); }
+            uiScalePercent <=> root.uiScalePercent;
+            uiScaleChanged(v) => { root.uiScaleChanged(v); }
         }
     }
 }

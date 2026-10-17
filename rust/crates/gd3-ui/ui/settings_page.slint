@@ -1,4 +1,4 @@
-// 设置页（Phase 7c，第 32-38 步）：镜像 setting_page.py GeneralDownload
+// 设置页（Phase 7c，第 32-39 步）：镜像 setting_page.py GeneralDownload
 // 组、「启用下载分类」、Aria2 RPC/浏览器扩展/关联/软件组简版卡。控件与
 // 标题副标题镜像 .tr 字面量；执行（落盘/生效）全在调用方。限速值
 // KB/s ⇄ 字节 1/1024 换算在 Rust speed.rs；代理卡拼装/校验镜像在
@@ -67,6 +67,13 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> runAtLogin: false;
     in-out property <int> closeModeIndex: 0;
     in-out property <bool> clipboardListener: true;
+    // 第 39 步：DpiScale 界面缩放（cfg.py:296：Personalization/DpiScale
+    // RangeConfigItem 缺省 0 范围 0-5，PercentSpinBox 显示 *100 步 25%
+    // 「0% 为自动」，leaveEvent cfg.set(value/100) 写浮点；窗口属性用
+    // 显示口径 %（单位缀名，0-500），换算归 install 层。restart=True
+    // 生效重启，本卡只写配置；磁盘串 python str(float) 口径（0.25/
+    // 整值补 .0，镜像在 gd3-core get_f64/set_f64）。
+    in-out property <int> uiScalePercent: 0;
 
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
@@ -93,6 +100,7 @@ export component SettingsPage inherits Rectangle {
     callback runAtLoginChanged(bool);
     callback closeModeChanged(int);
     callback clipboardListenerChanged(bool);
+    callback uiScaleChanged(int);
 
     background: transparent;
 
@@ -450,6 +458,26 @@ export component SettingsPage inherits Rectangle {
             Switch {
                 checked <=> root.clipboardListener;
                 toggled => { root.clipboardListenerChanged(self.checked); }
+            }
+        }
+        // 第 39 步：DpiScale 界面缩放卡（PercentSpinBoxSettingCard 镜像；
+        // std SpinBox 无后缀，% 走独立 Text；显示=配置*100 步 25，
+        // 换算归 install 层）。
+        HorizontalBox {
+            Text {
+                text: "界面缩放\n改变应用程序界面的缩放比例, 0% 为自动";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 0;
+                maximum: 500;
+                step-size: 25;
+                value <=> root.uiScalePercent;
+                edited(value) => { root.uiScaleChanged(value); }
+            }
+            Text {
+                text: " %";
+                vertical-alignment: center;
             }
         }
     }

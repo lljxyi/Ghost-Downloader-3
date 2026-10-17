@@ -241,6 +241,12 @@ pub fn push_settings(
             .get_bool("Software", "ClipboardListener")
             .unwrap_or(true),
     );
+    // 第 39 步：DpiScale 界面缩放（cfg.py:296 缺省 0「自动」；配置
+    // 0-5 浮点 → 显示 % *100 round 防浮点尾差；磁盘串 python
+    // str(float) 口径镜像在 gd3-core get_f64/set_f64）。
+    window.set_uiScalePercent(
+        (config.get_f64("Personalization", "DpiScale").unwrap_or(0.0) * 100.0).round() as i32,
+    );
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -281,6 +287,10 @@ pub struct SettingsActions {
     pub run_at_login: Box<dyn Fn(bool)>,
     pub close_mode: Box<dyn Fn(&str)>,
     pub clipboard_listener: Box<dyn Fn(bool)>,
+    // 第 39 步：界面缩放动作收**配置口径 0-5 浮点**（显示 % → 配置
+    // /100 换算在 install 层，对齐「动作收配置单位」惯例；restart=True
+    // 生效重启归引擎桥接步）。
+    pub dpi_scale: Box<dyn Fn(f64)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -389,6 +399,10 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     });
     let clipboard = actions.clone();
     window.on_clipboardListenerChanged(move |v| (clipboard.clipboard_listener)(v));
+    // 第 39 步：界面缩放（镜像 Python leaveEvent cfg.set(int(spinBox
+    // .value()/division))，division=1/100 显示% → 配置值）。
+    let dpi_scale = actions.clone();
+    window.on_uiScaleChanged(move |percent| (dpi_scale.dpi_scale)(percent as f64 / 100.0));
 }
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
@@ -655,6 +669,7 @@ mod smoke {
         config.set_bool("Software", "AutoRun", true);
         config.set_str("Software", "CloseMode", "Quit");
         config.set_bool("Software", "ClipboardListener", false);
+        config.set_f64("Personalization", "DpiScale", 1.25);
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -696,6 +711,8 @@ mod smoke {
         assert!(window.get_runAtLogin());
         assert_eq!(window.get_closeModeIndex(), 2);
         assert!(!window.get_clipboardListener());
+        // 第 39 步：有值推送（DpiScale=1.25 → 显示 125%）。
+        assert_eq!(window.get_uiScalePercent(), 125);
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -735,6 +752,8 @@ mod smoke {
         assert!(!window.get_runAtLogin());
         assert_eq!(window.get_closeModeIndex(), 0);
         assert!(window.get_clipboardListener());
+        // 第 39 步：缺省容错（DpiScale=0 → 0%「自动」）。
+        assert_eq!(window.get_uiScalePercent(), 0);
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -744,6 +763,7 @@ mod smoke {
         let token_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let draft_hits: Rc<RefCell<Vec<bool>>> = Rc::new(RefCell::new(Vec::new()));
         let close_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let dpi_hits: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -800,6 +820,11 @@ mod smoke {
                 move |s| h.borrow_mut().push(s.into())
             }),
             clipboard_listener: Box::new(|_| {}),
+            // 第 39 步：界面缩放动作收配置 0-5 浮点。
+            dpi_scale: Box::new({
+                let h = dpi_hits.clone();
+                move |v| h.borrow_mut().push(v)
+            }),
         });
         crate::install_settings_actions(&window, actions);
         window.invoke_speedLimitationChanged(102400);
@@ -847,6 +872,14 @@ mod smoke {
         assert_eq!(
             close_hits.borrow().last().map(|s| s.as_str()),
             Some("Background")
+        );
+        // 第 39 步：界面缩放 invoke 通路（显示 75% → 配置 0.75，
+        // 镜像 Python leaveEvent cfg.set(value/100)）。
+        window.invoke_uiScaleChanged(75);
+        assert_eq!(
+            dpi_hits.borrow().last().copied(),
+            Some(0.75),
+            "显示 % 应换算回配置 0-5 浮点"
         );
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");

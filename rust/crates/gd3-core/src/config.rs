@@ -143,6 +143,25 @@ impl UserConfig {
     pub fn set_i64(&mut self, group: &str, key: &str, value: i64) {
         self.set_str(group, key, &value.to_string());
     }
+
+    /// python `str(float)` 口径读：磁盘串 parse f64（`"0.25"`/`"3"`/
+    /// `"3.0"` 均可；非数字/缺键 None）。DpiScale 项（cfg.py:296，值域
+    /// 0-5、step 0.25，Python 端 cfg.set(x/100) 写浮点）消费。
+    pub fn get_f64(&self, group: &str, key: &str) -> Option<f64> {
+        self.get_str(group, key)?.parse().ok()
+    }
+
+    /// python `str(float)` 口径写：shortest repr；**整值浮点补 `.0`**
+    /// （python `str(2.0)` == `"2.0"`，Rust Display 只给 `"2"`）。本仓库
+    /// 数值域（0-5、二分步 0.25）无科学计数形态，Rust Display 也不产
+    /// 指数；NaN/Inf 不在项值域内（validator 侧守卫），原样落串。
+    pub fn set_f64(&mut self, group: &str, key: &str, value: f64) {
+        let mut text = format!("{}", value);
+        if value.is_finite() && value.fract() == 0.0 && !text.contains('.') {
+            text.push_str(".0");
+        }
+        self.set_str(group, key, &text);
+    }
 }
 
 /// 手写 JSON 字符串转义，镜像 `json.dumps(..., ensure_ascii=False)`：
@@ -229,5 +248,25 @@ mod tests {
             Some("C:/downloads")
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// python str(float) 口径：整值浮点补 `.0`、小数原样 shortest、
+    /// 读回 round-trip；非数字串 get_f64 容错 None。
+    #[test]
+    fn f64_python_repr_round_trip() {
+        let mut config = UserConfig::new();
+        config.set_f64("Personalization", "DpiScale", 0.25);
+        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("0.25"));
+        config.set_f64("Personalization", "DpiScale", 2.0);
+        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("2.0"));
+        config.set_f64("Personalization", "DpiScale", 5.0);
+        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("5.0"));
+        config.set_f64("Personalization", "DpiScale", 1.75);
+        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("1.75"));
+        assert_eq!(config.get_f64("Personalization", "DpiScale"), Some(1.75));
+        // 缺键/非数字容错。
+        assert_eq!(config.get_f64("Personalization", "NoSuchKey"), None);
+        config.set_str("Personalization", "DpiScale", "weird");
+        assert_eq!(config.get_f64("Personalization", "DpiScale"), None);
     }
 }
