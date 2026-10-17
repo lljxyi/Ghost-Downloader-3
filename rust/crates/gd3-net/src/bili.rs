@@ -1968,3 +1968,312 @@ mod playurl_gate_tests {
         );
     }
 }
+
+/// `fetchSubtitles` 字典变换层的错误通道（AttributeError/TypeError 桥侧映射原型异常）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubtitleError {
+    AttributeError(String),
+    TypeError(String),
+}
+
+/// `x.get(...)` 的 AttributeError 文案（SubtitleError 版）。
+fn sub_get_error(value: &Value) -> SubtitleError {
+    SubtitleError::AttributeError(format!(
+        "'{}' object has no attribute 'get'",
+        py_json_type(value)
+    ))
+}
+
+/// `for s in rawList` 不可迭代时的 TypeError 文案（SubtitleError 版）。
+fn sub_not_iterable(value: &Value) -> SubtitleError {
+    SubtitleError::TypeError(format!("'{}' object is not iterable", py_json_type(value)))
+}
+
+/// `(x or {})` 后接 `.get(...)`：x 真值非 dict → AttributeError；假值 → {}（无键）。
+fn sub_descend<'a>(
+    map: Option<&'a serde_json::Map<String, Value>>,
+    key: &str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, SubtitleError> {
+    match map.and_then(|m| m.get(key)) {
+        Some(value) if truthy(value) => match value {
+            Value::Object(m) => Ok(Some(m)),
+            other => Err(sub_get_error(other)),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Python `x == 1`：数字 1/1.0 与 `True` 相等；其余（"1"、False、Null、容器）不等。
+fn number_eq_one(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => *b,
+        Value::Number(number) => number.as_f64().map(|f| f == 1.0).unwrap_or(false),
+        _ => false,
+    }
+}
+
+use serde_json::json;
+
+/// `fetchSubtitles` 的字幕字典变换（`features/bili_pack/stream.py::subtitleList`
+/// 的镜像），逐行序对齐：
+///
+/// ```python
+/// rawList = ((payload.get("data") or {}).get("subtitle") or {}).get("subtitles") or []
+/// return [
+///     {"lan": s["lan"], "lan_doc": s.get("lan_doc", s["lan"]),
+///      "subtitle_url": s.get("subtitle_url", ""), "isAi": s.get("type", 0) == 1}
+///     for s in rawList if s.get("lan") and s.get("subtitle_url")
+/// ]
+/// ```
+///
+/// `.get(k, default)`：键存在即取值（可为 Null），仅键缺失用 default。
+/// rawList 为 str/dict 时逐元素（字符/键）也走 `s.get` → AttributeError 'str'。
+pub fn subtitle_list(payload: &Value) -> Result<Vec<Value>, SubtitleError> {
+    let root = match payload {
+        Value::Object(map) => map,
+        other => return Err(sub_get_error(other)),
+    };
+    let data = sub_descend(Some(root), "data")?;
+    let subtitle = sub_descend(data, "subtitle")?;
+    let raw = match subtitle.and_then(|m| m.get("subtitles")) {
+        Some(value) if truthy(value) => value,
+        // `or []`：缺失或假值 → 空列表 → 空输出
+        _ => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    match raw {
+        Value::Array(items) => {
+            for item in items {
+                let map = match item {
+                    Value::Object(map) => map,
+                    other => return Err(sub_get_error(other)),
+                };
+                // 过滤条件先于输出求值（`s.get("lan") and s.get("subtitle_url")`）
+                let lan = map.get("lan").cloned().unwrap_or(Value::Null);
+                if !truthy(&lan) {
+                    continue;
+                }
+                let subtitle_url = map.get("subtitle_url").cloned().unwrap_or(Value::Null);
+                if !truthy(&subtitle_url) {
+                    continue;
+                }
+                // `s.get("lan_doc", s["lan"])`：键存在取值（可为 Null），缺省用 s["lan"]
+                let lan_doc = map.get("lan_doc").cloned().unwrap_or_else(|| lan.clone());
+                let url = map
+                    .get("subtitle_url")
+                    .cloned()
+                    .unwrap_or_else(|| Value::from(""));
+                let kind = map.get("type").cloned().unwrap_or_else(|| Value::from(0));
+                out.push(json!({
+                    "lan": lan,
+                    "lan_doc": lan_doc,
+                    "subtitle_url": url,
+                    "isAi": number_eq_one(&kind),
+                }));
+            }
+        }
+        // 假值已被 `or []` 吃掉；str/dict 非空时首个元素就是 str → 无 .get
+        Value::String(_) | Value::Object(_) => {
+            return Err(SubtitleError::AttributeError(
+                "'str' object has no attribute 'get'".to_string(),
+            ));
+        }
+        other => return Err(sub_not_iterable(other)),
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod subtitle_list_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn items(payload: Value) -> Vec<Value> {
+        subtitle_list(&payload).expect("ok")
+    }
+
+    #[test]
+    fn normal_items_fields_in_order() {
+        let out = items(json!({
+            "data": {"subtitle": {"subtitles": [
+                {"lan": "ai-zh", "type": 1,
+                 "subtitle_url": "http://x"},
+                {"lan": "zh-CN", "lan_doc": "中文", "type": 0,
+                 "subtitle_url": "http://y"},
+            ]}}
+        }));
+        assert_eq!(
+            out,
+            vec![
+                json!({"lan": "ai-zh", "lan_doc": "ai-zh", "subtitle_url": "http://x", "isAi": true}),
+                json!({"lan": "zh-CN", "lan_doc": "中文", "subtitle_url": "http://y", "isAi": false}),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_skips_falsy_lan_or_url() {
+        let out = items(json!({
+            "data": {"subtitle": {"subtitles": [
+                {"lan": "", "subtitle_url": "http://x"},
+                {"lan": "zh"},
+                {"lan": null, "subtitle_url": "http://y"},
+                {"lan": "en", "subtitle_url": null},
+                {"lan": "en", "subtitle_url": true, "type": 2},
+            ]}}
+        }));
+        assert_eq!(
+            out,
+            vec![json!({
+                "lan": "en", "lan_doc": "en", "subtitle_url": true, "isAi": false,
+            })]
+        );
+    }
+
+    #[test]
+    fn falsy_subtitles_and_missing_chain() {
+        assert_eq!(items(json!({})), Vec::<Value>::new());
+        assert_eq!(items(json!({"data": null})), Vec::<Value>::new());
+        assert_eq!(items(json!({"data": {}})), Vec::<Value>::new());
+        assert_eq!(
+            items(json!({"data": {"subtitle": null}})),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            items(json!({"data": {"subtitle": {"subtitles": null}}})),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            items(json!({"data": {"subtitle": {"subtitles": []}}})),
+            Vec::<Value>::new()
+        );
+    }
+
+    #[test]
+    fn lan_doc_key_exists_wins_even_null() {
+        // .get(k, default)：键存在取值（可为 Null），仅缺省用 default
+        let out = items(json!({
+            "data": {"subtitle": {"subtitles": [
+                {"lan": "zh", "lan_doc": null, "subtitle_url": "u"},
+            ]}}
+        }));
+        assert_eq!(out[0]["lan_doc"], json!(null));
+    }
+
+    #[test]
+    fn is_ai_equals_one_semantics() {
+        for (kind, want) in [
+            (json!(1), true),
+            (json!(1.0), true),
+            (json!(true), true),
+            (json!(0), false),
+            (json!(2), false),
+            (json!("1"), false),
+            (json!(false), false),
+            (json!(null), false),
+        ] {
+            let out = items(json!({
+                "data": {"subtitle": {"subtitles": [
+                    {"lan": "zh", "subtitle_url": "u", "type": kind},
+                ]}}
+            }));
+            assert_eq!(out[0]["isAi"], json!(want), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn root_and_chain_truthy_non_dict_is_attribute_error() {
+        // 根非 dict（含假值 None）→ AttributeError
+        for bad in [
+            json!(5),
+            json!(1.5),
+            json!("x"),
+            json!([1]),
+            json!(null),
+            json!(true),
+            json!(false),
+        ] {
+            assert!(
+                matches!(subtitle_list(&bad), Err(SubtitleError::AttributeError(_))),
+                "{bad:?}"
+            );
+        }
+        // data 真值非 dict → AttributeError
+        for bad in [json!(5), json!("x"), json!([1]), json!(true)] {
+            let payload = json!({"data": bad});
+            assert!(
+                matches!(
+                    subtitle_list(&payload),
+                    Err(SubtitleError::AttributeError(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        // subtitle 真值非 dict → AttributeError
+        for bad in [json!(5), json!("x"), json!([1]), json!(true)] {
+            let payload = json!({"data": {"subtitle": bad}});
+            assert!(
+                matches!(
+                    subtitle_list(&payload),
+                    Err(SubtitleError::AttributeError(_))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_list_kind_semantics() {
+        // str / dict 作 rawList：逐元素（字符 / 键）走 .get → AttributeError 'str'
+        let payload = json!({"data": {"subtitle": {"subtitles": "xy"}}});
+        assert_eq!(
+            subtitle_list(&payload),
+            Err(SubtitleError::AttributeError(
+                "'str' object has no attribute 'get'".to_string()
+            ))
+        );
+        let payload = json!({"data": {"subtitle": {"subtitles": {"k": 1}}}});
+        assert_eq!(
+            subtitle_list(&payload),
+            Err(SubtitleError::AttributeError(
+                "'str' object has no attribute 'get'".to_string()
+            ))
+        );
+        // 数字/bool 逐个值 → TypeError
+        for (raw, kind) in [
+            (json!(5), "int"),
+            (json!(1.5), "float"),
+            (json!(true), "bool"),
+        ] {
+            let payload = json!({"data": {"subtitle": {"subtitles": raw.clone()}}});
+            assert_eq!(
+                subtitle_list(&payload),
+                Err(SubtitleError::TypeError(format!(
+                    "'{kind}' object is not iterable"
+                ))),
+                "{kind}"
+            );
+        }
+        // 列表元素非 dict → AttributeError（int / NoneType）
+        for bad in [json!(5), json!(null)] {
+            let payload = json!({"data": {"subtitle": {"subtitles": [bad.clone()]}}});
+            assert!(
+                matches!(
+                    subtitle_list(&payload),
+                    Err(SubtitleError::AttributeError(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        // 空串/空 dict 是假值 → or [] → 空输出
+        assert_eq!(
+            items(json!({"data": {"subtitle": {"subtitles": ""}}})),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            items(json!({"data": {"subtitle": {"subtitles": {}}}})),
+            Vec::<Value>::new()
+        );
+    }
+}
