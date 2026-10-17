@@ -18,6 +18,7 @@ pub mod close_mode;
 pub mod conflict;
 pub mod filter;
 mod format;
+pub mod headers;
 pub mod profile;
 pub mod proxy;
 pub mod row;
@@ -233,6 +234,29 @@ pub fn push_settings(
             .get_str("Network", "ClientProfile")
             .unwrap_or(profile::DEFAULT_PROFILE),
     ) as i32);
+    // 第 42 步：请求标头预设（cfg.py:328-333 实证：预设列表存 JSON
+    // 串、"0" 串索引；解析/逐项校验/缺省兜「默认+BASE_HEADERS」在
+    // headers.rs 镜像 HeadersPresetListValidator.correct）。
+    let headers_presets =
+        headers::parse_presets(config.get_str("Network", "HeadersPresets").unwrap_or(""));
+    let headers_index = headers::current_index(
+        config.get_str("Network", "CurrentHeadersPreset"),
+        headers_presets.len(),
+    );
+    window.set_headersPresetNames(slint::ModelRc::new(slint::VecModel::from(
+        headers_presets
+            .iter()
+            .map(|preset| preset.name.as_str().into())
+            .collect::<Vec<_>>(),
+    )));
+    window.set_headersPresetIndex(headers_index as i32);
+    window.set_headersPresetHeaderCount(
+        headers_presets
+            .get(headers_index)
+            .map(|preset| preset.headers.len())
+            .unwrap_or(0) as i32,
+    );
+    window.set_headersPresetCanRemove(headers_presets.len() > 1);
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
     // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
     // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
@@ -310,6 +334,10 @@ pub struct SettingsActions {
     // 第 41 步：模拟身份动作收 profile 字面量（auto/raw/家族），索引
     // →字面量换算在 install 层 profile.rs；引擎 resolve 在 gd3-net。
     pub client_profile: Box<dyn Fn(&str)>,
+    // 第 42 步：标头预设动作——选中/删除收**当前预设索引**（cfg 写与
+    // 索引调整、删除确认框归调用方，镜像 _onPick/_onRemoveClicked）。
+    pub headers_preset_pick: Box<dyn Fn(i64)>,
+    pub headers_preset_remove: Box<dyn Fn(i64)>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
     pub url_scheme_enabled: Box<dyn Fn(bool)>,
@@ -431,6 +459,14 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_clientProfileChanged(move |i| {
         (client_profile.client_profile)(profile::value_of(i as i64))
     });
+    // 第 42 步：标头预设注册（索引原样转发——镜像 _onPick 写
+    // CurrentHeadersPreset、_onRemoveClicked 移除后重排；cfg 写与删除
+    // 确认框 MessageBox 归调用方）。
+    let headers_pick = actions.clone();
+    window.on_headersPresetPicked(move |i| (headers_pick.headers_preset_pick)(i as i64));
+    let headers_remove = actions.clone();
+    window
+        .on_headersPresetRemoveRequested(move |i| (headers_remove.headers_preset_remove)(i as i64));
     // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
     // 开机启动注册归引擎桥接步）。
     let url_scheme = actions.clone();
@@ -718,6 +754,14 @@ mod smoke {
         config.set_f64("Personalization", "DpiScale", 1.25);
         config.set_str("Browser", "BrowserExtensionPairToken", "p41rt0kenal");
         config.set_str("Network", "ClientProfile", "firefox-android");
+        // 第 42 步：标头预设（JSON 串两预设 + 索引指到第二项）。
+        config.set_str(
+            "Network",
+            "HeadersPresets",
+            r#"[{"name":"A","headers":{"x-a":"1"}},
+                {"name":"B","headers":{"y-b":"2","z-c":"3"}}]"#,
+        );
+        config.set_str("Network", "CurrentHeadersPreset", "1");
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -756,6 +800,15 @@ mod smoke {
         assert_eq!(window.get_pairToken(), "p41rt0kenal");
         // 第 41 步：有值推送（ClientProfile="firefox-android" → 索引 5）。
         assert_eq!(window.get_clientProfileIndex(), 5);
+        // 第 42 步：有值推送（JSON 串解析：预设 A/B、当前索引 1、
+        // 计数取选中项 2 条、多预设可删）。
+        let preset_names = window.get_headersPresetNames();
+        assert_eq!(preset_names.row_count(), 2);
+        assert_eq!(preset_names.row_data(0).as_deref(), Some("A"));
+        assert_eq!(preset_names.row_data(1).as_deref(), Some("B"));
+        assert_eq!(window.get_headersPresetIndex(), 1);
+        assert_eq!(window.get_headersPresetHeaderCount(), 2);
+        assert!(window.get_headersPresetCanRemove());
         // 第 38 步：有值推送（urlScheme=F / 更新=F / 自启=T /
         // CloseMode="Quit"→索引 2 / 剪贴板=F）。
         assert!(!window.get_urlSchemeEnabled());
@@ -810,6 +863,14 @@ mod smoke {
         assert_eq!(window.get_pairToken(), "");
         // 第 41 步：缺省容错（ClientProfile 缺省 "auto" → 索引 0）。
         assert_eq!(window.get_clientProfileIndex(), 0);
+        // 第 42 步：缺省容错（空串 → 「默认」+BASE_HEADERS 8 条、
+        // 单预设不可删、索引 0）。
+        let default_names = window.get_headersPresetNames();
+        assert_eq!(default_names.row_count(), 1);
+        assert_eq!(default_names.row_data(0).as_deref(), Some("默认"));
+        assert_eq!(window.get_headersPresetIndex(), 0);
+        assert_eq!(window.get_headersPresetHeaderCount(), 8);
+        assert!(!window.get_headersPresetCanRemove());
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -826,6 +887,9 @@ mod smoke {
         let store_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let chromium_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let profile_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 42 步：标头预设动作命中记录。
+        let headers_pick_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        let headers_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -894,6 +958,15 @@ mod smoke {
             client_profile: Box::new({
                 let h = profile_hits.clone();
                 move |s| h.borrow_mut().push(s.into())
+            }),
+            // 第 42 步：标头预设动作收索引原样（验证通路）。
+            headers_preset_pick: Box::new({
+                let h = headers_pick_hits.clone();
+                move |i| h.borrow_mut().push(i)
+            }),
+            headers_preset_remove: Box::new({
+                let h = headers_remove_hits.clone();
+                move |i| h.borrow_mut().push(i)
             }),
             // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
             // 索引⇄字面量通路）。
@@ -988,6 +1061,12 @@ mod smoke {
             profile_hits.borrow().last().map(|s| s.as_str()),
             Some("edge")
         );
+        // 第 42 步：标头预设 invoke 通路（选中/删除索引原样，镜像
+        // _onPick 写 CurrentHeadersPreset、_onRemoveClicked 移除）。
+        window.invoke_headersPresetPicked(1);
+        assert_eq!(headers_pick_hits.borrow().last().copied(), Some(1));
+        window.invoke_headersPresetRemoveRequested(0);
+        assert_eq!(headers_remove_hits.borrow().last().copied(), Some(0));
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }
