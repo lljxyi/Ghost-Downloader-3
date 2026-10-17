@@ -3,6 +3,7 @@
 
 import { VerticalBox } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
+import { DrawerChecksumRow, DrawerFileRow, DrawerInfoRow, TaskDrawer } from "task_drawer.slint";
 import {
     CategoryEditDraft,
     HeadersEditDraft,
@@ -122,6 +123,32 @@ export component AppWindow inherits Window {
     in-out property <int> categoryIndex: 0;
     in-out property <int> sortFieldIndex: 0;
     in-out property <int> sortOrderIndex: 1;
+    // 第 53 步：任务抽屉（`drawer.rs` 五张卡片派生结果的装配位）。
+    // 全部字段由 `open_task_drawer` 一次写齐；Slint 只显示与发回调。
+    in-out property <bool> drawerVisible: false;
+    in-out property <string> drawerTaskId: "";
+    // HeaderCard
+    in-out property <string> drawerTaskName: "";
+    in-out property <int> drawerProgressValue: 0;
+    in-out property <bool> drawerProgressVisible: false;
+    in-out property <bool> drawerProgressError: false;
+    in-out property <string> drawerStatusText: "";
+    // ErrorBar
+    in-out property <bool> drawerErrorVisible: false;
+    in-out property <string> drawerErrorTitle: "下载失败";
+    in-out property <string> drawerErrorText: "";
+    // InfoCard
+    in-out property <[DrawerInfoRow]> drawerInfoRows;
+    // ChecksumCard
+    in-out property <bool> drawerChecksumVisible: false;
+    in-out property <[DrawerChecksumRow]> drawerChecksumRows;
+    in-out property <bool> drawerChecksumError: false;
+    in-out property <bool> drawerChecksumMatched: false;
+    in-out property <string> drawerChecksumTooltip: "";
+    in-out property <string> drawerExpectedChecksum: "";
+    // FileListCard
+    in-out property <bool> drawerFileListVisible: false;
+    in-out property <[DrawerFileRow]> drawerFileRows;
     callback searchChanged(string);
     callback filterModeChanged(string);
     callback taskPause(string);
@@ -133,6 +160,15 @@ export component AppWindow inherits Window {
     callback taskChecksum(string);
     callback taskOpenFile(string);
     callback taskOpenFolder(string);
+    // 第 53 步：任务抽屉。`taskOpenDrawer` 镜像卡片右键「任务详情」/
+    // 点信息区打开抽屉（`_openDrawer`）；其余五路是抽屉内部动作，
+    // 只带 taskId（+ 需要复制的文本），语义全在调用方。
+    callback taskOpenDrawer(string);
+    callback drawerCloseRequested(string);
+    callback drawerExpectedChecksumEdited(string, string);
+    callback drawerPasteChecksumRequested(string);
+    callback drawerCopyTextRequested(string, string);
+    callback drawerRevealInFolderRequested(string);
     callback categoryFilterChanged(int);
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
@@ -188,150 +224,202 @@ export component AppWindow inherits Window {
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
-    VerticalBox {
-        Text {
-            text: root.statusText;
-            font-size: 18px;
-            vertical-alignment: center;
+    // 第 53 步：抽屉覆盖层要与主内容同级叠放，故外层套一个撑满窗口的
+    // Rectangle（Rectangle 不参与布局，子元素按各自几何叠放）。
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        clip: true;
+
+        VerticalBox {
+            Text {
+                text: root.statusText;
+                font-size: 18px;
+                vertical-alignment: center;
+            }
+            TaskPage {
+                tasks: root.tasks;
+                filterMode: root.filterMode;
+                highlightAll: root.highlightAll;
+                highlightActive: root.highlightActive;
+                highlightCompleted: root.highlightCompleted;
+                categoryNames: root.categoryNames;
+                categoryEnabled: root.categoryEnabled;
+                categoryIndex <=> root.categoryIndex;
+                sortFieldIndex <=> root.sortFieldIndex;
+                sortOrderIndex <=> root.sortOrderIndex;
+                searchChanged(value) => { root.searchChanged(value); }
+                filterModeChanged(value) => { root.filterModeChanged(value); }
+                taskPause(taskId) => { root.taskPause(taskId); }
+                taskDelete(taskId) => { root.taskDelete(taskId); }
+                taskToggle(taskId) => { root.taskToggle(taskId); }
+                taskSelectFiles(taskId) => { root.taskSelectFiles(taskId); }
+                taskChecksum(taskId) => { root.taskChecksum(taskId); }
+                taskOpenFile(taskId) => { root.taskOpenFile(taskId); }
+                taskOpenFolder(taskId) => { root.taskOpenFolder(taskId); }
+                taskOpenDrawer(taskId) => { root.taskOpenDrawer(taskId); }
+                categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
+                sortFieldChanged(index) => { root.sortFieldChanged(index); }
+                sortOrderChanged(index) => { root.sortOrderChanged(index); }
+            }
+            SettingsPage {
+                downloadFolder <=> root.downloadFolder;
+                maxTaskNum <=> root.maxTaskNum;
+                preBlockNum <=> root.preBlockNum;
+                categoryEnabled <=> root.categoryEnabled;
+                downloadFolderChanged(value) => { root.downloadFolderChanged(value); }
+                maxTaskNumChanged(value) => { root.maxTaskNumChanged(value); }
+                preBlockNumChanged(value) => { root.preBlockNumChanged(value); }
+                categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
+                speedLimitationKb <=> root.speedLimitationKb;
+                speedLimitationChanged(kb) => { root.speedLimitationChanged(kb); }
+                autoSpeedUp <=> root.autoSpeedUp;
+                maxReassignSize <=> root.maxReassignSize;
+                preserveLastModified <=> root.preserveLastModified;
+                verifySsl <=> root.verifySsl;
+                nameConflictIndex <=> root.nameConflictIndex;
+                useSystemDns <=> root.useSystemDns;
+                autoSpeedUpChanged(v) => { root.autoSpeedUpChanged(v); }
+                maxReassignSizeChanged(v) => { root.maxReassignSizeChanged(v); }
+                preserveLastModifiedChanged(v) => { root.preserveLastModifiedChanged(v); }
+                verifySslChanged(v) => { root.verifySslChanged(v); }
+                nameConflictChanged(v) => { root.nameConflictChanged(v); }
+                useSystemDnsChanged(v) => { root.useSystemDnsChanged(v); }
+                proxyChoice <=> root.proxyChoice;
+                proxyProtocolIndex <=> root.proxyProtocolIndex;
+                proxyHost <=> root.proxyHost;
+                proxyPort <=> root.proxyPort;
+                proxyUser <=> root.proxyUser;
+                proxyPass <=> root.proxyPass;
+                proxyChoiceChanged(c) => { root.proxyChoiceChanged(c); }
+                proxyFieldsChanged(p, h, t, u, w) => { root.proxyFieldsChanged(p, h, t, u, w); }
+                aria2Enabled <=> root.aria2Enabled;
+                aria2RpcPort <=> root.aria2RpcPort;
+                aria2RpcToken <=> root.aria2RpcToken;
+                aria2EmulateFingerprint <=> root.aria2EmulateFingerprint;
+                aria2EnabledChanged(v) => { root.aria2EnabledChanged(v); }
+                aria2RpcPortChanged(v) => { root.aria2RpcPortChanged(v); }
+                aria2RpcTokenChanged(t) => { root.aria2RpcTokenChanged(t); }
+                aria2EmulateFingerprintChanged(v) => { root.aria2EmulateFingerprintChanged(v); }
+                browserEnabled <=> root.browserEnabled;
+                browserDraftTaken <=> root.browserDraftTaken;
+                browserPort <=> root.browserPort;
+                browserEnabledChanged(v) => { root.browserEnabledChanged(v); }
+                browserDraftTakenChanged(v) => { root.browserDraftTakenChanged(v); }
+                browserPortChanged(v) => { root.browserPortChanged(v); }
+                copyPairToken() => { root.copyPairToken(); }
+                regeneratePairToken() => { root.regeneratePairToken(); }
+                openStoreUrl(url) => { root.openStoreUrl(url); }
+                chromiumInstall() => { root.chromiumInstall(); }
+                clientProfileIndex <=> root.clientProfileIndex;
+                clientProfileChanged(i) => { root.clientProfileChanged(i); }
+                headersPresetNames <=> root.headersPresetNames;
+                headersPresetIndex <=> root.headersPresetIndex;
+                headersPresetHeaderCount <=> root.headersPresetHeaderCount;
+                headersPresetCanRemove <=> root.headersPresetCanRemove;
+                headersPresetPicked(i) => { root.headersPresetPicked(i); }
+                headersPresetRemoveRequested(i) => { root.headersPresetRemoveRequested(i); }
+                identityPresets <=> root.identityPresets;
+                identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
+                identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
+                identityEditVisible <=> root.identityEditVisible;
+                identityEditIndex <=> root.identityEditIndex;
+                identityEditName <=> root.identityEditName;
+                identityEditHosts <=> root.identityEditHosts;
+                identityEditHostsError <=> root.identityEditHostsError;
+                identityEditProfile <=> root.identityEditProfile;
+                identityEditProfileIndex <=> root.identityEditProfileIndex;
+                identityEditProfileLabels <=> root.identityEditProfileLabels;
+                identityEditProfileValues <=> root.identityEditProfileValues;
+                identityEditUserAgent <=> root.identityEditUserAgent;
+                identityEditHelpVisible <=> root.identityEditHelpVisible;
+                identityPresetAddRequested() => { root.identityPresetAddRequested(); }
+                identityPresetEditRequested(i) => { root.identityPresetEditRequested(i); }
+                identityPresetEditClosed() => { root.identityPresetEditClosed(); }
+                identityPresetEditAccepted(d) => { root.identityPresetEditAccepted(d); }
+                categoryRows <=> root.categoryRows;
+                categoryRuleCount <=> root.categoryRuleCount;
+                categoryResetRequested() => { root.categoryResetRequested(); }
+                categoryRemoveRequested(id) => { root.categoryRemoveRequested(id); }
+                categoryIconChoices <=> root.categoryIconChoices;
+                categoryEditVisible <=> root.categoryEditVisible;
+                categoryEditId <=> root.categoryEditId;
+                categoryEditName <=> root.categoryEditName;
+                categoryEditIconIndex <=> root.categoryEditIconIndex;
+                categoryEditExtensions <=> root.categoryEditExtensions;
+                categoryEditFolder <=> root.categoryEditFolder;
+                categoryAddRequested() => { root.categoryAddRequested(); }
+                categoryEditRequested(id) => { root.categoryEditRequested(id); }
+                categoryEditClosed() => { root.categoryEditClosed(); }
+                categoryEditAccepted(d) => { root.categoryEditAccepted(d); }
+                headersEditVisible <=> root.headersEditVisible;
+                headersEditIndex <=> root.headersEditIndex;
+                headersEditName <=> root.headersEditName;
+                headersEditPairs <=> root.headersEditPairs;
+                headersEditNameError <=> root.headersEditNameError;
+                headersEditDuplicateWarning <=> root.headersEditDuplicateWarning;
+                headersPresetAddRequested() => { root.headersPresetAddRequested(); }
+                headersPresetEditRequested(i) => { root.headersPresetEditRequested(i); }
+                headersPresetEditClosed() => { root.headersPresetEditClosed(); }
+                headersPresetEditAccepted(d) => { root.headersPresetEditAccepted(d); }
+                headersPresetPairsEdited(text) => { root.headersPresetPairsEdited(text); }
+                exportCrx() => { root.exportCrx(); }
+                urlSchemeEnabled <=> root.urlSchemeEnabled;
+                checkUpdateAtStartup <=> root.checkUpdateAtStartup;
+                runAtLogin <=> root.runAtLogin;
+                closeModeIndex <=> root.closeModeIndex;
+                clipboardListener <=> root.clipboardListener;
+                urlSchemeEnabledChanged(v) => { root.urlSchemeEnabledChanged(v); }
+                checkUpdateAtStartupChanged(v) => { root.checkUpdateAtStartupChanged(v); }
+                runAtLoginChanged(v) => { root.runAtLoginChanged(v); }
+                closeModeChanged(i) => { root.closeModeChanged(i); }
+                clipboardListenerChanged(v) => { root.clipboardListenerChanged(v); }
+                uiScalePercent <=> root.uiScalePercent;
+                uiScaleChanged(v) => { root.uiScaleChanged(v); }
+            }
         }
-        TaskPage {
-            tasks: root.tasks;
-            filterMode: root.filterMode;
-            highlightAll: root.highlightAll;
-            highlightActive: root.highlightActive;
-            highlightCompleted: root.highlightCompleted;
-            categoryNames: root.categoryNames;
-            categoryEnabled: root.categoryEnabled;
-            categoryIndex <=> root.categoryIndex;
-            sortFieldIndex <=> root.sortFieldIndex;
-            sortOrderIndex <=> root.sortOrderIndex;
-            searchChanged(value) => { root.searchChanged(value); }
-            filterModeChanged(value) => { root.filterModeChanged(value); }
-            taskPause(taskId) => { root.taskPause(taskId); }
-            taskDelete(taskId) => { root.taskDelete(taskId); }
-            taskToggle(taskId) => { root.taskToggle(taskId); }
-            taskSelectFiles(taskId) => { root.taskSelectFiles(taskId); }
-            taskChecksum(taskId) => { root.taskChecksum(taskId); }
-            taskOpenFile(taskId) => { root.taskOpenFile(taskId); }
-            taskOpenFolder(taskId) => { root.taskOpenFolder(taskId); }
-            categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
-            sortFieldChanged(index) => { root.sortFieldChanged(index); }
-            sortOrderChanged(index) => { root.sortOrderChanged(index); }
-        }
-        SettingsPage {
-            downloadFolder <=> root.downloadFolder;
-            maxTaskNum <=> root.maxTaskNum;
-            preBlockNum <=> root.preBlockNum;
-            categoryEnabled <=> root.categoryEnabled;
-            downloadFolderChanged(value) => { root.downloadFolderChanged(value); }
-            maxTaskNumChanged(value) => { root.maxTaskNumChanged(value); }
-            preBlockNumChanged(value) => { root.preBlockNumChanged(value); }
-            categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
-            speedLimitationKb <=> root.speedLimitationKb;
-            speedLimitationChanged(kb) => { root.speedLimitationChanged(kb); }
-            autoSpeedUp <=> root.autoSpeedUp;
-            maxReassignSize <=> root.maxReassignSize;
-            preserveLastModified <=> root.preserveLastModified;
-            verifySsl <=> root.verifySsl;
-            nameConflictIndex <=> root.nameConflictIndex;
-            useSystemDns <=> root.useSystemDns;
-            autoSpeedUpChanged(v) => { root.autoSpeedUpChanged(v); }
-            maxReassignSizeChanged(v) => { root.maxReassignSizeChanged(v); }
-            preserveLastModifiedChanged(v) => { root.preserveLastModifiedChanged(v); }
-            verifySslChanged(v) => { root.verifySslChanged(v); }
-            nameConflictChanged(v) => { root.nameConflictChanged(v); }
-            useSystemDnsChanged(v) => { root.useSystemDnsChanged(v); }
-            proxyChoice <=> root.proxyChoice;
-            proxyProtocolIndex <=> root.proxyProtocolIndex;
-            proxyHost <=> root.proxyHost;
-            proxyPort <=> root.proxyPort;
-            proxyUser <=> root.proxyUser;
-            proxyPass <=> root.proxyPass;
-            proxyChoiceChanged(c) => { root.proxyChoiceChanged(c); }
-            proxyFieldsChanged(p, h, t, u, w) => { root.proxyFieldsChanged(p, h, t, u, w); }
-            aria2Enabled <=> root.aria2Enabled;
-            aria2RpcPort <=> root.aria2RpcPort;
-            aria2RpcToken <=> root.aria2RpcToken;
-            aria2EmulateFingerprint <=> root.aria2EmulateFingerprint;
-            aria2EnabledChanged(v) => { root.aria2EnabledChanged(v); }
-            aria2RpcPortChanged(v) => { root.aria2RpcPortChanged(v); }
-            aria2RpcTokenChanged(t) => { root.aria2RpcTokenChanged(t); }
-            aria2EmulateFingerprintChanged(v) => { root.aria2EmulateFingerprintChanged(v); }
-            browserEnabled <=> root.browserEnabled;
-            browserDraftTaken <=> root.browserDraftTaken;
-            browserPort <=> root.browserPort;
-            browserEnabledChanged(v) => { root.browserEnabledChanged(v); }
-            browserDraftTakenChanged(v) => { root.browserDraftTakenChanged(v); }
-            browserPortChanged(v) => { root.browserPortChanged(v); }
-            copyPairToken() => { root.copyPairToken(); }
-            regeneratePairToken() => { root.regeneratePairToken(); }
-            openStoreUrl(url) => { root.openStoreUrl(url); }
-            chromiumInstall() => { root.chromiumInstall(); }
-            clientProfileIndex <=> root.clientProfileIndex;
-            clientProfileChanged(i) => { root.clientProfileChanged(i); }
-            headersPresetNames <=> root.headersPresetNames;
-            headersPresetIndex <=> root.headersPresetIndex;
-            headersPresetHeaderCount <=> root.headersPresetHeaderCount;
-            headersPresetCanRemove <=> root.headersPresetCanRemove;
-            headersPresetPicked(i) => { root.headersPresetPicked(i); }
-            headersPresetRemoveRequested(i) => { root.headersPresetRemoveRequested(i); }
-            identityPresets <=> root.identityPresets;
-            identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
-            identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
-            identityEditVisible <=> root.identityEditVisible;
-            identityEditIndex <=> root.identityEditIndex;
-            identityEditName <=> root.identityEditName;
-            identityEditHosts <=> root.identityEditHosts;
-            identityEditHostsError <=> root.identityEditHostsError;
-            identityEditProfile <=> root.identityEditProfile;
-            identityEditProfileIndex <=> root.identityEditProfileIndex;
-            identityEditProfileLabels <=> root.identityEditProfileLabels;
-            identityEditProfileValues <=> root.identityEditProfileValues;
-            identityEditUserAgent <=> root.identityEditUserAgent;
-            identityEditHelpVisible <=> root.identityEditHelpVisible;
-            identityPresetAddRequested() => { root.identityPresetAddRequested(); }
-            identityPresetEditRequested(i) => { root.identityPresetEditRequested(i); }
-            identityPresetEditClosed() => { root.identityPresetEditClosed(); }
-            identityPresetEditAccepted(d) => { root.identityPresetEditAccepted(d); }
-            categoryRows <=> root.categoryRows;
-            categoryRuleCount <=> root.categoryRuleCount;
-            categoryResetRequested() => { root.categoryResetRequested(); }
-            categoryRemoveRequested(id) => { root.categoryRemoveRequested(id); }
-            categoryIconChoices <=> root.categoryIconChoices;
-            categoryEditVisible <=> root.categoryEditVisible;
-            categoryEditId <=> root.categoryEditId;
-            categoryEditName <=> root.categoryEditName;
-            categoryEditIconIndex <=> root.categoryEditIconIndex;
-            categoryEditExtensions <=> root.categoryEditExtensions;
-            categoryEditFolder <=> root.categoryEditFolder;
-            categoryAddRequested() => { root.categoryAddRequested(); }
-            categoryEditRequested(id) => { root.categoryEditRequested(id); }
-            categoryEditClosed() => { root.categoryEditClosed(); }
-            categoryEditAccepted(d) => { root.categoryEditAccepted(d); }
-            headersEditVisible <=> root.headersEditVisible;
-            headersEditIndex <=> root.headersEditIndex;
-            headersEditName <=> root.headersEditName;
-            headersEditPairs <=> root.headersEditPairs;
-            headersEditNameError <=> root.headersEditNameError;
-            headersEditDuplicateWarning <=> root.headersEditDuplicateWarning;
-            headersPresetAddRequested() => { root.headersPresetAddRequested(); }
-            headersPresetEditRequested(i) => { root.headersPresetEditRequested(i); }
-            headersPresetEditClosed() => { root.headersPresetEditClosed(); }
-            headersPresetEditAccepted(d) => { root.headersPresetEditAccepted(d); }
-            headersPresetPairsEdited(text) => { root.headersPresetPairsEdited(text); }
-            exportCrx() => { root.exportCrx(); }
-            urlSchemeEnabled <=> root.urlSchemeEnabled;
-            checkUpdateAtStartup <=> root.checkUpdateAtStartup;
-            runAtLogin <=> root.runAtLogin;
-            closeModeIndex <=> root.closeModeIndex;
-            clipboardListener <=> root.clipboardListener;
-            urlSchemeEnabledChanged(v) => { root.urlSchemeEnabledChanged(v); }
-            checkUpdateAtStartupChanged(v) => { root.checkUpdateAtStartupChanged(v); }
-            runAtLoginChanged(v) => { root.runAtLoginChanged(v); }
-            closeModeChanged(i) => { root.closeModeChanged(i); }
-            clipboardListenerChanged(v) => { root.clipboardListenerChanged(v); }
-            uiScalePercent <=> root.uiScalePercent;
-            uiScaleChanged(v) => { root.uiScaleChanged(v); }
+
+        // 第 53 步：任务抽屉（自带遮罩 + 滑入动画）。属性全部来自
+        // `open_task_drawer` 的派生结果；这里只做单向装配与回调转发。
+        // 关闭按钮/遮罩点击**自行收起**（镜像 Qt `reject()`），同时通知
+        // 调用方——与第 47 步身份覆盖层「不自行收起」的差异在于这里
+        // 没有校验需要保持打开。
+        TaskDrawer {
+            opened: root.drawerVisible;
+            taskId: root.drawerTaskId;
+            taskName: root.drawerTaskName;
+            progressValue: root.drawerProgressValue;
+            progressVisible: root.drawerProgressVisible;
+            progressError: root.drawerProgressError;
+            statusText: root.drawerStatusText;
+            errorVisible: root.drawerErrorVisible;
+            errorTitle: root.drawerErrorTitle;
+            errorText: root.drawerErrorText;
+            infoRows: root.drawerInfoRows;
+            checksumVisible: root.drawerChecksumVisible;
+            checksumRows: root.drawerChecksumRows;
+            checksumError: root.drawerChecksumError;
+            checksumMatched: root.drawerChecksumMatched;
+            checksumTooltip: root.drawerChecksumTooltip;
+            expectedChecksum <=> root.drawerExpectedChecksum;
+            fileListVisible: root.drawerFileListVisible;
+            fileRows: root.drawerFileRows;
+            closeRequested(taskId) => {
+                root.drawerVisible = false;
+                root.drawerCloseRequested(taskId);
+            }
+            expectedChecksumEdited(taskId, text) => {
+                root.drawerExpectedChecksumEdited(taskId, text);
+            }
+            pasteChecksumRequested(taskId) => {
+                root.drawerPasteChecksumRequested(taskId);
+            }
+            copyTextRequested(taskId, text) => {
+                root.drawerCopyTextRequested(taskId, text);
+            }
+            revealInFolderRequested(taskId) => {
+                root.drawerRevealInFolderRequested(taskId);
+            }
         }
     }
 }

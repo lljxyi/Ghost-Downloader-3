@@ -1,0 +1,483 @@
+// 任务抽屉（第 53 步）：镜像 app/view/dialogs/task_drawer.py 的
+// `TaskDrawer` + 五张内建卡片（HeaderCard / ErrorBar / InfoCard /
+// ChecksumCard / FileListCard）。
+//
+// 分工与卡片列表页一致：文案/可见性/使能**全部**由 Rust 侧 `drawer.rs`
+// 算好（`header_card` / `error_bar` / `info_card` / `checksum_card` /
+// `file_list_card`），本文件只做三件事——按 `shown`/`visible` 显示、
+// 按字段排布、点击发字面量（taskId / 文本）。派生语义不进 slint。
+//
+// 未镜像的（记录在案，留给平台外壳步）：
+// - `MaskDialogBase` 的模态与点击遮罩关闭 → 这里用一层半透明遮罩 +
+//   `closeRequested` 回调，模态性归调用方；
+// - `QFileIconProvider` 的 48×48 文件图标（需要真实文件系统）；
+// - `featureService.detailCards()` 的插件扩展卡片（插件位）；
+// - `toBezierCurve` 的贝塞尔缓动 → 用 `ease-out`（Slint 只支持命名缓动）；
+// - 滑出动画：`opened` 落 false 时整层立刻隐藏（Qt 是 300ms 滑出后
+//   `done()`）。语义等价（关闭即不可见），动画细节留视觉步。
+//
+// 常量对齐 `drawer.rs`：DRAWER_WIDTH=592 / SLIDE_DURATION=300ms /
+// CAPTION_WIDTH=88 / ROW_BUTTON_SIZE=28 / MATCH_COLORS=(#0F7B0F, #6CCB5F)。
+
+import { VerticalBox, HorizontalBox, ScrollView, LineEdit, Button } from "std-widgets.slint";
+
+// InfoCard 一行（镜像 `InfoRowState`）。`key` 是行标识
+// （url / path / size / category / created / completed），复制与
+// 「在文件夹中显示」按钮按它分派——镜像 `InfoCard._initWidget` 里
+// 只给 urlRow / pathRow 装按钮、只给 pathRow 装文件夹按钮。
+export struct DrawerInfoRow {
+    key: string,
+    caption: string,
+    value: string,
+    shown: bool,
+}
+
+// ChecksumCard 一行（`ChecksumRow`，algorithm 已 upper()）。
+export struct DrawerChecksumRow {
+    algorithm: string,
+    value: string,
+}
+
+// FileListCard 一行（`FileListRow`）。
+export struct DrawerFileRow {
+    path: string,
+    size: string,
+    status: string,
+}
+
+// 信息行标题（`CaptionLabel` + `toCaptionStyle`：定宽 88、次要色）。
+component DrawerCaption inherits Text {
+    width: 88px;
+    font-size: 12px;
+    color: #606060;
+    vertical-alignment: top;
+    wrap: word-wrap;
+}
+
+// 卡片标题（`StrongBodyLabel`）。
+component DrawerSectionTitle inherits Text {
+    font-size: 13px;
+    font-weight: 600;
+    color: #1A1A1A;
+}
+
+// 行内小按钮（`TransparentToolButton` 定宽 28）。
+component DrawerRowButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    background: self.enabled ? #F3F5F8 : #F7F7F7;
+    opacity: self.enabled ? 1.0 : 0.5;
+
+    Text {
+        text: root.label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 10px;
+        color: #3A3A3A;
+    }
+    TouchArea {
+        clicked => { if (root.enabled) { root.clicked(); } }
+    }
+}
+
+// 抽屉主体。`opened` 由调用方写（Rust `open_task_drawer` 置 true、
+// 关闭按钮或调用方置 false）。
+export component TaskDrawer inherits Rectangle {
+    in property <bool> opened: false;
+    // 当前展示的任务 id（回调只带 taskId，语义在调用方）。
+    in property <string> taskId: "";
+
+    // HeaderCard（`HeaderCardState`）。
+    in property <string> taskName: "";
+    in property <int> progressValue: 0;
+    in property <bool> progressVisible: false;
+    in property <bool> progressError: false;
+    in property <string> statusText: "";
+
+    // ErrorBar（`ErrorBarState`）。
+    in property <bool> errorVisible: false;
+    in property <string> errorTitle: "下载失败";
+    in property <string> errorText: "";
+
+    // InfoCard（`InfoCardState`）。
+    in property <string> infoTitle: "信息";
+    in property <[DrawerInfoRow]> infoRows;
+
+    // ChecksumCard（`ChecksumCardState`）。
+    in property <bool> checksumVisible: false;
+    in property <string> checksumTitle: "校验值";
+    in property <[DrawerChecksumRow]> checksumRows;
+    // `expectedEdit.setError(bool(expected.strip()) and algorithm is None)`
+    in property <bool> checksumError: false;
+    // `algorithm is not None`：命中时输入框聚焦边框换 MATCH_COLORS，
+    // 这里用旁边一枚色点等价表达（LineEdit 不支持改边框色）。
+    in property <bool> checksumMatched: false;
+    // `expectedEdit.setToolTip(...)`：命中「与 X 一致」/ 不一致提示 / 空。
+    in property <string> checksumTooltip: "";
+    // `expectedEdit.text()`：in-out，输入框直接双向绑定。
+    in-out property <string> expectedChecksum: "";
+
+    // FileListCard（`FileListState`）。
+    in property <bool> fileListVisible: false;
+    in property <string> fileListTitle: "文件";
+    in property <[DrawerFileRow]> fileRows;
+
+    // 关闭（标题栏 × / 点击遮罩，镜像 `closeButton.clicked → reject` 与
+    // `setClosableOnMaskClicked(True)`）。
+    callback closeRequested(string);
+    // `expectedEdit.textChanged → _refreshMatch`。
+    callback expectedChecksumEdited(string, string);
+    // `pasteButton.clicked → _onPasteClicked`（剪贴板读取归调用方）。
+    callback pasteChecksumRequested(string);
+    // InfoRow / ErrorBar 的复制按钮（`QApplication.clipboard().setText`）。
+    callback copyTextRequested(string, string);
+    // `pathRow.addButton(FluentIcon.FOLDER, …) → revealInFolder`。
+    callback revealInFolderRequested(string);
+
+    // 关闭态整层不参与绘制与命中测试（Qt 侧是模态对话框）。
+    visible: root.opened;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+
+    // 遮罩：`setMaskColor(QColor(0, 0, 0, 102))`（浅色主题）。
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: rgba(0, 0, 0, 0.4);
+        opacity: root.opened ? 1.0 : 0.0;
+        animate opacity { duration: 300ms; easing: ease-out; }
+
+        TouchArea {
+            clicked => { root.closeRequested(root.taskId); }
+        }
+    }
+
+    // 抽屉面板：宽 `min(DRAWER_WIDTH, self.width())`，从右边界滑入
+    // （`showEvent` 里 start=(width,0) end=(width-drawerWidth,0)）。
+    Rectangle {
+        x: root.opened ? root.width - self.width : root.width;
+        y: 0;
+        width: min(592px, root.width);
+        height: parent.height;
+        background: #FFFFFF;
+        animate x { duration: 300ms; easing: ease-out; }
+
+        // 吞掉面板内的点击，避免穿透到遮罩（面板内点击不应关闭）。
+        TouchArea {}
+
+        VerticalBox {
+            // 标题栏：`titleLayout.setContentsMargins(24, 24, 24, 8)`。
+            HorizontalBox {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 24px;
+                padding-bottom: 8px;
+
+                Text {
+                    text: "任务详情";
+                    font-size: 16px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1.0;
+                }
+                DrawerRowButton {
+                    label: "×";
+                    clicked => { root.closeRequested(root.taskId); }
+                }
+            }
+
+            // 卡片区：`scrollLayout.setContentsMargins(24, 8, 24, 24)` +
+            // spacing 20，卡片顺序与 `self.cards` 一致。
+            ScrollView {
+                VerticalBox {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 8px;
+                    padding-bottom: 24px;
+                    spacing: 20px;
+
+                    // ---- HeaderCard ----
+                    HorizontalBox {
+                        spacing: 16px;
+                        VerticalBox {
+                            spacing: 4px;
+                            horizontal-stretch: 1.0;
+                            Text {
+                                text: root.taskName;
+                                font-size: 18px;
+                                font-weight: 600;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: root.statusText;
+                                font-size: 12px;
+                                color: #606060;
+                            }
+                            // 进度条：Qt 是 `ProgressBar.setVisible(...)` +
+                            // `setValue(int(progress))` + `setError(...)`。
+                            // std-widgets 的 ProgressIndicator 没有 error 态，
+                            // 故用自绘条把「值 + 错误色」一并表达。
+                            Rectangle {
+                                height: 6px;
+                                border-radius: 3px;
+                                background: #E2E6ED;
+                                visible: root.progressVisible;
+
+                                Rectangle {
+                                    x: 0;
+                                    y: 0;
+                                    height: parent.height;
+                                    // progressValue 是 0-100 的 int，先转 float
+                                    // 再除（int/int 在 Slint 里是整除）。
+                                    width: parent.width * min(1.0, root.progressValue * 1.0 / 100.0);
+                                    border-radius: 3px;
+                                    background: root.progressError ? #F5403C : #3477FF;
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- ErrorBar ----
+                    // `InfoBar(ERROR, "下载失败", text, isClosable=False)` +
+                    // 末尾复制按钮。
+                    Rectangle {
+                        visible: root.errorVisible;
+                        height: errorBox.preferred-height;
+                        border-radius: 6px;
+                        background: #FDEDED;
+
+                        errorBox := HorizontalBox {
+                            padding: 12px;
+                            spacing: 8px;
+                            Text {
+                                text: root.errorTitle;
+                                font-size: 13px;
+                                font-weight: 600;
+                                color: #B3261E;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: root.errorText;
+                                font-size: 12px;
+                                color: #B3261E;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1.0;
+                            }
+                            DrawerRowButton {
+                                label: "复制";
+                                clicked => {
+                                    root.copyTextRequested(root.taskId, root.errorText);
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- InfoCard ----
+                    VerticalBox {
+                        spacing: 8px;
+                        DrawerSectionTitle { text: root.infoTitle; }
+                        Rectangle {
+                            background: #F7F8FA;
+                            border-radius: 6px;
+                            height: infoBox.preferred-height;
+
+                            infoBox := VerticalBox {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                padding-top: 12px;
+                                padding-bottom: 12px;
+                                spacing: 10px;
+
+                                for row in root.infoRows: HorizontalBox {
+                                    visible: row.shown;
+                                    spacing: 12px;
+                                    DrawerCaption { text: row.caption; }
+                                    Text {
+                                        text: row.value;
+                                        font-size: 12px;
+                                        color: #1A1A1A;
+                                        wrap: word-wrap;
+                                        horizontal-stretch: 1.0;
+                                        vertical-alignment: top;
+                                    }
+                                    // `urlRow.addCopyButton()` /
+                                    // `pathRow.addCopyButton()`
+                                    DrawerRowButton {
+                                        label: "复制";
+                                        visible: row.key == "url" || row.key == "path";
+                                        clicked => {
+                                            root.copyTextRequested(root.taskId, row.value);
+                                        }
+                                    }
+                                    // `pathRow.addButton(FOLDER, "在文件夹中显示", …)`
+                                    DrawerRowButton {
+                                        label: "打开";
+                                        visible: row.key == "path";
+                                        clicked => {
+                                            root.revealInFolderRequested(root.taskId);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- ChecksumCard ----
+                    VerticalBox {
+                        visible: root.checksumVisible;
+                        spacing: 8px;
+                        DrawerSectionTitle { text: root.checksumTitle; }
+                        Rectangle {
+                            background: #F7F8FA;
+                            border-radius: 6px;
+                            height: checksumBox.preferred-height;
+
+                            checksumBox := VerticalBox {
+                                padding-left: 16px;
+                                padding-right: 16px;
+                                padding-top: 12px;
+                                padding-bottom: 12px;
+                                spacing: 10px;
+
+                                for row in root.checksumRows: HorizontalBox {
+                                    spacing: 12px;
+                                    DrawerCaption { text: row.algorithm; }
+                                    Text {
+                                        text: row.value;
+                                        font-size: 12px;
+                                        color: #1A1A1A;
+                                        wrap: word-wrap;
+                                        horizontal-stretch: 1.0;
+                                        vertical-alignment: top;
+                                    }
+                                    // `row.addCopyButton()`
+                                    DrawerRowButton {
+                                        label: "复制";
+                                        clicked => {
+                                            root.copyTextRequested(root.taskId, row.value);
+                                        }
+                                    }
+                                }
+
+                                // `compareLayout`：CaptionLabel("比对") +
+                                // expectedEdit + pasteButton。
+                                HorizontalBox {
+                                    spacing: 12px;
+                                    DrawerCaption {
+                                        text: "比对";
+                                        vertical-alignment: center;
+                                    }
+                                    LineEdit {
+                                        text <=> root.expectedChecksum;
+                                        placeholder-text: "粘贴期望值";
+                                        horizontal-stretch: 1.0;
+                                        edited(text) => {
+                                            root.expectedChecksumEdited(root.taskId, text);
+                                        }
+                                    }
+                                    // `setCustomFocusedBorderColor(*MATCH_COLORS)`
+                                    // 的等价表达（LineEdit 改不了边框色）。
+                                    Rectangle {
+                                        width: 8px;
+                                        height: 8px;
+                                        border-radius: 4px;
+                                        background: root.checksumMatched ? #0F7B0F : transparent;
+                                    }
+                                    DrawerRowButton {
+                                        label: "粘贴";
+                                        clicked => {
+                                            root.pasteChecksumRequested(root.taskId);
+                                        }
+                                    }
+                                }
+                                // `setToolTip(...)`：Slint 无 hover tooltip，
+                                // 直接作为一行提示文字展示。
+                                Text {
+                                    text: root.checksumTooltip;
+                                    visible: root.checksumTooltip != "";
+                                    font-size: 11px;
+                                    color: root.checksumMatched ? #0F7B0F
+                                        : (root.checksumError ? #B3261E : #606060);
+                                }
+                            }
+                        }
+                    }
+
+                    // ---- FileListCard ----
+                    // `DetailTable([文件, 大小, 状态])`：首列 stretch，
+                    // 其余按内容宽；`setVisible(len(files) > 1)`。
+                    VerticalBox {
+                        visible: root.fileListVisible;
+                        spacing: 8px;
+                        DrawerSectionTitle { text: root.fileListTitle; }
+                        Rectangle {
+                            background: #F7F8FA;
+                            border-radius: 6px;
+                            height: fileBox.preferred-height;
+
+                            fileBox := VerticalBox {
+                                padding: 8px;
+                                spacing: 4px;
+
+                                HorizontalBox {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "文件";
+                                        font-size: 12px;
+                                        color: #606060;
+                                        horizontal-stretch: 1.0;
+                                    }
+                                    Text {
+                                        text: "大小";
+                                        font-size: 12px;
+                                        color: #606060;
+                                        width: 80px;
+                                    }
+                                    Text {
+                                        text: "状态";
+                                        font-size: 12px;
+                                        color: #606060;
+                                        width: 72px;
+                                    }
+                                }
+                                for row in root.fileRows: HorizontalBox {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: row.path;
+                                        font-size: 12px;
+                                        color: #1A1A1A;
+                                        horizontal-stretch: 1.0;
+                                    }
+                                    Text {
+                                        text: row.size;
+                                        font-size: 12px;
+                                        color: #1A1A1A;
+                                        width: 80px;
+                                    }
+                                    Text {
+                                        text: row.status;
+                                        font-size: 12px;
+                                        color: #1A1A1A;
+                                        width: 72px;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

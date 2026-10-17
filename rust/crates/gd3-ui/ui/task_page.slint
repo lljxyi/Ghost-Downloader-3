@@ -126,6 +126,9 @@ export component TaskPage inherits Rectangle {
     callback taskChecksum(string);
     callback taskOpenFile(string);
     callback taskOpenFolder(string);
+    // 第 53 步：打开任务详情抽屉（镜像卡片右键「任务详情」与点信息区
+    // 触发 `_openDrawer`）。Slint 只发 taskId，装配在调用方。
+    callback taskOpenDrawer(string);
     callback categoryFilterChanged(int);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
@@ -234,7 +237,9 @@ export component TaskPage inherits Rectangle {
                     // 其余状态沿用上一次（`ProgressVisibility::visible()`）。
                     ProgressIndicator {
                         width: 120px;
-                        progress: row.progressValue / 100;
+                        // progressValue 是 0-100 的 int；先乘 1.0 转 float
+                        // 再除（Slint 里 int/int 是整除，直接除会恒得 0/1）。
+                        progress: row.progressValue * 1.0 / 100.0;
                         indeterminate: row.progressIndeterminate;
                         visible: row.progressVisible;
                     }
@@ -281,6 +286,12 @@ export component TaskPage inherits Rectangle {
                     CardButton {
                         label: "打开文件夹";
                         clicked => { root.taskOpenFolder(row.taskId); }
+                    }
+                    // 第 53 步：「详情」入口（镜像卡片右键「任务详情」与点
+                    // 信息区触发 `_openDrawer`；Slint 侧用显式按钮等价表达）。
+                    CardButton {
+                        label: "详情";
+                        clicked => { root.taskOpenDrawer(row.taskId); }
                     }
                     CardButton {
                         label: "删除";

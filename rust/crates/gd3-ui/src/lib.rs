@@ -98,6 +98,89 @@ pub fn refresh_task_rows(
         .collect();
     set_task_rows(window, rows);
 }
+
+/// 第 53 步：把 `drawer.rs` 的五张卡片派生结果一次装配到 `TaskDrawer`。
+///
+/// 顺序与 `TaskDrawer.__init__` 的 `self.cards` 一致（Header / Error /
+/// Info / Checksum / FileList）。`expectedChecksum` 走 `<=>` 双链，打开时
+/// 按运行时值初始化；后续键入由调用方在 `expectedChecksumEdited` 里重算。
+///
+/// 末尾才置 `drawerVisible = true`——镜像 Qt 先刷状态再 `show()`，
+/// 避免滑入过程中闪一帧空卡片。
+pub fn open_task_drawer(
+    window: &AppWindow,
+    record: &gd3_core::task::TaskRecord,
+    runtime: &drawer::DrawerRuntime,
+) {
+    let header = drawer::header_card(record, runtime);
+    let error = drawer::error_bar(record, runtime);
+    let info = drawer::info_card(record, runtime);
+    let checksum = drawer::checksum_card(record, &runtime.expected_checksum);
+    let files = drawer::file_list_card(record);
+
+    window.set_drawerTaskId(record.task_id.as_str().into());
+    // HeaderCard
+    window.set_drawerTaskName(header.name.as_str().into());
+    window.set_drawerProgressValue(header.progress_value as i32);
+    window.set_drawerProgressVisible(header.progress_visible);
+    window.set_drawerProgressError(header.progress_error);
+    window.set_drawerStatusText(header.status_text.as_str().into());
+    // ErrorBar
+    window.set_drawerErrorVisible(error.visible);
+    window.set_drawerErrorTitle(error.title.into());
+    window.set_drawerErrorText(error.text.as_str().into());
+    // InfoCard
+    let info_rows: Vec<DrawerInfoRow> = info
+        .rows
+        .iter()
+        .map(|row| DrawerInfoRow {
+            key: row.name.into(),
+            caption: row.caption.into(),
+            value: row.text.as_str().into(),
+            shown: row.visible,
+        })
+        .collect();
+    window.set_drawerInfoRows(slint::ModelRc::new(slint::VecModel::from(info_rows)));
+    // ChecksumCard
+    window.set_drawerChecksumVisible(checksum.visible);
+    let checksum_rows: Vec<DrawerChecksumRow> = checksum
+        .rows
+        .iter()
+        .map(|row| DrawerChecksumRow {
+            algorithm: row.algorithm.as_str().into(),
+            value: row.value.as_str().into(),
+        })
+        .collect();
+    window.set_drawerChecksumRows(slint::ModelRc::new(slint::VecModel::from(checksum_rows)));
+    window.set_drawerChecksumError(checksum.matched.error);
+    window.set_drawerChecksumMatched(checksum.matched.matched.is_some());
+    window.set_drawerChecksumTooltip(checksum.matched.tooltip.as_str().into());
+    window.set_drawerExpectedChecksum(runtime.expected_checksum.as_str().into());
+    // FileListCard
+    window.set_drawerFileListVisible(files.visible);
+    let file_rows: Vec<DrawerFileRow> = files
+        .rows
+        .iter()
+        .map(|row| DrawerFileRow {
+            path: row.path.as_str().into(),
+            size: row.size.as_str().into(),
+            status: row.status.as_str().into(),
+        })
+        .collect();
+    window.set_drawerFileRows(slint::ModelRc::new(slint::VecModel::from(file_rows)));
+
+    window.set_drawerVisible(true);
+}
+
+/// 第 53 步：关闭抽屉并把 `taskId` 归位。
+///
+/// Slint 侧的关闭按钮/遮罩点击已自行把 `drawerVisible` 置 false（镜像 Qt
+/// `reject()`），这里保证调用方从任何入口调都收敛到同一状态（幂等）。
+pub fn close_task_drawer(window: &AppWindow) {
+    window.set_drawerVisible(false);
+    window.set_drawerTaskId("".into());
+}
+
 /// 分类筛选下拉（ComboBox）的 [string] 模型装配（filter::menu_names
 /// 已含「全部分类」表头；current-index 由调用方回写）。
 ///
@@ -808,6 +891,8 @@ pub struct TaskActions {
     pub checksum: Box<dyn Fn(&str)>,
     pub open_file: Box<dyn Fn(&str)>,
     pub open_folder: Box<dyn Fn(&str)>,
+    /// 第 53 步：卡片「详情」→ 打开任务抽屉（镜像 `_openDrawer`）。
+    pub open_drawer: Box<dyn Fn(&str)>,
 }
 
 /// 把动作集注册到 AppWindow 的回调上（on_searchChanged 等生成名
@@ -838,6 +923,45 @@ pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions
     window.on_taskOpenFile(move |task_id| (open_file.open_file)(&task_id));
     let open_folder = actions.clone();
     window.on_taskOpenFolder(move |task_id| (open_folder.open_folder)(&task_id));
+    let open_drawer = actions.clone();
+    window.on_taskOpenDrawer(move |task_id| (open_drawer.open_drawer)(&task_id));
+}
+
+/// 抽屉动作集（第 53 步）：五路回调 → 调用方语义。
+///
+/// 全部只带 taskId（+ 需要复制的文本）：剪贴板读写、文件管理器、校验值
+/// 重算与重绘都在调用方（`task_drawer.py` 里这些是 `QApplication.clipboard()`、
+/// `revealInFolder`、`_refreshMatch` 的职责，不是派生层）。
+///
+/// 两个收 `(taskId, text)` 的回调抽成 `DrawerTextAction`——裸
+/// `Box<dyn Fn(&str, &str)>` 会被 `clippy::type_complexity` 拦。
+pub type DrawerTextAction = Box<dyn Fn(&str, &str)>;
+
+pub struct DrawerActions {
+    pub close: Box<dyn Fn(&str)>,
+    pub expected_edited: DrawerTextAction,
+    pub paste_checksum: Box<dyn Fn(&str)>,
+    pub copy_text: DrawerTextAction,
+    pub reveal_in_folder: Box<dyn Fn(&str)>,
+}
+
+/// 把抽屉动作集注册到 AppWindow 的五个抽屉回调上。
+pub fn install_drawer_actions(window: &AppWindow, actions: std::rc::Rc<DrawerActions>) {
+    let close = actions.clone();
+    window.on_drawerCloseRequested(move |task_id| (close.close)(&task_id));
+    let expected_edited = actions.clone();
+    window.on_drawerExpectedChecksumEdited(move |task_id, text| {
+        (expected_edited.expected_edited)(&task_id, &text)
+    });
+    let paste_checksum = actions.clone();
+    window
+        .on_drawerPasteChecksumRequested(move |task_id| (paste_checksum.paste_checksum)(&task_id));
+    let copy_text = actions.clone();
+    window.on_drawerCopyTextRequested(move |task_id, text| (copy_text.copy_text)(&task_id, &text));
+    let reveal_in_folder = actions.clone();
+    window.on_drawerRevealInFolderRequested(move |task_id| {
+        (reveal_in_folder.reveal_in_folder)(&task_id)
+    });
 }
 
 #[cfg(test)]
@@ -1068,6 +1192,7 @@ mod smoke {
             checksum: record("checksum", hits.clone()),
             open_file: record("open_file", hits.clone()),
             open_folder: record("open_folder", hits.clone()),
+            open_drawer: record("open_drawer", hits.clone()),
         });
         crate::install_task_actions(&window, actions);
         // 注册即通路：逐路 invoke 一次，断言动作集被按 taskId 打到。
@@ -1078,6 +1203,7 @@ mod smoke {
         window.invoke_taskChecksum("t2".into());
         window.invoke_taskOpenFile("t2".into());
         window.invoke_taskOpenFolder("t2".into());
+        window.invoke_taskOpenDrawer("t2".into());
         assert_eq!(
             *hits.borrow(),
             vec![
@@ -1088,6 +1214,153 @@ mod smoke {
                 "checksum:t2",
                 "open_file:t2",
                 "open_folder:t2",
+                "open_drawer:t2",
+            ]
+        );
+    }
+
+    /// 第 53 步：`open_task_drawer` 一次把五张卡片派生结果装配到窗口。
+    ///
+    /// 逐段核对 Header / Error / Info / Checksum / FileList 的属性与 model
+    /// 行内容（派生语义本身由 `drawer.rs` 的 48 条金文件锁定，这里锁
+    /// 「派生结果 → Slint 属性/model」这条通路）。
+    #[test]
+    fn open_task_drawer_assembles_states_headless() {
+        use gd3_core::task::TaskRecord;
+        use serde_json::json;
+
+        let record: TaskRecord = serde_json::from_value(json!({
+            "name": "big.iso", "url": "https://e/1", "packId": "pack",
+            "taskId": "t1", "status": "RUNNING", "fileSize": 4096,
+            "createdAt": 0,
+            "steps": [{"stepIndex": 0, "progress": 25, "speed": 1024, "receivedBytes": 1024}],
+            "checksums": {"sha256": "abc"},
+        }))
+        .expect("TaskRecord 反序列化失败");
+        let runtime = crate::drawer::DrawerRuntime {
+            output_path: "/downloads/big.iso".into(),
+            utc_offset_seconds: 0,
+            category_enabled: true,
+            category_name: Some("视频".into()),
+            expected_checksum: " abc ".into(),
+            ..crate::drawer::DrawerRuntime::default()
+        };
+        let window = crate::create_headless();
+        crate::open_task_drawer(&window, &record, &runtime);
+
+        // HeaderCard
+        assert!(window.get_drawerVisible());
+        assert_eq!(window.get_drawerTaskId(), "t1");
+        assert_eq!(window.get_drawerTaskName(), "big.iso");
+        assert_eq!(window.get_drawerProgressValue(), 25);
+        assert!(window.get_drawerProgressVisible());
+        assert!(!window.get_drawerProgressError());
+        assert_eq!(
+            window.get_drawerStatusText(),
+            "1.00 KB/s · 1.00 KB / 4.00 KB · 3s"
+        );
+
+        // ErrorBar（非 FAILED → 整条隐藏）
+        assert!(!window.get_drawerErrorVisible());
+        assert_eq!(window.get_drawerErrorTitle(), "下载失败");
+        assert_eq!(window.get_drawerErrorText(), "");
+
+        // InfoCard：六行，顺序与 `_initLayout` 的 addWidget 顺序一致。
+        let rows = window.get_drawerInfoRows();
+        assert_eq!(rows.row_count(), 6);
+        let row = |index: usize| rows.row_data(index).expect("信息行缺失");
+        let expected = [
+            ("url", "下载链接", "https://e/1", true),
+            ("path", "保存位置", "/downloads/big.iso", true),
+            ("size", "大小", "4.00 KB", true),
+            ("category", "分类", "视频", true),
+            ("created", "创建时间", "1970-01-01 00:00:00", true),
+            ("completed", "完成时间", "", false),
+        ];
+        for (index, (key, caption, value, shown)) in expected.iter().enumerate() {
+            let row = row(index);
+            assert_eq!(row.key, *key, "第 {index} 行 key");
+            assert_eq!(row.caption, *caption, "第 {index} 行 caption");
+            assert_eq!(row.value, *value, "第 {index} 行 value");
+            assert_eq!(row.shown, *shown, "第 {index} 行 shown");
+        }
+
+        // ChecksumCard：命中 sha256 → 无错误、色点亮、提示带大写算法名。
+        assert!(window.get_drawerChecksumVisible());
+        let checksums = window.get_drawerChecksumRows();
+        assert_eq!(checksums.row_count(), 1);
+        let checksum = checksums.row_data(0).expect("校验行缺失");
+        assert_eq!(checksum.algorithm, "SHA256");
+        assert_eq!(checksum.value, "abc");
+        assert!(!window.get_drawerChecksumError());
+        assert!(window.get_drawerChecksumMatched());
+        assert_eq!(window.get_drawerChecksumTooltip(), "与 SHA256 一致");
+        // `expectedEdit.text()` 由运行时值初始化（原样，不 strip）。
+        assert_eq!(window.get_drawerExpectedChecksum(), " abc ");
+
+        // FileListCard：单文件 → `len(files) <= 1` → 不可见且无行。
+        assert!(!window.get_drawerFileListVisible());
+        assert_eq!(window.get_drawerFileRows().row_count(), 0);
+    }
+
+    /// 第 53 步：`close_task_drawer` 收敛到「不可见 + taskId 清空」。
+    #[test]
+    fn close_task_drawer_hides_and_clears_task_id_headless() {
+        let window = crate::create_headless();
+        window.set_drawerVisible(true);
+        window.set_drawerTaskId("t9".into());
+        crate::close_task_drawer(&window);
+        assert!(!window.get_drawerVisible());
+        assert_eq!(window.get_drawerTaskId(), "");
+    }
+
+    /// 第 53 步：抽屉五路回调注册即通路（逐路 `invoke_*` 断言动作被按
+    /// taskId / 文本打到）。
+    #[test]
+    fn install_drawer_actions_registers_handlers_headless() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let window = crate::create_headless();
+        let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let actions = Rc::new(crate::DrawerActions {
+            close: {
+                let h = hits.clone();
+                Box::new(move |task_id| h.borrow_mut().push(format!("close:{task_id}")))
+            },
+            expected_edited: {
+                let h = hits.clone();
+                Box::new(move |task_id, text| {
+                    h.borrow_mut().push(format!("expected:{task_id}:{text}"))
+                })
+            },
+            paste_checksum: {
+                let h = hits.clone();
+                Box::new(move |task_id| h.borrow_mut().push(format!("paste:{task_id}")))
+            },
+            copy_text: {
+                let h = hits.clone();
+                Box::new(move |task_id, text| h.borrow_mut().push(format!("copy:{task_id}:{text}")))
+            },
+            reveal_in_folder: {
+                let h = hits.clone();
+                Box::new(move |task_id| h.borrow_mut().push(format!("reveal:{task_id}")))
+            },
+        });
+        crate::install_drawer_actions(&window, actions);
+        window.invoke_drawerCloseRequested("t1".into());
+        window.invoke_drawerExpectedChecksumEdited("t1".into(), "abc".into());
+        window.invoke_drawerPasteChecksumRequested("t1".into());
+        window.invoke_drawerCopyTextRequested("t1".into(), "https://e/1".into());
+        window.invoke_drawerRevealInFolderRequested("t1".into());
+        assert_eq!(
+            *hits.borrow(),
+            vec![
+                "close:t1",
+                "expected:t1:abc",
+                "paste:t1",
+                "copy:t1:https://e/1",
+                "reveal:t1",
             ]
         );
     }

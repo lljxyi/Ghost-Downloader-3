@@ -2803,3 +2803,74 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   3. 引擎状态桥接（`TaskService` 信号 → `CardRuntime`/`DrawerRuntime` 供给方）。
   4. 之后：Python UI 停用 + `AGENT-DONE`。
 - 卡点：无
+
+## 2026-10-17 12:51 第 53 步（Phase 7c）：把任务抽屉接到 Slint `TaskDrawer`
+- 做了什么：
+  - 新建 `rust/crates/gd3-ui/ui/task_drawer.slint`（483 行）：导出结构体
+    `DrawerInfoRow` / `DrawerChecksumRow` / `DrawerFileRow`，私有组件
+    `DrawerCaption`（宽 88px = `CAPTION_WIDTH`）/ `DrawerSectionTitle` /
+    `DrawerRowButton`（28px = `ROW_BUTTON_SIZE`），导出 `TaskDrawer`：
+    HeaderCard 5 属性 + ErrorBar 3 属性 + `infoRows` + ChecksumCard 7 属性
+    （含 `in-out expectedChecksum`）+ FileListCard 3 属性，6 个回调。
+    遮罩 `rgba(0,0,0,0.4)`（= `QColor(0,0,0,102)`）+ 面板 `x: opened ?
+    width - self.width : width`，`animate x { duration: 300ms; ease-out }`。
+  - `ui/appwindow.slint`（337 → 425 行）：import 抽屉三结构体 + `TaskDrawer`；
+    19 个 `in-out drawer*` 属性；6 个回调（`taskOpenDrawer` +
+    `drawerCloseRequested` / `drawerExpectedChecksumEdited` /
+    `drawerPasteChecksumRequested` / `drawerCopyTextRequested` /
+    `drawerRevealInFolderRequested`）；窗口体外层套
+    `Rectangle { width: 100%; height: 100%; clip: true; }` 让抽屉与主内容同级
+    叠放；末尾 `TaskDrawer` 实例（属性单向装配 + `expectedChecksum <=>` 双链
+    + 5 路回调转发）。
+  - `ui/task_page.slint`（293 → 304 行）：加 `callback taskOpenDrawer(string)`；
+    行内新增「详情」`CardButton`（镜像卡片右键「任务详情」/点信息区
+    `_openDrawer`）；**修进度条整除 bug**：`row.progressValue / 100` →
+    `row.progressValue * 1.0 / 100.0`（Slint 里 int/int 是整除，恒得 0/1）。
+  - `lib.rs`（2013 → 2201 行）：
+    - `pub fn open_task_drawer(window, record, &DrawerRuntime)`：调五个
+      `*_card` → 写 19 个 `drawer*` 属性（三个 model 走
+      `ModelRc::new(VecModel::from(...))`）→ **末尾**才 `set_drawerVisible(true)`
+      （镜像 Qt 先刷状态再 `show()`，避免滑入闪一帧空卡片）。
+    - `pub fn close_task_drawer(window)`：置不可见 + `taskId` 归位（幂等；
+      Slint 侧关闭按钮/遮罩已自行收起，镜像 Qt `reject()`）。
+    - `pub type DrawerTextAction = Box<dyn Fn(&str, &str)>` + `pub struct
+      DrawerActions { close, expected_edited, paste_checksum, copy_text,
+      reveal_in_folder }` + `install_drawer_actions`（五路注册）。
+    - `TaskActions` 补 `open_drawer` 字段 + `on_taskOpenDrawer` 注册。
+    - 三个新冒烟测试：`open_task_drawer_assembles_states_headless`（六条信息行
+      逐字段 + 校验命中 + 文件列表不可见）、
+      `close_task_drawer_hides_and_clears_task_id_headless`、
+      `install_drawer_actions_registers_handlers_headless`（五路 `invoke_*`）。
+- 决策与理由：
+  - **Slint 结构体字段避开保留名**：`shown` 代替 `visible`、`key` 代替 `name`。
+  - **`Window` 只能有一个子元素自动铺满** → 整个窗口体外层套撑满的
+    `Rectangle`（不参与布局），`TaskDrawer` 与之同级叠放。
+  - **`ProgressIndicator` 无 error 态** → 抽屉头部进度条改自绘（底槽 + 填充
+    `Rectangle`），把「值 + 错误色」一并表达。
+  - **`LineEdit` 改不了边框色** → `checksumMatched` 用一枚 8px 色点表达
+    `setCustomFocusedBorderColor(*MATCH_COLORS)`；`setToolTip` 降级为一行
+    提示文字（Slint 无 hover tooltip）。
+  - **「打开抽屉」用显式「详情」按钮**：Qt 侧是右键菜单 + 点信息区，Slint
+    侧没有右键菜单。
+  - **抽屉关闭「自行收起 + 通知」**（与第 47 步身份覆盖层「不自行收起」的
+    差异：这里没有校验需要保持打开）。
+  - **未镜像项记录在 `task_drawer.slint` 头注释**：`MaskDialogBase` 模态、
+    `QFileIconProvider` 48×48 文件图标、`featureService.detailCards()` 插件卡、
+    `toBezierCurve`（降级 `ease-out`）、滑出动画（`opened=false` 即隐藏）。
+  - 首次编译报三处 `vertical-alignment: start` 不存在（Text 的是
+    `top`/`center`/`bottom`），改 `top` 后一次通过；`min(592px, root.width)`
+    与 `errorBox.preferred-height` 循环引用均未报错。
+  - clippy：裸 `Box<dyn Fn(&str, &str)>` 被 `type_complexity` 拦 → 抽
+    `DrawerTextAction` 别名。
+- 验证：
+  - `cargo fmt --all --check` 通过。
+  - `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+  - `cargo test -p gd3-ui`：**87 passed**（84 → 87）。
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**237 passed**（不变）。
+  - Python 全量：**3 failed, 1347 passed, 8 skipped, 35 errors**，与基线完全相同。
+- 下一步：
+  1. 暂停/删除/继续的真实语义（`_onToggleClicked` 状态分派 + 队列推进）。
+  2. 引擎状态桥接（`TaskService` 信号 → `CardRuntime`/`DrawerRuntime` 供给方：
+     `isExisting` 走文件系统、`completedAt` 走本地时区）。
+  3. 按 `VPS-MIGRATION.md` 的 P0→P6 表继续。
+- 卡点：无
