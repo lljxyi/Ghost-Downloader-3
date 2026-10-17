@@ -19,6 +19,37 @@ from .task import (
 )
 
 
+def parseFtpSource(url: str, defaultPort: int) -> tuple:
+    """ftp URL → 连接信息纯变换（urlparse + unquote + PurePosixPath 归一化）。
+
+    返回 `(scheme, host, port, username, password, sourcePathStr, hasPort)`；
+    urlparse 会抛的 `ValueError`（Invalid IPv6 URL、bracketed host 校验、
+    port cast 等）原样传播。原生分支的行序与 `parse` 原实现一致；
+    `GD3_RUST_FTP_URL=1` 时交给 `gd3_net::ftp::parse_ftp_source`（影子模式），
+    两分支的 sink 端 `or` 兜底（`anonymous`/`anon@`、hostname `''`）逐行一致。
+    """
+    from . import rust_url
+
+    if rust_url.isEnabled():
+        scheme, host, port, username, password, sourcePathStr, hasPort = rust_url.source(url, defaultPort)
+        return (scheme, host, port, username or "anonymous", password or "anon@", sourcePathStr, hasPort)
+
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+
+    sourcePath = PurePosixPath(unquote(parsed.path or "/"))
+    return (
+        scheme,
+        parsed.hostname or "",
+        parsed.port or defaultPort,
+        unquote(parsed.username or "anonymous"),
+        unquote(parsed.password or "anon@"),
+        str(sourcePath),
+        parsed.port is not None,
+    )
+
+
+
 class FtpParser(TaskParser):
     priority = 95
 
@@ -27,18 +58,17 @@ class FtpParser(TaskParser):
 
     async def parse(self, options: TaskOptions) -> Task:
         url = options.url.strip()
-        parsed = urlparse(url)
-        scheme = parsed.scheme.lower()
+        scheme, host, port, username, password, sourcePathStr, hasPort = parseFtpSource(url, FTP_DEFAULT_PORT)
+        sourcePath = PurePosixPath(sourcePathStr)
 
-        sourcePath = PurePosixPath(unquote(parsed.path or "/"))
         connectionInfo = FtpConnectionInfo(
             scheme=scheme,
-            host=parsed.hostname or "",
-            port=parsed.port or FTP_DEFAULT_PORT,
-            username=unquote(parsed.username or "anonymous"),
-            password=unquote(parsed.password or "anon@"),
+            host=host,
+            port=port,
+            username=username,
+            password=password,
             sourcePath=str(sourcePath),
-            hasPort=parsed.port is not None,
+            hasPort=hasPort,
         )
 
         client = await connectionInfo.connect()
