@@ -539,3 +539,67 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
   邻项，注意齐全构建勿漏）。
 - 下一步：bili `fetchSubtitles` 字典变换（20b，可选）；
   之后 Phase 7 Slint UI 与 `/root/Ghost-Downloader-3/AGENT-DONE`。
+
+## 第 20b 步：bili `fetchSubtitles` 字典变换下沉（GD3_RUST_BILI_SUBTITLES，默认关）【完成】
+（2026-10-17 01:41 前收口；HEAD=c40d5f1）
+- 范围：只下沉 `fetchSubtitles` 拿到 payload 之后的**纯字典变换**
+  （`stream.py::subtitleList(payload) → list[dict]`）；网络 I/O
+  （client.get player/v2 API URL）与其外层 try/except 吞错留 Python。
+  原型异常（AttributeError/TypeError）被 fetchSubtitles 的
+  try/except 吞掉返回 `[]`——原生与 Rust 分支网络行为一致。
+- 核心层（`42ccc4f`）：`rust/crates/gd3-net/src/bili.rs` 追加
+  `SubtitleError{AttributeError, TypeError}`、`sub_get_error`/
+  `sub_not_iterable`（复用 py_json_type/truthy/or_default）、
+  `sub_descend`（`(x or {})` 链真值 dict 校验）、
+  `number_eq_one`（type==1：Number as_f64==1.0 与 Bool(true) 均相等）、
+  `subtitle_list(payload)`。`subtitle_list_tests` 7 用例；
+  gd3-net lib **63 passed**。语义要点：
+  1. `(payload.get("data") or {}).get("subtitle") or {}`——外层
+     payload 非 dict（含 None/假值）→ AttributeError（无外层
+     or 兜底）；data/subtitle 假值 or 链回退；真值非 dict →
+     AttributeError `'X' object has no attribute 'get'`。
+  2. rawList 经 `or []`（0/False/None/""/{} → 空）；
+     真值数字/bool → TypeError not iterable；真值 str/dict →
+     逐元素（字符/键）走 `s.get` → AttributeError `'str'`。
+  3. 过滤 `s.get("lan") and s.get("subtitle_url")` 真值；
+     `.get(k, default)` 键存在取值优先（lan_doc=None 不回退
+     default）；isAi=`type==1`（1/1.0/True→True；"1"/2/0.5/
+     False/None→False）；输出键序 lan/lan_doc/subtitle_url/isAi。
+- 桥（`08f4fb1`）：`gd3_py.bili_subtitle_list(payload)` →
+  pythonize 列表（键序一致）或直接抛 PyAttributeError/
+  PyTypeError（文案逐字：10 类错误路径含
+  `'float'/'bool'/'NoneType' object has no attribute 'get'` 的
+  根值/链值/元素层级）；lib.rs 注册，maturin 重建 OK，
+  clippy/fmt 干净。
+- 适配器 + 接线（`062951c`）：`features/bili_pack/rust_subtitles.py`
+  （isEnabled=env 动态读取 + subtitleList 透传）；`stream.py` 抽
+  模块级纯函数 `subtitleList(payload)`（原生分支=原 rawList or 链 +
+  列表推导逐行一致，函数内延迟 import 分流）；`fetchSubtitles`
+  变换块替换为 `return subtitleList(payload)`（try/except 包裹不变）。
+  冒烟 10 错误路径 + 正常态关/开双模式逐字一致；bili 6 测试子集
+  双模式各 157 passed。
+- parity（`c40d5f1`）：`tests/test_bili_subtitles_rust.py`——
+  37 outcome + 17 error 锚点（Python 原生先验内嵌 want，Rust 再对
+  want；error 先验 Python type/str 再验 Rust 逐字）+ 接线 + 默认关。
+  关模式 46 passed / 开模式 45 passed+1 deselect。
+  （入场时发现文件里 isAi 参数化残缺成 `kind`/`want` 未定义——
+  展开为 8 组固定值用例后入库。）
+- 质量门：cargo fmt/clippy 干净；cargo test -p gd3-core -p gd3-net
+  -p gd3-servers 0 失败。
+- 双模式全量回归（25 开关；--ignore=android_pack_import
+  -p no:randomly）：
+  关 → **3 failed / 1286 passed / 8 skipped / 34 errors**
+  （1240+46 新 parity 用例，严丝合缝）；
+  开 → 3 failed / 1283 passed / 11 skipped / 34 errors；
+  FAILED+ERROR 名单（37 条）与第 20 步基线 p20_off_names.txt
+  逐条 diff **为空**；开模式 +3 skip 形态与第 20 步记录一致。
+  失败 3 条为既有基线（android_config_parity / github_probe /
+  runtime_install）。
+- 开关清单（**25 个**）：GD3_RUST_{PERSIST, HTTP, ARIA2, BROWSER,
+  FILENAME, PROBE, PROBE_SIZE, HF_TREE, HF_FILES, HF_URL, HF_HEAD,
+  GITHUB, GITHUB_PROBE, BILI_PARSE, BILI_URL, BILI_PAGES, BILI_VIEW,
+  BILI_SIGN, BILI_PLAYURL, BILI_SUBTITLES, ED2K_LINK, ED2K_PROGRESS,
+  HTTP_MATCH, M3U8_OUTPUT, M3U8_PARSE}。
+- 下一步：其余纯字典/字符串变换小块扫尾（逐个评估可对齐性）；
+  之后 **Phase 7 Slint UI** 与 `/root/Ghost-Downloader-3/AGENT-DONE`
+  （进度文件完结条件）。
