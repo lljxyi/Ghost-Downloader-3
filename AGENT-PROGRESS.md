@@ -752,3 +752,50 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
 - cfg 与 account 数据伴生迁移放在列表页/设置页落地之后。
 - 每页迁完跑 gd3-ui 冒烟 + fmt/clippy；全部 UI 迁移完 → Python UI
   文件停用（不是删除），写 `/root/Ghost-Downloader-3/AGENT-DONE` 结案。
+
+## 第 23 步（2026-10-17 04:42；Phase 7b 起步）【完成】
+
+### 任务列表页数据层切片（commit 2f7467f）
+
+按第 22 步计划的「shell → 任务列表 → 设置 → 引擎桥接」顺序，本轮先做
+任务列表页的**数据层骨架**——先固化行数据契约，Qt 卡片/图标/进度环视觉
+后置：
+
+- **ui/task_page.slint**：
+  - `export struct TaskRow { taskId, name, statusText, progressText }`
+    （对齐 app/view/pages/task_page.py 与 app/view/cards/task_cards.py
+    的最小展示集）。
+  - `TaskPage`：`in property <[TaskRow]> tasks` + `searchText`（占位，
+    cfg 伴生迁移中期生效）+ VerticalBox 里搜索占位 Text 与 ListView。
+  - 文案（状态/进度/速度）由调用方给定，Slint 侧不格式化——与
+    「兜底不在核心层」同一分层原则。
+- **ui/appwindow.slint**：挂 `in property <[TaskRow]> tasks` 并透传给
+  内嵌 TaskPage。
+- **src/lib.rs**：`pub fn set_task_rows(&AppWindow, Vec<TaskRow>)`
+  ——Rust 侧 model 装配（ModelRc + VecModel）；无头冒烟测试从 1 增
+  **2 passed**（行模型推送 → get_tasks() 逐行 round-trip）。
+
+### slint 1.18 语法/API 实证（本步新增，行级核对）
+
+- **ListView 内容**不是 `delegate X {}`（`delegate` 不是 1.18 关键字，
+  解析错定位在同列），而是 `for row in model: Element { }` 重复元素
+  （compiler 自带 qt/combobox.slint:79 用例佐证）。
+- **布局**：`VerticalLayout/HorizontalLayout` 是 slint 语言内置类型、
+  **不导出自 std-widgets**；std-widgets 里对应导出名是
+  `VerticalBox/HorizontalBox`（导错名报 "No exported type"）。
+- **跨文件 struct 导入**须显式列出：`import { TaskPage, TaskRow }
+  from "task_page.slint"`——只 import 组件时对方 struct 报
+  "Unknown type 'TaskRow'"。
+- **生成 Rust 代码**：模型属性 setter 无返回值（`fn set_tasks(&self,
+  ModelRc<TaskRow>)`，build 产物 appwindow.rs:1840 实证；此前猜的
+  `SetPropertyError` 不存在于 crate 根）；数组属性 getter 直接回
+  `ModelRc<TaskRow>` 无 Option 包装；逐行读需 `use slint::Model`
+  （row_count/row_data 是 trait 方法），字段名保留 slint 命名
+  （`first.taskId`）。
+
+### 下一步（Phase 7b 续）
+
+1. gd3-core `TaskRecord` → `TaskRow` 的 Rust 侧映射（含 gd3-ui
+   依赖 gd3-core、状态文案/进度文案的语义口径对齐 task_cards.py 的
+   FieldSpec/formats——先 Python 实测再镜像）。
+2. 之后任务列表的交互回调（暂停/删除/分类筛选）逐个接。
