@@ -18,6 +18,7 @@ pub mod card;
 pub mod category;
 pub mod close_mode;
 pub mod conflict;
+pub mod drawer;
 pub mod filter;
 mod format;
 pub mod headers;

@@ -2728,3 +2728,78 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 3. 引擎状态桥接（`TaskService` 信号 → `push_task_records` 的 `CardRuntime`
    供给方：`isExisting` 走文件系统、`completedAt` 走本地时区）。
 4. 之后：Python UI 停用 + `AGENT-DONE`。
+
+## 2026-10-17 12:33 第 52 步
+- 做了什么：
+  - 新建 `rust/crates/gd3-ui/src/drawer.rs`（957 行，11 个测试），把
+    `app/view/dialogs/task_drawer.py` 里五张卡片的 `refresh()` 摊平成纯函数：
+    `header_card` / `error_bar` / `info_card` / `checksum_card` / `file_list_card`
+    + `file_status_text` / `file_list_needs_refresh`，配套五个结果 struct。
+  - 常量 `DRAWER_WIDTH=592` / `SLIDE_DURATION=300` / `CAPTION_WIDTH=88` /
+    `ROW_BUTTON_SIZE=28` / `MATCH_COLORS`。
+  - 原语：`to_time_text(timestamp, utc_offset_seconds)`（手写 Howard Hinnant
+    `civil_from_days`，`gd3-ui` 没有 chrono）、`parse_checksum`、`match_checksum`、
+    私有 `py_split_whitespace`（按 `pystr::py_isspace` 切，对齐 CPython 无参
+    `str.split()`）。
+  - `DrawerRuntime { card: CardRuntime, output_path, utc_offset_seconds,
+    category_enabled, category_name, expected_checksum }`。
+  - 金文件 `tests/fixtures/drawer.jsonl`（**48 条**，md5
+    `77ceb08b5c0c2d16a195c108bf2ea2a4`，连跑两次相同）+ 生成脚本
+    `generate_drawer_fixture.py`（708 行）；`drawer_layer_matches_python_fixture`
+    逐条对比并断言总条数。
+  - `lib.rs` 加 `pub mod drawer;`（按字母序插在 `conflict` 与 `filter` 之间）。
+- 口径决策：
+  - `DrawerRuntime` 内嵌 `CardRuntime` 而不是重列字段：抽屉的 `isSeeding` /
+    `lastError` / `outputExists` 与卡片同源，`header_card` 直接
+    `CardTask::from_record(record, &runtime.card)`。
+  - `output_path` 由调用方给 `String`，不在 Rust 拼 `Path`：`str(Path / name)`
+    的分隔符跨平台不一致，且调用方本就要算它来判 `outputExists`。
+  - `to_time_text` 自己实现 `strftime("%Y-%m-%d %H:%M:%S")`，偏移由调用方给
+    （DST 由调用方按当时生效偏移给）；金文件用
+    `datetime.fromtimestamp(t, timezone(timedelta(seconds=off)))` 对齐，并断言
+    offset=0 时与真 `toTimeText` 逐条相同。已知偏差：年份 < 1000 时 Rust 补到
+    4 位、Python/glibc 不补（用例不覆盖）。
+  - `checksum_card` 的行排序按**原始键**（`entries.sort_by` 后才 `to_uppercase()`）
+    ——Python 是 `sorted(task.checksums.items())` 再 `algorithm.upper()`；
+    已用 `checksum_rows_sort_by_raw_key_not_uppercased` 钉住（`"Sha256"` vs
+    `"sha1"` 会得出相反顺序）。
+  - `match_checksum` 走 dict 插入顺序（`serde_json::Map` 开 `preserve_order`），
+    与行显示顺序（排序后）**不同**：两处分别对齐 Python 的 `next(...)` 与
+    `sorted(...)`。
+  - `ChecksumCard.refresh` 的 `task.checksums == self._shownChecksums` 缓存短路
+    归调用方；`FileListCard.refresh` 的重算条件单独暴露为
+    `file_list_needs_refresh(last, current) = !(last == Some(current) && current != RUNNING)`。
+  - **金文件抓出的真实偏差**：`len(files) <= 1` 时 Python 在 `setVisible` 之后
+    直接 `return`，`setRows` **从不调用**，表格里没有行；初版 `file_list_card`
+    无条件生成行 → 被「文件-单文件隐藏」用例判死。已改为该分支返回空 `rows`，
+    并把两条守卫（提前 return / 状态缓存）在 doc 里分开写清。
+  - 金文件钉死 `outputFolder=Path("/downloads")`：本机
+    `cfg.downloadFolder.value == "//Downloads"`，不钉死金文件无法跨机器复现。
+  - 生成脚本用「真方法绑普通类 + 属性链桩」：`QWidget.isVisible()` 在父窗口
+    未 show 时恒 False，`setVisible(True)` 读回仍 False，只能靠记录调用序列判
+    可见性；`Stub.__getattr__` 返回可调用子 Stub 且共享日志，才能支持
+    `bar.textLayout.setStretchFactor(...)` 这类链式调用。
+  - `ErrorBar.refresh` 的复制按钮父是 InfoBar（桩），真
+    `TransparentToolButton` / `ToolTipFilter` 构造会炸 → 两者一并换桩。
+  - `_refreshMatch` 在 `refresh()` 之后显式再调一次：桩不跑 `_bind`，空
+    `checksums` 时 Python 的缓存短路会让 `_refreshMatch` 不被调用；显式补调
+    等价于「用户输入了期望值」，两侧口径才可比。
+  - clippy 收口：`DrawerRuntime` 改 `derive(Default)`（`derivable_impls`）、
+    `civil_from_days` 去掉多余的 `as i64`（`unnecessary_cast`）。
+- 验证：
+  - `cargo fmt --all --check` 通过。
+  - `cargo clippy --all-targets -- -D warnings`（全工作区）通过。
+  - `cargo test -p gd3-ui`：**84 passed**（73 → 84，新增 11 个 drawer 测试）。
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers`：**237 passed**（不变）。
+  - Python 全量：`pytest -q --continue-on-collection-errors` →
+    **3 failed, 1347 passed, 8 skipped, 35 errors**，与基线完全相同
+    （本步只动 Rust UI 层，不涉及影子开关）。
+- 下一步：
+  1. 第 53 步：把 `drawer.rs` 接到 Slint——新建 `ui/task_drawer.slint`
+     （HeaderCard / ErrorBar / InfoCard / ChecksumCard / FileListCard 五个
+     component + 滑入动画），`appwindow.slint` 加抽屉开关回调，`lib.rs` 加
+     `open_task_drawer(record, &DrawerRuntime)` 装配函数 + 无头冒烟测试。
+  2. 暂停/删除/继续的真实语义（`_onToggleClicked` 状态分派 + 队列推进）。
+  3. 引擎状态桥接（`TaskService` 信号 → `CardRuntime`/`DrawerRuntime` 供给方）。
+  4. 之后：Python UI 停用 + `AGENT-DONE`。
+- 卡点：无
