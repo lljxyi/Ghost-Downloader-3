@@ -603,3 +603,77 @@ VPS（Linux）上的 Rust 迁移日志。每步：做了什么 / 验证 / 下一
 - 下一步：其余纯字典/字符串变换小块扫尾（逐个评估可对齐性）；
   之后 **Phase 7 Slint UI** 与 `/root/Ghost-Downloader-3/AGENT-DONE`
   （进度文件完结条件）。
+
+## 第 21 步：ftp URL → FtpConnectionInfo 纯变换下沉（GD3_RUST_FTP_URL，默认关）【完成】
+（2026-10-17 04:05 收口；HEAD=f370b7c）
+- 范围：只下沉 `ftp_pack/pack.py::FtpParser.parse` 的
+  urlparse → unquote → PurePosixPath → FtpConnectionInfo **纯变换段**；
+  FTP 连接/枚举网络 I/O、文件层、toSafeFilename、重命名留 Python。
+  urlparse 的所有 `ValueError`（Invalid IPv6 URL、bracketed host 双校验、
+  port cast/range、NFKC netloc）由核心层逐字文案返回、桥直接抛
+  `PyValueError`——与原生传播路径一致（parse 外层无 try/except 吞错）。
+- 核心层（`13db908`/`4cc841cb`）：`rust/crates/gd3-net/src/ftp.rs`
+  （~713 行）+ `pub mod ftp;`。语义逐条对照磁盘 CPython 3.13
+  （`/usr/lib/python3.13/urllib/parse.py`）+ 探针实测：
+  1. `urlsplit` 仅左端去 C0+空格、`\t\r\n` 全删；`_check_bracketed_netloc`
+     只在 `[`+`]` 同时入 netloc 时调用；`_checknetloc`：非 ASCII 且
+     去 `@:?#` 后 NFKC 归一化**变了值**且归一化含 `/?#:@` 才报错
+     （ASCII fast-path；所以 `host:21℀` 报 NFKC 错而 `host:21℄` 落到
+     port cast 报错、`hⒶost` 正常通过 lower 为 `hⓐost`）。
+  2. `_userinfo`=`rpartition('@')`+首次 `partition(':')`；**userinfo
+     空串原样保留 ''**，`anonymous`/`anon@` 兜底在 pack.py sink 端
+     `or` 完成（第 17 轮曾误内嵌核心层，第 18 轮冒烟发现后修正——
+     `or_empty` 函数移除，测试断言随迁）。
+  3. `hostname` 首次 `partition('%')` 头段 lower、zone 原样
+     （'H%6Fst' → 'h%6Fst'：'%6F' 原样不动）。
+  4. `valid_ipv6` 算法级复刻 ipaddress：zone=`partition('%')`（空或含
+     第二个 `%` 非法）、45 字符限剥离 zone 后、冒号 ≥9 非法、嵌入
+     IPv4 占 2 段（IPv4Address 严格解析：ascii digit、≤3 位、零前缀
+     禁、≤255）、内部空段=压缩 `::` 至多一个、skip 分支 endpoint 空
+     段降 0、非 skip 恰 8 段首尾非空、hextet 1..4 ascii hex。
+  5. `unquote` per-ASCII-run：按 `_asciire` 切段独立 utf-8 replace
+     解码、非 ASCII 段原样穿过（`%C3%A4%ee%` 混排 UTF-8 序列不跨界
+     合并 → '/\ufffd%'）。
+  6. port：ascii digits 才收、Ok(0)→default（`or` 假值语义）、
+     hasPort=有显式端口段。
+  gd3-net --lib **73 passed**（10 个 ftp 用例）。
+- 桥（`c14fe8b`）：`gd3_py.ftp_source(url, defaultPort)` → 7 元组
+  `(scheme, host, port, username, password, sourcePath, hasPort)`，
+  Err 直接 PyValueError；lib.rs 注册，maturin 重建 OK。
+- 适配器 + 接线（`ebfe8b4`）：`features/ftp_pack/rust_url.py`
+  （isEnabled env 动态 + `source(url, defaultPort)` 透传）；
+  `pack.py` 抽模块级纯函数 `parseFtpSource(url, defaultPort) -> tuple`
+  （原生分支=原 urlparse+unquote+PurePosixPath+`or` 兜底**行序逐行
+  一致**；Rust 分支=适配器 7 元组 + sink 端同样的 `or` 兜底行），
+  `parse()` 首段替换为解包 + 局部
+  `sourcePath = PurePosixPath(sourcePathStr)` 构造 FtpConnectionInfo，
+  其余（stat/list/REST 探测/task 构造）不动。冒烟：31 用例双模式
+  与原生先验零差异（正常值/错误文案）。
+- parity（`f370b7c`）：`tests/test_ftp_url_rust.py`——61 用例
+  （36 outcome + 20 error 逐字锚点 + 接线 + 默认关 + 桥原样契约）。
+  关键先验修正过程：①初版 want 手写有 22 处笔误，脚本对原生核正；
+  ②桥原样值（''/'anon@' 前）≠ parse 分派的兜底值——双侧统一走
+  `parseFtpSource`（runBoth 内部 delenv/setenv 分派含 or 兜底），
+  另设 `test_bridge_raw_contract` 锁桥契约；③`FTP://HOST/X Y#Z`
+  的 path 是 `/X Y`（fragment 截断）等。关/开模式各 61 passed。
+- 质量门：cargo fmt/clippy 干净；cargo test gd3-core/net/servers
+  22 套件 0 失败。
+- 双模式全量回归（26 开关；--ignore=android_pack_import
+  -p no:randomly）：
+  关 → **3 failed / 1347 passed / 8 skipped / 34 errors**
+  （1286+61 新 parity 用例严丝合缝）；
+  开 → 4 failed / 1343 passed / 11 skipped / 34 errors；
+  FAILED+ERROR 名单（关 37 条）与第 20 步基线 p20_off_names.txt
+  逐条 diff **为空**；开模式多出的
+  `test_engine_listeners.py::test_stopping_the_engine_releases_both_ports[uvloop]`
+  独立复跑 1 passed——即第 19/20 步已定性的本机端口释放偶发，未追。
+  失败 3 条为既有基线（android_config_parity / github_probe /
+  runtime_install）。
+- 开关清单（**26 个**）：第 20b 步 25 个 + `GD3_RUST_FTP_URL`。
+  基线文件：`$PI_SCRATCH_DIR/p21_off_names.txt`（关）、
+  `p21_on_names.txt`（开）、p20_off_names.txt（关基线）。
+- 已知偏差（不阻塞）：希腊 final sigma lower 语境规则未复刻（Σ 恒
+  →σ，非 ASCII 主机名不出现在 ftp 流量）；isdigit 只认 ascii 数字
+  （与 Python 非 ascii 数字同为 cast error 殊途同归）。
+- 下一步：其余纯变换小块扫尾（如有）；之后 **Phase 7 Slint UI**
+  与 `/root/Ghost-Downloader-3/AGENT-DONE`（进度文件完结条件）。

@@ -336,3 +336,27 @@ date '+%Y-%m-%d %H:%M'
 
 不要凭推理编日期，也不要复用上一轮笔记里的日期。宁可只写「第 N 步」不写日期，
 也不要写错日期——错的时间戳会让运维方误判时序。
+
+### 11. 跑测试一律带 `timeout`（硬规则）
+
+实测发生过两次测试进程永久挂死，其中一次挂了 **11.8 小时**、另一次 82 分钟，
+直接把整个回合拖住。所以：
+
+```bash
+# 全量 Python（15 分钟上限）
+timeout 900 .venv/bin/python -m pytest -q --continue-on-collection-errors
+
+# Rust（20 分钟上限；首次编译慢，给足）
+timeout 1200 cargo test -p gd3-core -p gd3-net -p gd3-servers
+```
+
+- **不要不带 `timeout` 就跑全量测试。**
+- 超时（退出码 124）不是"结果未知"，而是**明确的挂起信号**：立刻按第 8 节
+  「反兔子洞」处理——记录现象、标 `#[ignore]`/`skip`、换活干。
+- 别用 `cargo test --test 'xxx-*'` 这类通配符：会匹配进历史遗留的旧二进制，
+  那些旧二进制可能还卡着死锁（实测有 11.8 小时的僵尸）。一律给精确路径。
+- 如果怀疑有僵尸进程占着资源，先看：
+  ```bash
+  ps -eo pid,etimes,cmd --sort=-etimes | awk '$2 > 1800' | grep -E 'cargo|pytest|deps/'
+  ```
+  确认是自己这轮起的再杀，不要动别人的。
