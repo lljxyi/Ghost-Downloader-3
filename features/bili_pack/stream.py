@@ -159,6 +159,33 @@ def matchStream(
     raise ValueError("未找到可用的媒体流")
 
 
+def playurlGate(playPayload, qn: int) -> tuple:
+    """`fetchPlayurl` 的响应判定层（纯函数，影子开关 `GD3_RUST_BILI_PLAYURL`）。
+
+    返回元组协议：
+      ('fallback',) → 上层按 qn=80 递归 fetchPlayurl（qn==80 时不再递归）
+      ('error', message) → 上层 raise ValueError(message)
+      ('ok', dash, acceptQuality) → 上层接 parseDash
+    原生分支的行序与 fetchPlayurl 原实现逐行一致。
+    """
+    from .rust_playurl import isEnabled as rustPlayurlEnabled, playurlGate as rustPlayurlGate
+
+    if rustPlayurlEnabled():
+        return rustPlayurlGate(playPayload, qn)
+    if playPayload.get("code") not in {None, 0}:
+        if qn != 80:
+            return ("fallback",)
+        return ("error", playPayload.get("message") or "获取 Bilibili 音视频流失败")
+
+    pageData = playPayload.get("data") or {}
+    dash = pageData.get("dash") or {}
+    videoStreams = list(dash.get("video") or [])
+    if not videoStreams and qn != 80:
+        return ("fallback",)
+    acceptQuality = list(pageData.get("accept_quality") or [])
+    return ("ok", dash, acceptQuality)
+
+
 async def fetchPlayurl(
     page: BiliPage,
     *,
@@ -196,21 +223,17 @@ async def fetchPlayurl(
             raise ValueError("Bilibili 拦截了取流请求（412 风控）。请稍后再试，登录 Cookie 建议带上 buvid3")
         response.raise_for_status()
         playPayload = await response.json()
-        if playPayload.get("code") not in {None, 0}:
-            if qn != 80:
-                return await fetchPlayurl(page, qn=80, headers=headers, signParams=signParams, audioQn=audioQn)
-            raise ValueError(playPayload.get("message") or "获取 Bilibili 音视频流失败")
-
-        pageData = playPayload.get("data") or {}
-        dash = pageData.get("dash") or {}
-        videoStreams = list(dash.get("video") or [])
-        if not videoStreams and qn != 80:
+        # 消疑层（影子模式，默认关）：响应判定层已下沉到 playurlGate
+        gate = playurlGate(playPayload, qn)
+        if gate[0] == "fallback":
             return await fetchPlayurl(page, qn=80, headers=headers, signParams=signParams, audioQn=audioQn)
-        acceptQuality = list(pageData.get("accept_quality") or [])
+        if gate[0] == "error":
+            raise ValueError(gate[1])
+        dash, acceptQuality = gate[1], gate[2]
         parseDash(page, dash, qn=qn, acceptQuality=acceptQuality, audioQn=audioQn)
         if not page.subtitles:
             page.subtitles = await fetchSubtitles(client, page)
-        return acceptQuality, list(pageData.get("accept_description") or []), qn
+        return acceptQuality, list((playPayload.get("data") or {}).get("accept_description") or []), qn
     finally:
         client.close()
 
