@@ -1587,3 +1587,61 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    组复杂卡（clientProfileCard/HeadersPresetSettingCard/History）
    先验。之后暂停/删除接真实语义（Phase 8 桥接一体考虑）→ 引擎
    状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 38 步 — 关联组 urlScheme 静态卡 + 软件组简版五卡（cfg.py）
+
+- 时间：2026-10-17 07:54（date 实取；代码提交 `7fc3bcb`）
+
+### 改动
+
+- `src/close_mode.rs`（新，48 行）：镜像 OptionsConfigItem
+  Software/CloseMode + ComboBoxSettingCard 索引⇄字面量
+  （"Ask"/"Background"/"Quit"，缺省 Ask；EnumSerializer 存
+  enum.value .venv 实证 cfg.py:65-69）；未知字面量/越界兜底
+  （同 conflict.rs 惯例）+1 单测。
+- `ui/settings_page.slint`：5 in-out（urlSchemeEnabled/
+  checkUpdateAtStartup/runAtLogin/closeModeIndex/clipboardListener）
+  + 5 回调 + 五卡（头注释 32-38 步）。
+- `ui/appwindow.slint`：同名透传。
+- `src/lib.rs`：`pub mod close_mode;`（conflict 前）；push 五组 set；
+  SettingsActions 五动作（close_mode 收字面量，索引换算在 install
+  层）；install 注册。
+
+### 键位实证（cfg.py）
+
+- `Browser/UrlSchemeRegistered` 缺省 True；`Software/
+  CheckUpdateAtStartUp` 缺省 True；`Software/AutoRun`（开机启动）
+  缺省 False；`Software/CloseMode` 缺省 CloseMode.ASK 选项字面量
+  Ask/Background/Quit；`Software/ClipboardListener` 缺省 True。
+- 平台守卫注记：urlScheme 动态卡 sys!=darwin 才构建（本机 Linux，
+  Slint 静态显示）；closeMode/剪贴板安卓不显示。
+- **欠账清单**：每包关联动态 Switch（featureService packs 的
+  associateFileTypes/uriSchemes 真数据留引擎桥接步）、迁移模式
+  PushCard、zoomCard/主题/语言/背景材质留主题布局步。
+
+### 工具坑增量（第 3 次）
+
+- 生成/替换文本中混入坏 token 两次（close_mode.rs 注释
+  "ORIZATION" 与 settings_page 注释 "компанию"）——grep 非常规
+  模式扫描现场、立即修复；后续写中文注释时先 grep "�" 与可疑
+  西里尔串再进质量门。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 一次通过。
+- `timeout 1200 cargo test -p gd3-ui`：**28 → 29 passed**（+
+  close_mode round-trip/兜底；smoke 补五键有值推送/缺省容错/
+  invoke_closeModeChanged(1) => "Background"）。0 failed。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 39 步候选：下载路径卡动作骨架（FolderPicker 换行编辑已
+   占位）、HistoryDownloadFolder、PercentSpinBox 界面缩放
+   （DpiScale 0-5 → % 显示 0-500 步 25）；或开始暂停/删除真实
+   语义（Phase 8 桥接一体考虑）。
+2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
