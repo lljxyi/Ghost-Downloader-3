@@ -14,6 +14,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+pub mod conflict;
 pub mod filter;
 mod format;
 pub mod row;
@@ -131,6 +132,39 @@ pub fn push_settings(
             .get_i64("GeneralDownload", "SpeedLimitation")
             .unwrap_or(speed::DEFAULT_BYTES),
     ) as i32);
+    // 第 34 步：GeneralDownload 组剩余简版键（键名/缺省 cfg.py 实证）；
+    // NameConflict 镜像 ComboBoxSettingCard——存字面量、UI 发索引
+    // （映射归 conflict.rs）。
+    window.set_autoSpeedUp(
+        config
+            .get_bool("GeneralDownload", "AutoSpeedUp")
+            .unwrap_or(true),
+    );
+    window.set_maxReassignSize(
+        config
+            .get_i64("GeneralDownload", "MaxReassignSize")
+            .unwrap_or(512) as i32,
+    );
+    window.set_preserveLastModified(
+        config
+            .get_bool("GeneralDownload", "PreserveLastModified")
+            .unwrap_or(false),
+    );
+    window.set_verifySsl(
+        config
+            .get_bool("GeneralDownload", "shouldVerifySsl")
+            .unwrap_or(false),
+    );
+    window.set_nameConflictIndex(conflict::index_of_option(
+        config
+            .get_str("GeneralDownload", "NameConflict")
+            .unwrap_or(conflict::DEFAULT_OPTION),
+    ) as i32);
+    window.set_useSystemDns(
+        config
+            .get_bool("Network", "ShouldUseSystemDns")
+            .unwrap_or(true),
+    );
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -142,6 +176,14 @@ pub struct SettingsActions {
     /// 限速值动作收**配置口径字节**（显示 KB/s → 字节换算在 install
     /// 层完成，与其它动作统一「动作收配置单位」）。
     pub speed_limitation: Box<dyn Fn(i64)>,
+    // 第 34 步：GeneralDownload 组剩余简版动作（统一收配置单位；
+    // NameConflict 收选项字面量，索引→字面量换算在 install 层）。
+    pub auto_speed_up: Box<dyn Fn(bool)>,
+    pub max_reassign_size: Box<dyn Fn(i64)>,
+    pub preserve_last_modified: Box<dyn Fn(bool)>,
+    pub verify_ssl: Box<dyn Fn(bool)>,
+    pub name_conflict: Box<dyn Fn(&str)>,
+    pub use_system_dns: Box<dyn Fn(bool)>,
 }
 
 pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<SettingsActions>) {
@@ -160,8 +202,25 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_speedLimitationChanged(move |kb| {
         (speed.speed_limitation)(speed::from_display_kb(kb as i64))
     });
+    // 第 34 步：GeneralDownload 简版动作注册（NameConflict 由 install
+    // 层把索引换成字面量，动作统一收配置单位）。
+    let auto_speed_up = actions.clone();
+    window.on_autoSpeedUpChanged(move |v| (auto_speed_up.auto_speed_up)(v));
+    let max_reassign_size = actions.clone();
+    window.on_maxReassignSizeChanged(move |v| (max_reassign_size.max_reassign_size)(v as i64));
+    let preserve_last_modified = actions.clone();
+    window.on_preserveLastModifiedChanged(move |v| {
+        (preserve_last_modified.preserve_last_modified)(v)
+    });
+    let verify_ssl = actions.clone();
+    window.on_verifySslChanged(move |v| (verify_ssl.verify_ssl)(v));
+    let name_conflict = actions.clone();
+    window.on_nameConflictChanged(move |i| {
+        (name_conflict.name_conflict)(conflict::option_of_index(i as i64))
+    });
+    let use_system_dns = actions.clone();
+    window.on_useSystemDnsChanged(move |v| (use_system_dns.use_system_dns)(v));
 }
-
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
 /// 分层：Slint 只发 taskId/路由字面量；真正的暂停/删除/筛选语义都在
@@ -404,6 +463,12 @@ mod smoke {
         config.set_i64("GeneralDownload", "MaxTaskNum", 5);
         config.set_bool("Category", "EnableCategory", true);
         config.set_i64("GeneralDownload", "SpeedLimitation", 8_388_608);
+        config.set_bool("GeneralDownload", "AutoSpeedUp", false);
+        config.set_i64("GeneralDownload", "MaxReassignSize", 1024);
+        config.set_bool("GeneralDownload", "PreserveLastModified", true);
+        config.set_bool("GeneralDownload", "shouldVerifySsl", true);
+        config.set_str("GeneralDownload", "NameConflict", "ask");
+        config.set_bool("Network", "ShouldUseSystemDns", false);
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -413,6 +478,14 @@ mod smoke {
         assert!(window.get_categoryEnabled());
         // 第 33 步：限速值字节 → 显示 KB/s（8388608/1024=8192）。
         assert_eq!(window.get_speedLimitationKb(), 8192);
+        // 第 34 步：有值推送（AutoSpeedUp 取 False / MaxReassignSize
+        // 直读 / NameConflict="ask"→索引 2 / DNS 走 Network 组）。
+        assert!(!window.get_autoSpeedUp());
+        assert_eq!(window.get_maxReassignSize(), 1024);
+        assert!(window.get_preserveLastModified());
+        assert!(window.get_verifySsl());
+        assert_eq!(window.get_nameConflictIndex(), 2);
+        assert!(!window.get_useSystemDns());
 
         // 缺省容错：空配置 → folder 用调用方缺省，数字走 Python 缺省。
         let window = crate::create_headless();
@@ -423,10 +496,19 @@ mod smoke {
         assert!(!window.get_categoryEnabled());
         // 限速值缺省 4194304 → 显示 4096 KB/s。
         assert_eq!(window.get_speedLimitationKb(), 4096);
+        // 第 34 步：缺省容错（AutoSpeedUp=T/MaxReassignSize=512/
+        // preserve=F/verifySsl=F/NameConflict=keepBoth/DNS=T）。
+        assert!(window.get_autoSpeedUp());
+        assert_eq!(window.get_maxReassignSize(), 512);
+        assert!(!window.get_preserveLastModified());
+        assert!(!window.get_verifySsl());
+        assert_eq!(window.get_nameConflictIndex(), 0);
+        assert!(window.get_useSystemDns());
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let speed_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        let name_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -442,6 +524,17 @@ mod smoke {
                 let h = speed_hits.clone();
                 move |bytes| h.borrow_mut().push(bytes)
             }),
+            // 第 34 步：GeneralDownload 简版动作（no-op 注册仅验证
+            // 通路；NameConflict 收字面量）。
+            auto_speed_up: Box::new(|_| {}),
+            max_reassign_size: Box::new(|_| {}),
+            preserve_last_modified: Box::new(|_| {}),
+            verify_ssl: Box::new(|_| {}),
+            name_conflict: Box::new({
+                let h = name_hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
+            use_system_dns: Box::new(|_| {}),
         });
         crate::install_settings_actions(&window, actions);
         window.invoke_speedLimitationChanged(102400);
@@ -450,6 +543,10 @@ mod smoke {
             Some(104_857_600),
             "显示 KB/s 上限应换算回配置字节上限"
         );
+        // 第 34 步：NameConflict invoke 验证索引→字面量紧凑换算通路
+        // （镜像 qconfig.set(item, itemData(index))）。
+        window.invoke_nameConflictChanged(2);
+        assert_eq!(name_hits.borrow().last().map(|s| s.as_str()), Some("ask"));
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

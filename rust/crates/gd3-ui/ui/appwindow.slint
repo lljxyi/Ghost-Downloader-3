@@ -23,6 +23,15 @@ export component AppWindow inherits Window {
     // 第 33 步：限速值窗口属性用显示口径 KB/s（单位名缀入属性名，
     // 字节 ⇄ KB 换算归 Rust speed.rs 镜像层，不进 slint）。
     in-out property <int> speedLimitationKb: 4096;
+    // 第 34 步：GeneralDownload 组剩余简版键（缺省与 cfg.py 一致；
+    // nameConflictIndex 镜像 ComboBoxSettingCard——索引 i ⇄
+    // options[i]，字面量映射归 Rust conflict.rs）。
+    in-out property <bool> autoSpeedUp: true;
+    in-out property <int> maxReassignSize: 512;
+    in-out property <bool> preserveLastModified: false;
+    in-out property <bool> verifySsl: false;
+    in-out property <int> nameConflictIndex: 0;
+    in-out property <bool> useSystemDns: true;
     // 段高亮唯一派生点（`<=>` 双链初值竞态实证会互相覆盖，套单向
     // 传入：窗口层派生 → TaskPage 消费）。
     in-out property <bool> highlightAll: root.filterMode == "all";
@@ -45,6 +54,12 @@ export component AppWindow inherits Window {
     callback preBlockNumChanged(int);
     callback categoryEnabledChanged(bool);
     callback speedLimitationChanged(int);
+    callback autoSpeedUpChanged(bool);
+    callback maxReassignSizeChanged(int);
+    callback preserveLastModifiedChanged(bool);
+    callback verifySslChanged(bool);
+    callback nameConflictChanged(int);
+    callback useSystemDnsChanged(bool);
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
@@ -84,6 +99,18 @@ export component AppWindow inherits Window {
             categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
             speedLimitationKb <=> root.speedLimitationKb;
             speedLimitationChanged(kb) => { root.speedLimitationChanged(kb); }
+            autoSpeedUp <=> root.autoSpeedUp;
+            maxReassignSize <=> root.maxReassignSize;
+            preserveLastModified <=> root.preserveLastModified;
+            verifySsl <=> root.verifySsl;
+            nameConflictIndex <=> root.nameConflictIndex;
+            useSystemDns <=> root.useSystemDns;
+            autoSpeedUpChanged(v) => { root.autoSpeedUpChanged(v); }
+            maxReassignSizeChanged(v) => { root.maxReassignSizeChanged(v); }
+            preserveLastModifiedChanged(v) => { root.preserveLastModifiedChanged(v); }
+            verifySslChanged(v) => { root.verifySslChanged(v); }
+            nameConflictChanged(v) => { root.nameConflictChanged(v); }
+            useSystemDnsChanged(v) => { root.useSystemDnsChanged(v); }
         }
     }
 }

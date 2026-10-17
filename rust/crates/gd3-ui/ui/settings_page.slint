@@ -1,13 +1,11 @@
-// 设置页（Phase 7c 骨架，第 32 步）：先验四键最小集——下载路径 /
-// 最大任务数 / 预分配线程数 / 启用下载分类。控件与标题副标题镜像
-// app/view/pages/setting_page.py 的 .tr 字面量；执行（落盘/生效）全
-// 在调用方。限速值（SpeedLimitation，KB/s ⇄ 字节 1/1024 换算）留单独
-// 步先验，避免一步塞太多换算语义。
+// 设置页（Phase 7c，第 32-34 步）：镜像 setting_page.py GeneralDownload
+// 组与「启用下载分类」。控件与标题副标题镜像 .tr 字面量；执行（落盘/
+// 生效）全在调用方。限速值 KB/s ⇄ 字节 1/1024 换算在 Rust speed.rs；
 //
 // 契约：Rust 侧 push_settings 写值串/数字派生值；控件只回发变化
 // （Line/Spin edited、Switch toggled），映射在 Rust 侧 typed set。
 
-import { VerticalBox, HorizontalBox, LineEdit, SpinBox, Switch } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, LineEdit, SpinBox, Switch, ComboBox } from "std-widgets.slint";
 
 export component SettingsPage inherits Rectangle {
     // in-out 供 SpinBox/Switch 自身编辑态直写，AppWindow 推送覆盖。
@@ -16,12 +14,30 @@ export component SettingsPage inherits Rectangle {
     in-out property <int> preBlockNum: 8;
     in-out property <bool> categoryEnabled: false;
     in-out property <int> speedLimitationKb: 4096;
+    // 第 34 步：GeneralDownload 组剩余简版键（cfg.py 实证）：
+    // AutoSpeedUp 默认 True / MaxReassignSize 默认 512 范围 64-102400
+    // 单位 KB（division=1 显示=配置值）/ PreserveLastModified 默认 F /
+    // shouldVerifySsl 默认 F / NameConflict 选项 keepBoth-overwrite-ask
+    // 缺省 keepBoth（发索引，映射归 Rust conflict.rs）/ Network 组
+    // ShouldUseSystemDns 默认 True（仅 UI 归组在 GeneralDownload）。
+    in-out property <bool> autoSpeedUp: true;
+    in-out property <int> maxReassignSize: 512;
+    in-out property <bool> preserveLastModified: false;
+    in-out property <bool> verifySsl: false;
+    in-out property <int> nameConflictIndex: 0;
+    in-out property <bool> useSystemDns: true;
 
     callback downloadFolderChanged(string);
     callback maxTaskNumChanged(int);
     callback preBlockNumChanged(int);
     callback categoryEnabledChanged(bool);
     callback speedLimitationChanged(int);
+    callback autoSpeedUpChanged(bool);
+    callback maxReassignSizeChanged(int);
+    callback preserveLastModifiedChanged(bool);
+    callback verifySslChanged(bool);
+    callback nameConflictChanged(int);
+    callback useSystemDnsChanged(bool);
 
     background: transparent;
 
@@ -90,6 +106,76 @@ export component SettingsPage inherits Rectangle {
             Text {
                 text: " KB/s";
                 vertical-alignment: center;
+            }
+        }
+        // 第 34 步：GeneralDownload 组剩余简版卡（卡序与 Python 组内
+        // 顺序不一一对应，全量重排留主题/布局步）。
+        HorizontalBox {
+            Text {
+                text: "自动提速\nAI 实时检测各线程效率并自动增加线程数以提高下载速度";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.autoSpeedUp;
+                toggled => { root.autoSpeedUpChanged(self.checked); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "最小再分配大小\n每线程剩余量大于此值时, 有线程完成或自动提速条件满足会触发重新分配";
+                vertical-alignment: center;
+            }
+            SpinBox {
+                minimum: 64;
+                maximum: 102400;
+                step-size: 64;
+                value <=> root.maxReassignSize;
+                edited(value) => { root.maxReassignSizeChanged(value); }
+            }
+            Text {
+                text: " KB";
+                vertical-alignment: center;
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "保留文件修改时间\n下载完成后将文件的修改时间设为服务器提供的 Last-Modified 值";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.preserveLastModified;
+                toggled => { root.preserveLastModifiedChanged(self.checked); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "下载时验证 SSL 证书\n文件无法下载时，可尝试关闭该选项";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.verifySsl;
+                toggled => { root.verifySslChanged(self.checked); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "同名文件\n下载目录中已有同名文件时的处理方式";
+                vertical-alignment: center;
+            }
+            ComboBox {
+                model: ["保留两者", "覆盖", "询问"];
+                current-index <=> root.nameConflictIndex;
+                selected => { root.nameConflictChanged(self.current-index); }
+            }
+        }
+        HorizontalBox {
+            Text {
+                text: "使用系统 DNS\n使用操作系统的 DNS 解析，兼容 TUN、VPN 和代理等网络环境";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> root.useSystemDns;
+                toggled => { root.useSystemDnsChanged(self.checked); }
             }
         }
     }
