@@ -1833,3 +1833,86 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    并轨）、identityPresets 列表镜像层；或直接起手暂停/删除真实
    语义（Phase 8 桥接一体考虑）。
 2. 之后引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 42 步：请求标头预设镜像层（cfg.py Network/HeadersPresets + CurrentHeadersPreset）
+
+- 时间：2026-10-17 08:47（date 实取；代码提交 `6a61bd2`）
+
+### 改动
+
+- `src/headers.rs`（新，~150 行）：
+  - `BASE_HEADERS` cfg.py:29-38 逐字 8 对（保持 dict 插入序）；
+  - `parse_presets`：serde_json 解析（落盘是
+    `json.dumps(list, ensure_ascii=False)`，JsonConfigSerializer
+    cfg.py:151-165 实证）→ 逐项校验（name 为 str、headers 为全
+    字符串值 dict，对齐 HeadersPresetListValidator._isValid）→
+    无合法项兜 `[{"name":"默认","headers":BASE_HEADERS}]`（对齐
+    correct 的 `presets or [默认]`，空串/非 JSON/非数组/空数组/
+    全非法五路输入同兜，不复刻 Python 崩溃面）；
+  - `current_index` 镜像 `currentHeadersPresetIndex()` 的
+    min(value, len-1)（cfg.py:347），负值/非整串按 0 夹取容错
+    （Range 0-99 落盘 "0" 串，get_i64 解析）；
+  - 3 单测：合法项保序过滤（name 数字/headers 非字符串值整条
+    剔除）、五路非法输入兜底、夹取口径。
+- `Cargo.toml`：serde_json 提升为 gd3-ui 正式依赖（JSON 串落盘
+  解析需要，原本只是 dev-dep；workspace 同版）。
+- `ui/settings_page.slint`（python 脚本 3 处锚点全中）：
+  `headersPresetNames`（[string] 模型）+ `headersPresetIndex` +
+  `headersPresetHeaderCount` + `headersPresetCanRemove` 属性 +
+  `headersPresetPicked(int)`/`headersPresetRemoveRequested(int)`
+  回调 + 卡（「请求标头预设/新建任务的标头起点」；std 无
+  RadioButton，逐行单选退化 ComboBox，镜像 CollapsibleSettingCard
+  结构；头注释 32-42 步）。
+- `ui/appwindow.slint`：四属性两回调透传。
+- `src/lib.rs`（python 脚本 10 处锚点全中）：push 解析推送
+  （names 模型/索引/选中项计数/可删派生）；SettingsActions 增
+  `headers_preset_pick`/`headers_preset_remove`（统一收当前预设
+  索引 i64——cfg 写、删除后索引重排、MessageBox 确认框归调用
+  方，镜像 _onPick/_onRemoveClicked）；smoke 补有值（两预设
+  A/B、索引 1、计数 2、可删）/缺省（默认 1 条 8 项、不可删）/
+  invoke 选中与删除通路断言。
+
+### 键位与 UI 实证
+
+- `HeadersPresetSettingCard`（setting_cards.py:656-763）：
+  CollapsibleSettingCard「请求标头预设」/「新建任务的标头起点」+
+  choiceLabel（当前预设名）+ 添加预设按钮 + 逐行
+  HeadersPresetRow（RadioButton + "{0} 条标头" 计数 + 编辑/删除
+  ToolButton，canRemove=len>1）；
+- `HeadersPresetEditDialog`（headers_preset_edit.py）：名称
+  LineEdit（空→InfoBar 拒绝，落 "未命名预设"）+ HeadersEditor
+  （BASE_HEADERS 起点）——本步不动，留欠账步。
+- `currentHeaders()`（cfg.py:349-351）= 选中预设 headers 的
+  dict 拷贝，供 HeadersEditCard（新建任务流）起步——随 Phase 8
+  任务流迁移并轨。
+
+### 工具坑增量
+
+- clippy 两连：`items_after_test_module`（测试助手 trait 写在
+  tests 模块后面，上移解决）+ `doc_lazy_continuation`（doc 注释
+  列表后接段落需空 `//!` 行分隔）。均为格式规范类，一次即修。
+- 生成文本笔误自查：headers.rs 初稿「min 达式」少字，写入前
+  python 脚本一并修为「min 表达式」；坏 token 扫描 CLEAN。
+
+### 验证
+
+- `cargo fmt --all --check` + `cargo clippy -p gd3-ui
+  --all-targets -- -D warnings` 通过（fmt 一次过，clippy 两轮）。
+- `timeout 1200 cargo test -p gd3-ui`：**30 → 33 passed**
+  （+headers.rs 3 单测；smoke 四段断言并入既有用例）。0 failed。
+- post-write diff 复核：slint/lib.rs 各锚点内容与设计一致，
+  无夹带。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7c 续）
+
+1. 第 43 步候选：identityPresets 列表镜像层（同款
+   ComboBox+删除形态；REQUIRED_KEYS={name,clientProfile,
+   userAgent,hosts}、缺省百度网盘预设 cfg.py:335-340）、
+   headers 预设添加/编辑对话框骨架、categoryRulesCard（或与
+   引擎桥接并轨）。
+2. 之后：暂停/删除真实语义（Phase 8 桥接一体）→ 引擎状态桥接
+   → Python UI 停用 + AGENT-DONE。
