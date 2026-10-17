@@ -1087,3 +1087,51 @@ gd3-ui` 8 passed（smoke 2 + format 2 + row 4）。
    filterMode 段按钮高亮。
 2. 暂停/删除接 gd3-core 真实语义（bridging 层）。
 3. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
+
+## 第 29 步 — TaskRow 结构化渲染字段（status 字面量 + progress 直通）
+
+### 改动
+
+- **ui/task_page.slint**：`TaskRow` 增两个结构化字段——
+  - `status: string`：磁盘持久化枚举名（TaskStatus.name 口径），
+    供状态色点与控件可见性派发；
+  - `progress: float`：0-100 百分比。
+  - 行渲染升级：状态色点（RUNNING=#3477FF/COMPLETED=#30BE60/
+    FAILED=#F5403C/PAUSED=#FFC107/其它 #858585，**临时色、主题对齐
+    留给后续视觉步**）+ std `ProgressIndicator`（仅 RUNNING 显示、
+    `progress: row.progress / 100` 换算 0-1 契约），镜像 Python 卡片
+    「RUNNING 走进度条、其余走 statusLabel」分发（task_cards.py
+    295-332 行 refresh 分支 + 267 行 `setValue(int(progress))`）。
+
+### slint/核心契约实证（本步新增）
+
+- **std-widgets ProgressIndicator 契约 0-1**：cupertino stub
+  progressindicator.slint 实证 `accessible-value-maximum: 1.0`、
+  宽度按 `progress` 比例——Python QProgressBar 是 0-100，直通前要
+  `/100`（gd3-core `current_snapshot()` 的 progress 也是 0-100，
+  `(sum(step.percent)/len)` 语义，两端一致）。
+- **slint `float` 是 f32**：`current_snapshot()` 的 f64 直塞 TaskRow
+  构造报 E0308 `expected f32, found f64`——加 `as f32` 收窄（0-100
+  量级无精度顾虑）。
+- `status_literal(TaskStatus)->&'static str`：手写 match 而非 serde
+  序列化（TaskStatus serde rename UPPERCASE 与磁盘同名，但手写省
+  一次 JSON 往返、且全枚举测试锁定）。
+
+### 验证
+
+- `cargo test -p gd3-ui`：**22 → 23 passed**（+1 status_literal 全
+  枚举覆盖；装配测试补 `row.progress==50.0`（steps 30+70 → 均值）、
+  `row.status=="RUNNING"`；push smoke 补 status/progress 断言；
+  rows round-trip 构造与断言×2 补字段）。0 failed。
+- `cargo fmt --all --check`、`cargo clippy -p gd3-ui --all-targets
+  -- -D warnings` 干净。
+
+### 卡点
+
+无
+
+### 下一步（Phase 7b 续）
+
+1. filterMode 段高亮（三段按钮选中态视觉 + 派生 bool 供测试锁）。
+2. 暂停/删除接 gd3-core 真实语义（bridging 层决策：调用方是谁）。
+3. 之后设置页 → 引擎状态桥接 → Python UI 停用 + AGENT-DONE。
