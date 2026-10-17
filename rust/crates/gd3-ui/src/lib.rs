@@ -14,6 +14,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+pub mod category;
 pub mod close_mode;
 pub mod conflict;
 pub mod filter;
@@ -272,6 +273,21 @@ pub fn push_settings(
             })
             .collect::<Vec<_>>(),
     )));
+    // 第 44 步：库分类规则（Category/CategoryRules：缺键/空串/[]/
+    // 非 JSON → 八预设镜像 category.rs parse_rules；行摘要镜像
+    // _toSummary；缺 categoryId 保留空串——随机 ID 不复刻）。
+    let category_rules = category::parse_rules(config.get_str("Category", "CategoryRules"));
+    window.set_categoryRows(slint::ModelRc::new(slint::VecModel::from(
+        category_rules
+            .iter()
+            .map(|rule| CategoryRowData {
+                name: rule.name.as_str().into(),
+                desc: category::summary_of(&rule.extensions).into(),
+                id: rule.category_id.as_str().into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
+    window.set_categoryRuleCount(category_rules.len() as i32);
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
     // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
     // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
@@ -358,6 +374,10 @@ pub struct SettingsActions {
     // _onToggled/_onRemoveClicked；编辑/添加对话框留欠账步）。
     pub identity_preset_toggle: Box<dyn Fn(i64, bool)>,
     pub identity_preset_remove: Box<dyn Fn(i64)>,
+    // 第 44 步：库分类动作（恢复默认收 ()、删除收 categoryId 原样；
+    // cfg 写与重推归调用方）。
+    pub category_reset: Box<dyn Fn()>,
+    pub category_remove: Box<dyn Fn(String)>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
     pub url_scheme_enabled: Box<dyn Fn(bool)>,
@@ -497,6 +517,11 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_identityPresetRemoveRequested(move |i| {
         (identity_remove.identity_preset_remove)(i as i64)
     });
+    // 第 44 步：库分类动作注册（删除收 SharedString → String 原样）。
+    let category_reset = actions.clone();
+    window.on_categoryResetRequested(move || (category_reset.category_reset)());
+    let category_remove = actions.clone();
+    window.on_categoryRemoveRequested(move |id| (category_remove.category_remove)(id.to_string()));
     // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
     // 开机启动注册归引擎桥接步）。
     let url_scheme = actions.clone();
@@ -802,6 +827,14 @@ mod smoke {
                 {"name":"B","clientProfile":"raw","userAgent":"",
                  "hosts":[]}]"#,
         );
+        // 第 44 步：库分类（JSON 两项：自定义项 + 缺 categoryId 项）。
+        config.set_str(
+            "Category",
+            "CategoryRules",
+            r#"[{"categoryId":"x","name":"自定义","icon":"",
+                 "extensions":[".MP4","mkv","mkv"],"folder":""},
+                {"name":"无 id"}]"#,
+        );
         let window = crate::create_headless();
         crate::push_settings(&window, &config, "/default/download");
         assert_eq!(window.get_downloadFolder(), "/data/ghost");
@@ -864,6 +897,14 @@ mod smoke {
             "不模拟（原样发送）"
         );
         assert!(identity_rows.row_data(1).as_ref().unwrap().enabled);
+        // 第 44 步：有值推送（逐项 fromDict 归一化：去点/小写/去重、
+        // icon 缺省 DOCUMENT、folder 空串 → None、缺 id 保留空串）。
+        let category_rows = window.get_categoryRows();
+        assert_eq!(category_rows.row_count(), 2);
+        assert_eq!(category_rows.row_data(0).as_ref().unwrap().name, "自定义");
+        assert_eq!(category_rows.row_data(0).as_ref().unwrap().desc, "mp4, mkv");
+        assert_eq!(category_rows.row_data(1).as_ref().unwrap().id, "");
+        assert_eq!(window.get_categoryRuleCount(), 2);
         // 第 38 步：有值推送（urlScheme=F / 更新=F / 自启=T /
         // CloseMode="Quit"→索引 2 / 剪贴板=F）。
         assert!(!window.get_urlSchemeEnabled());
@@ -938,6 +979,18 @@ mod smoke {
             "*.pcs.baidu.com · 不模拟（原样发送） · pan.baidu.com"
         );
         assert!(identity_rows.row_data(0).as_ref().unwrap().enabled);
+        // 第 44 步：缺省容错（缺键 → CATEGORY_PRESETS 八预设逐字，
+        // 计数 8）。
+        let category_rows = window.get_categoryRows();
+        assert_eq!(category_rows.row_count(), 8);
+        assert_eq!(category_rows.row_data(0).as_ref().unwrap().name, "视频");
+        assert_eq!(
+            category_rows.row_data(0).as_ref().unwrap().desc,
+            "mp4, mkv, avi, mov 等 20 项"
+        );
+        assert_eq!(category_rows.row_data(7).as_ref().unwrap().name, "其他");
+        assert_eq!(category_rows.row_data(7).as_ref().unwrap().desc, "无扩展名");
+        assert_eq!(window.get_categoryRuleCount(), 8);
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -960,6 +1013,9 @@ mod smoke {
         // 第 43 步：身份预设动作命中记录。
         let identity_toggle_hits: Rc<RefCell<Vec<(i64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
         let identity_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 44 步：库分类动作命中记录。
+        let category_reset_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let category_remove_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -1046,6 +1102,15 @@ mod smoke {
             identity_preset_remove: Box::new({
                 let h = identity_remove_hits.clone();
                 move |i| h.borrow_mut().push(i)
+            }),
+            // 第 44 步：库分类动作（通路验证）。
+            category_reset: Box::new({
+                let h = category_reset_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            category_remove: Box::new({
+                let h = category_remove_hits.clone();
+                move |s| h.borrow_mut().push(s)
             }),
             // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
             // 索引⇄字面量通路）。
@@ -1154,6 +1219,14 @@ mod smoke {
         );
         window.invoke_identityPresetRemoveRequested(0);
         assert_eq!(identity_remove_hits.borrow().last().copied(), Some(0));
+        // 第 44 步：库分类 invoke 通路（恢复默认 ()、删除收 id 原样）。
+        window.invoke_categoryResetRequested();
+        assert_eq!(category_reset_hits.borrow().len(), 1);
+        window.invoke_categoryRemoveRequested("x".into());
+        assert_eq!(
+            category_remove_hits.borrow().last().map(|s| s.as_str()),
+            Some("x")
+        );
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

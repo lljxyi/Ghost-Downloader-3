@@ -3,7 +3,7 @@
 
 import { VerticalBox } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
-import { SettingsPage, IdentityPresetData } from "settings_page.slint";
+import { SettingsPage, IdentityPresetData, CategoryRowData } from "settings_page.slint";
 
 export component AppWindow inherits Window {
     title: "Ghost-Downloader-3";
@@ -65,6 +65,8 @@ export component AppWindow inherits Window {
     // 第 43 步：身份预设列表（行结构镜像 PresetRowWidget；编辑/添加
     // 留欠账步）。
     in-out property <[IdentityPresetData]> identityPresets;
+    in-out property <[CategoryRowData]> categoryRows;
+    in-out property <int> categoryRuleCount;
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版五键
     // （cfg.py 缺省 T/T/F/"Ask"/T；CloseMode 映射归 close_mode.rs）。
     in-out property <bool> urlSchemeEnabled: true;
@@ -117,6 +119,8 @@ export component AppWindow inherits Window {
     callback headersPresetRemoveRequested(int);
     callback identityPresetToggled(int, bool);
     callback identityPresetRemoveRequested(int);
+    callback categoryResetRequested();
+    callback categoryRemoveRequested(string);
     callback copyPairToken();
     callback regeneratePairToken();
     callback openStoreUrl(string);
@@ -216,6 +220,10 @@ export component AppWindow inherits Window {
             identityPresets <=> root.identityPresets;
             identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
             identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
+            categoryRows <=> root.categoryRows;
+            categoryRuleCount <=> root.categoryRuleCount;
+            categoryResetRequested() => { root.categoryResetRequested(); }
+            categoryRemoveRequested(id) => { root.categoryRemoveRequested(id); }
             exportCrx() => { root.exportCrx(); }
             urlSchemeEnabled <=> root.urlSchemeEnabled;
             checkUpdateAtStartup <=> root.checkUpdateAtStartup;
