@@ -10,7 +10,7 @@
 // 回写（Rust 侧 FilterMode 状态推回）供后续高亮。搜索/暂停/删除的
 // 执行都在调用方，Slint 只发字面量。
 
-import { ListView, VerticalBox, HorizontalBox, LineEdit, Button } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, LineEdit, Button, ComboBox } from "std-widgets.slint";
 
 export struct TaskRow {
     taskId: string,
@@ -23,12 +23,16 @@ export component TaskPage inherits Rectangle {
     in property <[TaskRow]> tasks;
     in property <string> searchText: "";
     in property <string> filterMode: "all";
+    in property <[string]> categoryNames;
+    in property <bool> categoryEnabled: false;
+    in-out property <int> categoryIndex: 0;
     in property <string> searchPlaceholder: "搜索任务";
 
     callback searchChanged(string);
     callback filterModeChanged(string);
     callback taskPause(string);
     callback taskDelete(string);
+    callback categoryFilterChanged(int);
 
     background: transparent;
 
@@ -45,6 +49,12 @@ export component TaskPage inherits Rectangle {
             Button {
                 text: "已完成";
                 clicked => { root.filterModeChanged("completed"); }
+            }
+            ComboBox {
+                model: root.categoryNames;
+                current-index <=> root.categoryIndex;
+                visible: root.categoryEnabled;
+                selected => { root.categoryFilterChanged(self.current-index); }
             }
             LineEdit {
                 placeholder-text: root.searchPlaceholder;

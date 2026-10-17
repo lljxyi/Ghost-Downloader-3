@@ -78,6 +78,17 @@ pub fn refresh_task_rows(
     set_task_rows(window, rows);
 }
 
+/// 分类筛选下拉（ComboBox）的 [string] 模型装配（filter::menu_names
+/// 已含「全部分类」表头；current-index 由调用方回写）。
+///
+/// slint 生成名保留 camelCase：set_categoryNames / get_categoryIndex。
+pub fn set_category_names(window: &AppWindow, names: Vec<String>) {
+    let names: Vec<slint::SharedString> =
+        names.into_iter().map(slint::SharedString::from).collect();
+    let model = slint::ModelRc::new(slint::VecModel::from(names));
+    window.set_categoryNames(model);
+}
+
 /// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
 ///
 /// 分层：Slint 只发 taskId/路由字面量；真正的暂停/删除/筛选语义都在
@@ -85,17 +96,20 @@ pub fn refresh_task_rows(
 pub struct TaskActions {
     pub search: Box<dyn Fn(&str)>,
     pub filter_mode: Box<dyn Fn(&str)>,
+    pub category_selected: Box<dyn Fn(i32)>,
     pub pause: Box<dyn Fn(&str)>,
     pub delete: Box<dyn Fn(&str)>,
 }
 
-/// 把动作集注册到 AppWindow 的四个回调上（on_searchChanged 等生成名
+/// 把动作集注册到 AppWindow 的五个回调上（on_searchChanged 等生成名
 /// 保留 slint 原命名，见 build 产物 appwindow.rs:9572-9608）。
 pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions>) {
     let search = actions.clone();
     window.on_searchChanged(move |text| (search.search)(&text));
     let filter_mode = actions.clone();
     window.on_filterModeChanged(move |route| (filter_mode.filter_mode)(&route));
+    let category_selected = actions.clone();
+    window.on_categoryFilterChanged(move |index| (category_selected.category_selected)(index));
     let pause = actions.clone();
     window.on_taskPause(move |task_id| (pause.pause)(&task_id));
     let delete = actions.clone();
@@ -246,11 +260,39 @@ mod smoke {
                 move |s| h.borrow_mut().push(s.into())
             }),
             filter_mode: Box::new(|_| {}),
+            category_selected: Box::new(|_| {}),
             pause: Box::new(|_| {}),
             delete: Box::new(|_| {}),
         });
         crate::install_task_actions(&window, actions);
-        // 无头环境无法模拟点按；注册本身即通路（真实触发在屏上联调）。
+        // 无头环境无法模拟点按；注册本身即通路（真实触发屏上联调）。
         assert!(hits.borrow().is_empty());
+    }
+
+    /// 分类筛选 UI：menu_names 装配 [string] 模型 + categoryIndex
+    /// 属性可回写（选中态由调用方管理，ComboBox 绑定印证连通）。
+    #[test]
+    fn set_category_names_and_index_round_trip_headless() {
+        use crate::filter::{CategoryRef, menu_names};
+
+        let categories = vec![
+            CategoryRef {
+                category_id: "cat_video".into(),
+                name: "视频".into(),
+            },
+            CategoryRef {
+                category_id: "cat_audio".into(),
+                name: "音频".into(),
+            },
+        ];
+        let names = menu_names(&categories);
+        assert_eq!(names.first().map(String::as_str), Some("全部分类"));
+        let window = crate::create_headless();
+        crate::set_category_names(&window, names);
+        let model = window.get_categoryNames();
+        assert_eq!(model.row_count(), 3);
+        assert_eq!(model.row_data(1).as_deref(), Some("视频"));
+        window.set_categoryIndex(2);
+        assert_eq!(window.get_categoryIndex(), 2);
     }
 }

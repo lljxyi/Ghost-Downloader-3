@@ -80,6 +80,50 @@ pub fn filtered<'a>(records: &'a [TaskRecord], filter: TaskFilter<'a>) -> Vec<&'
         .collect()
 }
 
+/// 分类菜单条目（对齐 `CategoryService.categories()` 的最小子集）。
+///
+/// Python 侧 `Category` 还带 icon/summaryPrefix 等，UI 菜单只消费
+/// categoryId + 展示名（toCategoryName），其余字段后续用到再接。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CategoryRef {
+    pub category_id: String,
+    pub name: String,
+}
+
+/// 「全部分类」表头（task_page.py:_rebuildCategoryFilterMenu 的
+/// allAction，对应空 categoryFilter ""）。
+pub const ALL_CATEGORIES_LABEL: &str = "全部分类";
+
+/// ComboBox 的 []string 模型：表头 + 各分类展示名（索引序即菜单序）。
+pub fn menu_names(categories: &[CategoryRef]) -> Vec<String> {
+    std::iter::once(ALL_CATEGORIES_LABEL.to_string())
+        .chain(categories.iter().map(|category| category.name.clone()))
+        .collect()
+}
+
+/// ComboBox 选中索引 → categoryFilter：0（表头）→ ""，其余取
+/// `categories[index-1].categoryId`；越界容错回 ""（slint 回调只会
+/// 带当前模型内的索引，防御性兜底）。
+pub fn category_id_at(categories: &[CategoryRef], index: i32) -> &str {
+    if index <= 0 {
+        return "";
+    }
+    categories
+        .get((index - 1) as usize)
+        .map(|category| category.category_id.as_str())
+        .unwrap_or("")
+}
+
+/// 镜像 `_rebuildCategoryFilterMenu` 尾部的失效容错：当前过滤值不
+/// 「在合法集合（含 ""）」内 → 回落 ""（调用方需据此重刷列表）。
+pub fn sanitize_category_filter<'a>(current: &'a str, categories: &[CategoryRef]) -> &'a str {
+    if current.is_empty() || categories.iter().any(|c| c.category_id == current) {
+        current
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +213,34 @@ mod tests {
         // 条件叠加：mode ∩ category ∩ search。
         assert_eq!(view(FilterMode::Completed, "vip", "abc"), ["AbC.iso"]);
         assert_eq!(view(FilterMode::Active, "vip", "abc"), Vec::<&str>::new());
+    }
+
+    /// 分类菜单：表头「全部分类」+ 各分类名；索引→id 映射（0=空，
+    /// 越界容错）与失效过滤值清理（镜像 _rebuildCategoryFilterMenu）。
+    #[test]
+    fn category_menu_names_index_mapping_and_sanitize() {
+        let categories = vec![
+            CategoryRef {
+                category_id: "cat_video".into(),
+                name: "视频".into(),
+            },
+            CategoryRef {
+                category_id: "cat_audio".into(),
+                name: "音频".into(),
+            },
+        ];
+        assert_eq!(menu_names(&categories), ["全部分类", "视频", "音频"]);
+        assert_eq!(category_id_at(&categories, 0), "");
+        assert_eq!(category_id_at(&categories, 1), "cat_video");
+        assert_eq!(category_id_at(&categories, 2), "cat_audio");
+        assert_eq!(category_id_at(&categories, 3), "");
+        assert_eq!(category_id_at(&categories, -1), "");
+        // 失效过滤值（分类被删）回落 ""；合法值与空值原样保留。
+        assert_eq!(
+            sanitize_category_filter("cat_audio", &categories),
+            "cat_audio"
+        );
+        assert_eq!(sanitize_category_filter("cat_gone", &categories), "");
+        assert_eq!(sanitize_category_filter("", &categories), "");
     }
 }

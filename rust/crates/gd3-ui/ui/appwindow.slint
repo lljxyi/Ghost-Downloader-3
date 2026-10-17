@@ -11,11 +11,14 @@ export component AppWindow inherits Window {
 
     in property <string> statusText: "Ghost-Downloader-3 (Slint)";
     in property <[TaskRow]> tasks;
-
+    in property <[string]> categoryNames;
+    in property <bool> categoryEnabled: false;
+    in-out property <int> categoryIndex: 0;
     callback searchChanged(string);
     callback filterModeChanged(string);
     callback taskPause(string);
     callback taskDelete(string);
+    callback categoryFilterChanged(int);
 
     VerticalBox {
         Text {
@@ -23,13 +26,16 @@ export component AppWindow inherits Window {
             font-size: 18px;
             vertical-alignment: center;
         }
-
         TaskPage {
             tasks: root.tasks;
+            categoryNames: root.categoryNames;
+            categoryEnabled: root.categoryEnabled;
+            categoryIndex <=> root.categoryIndex;
             searchChanged(value) => { root.searchChanged(value); }
             filterModeChanged(value) => { root.filterModeChanged(value); }
             taskPause(taskId) => { root.taskPause(taskId); }
             taskDelete(taskId) => { root.taskDelete(taskId); }
+            categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
         }
     }
 }
