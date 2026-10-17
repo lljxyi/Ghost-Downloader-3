@@ -154,12 +154,16 @@ mod smoke {
                     name: "a.bin".into(),
                     statusText: "等待中".into(),
                     progressText: "0.00 B / --".into(),
+                    status: "WAITING".into(),
+                    progress: 0.0,
                 },
                 crate::TaskRow {
                     taskId: "tsk_2".into(),
                     name: "b.iso".into(),
                     statusText: "正在下载".into(),
                     progressText: "1.00 MB / 4.00 MB".into(),
+                    status: "RUNNING".into(),
+                    progress: 25.0,
                 },
             ],
         );
@@ -169,6 +173,8 @@ mod smoke {
         assert_eq!(first.taskId, "tsk_1");
         assert_eq!(first.name, "a.bin");
         assert_eq!(first.statusText, "等待中");
+        assert_eq!(first.status, "WAITING");
+        assert_eq!(first.progress, 0.0);
         let second = model.row_data(1).expect("次行缺失");
         assert_eq!(second.taskId, "tsk_2");
         assert_eq!(second.statusText, "正在下载");
@@ -204,6 +210,8 @@ mod smoke {
         assert_eq!(first.taskId, "tsk_a");
         assert_eq!(first.statusText, "1.00 KB/s · 512.00 B / 4.00 KB · 3s");
         assert_eq!(first.progressText, "512.00 B/4.00 KB");
+        assert_eq!(first.status, "RUNNING");
+        assert_eq!(first.progress, 50.0);
         let second = model.row_data(1).expect("次行缺失");
         assert_eq!(second.statusText, "做种中");
         assert_eq!(second.progressText, "1.00 MB");

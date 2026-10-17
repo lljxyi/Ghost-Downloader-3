@@ -84,14 +84,30 @@ pub fn to_task_row(record: &TaskRecord) -> TaskRow {
 
 /// 同上，但由调用方声明做种态（COMPLETED 时影响文案）。
 pub fn to_task_row_with(record: &TaskRecord, is_seeding: bool) -> TaskRow {
-    // 快照的进度百分比后续接进度环时另用，此处只消费速度与字节数。
-    let (_, speed, received) = record.current_snapshot();
+    // 快照 (progress 0-100, speed, received)；progress 供进度条直通。
+    let (progress, speed, received) = record.current_snapshot();
     TaskRow {
         taskId: record.task_id.clone().into(),
         name: record.name.clone().into(),
         statusText: to_status_text(record, speed, received, is_seeding).into(),
-        // 渲染进度走 progressText 文案；record 的百分比后续接进度环时另用。
+        // 渲染进度走 progressText 文案；数值 progress 另供进度条绑定。
         progressText: to_size_text(record, received).unwrap_or_default().into(),
+        // 结构化字段：磁盘同名枚举字面量 + 快照百分比（0-100）。
+        status: status_literal(record.status).into(),
+        // slint float 是 f32（E0308 实证），进度直通时收窄；0-100 量级
+        // 无精度损失顾虑。
+        progress: progress as f32,
+    }
+}
+
+/// 磁盘持久化口径的枚举名（Python TaskStatus.name，serde UPPERCASE 同款）。
+pub fn status_literal(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Waiting => "WAITING",
+        TaskStatus::Running => "RUNNING",
+        TaskStatus::Paused => "PAUSED",
+        TaskStatus::Completed => "COMPLETED",
+        TaskStatus::Failed => "FAILED",
     }
 }
 
@@ -186,5 +202,26 @@ mod tests {
         // 快照 received=384+128=512、speed=512+512=1024 → 与手工先验一致。
         assert_eq!(row.statusText, "1.00 KB/s · 512.00 B / 4.00 KB · 3s");
         assert_eq!(row.progressText, "512.00 B/4.00 KB");
+        // progress = (30+70)/2 = 50（0-100）；status 为枚举字面量。
+        assert_eq!(row.progress, 50.0);
+        assert_eq!(row.status, "RUNNING");
+    }
+
+    /// status_literal：全枚举覆盖（磁盘 TaskStatus.name 同款）。
+    #[test]
+    fn status_literal_covers_all_statuses() {
+        for (literal, want) in [
+            ("WAITING", "WAITING"),
+            ("RUNNING", "RUNNING"),
+            ("PAUSED", "PAUSED"),
+            ("COMPLETED", "COMPLETED"),
+            ("FAILED", "FAILED"),
+        ] {
+            let r = record(json! ({
+                "name": "a.bin", "url": "https://example/1", "packId": "pack",
+                "taskId": "tsk_lit", "status": literal, "fileSize": 0,
+            }));
+            assert_eq!(status_literal(r.status), want);
+        }
     }
 }

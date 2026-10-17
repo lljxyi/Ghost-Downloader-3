@@ -10,13 +10,18 @@
 // 回写（Rust 侧 FilterMode 状态推回）供后续高亮。搜索/暂停/删除的
 // 执行都在调用方，Slint 只发字面量。
 
-import { ListView, VerticalBox, HorizontalBox, LineEdit, Button, ComboBox } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, LineEdit, Button, ComboBox, ProgressIndicator } from "std-widgets.slint";
 
 export struct TaskRow {
     taskId: string,
     name: string,
     statusText: string,
     progressText: string,
+    // 结构化渲染字段（第 29 步）：status 为磁盘持久化枚举名（
+    // TaskStatus.name 口径，供状态色/控件可见性派发）；progress 为
+    // 0-100 百分比（std ProgressIndicator 契约 0-1，行内 /100 换算）。
+    status: string,
+    progress: float,
 }
 
 export component TaskPage inherits Rectangle {
@@ -92,9 +97,27 @@ export component TaskPage inherits Rectangle {
                 height: 32px;
 
                 HorizontalBox {
+                    // 状态色点（第 29 步临时色，主题对齐在后续视觉步）。
+                    Rectangle {
+                        width: 8px;
+                        height: 8px;
+                        y: 12px;
+                        border-radius: 4px;
+                        background: row.status == "RUNNING" ? #3477FF
+                            : row.status == "COMPLETED" ? #30BE60
+                            : row.status == "FAILED" ? #F5403C
+                            : row.status == "PAUSED" ? #FFC107
+                            : #858585;
+                    }
                     Text {
                         vertical-alignment: center;
                         text: row.name;
+                    }
+                    // 进度条：仅 RUNNING 显示（Python 卡片 RUNNING 走
+                    // 进度条、其余走 statusLabel 的同款分发）。
+                    ProgressIndicator {
+                        progress: row.progress / 100;
+                        visible: row.status == "RUNNING";
                     }
                     Text {
                         vertical-alignment: center;
