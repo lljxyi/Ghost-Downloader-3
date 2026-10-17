@@ -22,6 +22,7 @@
 //! Phase 8 任务造/引擎桥接并轨；「恢复默认」「删除」动作收 (),
 //! id 字面量，cfg 写与 categoriesChanged 重推归调用方。
 
+#[derive(Clone)]
 pub struct CategoryRule {
     pub category_id: String,
     pub name: String,
@@ -127,6 +128,35 @@ fn default_rules() -> Vec<CategoryRule> {
     ]
 }
 
+/// CategoryEditDialog.ICON_CHOICES 逐字（category_edit.py:17-23）。
+pub const ICON_CHOICES: [&str; 25] = [
+    "DOCUMENT",
+    "MUSIC",
+    "VIDEO",
+    "ZIP_FOLDER",
+    "APPLICATION",
+    "LIBRARY",
+    "ALBUM",
+    "PHOTO",
+    "MOVIE",
+    "MEDIA",
+    "GAME",
+    "CODE",
+    "EDUCATION",
+    "LANGUAGE",
+    "BRUSH",
+    "FOLDER",
+    "CHAT",
+    "MAIL",
+    "PRINT",
+    "GLOBE",
+    "CAMERA",
+    "IMAGE_EXPORT",
+    "MUSIC_FOLDER",
+    "MARKET",
+    "HELP",
+];
+
 /// 单项 fromDict 容错归一化镜像（判空与缺省口径见模块注释）。
 fn from_dict(item: &serde_json::Value) -> CategoryRule {
     let extensions = item
@@ -212,6 +242,50 @@ pub fn summary_of(extensions: &[String]) -> String {
     }
 }
 
+/// 镜像 CategoryEditDialog.category()（category_edit.py:93-110）：
+/// 名称 strip 空兜「未命名分类」；扩展名逐 token strip→去点→小写、
+/// 空 token 丢弃、**不去重**（TokenLineEdit tokens 口径：回车/空格
+/// 逐 token，简版改为逗号分隔）；folder strip 空兜 None；icon 兜
+/// DOCUMENT（与 fromDict 同口径）。
+///
+/// 差异记录：Qt 侧「显示名未改动则保留原文名」依赖翻译层（
+/// toCategoryName 对照），Rust 无译文层，直接采用所填名称。
+pub fn draft_to_rule(
+    draft_id: &str,
+    draft_name: &str,
+    draft_icon: &str,
+    draft_extensions: &str,
+    draft_folder: &str,
+) -> CategoryRule {
+    let name = draft_name.trim();
+    let folder = draft_folder.trim();
+    CategoryRule {
+        category_id: draft_id.to_string(),
+        name: if name.is_empty() {
+            "未命名分类".to_string()
+        } else {
+            name.to_string()
+        },
+        icon: if draft_icon.is_empty() {
+            "DOCUMENT".to_string()
+        } else {
+            draft_icon.to_string()
+        },
+        extensions: draft_extensions
+            .split(',')
+            .filter_map(|token| {
+                let ext = token.trim().trim_start_matches('.').to_lowercase();
+                if ext.is_empty() { None } else { Some(ext) }
+            })
+            .collect(),
+        folder: if folder.is_empty() {
+            None
+        } else {
+            Some(folder.to_string())
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +330,30 @@ mod tests {
         assert_eq!(summary_of(&["mp4".into(), "mkv".into()]), "mp4, mkv");
         let many: Vec<String> = ["a", "b", "c", "d", "e"].map(str::to_string).to_vec();
         assert_eq!(summary_of(&many), "a, b, c, d 等 5 项");
+    }
+
+    #[test]
+    fn draft_to_rule_mirrors_dialog_category() {
+        // 名称空兜「未命名分类」；扩展名去点/小写/去空、不去重；
+        // folder 空串兜 None；id 原样保留。
+        let rule = draft_to_rule("", "  自定义  ", "PHOTO", " .MP4 , mkv,,  ", " ");
+        assert_eq!(rule.category_id, "");
+        assert_eq!(rule.name, "自定义");
+        assert_eq!(rule.extensions, vec!["mp4", "mkv"]);
+        assert_eq!(rule.folder, None);
+
+        let filled = draft_to_rule("x", "名称", "", "mp4, MP4, tar.gz", "{default}/X");
+        assert_eq!(filled.icon, "DOCUMENT", "icon 空/非法兜 DOCUMENT");
+        // 不去重的 Python 口径保留重复项。
+        assert_eq!(filled.extensions, vec!["mp4", "mp4", "tar.gz"]);
+        assert_eq!(filled.folder.as_deref(), Some("{default}/X"));
+        assert_eq!(filled.category_id, "x");
+    }
+
+    #[test]
+    fn icon_choices_mirror_dialog_list() {
+        assert_eq!(ICON_CHOICES.len(), 25);
+        assert_eq!(ICON_CHOICES[0], "DOCUMENT");
+        assert_eq!(ICON_CHOICES[24], "HELP");
     }
 }

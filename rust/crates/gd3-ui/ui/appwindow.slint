@@ -3,7 +3,12 @@
 
 import { VerticalBox } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
-import { SettingsPage, IdentityPresetData, CategoryRowData } from "settings_page.slint";
+import {
+    CategoryEditDraft,
+    SettingsPage,
+    IdentityPresetData,
+    CategoryRowData,
+} from "settings_page.slint";
 
 export component AppWindow inherits Window {
     title: "Ghost-Downloader-3";
@@ -67,6 +72,13 @@ export component AppWindow inherits Window {
     in-out property <[IdentityPresetData]> identityPresets;
     in-out property <[CategoryRowData]> categoryRows;
     in-out property <int> categoryRuleCount;
+    in-out property <[string]> categoryIconChoices;
+    in-out property <bool> categoryEditVisible;
+    in-out property <string> categoryEditId;
+    in-out property <string> categoryEditName;
+    in-out property <int> categoryEditIconIndex;
+    in-out property <string> categoryEditExtensions;
+    in-out property <string> categoryEditFolder;
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版五键
     // （cfg.py 缺省 T/T/F/"Ask"/T；CloseMode 映射归 close_mode.rs）。
     in-out property <bool> urlSchemeEnabled: true;
@@ -121,6 +133,10 @@ export component AppWindow inherits Window {
     callback identityPresetRemoveRequested(int);
     callback categoryResetRequested();
     callback categoryRemoveRequested(string);
+    callback categoryAddRequested();
+    callback categoryEditRequested(string);
+    callback categoryEditClosed();
+    callback categoryEditAccepted(CategoryEditDraft);
     callback copyPairToken();
     callback regeneratePairToken();
     callback openStoreUrl(string);
@@ -224,6 +240,17 @@ export component AppWindow inherits Window {
             categoryRuleCount <=> root.categoryRuleCount;
             categoryResetRequested() => { root.categoryResetRequested(); }
             categoryRemoveRequested(id) => { root.categoryRemoveRequested(id); }
+            categoryIconChoices <=> root.categoryIconChoices;
+            categoryEditVisible <=> root.categoryEditVisible;
+            categoryEditId <=> root.categoryEditId;
+            categoryEditName <=> root.categoryEditName;
+            categoryEditIconIndex <=> root.categoryEditIconIndex;
+            categoryEditExtensions <=> root.categoryEditExtensions;
+            categoryEditFolder <=> root.categoryEditFolder;
+            categoryAddRequested() => { root.categoryAddRequested(); }
+            categoryEditRequested(id) => { root.categoryEditRequested(id); }
+            categoryEditClosed() => { root.categoryEditClosed(); }
+            categoryEditAccepted(d) => { root.categoryEditAccepted(d); }
             exportCrx() => { root.exportCrx(); }
             urlSchemeEnabled <=> root.urlSchemeEnabled;
             checkUpdateAtStartup <=> root.checkUpdateAtStartup;

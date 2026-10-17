@@ -288,6 +288,13 @@ pub fn push_settings(
             .collect::<Vec<_>>(),
     )));
     window.set_categoryRuleCount(category_rules.len() as i32);
+    // 第 45 步：图标下拉 choices（ICON_CHOICES 逐字 25 项）。
+    window.set_categoryIconChoices(slint::ModelRc::new(slint::VecModel::from(
+        category::ICON_CHOICES
+            .iter()
+            .map(|choice| choice.to_string().into())
+            .collect::<Vec<_>>(),
+    )));
     // 第 38 步：关联 urlScheme 静态卡 + 软件组简版（cfg.py 实证：
     // Browser/UrlSchemeRegistered 缺省 T（sys!=darwin 显示）；
     // Software/CheckUpdateAtStartUp 缺省 T / AutoRun 缺省 F（应用
@@ -320,6 +327,31 @@ pub fn push_settings(
     window.set_uiScalePercent(
         (config.get_f64("Personalization", "DpiScale").unwrap_or(0.0) * 100.0).round() as i32,
     );
+}
+
+/// 第 45 步：打开分类添加/编辑表单（直写窗口字段+置可见；`rule`
+/// None=添加镜像 Dialog(category=None)：字段前置空、icon 落 0）。
+pub fn open_category_edit(window: &AppWindow, rule: Option<&category::CategoryRule>) {
+    let Some(rule) = rule else {
+        window.set_categoryEditId("".into());
+        window.set_categoryEditName("".into());
+        window.set_categoryEditIconIndex(0);
+        window.set_categoryEditExtensions("".into());
+        window.set_categoryEditFolder("".into());
+        window.set_categoryEditVisible(true);
+        return;
+    };
+    window.set_categoryEditId(rule.category_id.as_str().into());
+    window.set_categoryEditName(rule.name.as_str().into());
+    // 图标预选镜像 _populate：findData 命中否则 0（未知 icon 落首项）。
+    let index = category::ICON_CHOICES
+        .iter()
+        .position(|choice| *choice == rule.icon)
+        .unwrap_or(0) as i32;
+    window.set_categoryEditIconIndex(index);
+    window.set_categoryEditExtensions(rule.extensions.join(",").into());
+    window.set_categoryEditFolder(rule.folder.clone().unwrap_or_default().into());
+    window.set_categoryEditVisible(true);
 }
 
 /// 设置页动作集：控件变化 → 调用方 typed set + 落盘。
@@ -378,6 +410,13 @@ pub struct SettingsActions {
     // cfg 写与重推归调用方）。
     pub category_reset: Box<dyn Fn()>,
     pub category_remove: Box<dyn Fn(String)>,
+    // 第 45 步：分类添加/编辑动作（添加/取消收 ()；编辑入口收
+    // categoryId 原样——查行与开框归调用方；确定收归一化后的
+    // 规则，cfg 写与 categoriesChanged 重推归调用方）。
+    pub category_add_requested: Box<dyn Fn()>,
+    pub category_edit_requested: Box<dyn Fn(String)>,
+    pub category_edit_closed: Box<dyn Fn()>,
+    pub category_edit_submit: Box<dyn Fn(category::CategoryRule)>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
     pub url_scheme_enabled: Box<dyn Fn(bool)>,
@@ -522,6 +561,27 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_categoryResetRequested(move || (category_reset.category_reset)());
     let category_remove = actions.clone();
     window.on_categoryRemoveRequested(move |id| (category_remove.category_remove)(id.to_string()));
+    // 第 45 步：分类添加/编辑动作注册（确定草稿经五字段构造即
+    // category::draft_to_rule 归一化后转发——对话框端只回发原样
+    // 字段，容错口径在镜像层）。
+    let category_add = actions.clone();
+    window.on_categoryAddRequested(move || (category_add.category_add_requested)());
+    let category_edit = actions.clone();
+    window.on_categoryEditRequested(move |id| {
+        (category_edit.category_edit_requested)(id.to_string())
+    });
+    let category_close = actions.clone();
+    window.on_categoryEditClosed(move || (category_close.category_edit_closed)());
+    let category_submit = actions.clone();
+    window.on_categoryEditAccepted(move |draft| {
+        (category_submit.category_edit_submit)(category::draft_to_rule(
+            &draft.id,
+            &draft.name,
+            &draft.icon,
+            &draft.extensions,
+            &draft.folder,
+        ))
+    });
     // 第 38 步：关联 + 软件组注册（urlScheme 协议注册真生效/
     // 开机启动注册归引擎桥接步）。
     let url_scheme = actions.clone();
@@ -991,6 +1051,9 @@ mod smoke {
         assert_eq!(category_rows.row_data(7).as_ref().unwrap().name, "其他");
         assert_eq!(category_rows.row_data(7).as_ref().unwrap().desc, "无扩展名");
         assert_eq!(window.get_categoryRuleCount(), 8);
+        // 第 45 步：缺省容错（图标 choices 25 项逐字、覆盖层收起）。
+        assert_eq!(window.get_categoryIconChoices().row_count(), 25);
+        assert!(!window.get_categoryEditVisible());
 
         let window = crate::create_headless();
         let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
@@ -1016,6 +1079,12 @@ mod smoke {
         // 第 44 步：库分类动作命中记录。
         let category_reset_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let category_remove_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 45 步：分类添加/编辑动作命中记录（提交收归一化规则）。
+        let category_add_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let category_edit_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let category_close_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        let category_submit_hits: Rc<RefCell<Vec<crate::category::CategoryRule>>> =
+            Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
             folder: Box::new({
                 let h = hits.clone();
@@ -1111,6 +1180,23 @@ mod smoke {
             category_remove: Box::new({
                 let h = category_remove_hits.clone();
                 move |s| h.borrow_mut().push(s)
+            }),
+            // 第 45 步：添加/编辑动作（提交收 draft_to_rule 归一化产物）。
+            category_add_requested: Box::new({
+                let h = category_add_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            category_edit_requested: Box::new({
+                let h = category_edit_hits.clone();
+                move |s| h.borrow_mut().push(s)
+            }),
+            category_edit_closed: Box::new({
+                let h = category_close_hits.clone();
+                move || h.borrow_mut().push(())
+            }),
+            category_edit_submit: Box::new({
+                let h = category_submit_hits.clone();
+                move |rule| h.borrow_mut().push(rule)
             }),
             // 第 38 步：关联+软件组动作（CloseMode 收字面量验证
             // 索引⇄字面量通路）。
@@ -1227,8 +1313,80 @@ mod smoke {
             category_remove_hits.borrow().last().map(|s| s.as_str()),
             Some("x")
         );
+        // 第 45 步：添加/编辑 invoke 通路；draft_to_rule 归一化产物
+        // 断言（名称空兜/扩展名去点去空/不存在项）。图标 choices
+        // 25 项先落在有值推送段（push 断言见缺省段）。
+        window.invoke_categoryAddRequested();
+        assert_eq!(category_add_hits.borrow().len(), 1);
+        window.invoke_categoryEditRequested("x".into());
+        assert_eq!(
+            category_edit_hits.borrow().last().map(|s| s.as_str()),
+            Some("x")
+        );
+        window.invoke_categoryEditAccepted(crate::CategoryEditDraft {
+            id: "x".into(),
+            name: "自定义".into(),
+            icon: "DOCUMENT".into(),
+            extensions: ".MP4, mkv, tar.gz".into(),
+            folder: "{default}/X".into(),
+        });
+        let got = category_submit_hits.borrow().last().cloned().unwrap();
+        assert_eq!(got.name, "自定义");
+        assert_eq!(got.icon, "DOCUMENT");
+        assert_eq!(
+            got.extensions,
+            vec!["mp4".to_string(), "mkv".to_string(), "tar.gz".to_string()]
+        );
+        assert_eq!(got.folder.as_deref(), Some("{default}/X"));
+        assert_eq!(got.category_id, "x");
+        window.invoke_categoryEditClosed();
+        assert_eq!(category_close_hits.borrow().len(), 1);
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
+    }
+
+    /// 第 45 步：open_category_edit 带值/添加两态直写字段+置可见。
+    #[test]
+    fn open_category_edit_form_states_headless() {
+        use gd3_core::config::UserConfig;
+
+        let window = crate::create_headless();
+        crate::push_settings(&window, &UserConfig::new(), "/default/download");
+        crate::open_category_edit(&window, None);
+        assert!(window.get_categoryEditVisible());
+        assert_eq!(window.get_categoryEditId(), "");
+        assert_eq!(window.get_categoryEditName(), "");
+        assert_eq!(window.get_categoryEditIconIndex(), 0);
+
+        crate::open_category_edit(
+            &window,
+            Some(&crate::category::CategoryRule {
+                category_id: "x".into(),
+                name: "自定义".into(),
+                icon: "VIDEO".into(),
+                extensions: vec!["mp4".into(), "mkv".into()],
+                folder: Some("{default}/V".into()),
+            }),
+        );
+        assert_eq!(window.get_categoryEditId(), "x");
+        assert_eq!(window.get_categoryEditName(), "自定义");
+        assert_eq!(window.get_categoryEditIconIndex(), 2, "VIDEO 下标 2");
+        assert_eq!(window.get_categoryEditExtensions(), "mp4,mkv");
+        assert_eq!(window.get_categoryEditFolder(), "{default}/V");
+
+        // 预选镜像 findData：未知 icon 落首项；缺 folder 空串。
+        crate::open_category_edit(
+            &window,
+            Some(&crate::category::CategoryRule {
+                category_id: "y".into(),
+                name: "n".into(),
+                icon: "NOT_EXIST".into(),
+                extensions: vec![],
+                folder: None,
+            }),
+        );
+        assert_eq!(window.get_categoryEditIconIndex(), 0);
+        assert_eq!(window.get_categoryEditFolder(), "");
     }
 
     /// 段高亮：filterMode → 派生选中态。缺省 all；未知字面量全不

@@ -23,6 +23,18 @@ export struct CategoryRowData {
     id: string,
 }
 
+// 第 45 步：分类添加/编辑对话框草稿（镜像 CategoryEditDialog.category()
+// 的输入侧；id 空串=添加镜像 Dialog(category=None)；extensions 为
+// TokenLineEdit 简版——逗号分隔原样串，拆分/容错归一化在 Rust
+// category.rs draft_to_rule）。
+export struct CategoryEditDraft {
+    id: string,
+    name: string,
+    icon: string,
+    extensions: string,
+    folder: string,
+}
+
 export component SettingsPage inherits Rectangle {
     // in-out 供 SpinBox/Switch 自身编辑态直写，AppWindow 推送覆盖。
     in-out property <string> downloadFolder: "";
@@ -111,6 +123,16 @@ export component SettingsPage inherits Rectangle {
     // 第 44 步：库分类规则行（categoryRules 镜像，缺省八预设）。
     in-out property <[CategoryRowData]> categoryRows;
     in-out property <int> categoryRuleCount: 0;
+    // 第 45 步：分类添加/编辑覆盖层（镜像 CategoryEditDialog：名称/
+    // 图标下拉/扩展名 TokenLineEdit 简版/下载文件夹；choices 由 Rust
+    // 推送 ICON_CHOICES 逐字 25 项；id 空串=添加）。
+    in-out property <[string]> categoryIconChoices;
+    in-out property <bool> categoryEditVisible: false;
+    in-out property <string> categoryEditId: "";
+    in-out property <string> categoryEditName: "";
+    in-out property <int> categoryEditIconIndex: 0;
+    in-out property <string> categoryEditExtensions: "";
+    in-out property <string> categoryEditFolder: "";
     // 第 38 步：关联组 urlScheme 静态卡 + 软件组简版（cfg.py 实证）：
     // Browser/UrlSchemeRegistered 默认 T（sys!=darwin 显示）/ Software/
     // CheckUpdateAtStartUp 默认 T / AutoRun 默认 F（应用生效归桥接步）/
@@ -160,6 +182,12 @@ export component SettingsPage inherits Rectangle {
     // ——cfg 写与重推归调用方。
     callback categoryResetRequested();
     callback categoryRemoveRequested(string);
+    // 第 45 步：分类添加/编辑动作（入口收 () 或 categoryId 原样；
+    // 「取消」收 ()；「确定」回发草稿——归一化与 cfg 写归调用方）。
+    callback categoryAddRequested();
+    callback categoryEditRequested(string);
+    callback categoryEditClosed();
+    callback categoryEditAccepted(CategoryEditDraft);
     callback copyPairToken();
     callback regeneratePairToken();
     callback openStoreUrl(string);
@@ -232,6 +260,10 @@ export component SettingsPage inherits Rectangle {
                     vertical-alignment: center;
                 }
                 Button {
+                    text: "编辑";
+                    clicked => { root.categoryEditRequested(row.id); }
+                }
+                Button {
                     text: "删除";
                     clicked => { root.categoryRemoveRequested(row.id); }
                 }
@@ -244,6 +276,10 @@ export component SettingsPage inherits Rectangle {
                 Button {
                     text: "恢复默认";
                     clicked => { root.categoryResetRequested(); }
+                }
+                Button {
+                    text: "添加分类";
+                    clicked => { root.categoryAddRequested(); }
                 }
             }
         }
@@ -686,6 +722,64 @@ export component SettingsPage inherits Rectangle {
             Text {
                 text: " %";
                 vertical-alignment: center;
+            }
+        }
+        // 第 45 步：分类添加/编辑覆盖层（镜像 CategoryEditDialog
+        // _initWidget/_initLayout 字段与占位文案；浏览文件夹按钮与
+        // TokenLineEdit 逐 token 交互留欠账步）。
+        Rectangle {
+            visible: root.categoryEditVisible;
+            background: rgba(0, 0, 0, 0.4);
+            width: 100%;
+            height: 100%;
+            VerticalBox {
+                padding: 24px;
+                Text {
+                    text: root.categoryEditId == "" ? "添加分类" : "编辑分类";
+                    font-size: 18px;
+                }
+                Text { text: "名称"; }
+                LineEdit {
+                    text <=> root.categoryEditName;
+                    placeholder-text: "分类名称";
+                }
+                Text { text: "图标"; }
+                ComboBox {
+                    model: root.categoryIconChoices;
+                    current-index <=> root.categoryEditIconIndex;
+                }
+                Text { text: "扩展名"; }
+                LineEdit {
+                    text <=> root.categoryEditExtensions;
+                    placeholder-text: "输入扩展名后按回车添加（简版：逗号分隔）";
+                }
+                Text { text: "下载文件夹"; }
+                LineEdit {
+                    text <=> root.categoryEditFolder;
+                    placeholder-text: "留空则使用默认下载路径；可用 \u{7b}default\u{7d} 代表默认下载文件夹";
+                }
+                HorizontalBox {
+                    Button {
+                        text: "取消";
+                        clicked => {
+                            root.categoryEditVisible = false;
+                            root.categoryEditClosed();
+                        }
+                    }
+                    Button {
+                        text: "确定";
+                        clicked => {
+                            root.categoryEditVisible = false;
+                            root.categoryEditAccepted({
+                                id: root.categoryEditId,
+                                name: root.categoryEditName,
+                                icon: root.categoryIconChoices[root.categoryEditIconIndex],
+                                extensions: root.categoryEditExtensions,
+                                folder: root.categoryEditFolder,
+                            });
+                        }
+                    }
+                }
             }
         }
     }
