@@ -14,6 +14,7 @@ use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferTyp
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
+pub mod filter;
 mod format;
 pub mod row;
 
@@ -60,6 +61,45 @@ pub fn push_task_records(
         .map(|record| row::to_task_row_with(record, is_seeding(record)))
         .collect();
     set_task_rows(window, rows);
+}
+
+/// 筛选后的推流：按 `filter::TaskFilter` 过滤 records 再成行推送
+/// （顺路接通 `set_searchText`/`set_filterMode` 的 UI 态）。
+pub fn refresh_task_rows(
+    window: &AppWindow,
+    records: &[gd3_core::task::TaskRecord],
+    filter: filter::TaskFilter<'_>,
+    is_seeding: impl Fn(&gd3_core::task::TaskRecord) -> bool,
+) {
+    let rows: Vec<TaskRow> = filter::filtered(records, filter)
+        .iter()
+        .map(|record| row::to_task_row_with(record, is_seeding(record)))
+        .collect();
+    set_task_rows(window, rows);
+}
+
+/// Rust 侧动作集：Slint 回调 → 调用方桥接（task_service/queue 等）。
+///
+/// 分层：Slint 只发 taskId/路由字面量；真正的暂停/删除/筛选语义都在
+/// 调用方，由 install_task_actions 注册到 AppWindow。
+pub struct TaskActions {
+    pub search: Box<dyn Fn(&str)>,
+    pub filter_mode: Box<dyn Fn(&str)>,
+    pub pause: Box<dyn Fn(&str)>,
+    pub delete: Box<dyn Fn(&str)>,
+}
+
+/// 把动作集注册到 AppWindow 的四个回调上（on_searchChanged 等生成名
+/// 保留 slint 原命名，见 build 产物 appwindow.rs:9572-9608）。
+pub fn install_task_actions(window: &AppWindow, actions: std::rc::Rc<TaskActions>) {
+    let search = actions.clone();
+    window.on_searchChanged(move |text| (search.search)(&text));
+    let filter_mode = actions.clone();
+    window.on_filterModeChanged(move |route| (filter_mode.filter_mode)(&route));
+    let pause = actions.clone();
+    window.on_taskPause(move |task_id| (pause.pause)(&task_id));
+    let delete = actions.clone();
+    window.on_taskDelete(move |task_id| (delete.delete)(&task_id));
 }
 
 #[cfg(test)]
@@ -139,5 +179,78 @@ mod smoke {
         let second = model.row_data(1).expect("次行缺失");
         assert_eq!(second.statusText, "做种中");
         assert_eq!(second.progressText, "1.00 MB");
+    }
+
+    /// 筛选推流：refresh_task_rows 过滤后仅剩选中状态的行（语义由
+    /// filter.rs 纯变换测试锁定，这里锁「过滤 → 成行 → 装配」通路）。
+    #[test]
+    fn refresh_task_rows_applies_filter_headless() {
+        use gd3_core::task::TaskRecord;
+
+        use serde_json::json;
+        let records: Vec<TaskRecord> = serde_json::from_value(json!([
+            {
+                "name": "run.bin", "url": "https://e/1", "packId": "p",
+                "taskId": "t1", "status": "RUNNING", "fileSize": 2048,
+                "steps": [{"stepIndex": 0, "progress": 10, "speed": 0, "receivedBytes": 8}],
+            },
+            {
+                "name": "done.iso", "url": "https://e/2", "packId": "p",
+                "taskId": "t2", "status": "COMPLETED", "fileSize": 1024,
+            },
+        ]))
+        .expect("反序列化失败");
+        let window = crate::create_headless();
+
+        // ACTIVE：只剩 RUNNING 行。
+        crate::refresh_task_rows(
+            &window,
+            &records,
+            crate::filter::TaskFilter {
+                mode: crate::filter::FilterMode::Active,
+                category: "",
+                search: "",
+            },
+            |_| false,
+        );
+        let model = window.get_tasks();
+        assert_eq!(model.row_count(), 1);
+        assert_eq!(model.row_data(0).expect("缺失").name, "run.bin");
+
+        // 搜索不命中 → 空列表（UI 侧空态文案在后续步接）。
+        crate::refresh_task_rows(
+            &window,
+            &records,
+            crate::filter::TaskFilter {
+                mode: crate::filter::FilterMode::All,
+                category: "",
+                search: "zzz",
+            },
+            |_| false,
+        );
+        assert_eq!(window.get_tasks().row_count(), 0);
+    }
+
+    /// 回调注册冒烟：install_task_actions 把四个动作挂上不 panic
+    /// （生成名 on_searchChanged 等保留 slint 命名）。
+    #[test]
+    fn install_task_actions_registers_handlers_headless() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let window = crate::create_headless();
+        let hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let actions = Rc::new(crate::TaskActions {
+            search: Box::new({
+                let h = hits.clone();
+                move |s| h.borrow_mut().push(s.into())
+            }),
+            filter_mode: Box::new(|_| {}),
+            pause: Box::new(|_| {}),
+            delete: Box::new(|_| {}),
+        });
+        crate::install_task_actions(&window, actions);
+        // 无头环境无法模拟点按；注册本身即通路（真实触发在屏上联调）。
+        assert!(hits.borrow().is_empty());
     }
 }

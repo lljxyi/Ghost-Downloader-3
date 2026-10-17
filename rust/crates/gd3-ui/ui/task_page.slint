@@ -4,8 +4,13 @@
 //
 // 文案（状态/进度/速度）由调用方（Rust 或 Python 桥）给出；Slint 侧
 // 不管格式化语义——与「兜底不在核心层」同一分层原则。
+//
+// 筛选口径（对齐 task_page.py ROUTE_TO_FILTER，45-47 行）：段按钮固定
+// 发出 "all"/"active"/"completed" 字面量；filterMode 属性由调用方
+// 回写（Rust 侧 FilterMode 状态推回）供后续高亮。搜索/暂停/删除的
+// 执行都在调用方，Slint 只发字面量。
 
-import { ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { ListView, VerticalBox, HorizontalBox, LineEdit, Button } from "std-widgets.slint";
 
 export struct TaskRow {
     taskId: string,
@@ -17,14 +22,43 @@ export struct TaskRow {
 export component TaskPage inherits Rectangle {
     in property <[TaskRow]> tasks;
     in property <string> searchText: "";
+    in property <string> filterMode: "all";
+    in property <string> searchPlaceholder: "搜索任务";
+
+    callback searchChanged(string);
+    callback filterModeChanged(string);
+    callback taskPause(string);
+    callback taskDelete(string);
 
     background: transparent;
 
     VerticalBox {
+        HorizontalBox {
+            Button {
+                text: "全部";
+                clicked => { root.filterModeChanged("all"); }
+            }
+            Button {
+                text: "进行中";
+                clicked => { root.filterModeChanged("active"); }
+            }
+            Button {
+                text: "已完成";
+                clicked => { root.filterModeChanged("completed"); }
+            }
+            LineEdit {
+                placeholder-text: root.searchPlaceholder;
+                text: root.searchText;
+                edited(text) => { root.searchChanged(text); }
+                accepted(text) => { root.searchChanged(text); }
+            }
+        }
+
         Text {
-            // 搜索过滤在迁移中期接 cfg 伴生时生效；本步空文本仅占位。
-            text: root.searchText;
-            font-size: 13px;
+            // filterMode 属性行当前只供调用方/测试回写读校；段高亮在
+            // 视觉接近平卡片的后续步再展开（Qt 侧是段控件）。
+            text: root.filterMode;
+            font-size: 11px;
         }
 
         ListView {

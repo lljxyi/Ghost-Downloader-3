@@ -12,6 +12,11 @@ export component AppWindow inherits Window {
     in property <string> statusText: "Ghost-Downloader-3 (Slint)";
     in property <[TaskRow]> tasks;
 
+    callback searchChanged(string);
+    callback filterModeChanged(string);
+    callback taskPause(string);
+    callback taskDelete(string);
+
     VerticalBox {
         Text {
             text: root.statusText;
@@ -21,6 +26,10 @@ export component AppWindow inherits Window {
 
         TaskPage {
             tasks: root.tasks;
+            searchChanged(value) => { root.searchChanged(value); }
+            filterModeChanged(value) => { root.filterModeChanged(value); }
+            taskPause(taskId) => { root.taskPause(taskId); }
+            taskDelete(taskId) => { root.taskDelete(taskId); }
         }
     }
 }
