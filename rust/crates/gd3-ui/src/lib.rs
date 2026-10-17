@@ -966,6 +966,199 @@ pub fn install_drawer_actions(window: &AppWindow, actions: std::rc::Rc<DrawerAct
     });
 }
 
+// ---------------------------------------------------------------------------
+// 第 57 步：主窗口外壳装配（导航栏 / 标题栏搜索框 / 通知条 / 消息框 / 拖放）
+// ---------------------------------------------------------------------------
+//
+// 这一层的职责只有「形状 → model/属性」：所有文案、按钮集合与判定都在
+// `window.rs`（Slint-free，金文件逐条钉死），这里不重复任何业务规则。
+
+/// 导航 model：`window::nav_items_at` 的一侧 → Slint 结构体。
+///
+/// `selected` 只对 `selectable` 的项可能为真——「新建任务」在 Qt 侧
+/// 从未调用 `setSelected`（`_addPage` 只对真页面调）。
+pub fn nav_model(
+    position: window::NavPosition,
+    current_route: &str,
+) -> slint::ModelRc<NavItemData> {
+    let items: Vec<NavItemData> = window::nav_items_at(position)
+        .into_iter()
+        .map(|item| NavItemData {
+            routeKey: item.route_key.into(),
+            text: item.title.into(),
+            icon: item.icon.into(),
+            selectable: item.selectable,
+            selected: item.selectable && item.route_key == current_route,
+        })
+        .collect();
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
+
+/// 一次写齐导航栏两侧（镜像 `_initLayout` 收尾时的 `navigationInterface`
+/// 状态）。
+pub fn set_nav_items(window: &AppWindow, current_route: &str) {
+    window.set_navTop(nav_model(window::NavPosition::Top, current_route));
+    window.set_navBottom(nav_model(window::NavPosition::Bottom, current_route));
+}
+
+/// 切页：`currentRoute` + 搜索框口径 + 导航选中态。
+///
+/// 镜像 `switchTo(page)` + `_updateSearchTarget(page)`：后者无论如何都会
+/// 先 `self.searchEdit.clear()`，故这里也清空 `searchText`。
+pub fn switch_page(window: &AppWindow, route_key: &str) {
+    window.set_currentRoute(route_key.into());
+    let target = window::search_target(route_key);
+    window.set_searchVisible(target.placeholder.is_some());
+    window.set_searchPlaceholder(target.placeholder.unwrap_or_default().into());
+    window.set_searchText("".into());
+    set_nav_items(window, route_key);
+}
+
+/// `InfoBarSpec` / `DialogSpec` 的按钮 → Slint model。`index` 就是
+/// `addWidget(...)` 的顺序，回调只回传序号，分派归调用方。
+pub fn bar_buttons(buttons: &[window::BarButton]) -> slint::ModelRc<BarButtonData> {
+    let rows: Vec<BarButtonData> = buttons
+        .iter()
+        .enumerate()
+        .map(|(index, button)| BarButtonData {
+            text: button.text.as_str().into(),
+            index: index as i32,
+            primary: button.primary,
+        })
+        .collect();
+    slint::ModelRc::new(slint::VecModel::from(rows))
+}
+
+/// 弹通知条（镜像 `InfoBar(...)` + `addWidget` 序列 + `show()`）。
+pub fn show_info_bar(window: &AppWindow, spec: &window::InfoBarSpec) {
+    window.set_infoBarTitle(spec.title.as_str().into());
+    window.set_infoBarText(spec.text.as_str().into());
+    window.set_infoBarButtons(bar_buttons(&spec.buttons));
+    window.set_infoBarVisible(true);
+}
+
+/// 收起通知条（关闭按钮 / `_onUpdateChanged` 里 `close()` 的对应物）。
+pub fn hide_info_bar(window: &AppWindow) {
+    window.set_infoBarVisible(false);
+}
+
+/// 弹消息框。`checkbox == None` 时 `dialogCheckboxLabel` 写空串——
+/// Slint 侧约定「空串 = 没有复选框」。
+pub fn show_dialog(window: &AppWindow, spec: &window::DialogSpec) {
+    window.set_dialogTitle(spec.title.as_str().into());
+    window.set_dialogText(spec.text.as_str().into());
+    let (label, checked) = match &spec.checkbox {
+        Some((label, checked)) => (label.as_str(), *checked),
+        None => ("", false),
+    };
+    window.set_dialogCheckboxLabel(label.into());
+    window.set_dialogCheckboxChecked(checked);
+    window.set_dialogButtons(bar_buttons(&spec.buttons));
+    window.set_dialogVisible(true);
+}
+
+/// 收起消息框并清掉复选框态——镜像 Qt 侧每次 `exec()` 都是新对话框对象，
+/// 勾选态不会残留到下一次。
+pub fn hide_dialog(window: &AppWindow) {
+    window.set_dialogVisible(false);
+    window.set_dialogCheckboxLabel("".into());
+    window.set_dialogCheckboxChecked(false);
+}
+
+/// 读回消息框第 `index` 个按钮的文案（调用方按文案分派，等价于 Qt 侧
+/// `dialog.yesButton.clicked.connect(...)` 的按钮身份）。
+pub fn dialog_button_text(window: &AppWindow, index: usize) -> Option<String> {
+    use slint::Model;
+    window
+        .get_dialogButtons()
+        .row_data(index)
+        .map(|button| button.text.to_string())
+}
+
+/// 拖放载荷的扁平快照。
+///
+/// `data-transfer` 在 Slint 里不透明（`i-slint-compiler-1.18.1/
+/// builtin_elements.rs` 只把它暴露给宿主语言），所以宿主在回调里一次读全，
+/// 之后的判定仍走 `window::drop_decision` / `window::drop_urls`。
+///
+/// **与 Qt 的差异**：`mimeData().urls()` 能给任意 URL（浏览器拖链接也是），
+/// `DataTransfer` 只给**本地文件路径**，故 `has_urls` 按
+/// `has_file_paths()` 判定——非文件 URL 的拖放在 Slint 侧拿不到，
+/// 需要等 slint 暴露 URL 列表能力再补。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DropPayload {
+    pub file_paths: Vec<String>,
+    pub text: Option<String>,
+}
+
+impl DropPayload {
+    /// 从宿主拿到的 `data-transfer` 读一次（读操作可能有 I/O，故只读一遍）。
+    pub fn from_transfer(data: &slint::DataTransfer) -> Self {
+        let file_paths = data
+            .file_paths()
+            .map(|paths| {
+                paths
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = data.plain_text().ok().map(|text| text.to_string());
+        Self { file_paths, text }
+    }
+
+    /// 镜像 `event.mimeData()` 的三件套（`hasUrls` / `hasText` / `text`）。
+    pub fn drop_input(
+        &self,
+        is_file_drag_active: bool,
+        mask_dialog_visible: bool,
+    ) -> window::DropInput<'_> {
+        window::DropInput {
+            is_file_drag_active,
+            has_urls: !self.file_paths.is_empty(),
+            has_text: self.text.is_some(),
+            text: self.text.as_deref().unwrap_or(""),
+            mask_dialog_visible,
+        }
+    }
+}
+
+/// 外壳动作集（第 57 步）：导航 / 搜索 / 通知条 / 消息框 / 拖放。
+///
+/// 全部只带字面量（routeKey、按钮序号、勾选态、拖放载荷）——建任务、
+/// 切页副作用、落盘、开浏览器都在调用方。
+pub struct ShellActions {
+    pub nav_item: Box<dyn Fn(&str)>,
+    pub search: Box<dyn Fn(&str)>,
+    pub info_bar_button: Box<dyn Fn(i32)>,
+    pub info_bar_closed: Box<dyn Fn()>,
+    pub dialog_button: Box<dyn Fn(i32)>,
+    pub dialog_checkbox: Box<dyn Fn(bool)>,
+    /// `can-drop`：载荷是否可接（调用方拼 `DropInput` 后问 `drop_decision`）。
+    pub can_drop: Box<dyn Fn(&DropPayload) -> bool>,
+    /// `dropped`：取址（`drop_urls`）后交给 `addUrls`。
+    pub drop: Box<dyn Fn(&DropPayload)>,
+}
+
+/// 把外壳动作集注册到 AppWindow 的回调上。
+pub fn install_shell_actions(window: &AppWindow, actions: std::rc::Rc<ShellActions>) {
+    let nav_item = actions.clone();
+    window.on_navItemClicked(move |route_key| (nav_item.nav_item)(&route_key));
+    let search = actions.clone();
+    window.on_searchEdited(move |text| (search.search)(&text));
+    let info_bar_button = actions.clone();
+    window.on_infoBarButtonClicked(move |index| (info_bar_button.info_bar_button)(index));
+    let info_bar_closed = actions.clone();
+    window.on_infoBarClosed(move || (info_bar_closed.info_bar_closed)());
+    let dialog_button = actions.clone();
+    window.on_dialogButtonClicked(move |index| (dialog_button.dialog_button)(index));
+    let dialog_checkbox = actions.clone();
+    window.on_dialogCheckboxToggled(move |checked| (dialog_checkbox.dialog_checkbox)(checked));
+    let can_drop = actions.clone();
+    window.on_canDropPayload(move |data| (can_drop.can_drop)(&DropPayload::from_transfer(&data)));
+    let drop = actions.clone();
+    window.on_dropPayload(move |data| (drop.drop)(&DropPayload::from_transfer(&data)));
+}
+
 #[cfg(test)]
 mod smoke {
     use slint::Model;
@@ -2376,5 +2569,160 @@ mod smoke {
             .filter_map(|index| model.row_data(index).map(|row| row.name.to_string()))
             .collect();
         assert_eq!(names, ["c.m3u8", "b.iso", "a.bin"]);
+    }
+
+    /// 第 57 步：外壳导航 model 装配 + 切页联动（选中态 / 搜索框口径）。
+    ///
+    /// `navTop` 两项（下载任务 / 新建任务）、`navBottom` 一项（设置）；
+    /// 「新建任务」`selectable=false` 故永不选中。
+    #[test]
+    fn shell_nav_and_search_follow_route_headless() {
+        let window = crate::create_headless();
+        crate::set_nav_items(&window, crate::window::PAGE_TASK);
+
+        let top = window.get_navTop();
+        assert_eq!(top.row_count(), 2);
+        let first = top.row_data(0).expect("首项缺失");
+        assert_eq!(first.routeKey, "TaskPage");
+        assert_eq!(first.text, "下载任务");
+        assert_eq!(first.icon, "DOWNLOAD");
+        assert!(first.selectable);
+        assert!(first.selected, "当前页应选中");
+        let second = top.row_data(1).expect("次项缺失");
+        assert_eq!(second.routeKey, "addTaskButton");
+        assert_eq!(second.text, "新建任务");
+        assert!(!second.selectable);
+        assert!(!second.selected, "「新建任务」不可选中");
+
+        let bottom = window.get_navBottom();
+        assert_eq!(bottom.row_count(), 1);
+        let settings = bottom.row_data(0).expect("设置项缺失");
+        assert_eq!(settings.routeKey, "SettingPage");
+        assert_eq!(settings.text, "设置");
+        assert!(settings.selectable);
+        assert!(!settings.selected, "当前不在设置页");
+
+        // 切到设置页：选中态转移 + 搜索框口径跟着变（`searchEdit.clear()`）。
+        window.set_searchText("旧关键字".into());
+        crate::switch_page(&window, crate::window::PAGE_SETTINGS);
+        assert_eq!(window.get_currentRoute(), "SettingPage");
+        assert!(window.get_searchVisible());
+        assert_eq!(window.get_searchPlaceholder(), "搜索设置");
+        assert_eq!(window.get_searchText(), "", "切页会清空搜索框");
+        assert!(!window.get_navTop().row_data(0).unwrap().selected);
+        assert!(window.get_navBottom().row_data(0).unwrap().selected);
+
+        // 未知路由（pack 页面）：搜索框隐藏、placeholder 清空、无选中项。
+        crate::switch_page(&window, "SomePackPage");
+        assert!(!window.get_searchVisible());
+        assert_eq!(window.get_searchPlaceholder(), "");
+        assert!(!window.get_navTop().row_data(0).unwrap().selected);
+        assert!(!window.get_navBottom().row_data(0).unwrap().selected);
+    }
+
+    /// 第 57 步：通知条与消息框的形状装配（按钮序号 + 主按钮 + 复选框）。
+    #[test]
+    fn shell_info_bar_and_dialog_assembly_headless() {
+        let window = crate::create_headless();
+
+        // 更新提示条：三个按钮，`立即下载` 是主按钮。
+        crate::show_info_bar(&window, &crate::window::update_available_info_bar("1.2.3"));
+        assert!(window.get_infoBarVisible());
+        assert_eq!(
+            window.get_infoBarTitle(),
+            crate::window::UPDATE_AVAILABLE_TITLE
+        );
+        assert_eq!(
+            window.get_infoBarText(),
+            crate::window::update_available_content("1.2.3")
+        );
+        let buttons = window.get_infoBarButtons();
+        assert_eq!(buttons.row_count(), 3);
+        let download = buttons.row_data(0).expect("首按钮缺失");
+        assert_eq!(download.text, crate::window::UPDATE_DOWNLOAD_BUTTON);
+        assert_eq!(download.index, 0);
+        assert!(download.primary);
+        let detail = buttons.row_data(1).expect("次按钮缺失");
+        assert_eq!(detail.index, 1);
+        assert!(!detail.primary);
+        assert_eq!(buttons.row_data(2).unwrap().index, 2);
+
+        crate::hide_info_bar(&window);
+        assert!(!window.get_infoBarVisible());
+
+        // 关闭确认框：两按钮 + 「记住我的选择」复选框（缺省不勾）。
+        crate::show_dialog(&window, &crate::window::close_ask_dialog());
+        assert!(window.get_dialogVisible());
+        assert_eq!(window.get_dialogTitle(), crate::window::CLOSE_ASK_TITLE);
+        assert_eq!(
+            window.get_dialogCheckboxLabel(),
+            crate::window::CLOSE_ASK_REMEMBER
+        );
+        assert!(!window.get_dialogCheckboxChecked());
+        assert_eq!(window.get_dialogButtons().row_count(), 2);
+        assert_eq!(
+            crate::dialog_button_text(&window, 0).as_deref(),
+            Some(crate::window::CLOSE_ASK_YES)
+        );
+        assert_eq!(
+            crate::dialog_button_text(&window, 9),
+            None,
+            "越界序号返回 None"
+        );
+
+        // 异常框：没有复选框（空串 = 没有）。
+        crate::show_dialog(&window, &crate::window::exception_dialog("boom"));
+        assert_eq!(window.get_dialogCheckboxLabel(), "");
+        assert_eq!(
+            window.get_dialogText(),
+            crate::window::exception_text("boom")
+        );
+
+        // 收起时清掉复选框态（Qt 侧每次 exec() 都是新对象）。
+        window.set_dialogCheckboxLabel("残留".into());
+        window.set_dialogCheckboxChecked(true);
+        crate::hide_dialog(&window);
+        assert!(!window.get_dialogVisible());
+        assert_eq!(window.get_dialogCheckboxLabel(), "");
+        assert!(!window.get_dialogCheckboxChecked());
+    }
+
+    /// 第 57 步：拖放载荷 → `DropInput` 映射（`has_urls` 由本地文件路径决定）。
+    ///
+    /// `DataTransfer` 无法在测试里构造，故直接喂 `DropPayload`；Qt 侧的
+    /// `mimeData().urls()` 与 Slint 的 `file_paths()` 差异记在 `DropPayload`
+    /// 的文档注释里。
+    #[test]
+    fn drop_payload_maps_to_drop_input() {
+        let files = crate::DropPayload {
+            file_paths: vec!["/tmp/a.bin".into()],
+            text: None,
+        };
+        let input = files.drop_input(true, false);
+        assert!(input.is_file_drag_active);
+        assert!(input.has_urls);
+        assert!(!input.has_text);
+        assert_eq!(input.text, "");
+        assert!(!input.mask_dialog_visible);
+
+        let text = crate::DropPayload {
+            file_paths: vec![],
+            text: Some("https://example/a.bin".into()),
+        };
+        let input = text.drop_input(false, true);
+        assert!(!input.has_urls);
+        assert!(input.has_text);
+        assert_eq!(input.text, "https://example/a.bin");
+        assert!(input.mask_dialog_visible);
+
+        // 空载荷：两个 flag 都假 → `drop_decision` 走「忽略」分支。
+        let payload = crate::DropPayload::default();
+        let empty = payload.drop_input(false, false);
+        assert!(!empty.has_urls);
+        assert!(!empty.has_text);
+        assert_eq!(
+            crate::window::drop_decision(&empty, |_| true),
+            crate::window::DropDecision::Ignore
+        );
     }
 }

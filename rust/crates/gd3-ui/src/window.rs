@@ -80,6 +80,18 @@ pub const NAV_ITEMS: [NavItem; 3] = [
     },
 ];
 
+/// 某一侧的导航项，保持 `NAV_ITEMS` 里的相对顺序。
+///
+/// Slint 的 `NavigationInterface` 把 TOP / BOTTOM 两组分开摆放，故导航 model
+/// 也拆成两个（`app_shell.slint` 里的 `navTop` / `navBottom`）。
+pub fn nav_items_at(position: NavPosition) -> Vec<NavItem> {
+    NAV_ITEMS
+        .iter()
+        .copied()
+        .filter(|item| item.position == position)
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // 搜索框（`_updateSearchTarget` / `_onSearchTextChanged` / `_refreshSearchEditGeometry`）
 // ---------------------------------------------------------------------------
@@ -387,6 +399,128 @@ pub const UPDATE_TARGET_APP: &str = "app";
 /// 所以这里只回答「这次事件要不要更新 toast」。
 pub fn wants_progress_toast(target_id: &str, state: &str) -> bool {
     target_id == UPDATE_TARGET_APP && PROGRESS_TOAST_STATES.contains(&state)
+}
+// ---------------------------------------------------------------------------
+// 通知条与消息框的「形状」（第 57 步：接到 Slint 外壳）
+// ---------------------------------------------------------------------------
+//
+// Python 侧这些是 qfluentwidgets 的 `InfoBar` / `MessageBox`。文案本身上面
+// 已经逐条钉死，这里补的是**按钮集合与顺序**（`infoBar.addWidget(...)` 的
+// 调用顺序、`yesButton`/`cancelButton` 的文案改写）以及复选框的有无。
+//
+// Slint 侧用「一个通知条 + 一个通用消息框」承载这四种弹窗，形状由下面这些
+// 构造函数给出，`lib.rs` 只做 model 装配。
+
+/// 一个通知/对话框按钮（`PushButton` / `PrimaryPushButton`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BarButton {
+    pub text: String,
+    /// `PrimaryPushButton`——`立即下载`、`yesButton` 是主按钮。
+    pub primary: bool,
+}
+
+impl BarButton {
+    fn new(text: &str, primary: bool) -> Self {
+        Self {
+            text: text.to_string(),
+            primary,
+        }
+    }
+}
+
+/// `InfoBar(...)` + 若干 `addWidget(...)` 的形状（`isClosable=True` 恒成立，
+/// 关闭按钮由 Slint 侧固定画，不进这里）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InfoBarSpec {
+    pub title: String,
+    pub text: String,
+    pub buttons: Vec<BarButton>,
+}
+
+/// `MessageBoxBase` 家族的形状：标题 + 正文 + 可选复选框 + 按钮。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogSpec {
+    pub title: String,
+    pub text: String,
+    /// `Some((文案, 缺省勾选))` = `textLayout.addWidget(checkbox)` 有复选框。
+    pub checkbox: Option<(String, bool)>,
+    pub buttons: Vec<BarButton>,
+}
+
+/// `MessageBox` 默认的 `yesButton` / `cancelButton` 文案。
+///
+/// 实证：`MessageBoxBase.__init__` 用 `self.tr('OK')` / `self.tr('Cancel')`；
+/// 装了中文 translator 时是「确定」/「取消」（本仓库 `app/` 走的就是这套）。
+pub const DIALOG_OK: &str = "确定";
+pub const DIALOG_CANCEL: &str = "取消";
+
+/// 镜像 `_onListenFailed` 的 InfoBar：正文是 `toLocalizedError(error)`（由
+/// 调用方算好传进来），只有一个「前往设置」按钮。
+pub fn listen_failed_info_bar(title: &str, text: &str) -> InfoBarSpec {
+    InfoBarSpec {
+        title: title.to_string(),
+        text: text.to_string(),
+        buttons: vec![BarButton::new(LISTEN_FAILED_SETTINGS_BUTTON, false)],
+    }
+}
+
+/// 镜像 `onUpdateAvailable` 的 InfoBar：三个按钮，`立即下载` 是主按钮。
+pub fn update_available_info_bar(latest_version: &str) -> InfoBarSpec {
+    InfoBarSpec {
+        title: UPDATE_AVAILABLE_TITLE.to_string(),
+        text: update_available_content(latest_version),
+        buttons: vec![
+            BarButton::new(UPDATE_DOWNLOAD_BUTTON, true),
+            BarButton::new(UPDATE_DETAIL_BUTTON, false),
+            BarButton::new(UPDATE_SPONSOR_BUTTON, false),
+        ],
+    }
+}
+
+/// 镜像 `_onCloseClicked` 的 ASK 确认框：`yesButton`/`cancelButton` 改文案 +
+/// 一个「记住我的选择」复选框（缺省不勾）。
+pub fn close_ask_dialog() -> DialogSpec {
+    DialogSpec {
+        title: CLOSE_ASK_TITLE.to_string(),
+        text: CLOSE_ASK_CONTENT.to_string(),
+        checkbox: Some((CLOSE_ASK_REMEMBER.to_string(), false)),
+        buttons: vec![
+            BarButton::new(CLOSE_ASK_YES, true),
+            BarButton::new(CLOSE_ASK_NO, false),
+        ],
+    }
+}
+
+/// 镜像 `onExceptionCaught` 的 `MessageBox`（默认「确定」/「取消」两个按钮；
+/// 标题行里那个「查看日志」`TransparentToolButton` 不在按钮组里，Slint 侧
+/// 记在头注释的未镜像项）。
+pub fn exception_dialog(message: &str) -> DialogSpec {
+    DialogSpec {
+        title: EXCEPTION_TITLE.to_string(),
+        text: exception_text(message),
+        checkbox: None,
+        buttons: vec![
+            BarButton::new(DIALOG_OK, true),
+            BarButton::new(DIALOG_CANCEL, false),
+        ],
+    }
+}
+
+/// 镜像 `onPairRequested` 的 `MessageBox`（「允许配对」/「拒绝」）。
+pub fn pair_request_dialog(
+    peer: &str,
+    client_kind: Option<&str>,
+    extension_version: Option<&str>,
+) -> DialogSpec {
+    DialogSpec {
+        title: PAIR_REQUEST_TITLE.to_string(),
+        text: pair_request_text(peer, client_kind, extension_version),
+        checkbox: None,
+        buttons: vec![
+            BarButton::new(PAIR_REQUEST_ALLOW, true),
+            BarButton::new(PAIR_REQUEST_DENY, false),
+        ],
+    }
 }
 
 #[cfg(test)]
@@ -827,6 +961,18 @@ mod tests {
                     match (&case["message"], message) {
                         (serde_json::Value::Null, None) => {}
                         (serde_json::Value::Object(fields), Some(texts)) => {
+                            // 第 57 步：形状层（按钮集合与顺序 + 复选框）逐条对齐。
+                            let spec = close_ask_dialog();
+                            assert_eq!(spec.title, texts[0]);
+                            assert_eq!(spec.text, texts[1]);
+                            assert_eq!(spec.buttons.len(), 2);
+                            assert_eq!(spec.buttons[0].text, texts[2]);
+                            assert_eq!(spec.buttons[1].text, texts[3]);
+                            assert!(spec.buttons[0].primary, "「退出程序」是主按钮");
+                            assert!(!spec.buttons[1].primary);
+                            let (label, checked) = spec.checkbox.expect("ASK 框带复选框");
+                            assert_eq!(label, texts[4]);
+                            assert!(!checked, "「记住我的选择」缺省不勾");
                             assert_eq!(fields["title"].as_str().unwrap(), texts[0]);
                             assert_eq!(fields["content"].as_str().unwrap(), texts[1]);
                             assert_eq!(fields["yes"].as_str().unwrap(), texts[2]);
@@ -852,6 +998,21 @@ mod tests {
                         ),
                         case["content"].as_str().unwrap()
                     );
+                    let spec = pair_request_dialog(
+                        case["peerAddress"].as_str().unwrap(),
+                        case["clientKind"].as_str(),
+                        case["extensionVersion"].as_str(),
+                    );
+                    assert_eq!(spec.title, case["title"].as_str().unwrap());
+                    assert_eq!(spec.text, case["content"].as_str().unwrap());
+                    assert_eq!(spec.checkbox, None);
+                    assert_eq!(
+                        spec.buttons,
+                        vec![
+                            BarButton::new(PAIR_REQUEST_ALLOW, true),
+                            BarButton::new(PAIR_REQUEST_DENY, false),
+                        ]
+                    );
                     // `dialog.exec()` 为真 → approve，否则 reject。
                     let expected = if exec {
                         "approve:req-1"
@@ -868,6 +1029,13 @@ mod tests {
                         other => panic!("未知监听目标 {other}"),
                     };
                     assert_eq!(case["title"].as_str().unwrap(), title);
+                    let spec = listen_failed_info_bar(title, case["content"].as_str().unwrap());
+                    assert_eq!(spec.title, case["title"].as_str().unwrap());
+                    assert_eq!(spec.text, case["content"].as_str().unwrap());
+                    assert_eq!(
+                        spec.buttons,
+                        vec![BarButton::new(LISTEN_FAILED_SETTINGS_BUTTON, false)]
+                    );
                     assert_eq!(
                         strings(&case["buttonTexts"]),
                         vec![LISTEN_FAILED_SETTINGS_BUTTON]
@@ -880,6 +1048,17 @@ mod tests {
                     assert_eq!(
                         case["content"].as_str().unwrap(),
                         update_available_content(case["latestVersion"].as_str().unwrap())
+                    );
+                    let spec = update_available_info_bar(case["latestVersion"].as_str().unwrap());
+                    assert_eq!(spec.title, case["title"].as_str().unwrap());
+                    assert_eq!(spec.text, case["content"].as_str().unwrap());
+                    assert_eq!(
+                        spec.buttons,
+                        vec![
+                            BarButton::new(UPDATE_DOWNLOAD_BUTTON, true),
+                            BarButton::new(UPDATE_DETAIL_BUTTON, false),
+                            BarButton::new(UPDATE_SPONSOR_BUTTON, false),
+                        ]
                     );
                     assert_eq!(
                         strings(&case["buttonTexts"]),
@@ -900,6 +1079,17 @@ mod tests {
                     assert_eq!(case["title"].as_str().unwrap(), EXCEPTION_TITLE);
                     assert_eq!(case["content"].as_str().unwrap(), exception_text(message));
                     assert_eq!(case["logTooltip"].as_str().unwrap(), EXCEPTION_LOG_TOOLTIP);
+                    let spec = exception_dialog(message);
+                    assert_eq!(spec.title, case["title"].as_str().unwrap());
+                    assert_eq!(spec.text, case["content"].as_str().unwrap());
+                    assert_eq!(spec.checkbox, None);
+                    assert_eq!(
+                        spec.buttons,
+                        vec![
+                            BarButton::new(DIALOG_OK, true),
+                            BarButton::new(DIALOG_CANCEL, false),
+                        ]
+                    );
                     // 把 titleLabel 摘出来、塞进带「查看日志」按钮的一行。
                     assert_eq!(strings(&case["layoutOps"]), vec!["remove", "insert"]);
                     let clipboard = strings(&case["clipboard"]);

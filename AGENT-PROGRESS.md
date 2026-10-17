@@ -3114,3 +3114,54 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   1. P0 主链路收口：把 `toggle_action` 接到服务层（暂停/继续/删除的真调用）。
   2. `VPS-MIGRATION.md` 的 P1：设置页剩余卡片（网络/下载/其他三个分区）。
 - 卡点：无
+
+## 2026-10-17 15:41 第 57 步
+- 做了什么：主窗口外壳装配（导航栏 / 标题栏搜索框 / 通知条 / 消息框 / 拖放）
+  接到 Slint（接上一轮未提交的半成品并收口）。
+  - 新增 `rust/crates/gd3-ui/ui/app_shell.slint`（244 行）：`NavItemData` /
+    `BarButtonData` 两个结构体 + `ShellButton`（`PushButton`/`PrimaryPushButton`
+    两态）/ `NavButton`（选中态 = 左侧 3px 指示条 + 底色，`selectable=false`
+    永不选中）/ `ShellInfoBar`（标题 + 正文 + 按钮组 + 固定关闭按钮，
+    镜像 `isClosable=True`）/ `ShellMessageDialog`（模态遮罩 + 面板 +
+    `checkboxLabel == ""` 表示没有复选框）。
+  - `appwindow.slint` 重排为 `_initLayout` 的形状：左导航栏 190px
+    （`navTop` → 弹性空隙 → `navBottom`）+ 右侧 VerticalLayout
+    （标题栏 48px 含搜索框 + 页面栈）；覆盖层按声明顺序决定 z 序
+    （主内容 → 通知条 → 抽屉 → 消息框 → 拖放区）。
+  - `window.rs` 补「形状层」（+190 行）：`nav_items_at(NavPosition)`、
+    `BarButton`/`InfoBarSpec`/`DialogSpec`、`DIALOG_OK`/`DIALOG_CANCEL`
+    （「确定」/「取消」，实证 `MessageBoxBase.__init__` 用 `tr('OK')`/`tr('Cancel')`
+    且本仓库装了中文 translator）、四个构造函数
+    `listen_failed_info_bar` / `update_available_info_bar` /
+    `close_ask_dialog` / `exception_dialog` / `pair_request_dialog`。
+  - `lib.rs` 补装配层（+155 行）：`nav_model` / `set_nav_items` /
+    `switch_page` / `bar_buttons` / `show_info_bar` / `hide_info_bar` /
+    `show_dialog` / `hide_dialog` / `dialog_button_text` / `DropPayload`
+    （`from_transfer` + `drop_input`）/ `ShellActions` + `install_shell_actions`。
+- 决策与理由：
+  - **`switch_page` 一定清空 `searchText`**——镜像 `_updateSearchTarget`
+    无条件先 `self.searchEdit.clear()`。
+  - **`DropPayload.has_urls` 按 `has_file_paths()` 判定**：Slint 1.18 的
+    `data-transfer` 只暴露本地文件路径与纯文本（`i-slint-compiler-1.18.1/
+    builtin_elements.rs` 里 URL 列表未导出），与 Qt 的 `mimeData().urls()`
+    有差异，已写进结构体文档注释，等 slint 暴露再补。
+  - **按钮分派只回传序号**（`BarButtonData.index` = Python `addWidget(...)`
+    的顺序），按钮身份 → 行为的映射留在调用方，派生层不持有行为。
+  - **`dialogCheckboxLabel == ""` 当「没有复选框」**——Slint 没有 Option
+    属性，用空串承载 `textLayout.addWidget(checkbox)` 的有无。
+  - **`nav_model` 的 `selected` 只对 `selectable` 项可能为真**——Qt 侧
+    `_addPage` 只对真页面调 `setSelected`，「新建任务」从未进入选中态。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error。
+  - `cargo test -p gd3-ui`：**112 → 115 passed**（新增 3 个无头冒烟：
+    `shell_nav_and_search_follow_route_headless` /
+    `shell_info_bar_and_dialog_assembly_headless` /
+    `drop_payload_maps_to_drop_input`）。
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers`：250 passed（未受影响，
+    本步只动 gd3-ui）。
+- 下一步：
+  1. P0 收口：核对 `cards/task_cards.py` 与 `card.rs` 的覆盖差（按钮态 /
+     右键菜单 / 卡片高度）。
+  2. 之后按 P1 推进设置页剩余卡片。
+- 卡点：无

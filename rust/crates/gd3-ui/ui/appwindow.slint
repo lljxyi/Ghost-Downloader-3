@@ -1,9 +1,18 @@
-// Ghost-Downloader-3 Slint UI（Phase 7a 脚手架。
-// 当前只装一个最小窗口骨架，逐页 strangler 迁移时按 Qt 版一一镜像展开。
+// Ghost-Downloader-3 Slint UI 主窗口（Phase 7c 第 57 步：外壳接线）。
+//
+// 布局镜像 `main_window.py::_initLayout`：
+//   左导航栏（190px，TOP 组 + 弹性空隙 + BOTTOM 组）
+//   └ 右侧 VerticalLayout（标题栏 48px 含搜索框 + 页面栈）
+// 通知条 / 消息框 / 任务抽屉 / 拖放区都是同级覆盖层（绝对定位），
+// 顺序即 z 序：主内容 → 通知条 → 抽屉 → 消息框 → 拖放区。
+//
+// 语义镜像、不追求像素一致：图标只有名字（`NavItemData.icon`），
+// 主题色/圆角/阴影留给主题对齐步。
 
-import { VerticalBox } from "std-widgets.slint";
+import { LineEdit } from "std-widgets.slint";
 import { TaskPage, TaskRow } from "task_page.slint";
 import { DrawerChecksumRow, DrawerFileRow, DrawerInfoRow, TaskDrawer } from "task_drawer.slint";
+import { BarButtonData, NavButton, NavItemData, ShellInfoBar, ShellMessageDialog } from "app_shell.slint";
 import {
     CategoryEditDraft,
     HeadersEditDraft,
@@ -224,158 +233,303 @@ export component AppWindow inherits Window {
     callback sortFieldChanged(int);
     callback sortOrderChanged(int);
 
-    // 第 53 步：抽屉覆盖层要与主内容同级叠放，故外层套一个撑满窗口的
-    // Rectangle（Rectangle 不参与布局，子元素按各自几何叠放）。
+    // -----------------------------------------------------------------
+    // 第 57 步：外壳（导航栏 / 标题栏搜索框 / 通知条 / 消息框 / 拖放区）
+    // -----------------------------------------------------------------
+    // 当前路由 = 页面栈里可见的那一页（`window::PAGE_TASK` / `PAGE_SETTINGS`）。
+    in-out property <string> currentRoute: "TaskPage";
+    // 导航项按 `NavigationItemPosition` 拆成两个 model（TOP 贴顶、BOTTOM
+    // 贴底），顺序由 `window::nav_items_at` 给。
+    in property <[NavItemData]> navTop;
+    in property <[NavItemData]> navBottom;
+    // 搜索框：`window::search_target(route)` 决定可见性与 placeholder。
+    in-out property <bool> searchVisible: true;
+    in property <string> searchPlaceholder: "搜索任务";
+    in-out property <string> searchText: "";
+    // 通知条（`InfoBar`）：形状来自 `window::listen_failed_info_bar` /
+    // `update_available_info_bar`。
+    in-out property <bool> infoBarVisible: false;
+    in-out property <string> infoBarTitle: "";
+    in-out property <string> infoBarText: "";
+    in property <[BarButtonData]> infoBarButtons;
+    // 消息框（`MessageBoxBase` 家族）：形状来自 `window::close_ask_dialog` /
+    // `exception_dialog` / `pair_request_dialog`。`dialogCheckboxLabel == ""`
+    // 即没有复选框。
+    in-out property <bool> dialogVisible: false;
+    in-out property <string> dialogTitle: "";
+    in-out property <string> dialogText: "";
+    in-out property <string> dialogCheckboxLabel: "";
+    in-out property <bool> dialogCheckboxChecked: false;
+    in property <[BarButtonData]> dialogButtons;
+    callback navItemClicked(string);
+    callback searchEdited(string);
+    callback infoBarButtonClicked(int);
+    callback infoBarClosed();
+    callback dialogButtonClicked(int);
+    callback dialogCheckboxToggled(bool);
+    // 拖放：`data-transfer` 在 Slint 里不透明，只能由宿主语言读
+    // （`DataTransfer::has_file_paths` / `file_paths` / `plain_text`）。
+    // 判定仍走 `window::drop_decision` / `drop_urls`。
+    pure callback canDropPayload(data-transfer) -> bool;
+    pure callback dropPayload(data-transfer);
+
+
+    // 外层 Rectangle 撑满窗口并裁剪：所有覆盖层（通知条/抽屉/消息框/
+    // 拖放区）都与主内容同级叠放，按声明顺序决定 z 序。
     Rectangle {
         width: 100%;
         height: 100%;
         clip: true;
+        background: white;
 
-        VerticalBox {
-            Text {
-                text: root.statusText;
-                font-size: 18px;
-                vertical-alignment: center;
+        // ---- 左侧导航栏（190px，镜像 `navigationInterface` 宽度）----
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: 190px;
+            height: parent.height;
+            background: #f7f7f7;
+
+            VerticalLayout {
+                padding-top: 8px;
+                padding-bottom: 8px;
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 4px;
+                for nav in root.navTop : NavButton {
+                    item: nav;
+                    clicked => {
+                        root.navItemClicked(nav.routeKey);
+                    }
+                }
+                // 弹性空隙：TOP 组贴顶、BOTTOM 组贴底。
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: transparent;
+                }
+                for nav in root.navBottom : NavButton {
+                    item: nav;
+                    clicked => {
+                        root.navItemClicked(nav.routeKey);
+                    }
+                }
             }
-            TaskPage {
-                tasks: root.tasks;
-                filterMode: root.filterMode;
-                highlightAll: root.highlightAll;
-                highlightActive: root.highlightActive;
-                highlightCompleted: root.highlightCompleted;
-                categoryNames: root.categoryNames;
-                categoryEnabled: root.categoryEnabled;
-                categoryIndex <=> root.categoryIndex;
-                sortFieldIndex <=> root.sortFieldIndex;
-                sortOrderIndex <=> root.sortOrderIndex;
-                searchChanged(value) => { root.searchChanged(value); }
-                filterModeChanged(value) => { root.filterModeChanged(value); }
-                taskPause(taskId) => { root.taskPause(taskId); }
-                taskDelete(taskId) => { root.taskDelete(taskId); }
-                taskToggle(taskId) => { root.taskToggle(taskId); }
-                taskSelectFiles(taskId) => { root.taskSelectFiles(taskId); }
-                taskChecksum(taskId) => { root.taskChecksum(taskId); }
-                taskOpenFile(taskId) => { root.taskOpenFile(taskId); }
-                taskOpenFolder(taskId) => { root.taskOpenFolder(taskId); }
-                taskOpenDrawer(taskId) => { root.taskOpenDrawer(taskId); }
-                categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
-                sortFieldChanged(index) => { root.sortFieldChanged(index); }
-                sortOrderChanged(index) => { root.sortOrderChanged(index); }
+        }
+
+        // ---- 右侧：标题栏 + 页面栈 ----
+        Rectangle {
+            x: 190px;
+            y: 0;
+            width: parent.width - 190px;
+            height: parent.height;
+
+            VerticalLayout {
+                // 标题栏（48px）：搜索框 + 状态文本。
+                Rectangle {
+                    height: 48px;
+                    background: #fafafa;
+
+                    Rectangle {
+                        x: 0;
+                        y: parent.height - 1px;
+                        width: parent.width;
+                        height: 1px;
+                        background: #e5e5e5;
+                    }
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+                        LineEdit {
+                            width: 240px;
+                            height: 32px;
+                            visible: root.searchVisible;
+                            placeholder-text: root.searchPlaceholder;
+                            text <=> root.searchText;
+                            edited(text) => {
+                                root.searchEdited(text);
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: transparent;
+                        }
+                        Text {
+                            text: root.statusText;
+                            font-size: 13px;
+                            color: #666;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                // 页面栈：两个页面绝对铺满，按 `currentRoute` 切换可见性
+                // （镜像 `QStackedWidget`）。
+                Rectangle {
+                    clip: true;
+                    background: white;
+
+                    TaskPage {
+                        visible: root.currentRoute == "TaskPage";
+                        tasks: root.tasks;
+                        filterMode: root.filterMode;
+                        highlightAll: root.highlightAll;
+                        highlightActive: root.highlightActive;
+                        highlightCompleted: root.highlightCompleted;
+                        categoryNames: root.categoryNames;
+                        categoryEnabled: root.categoryEnabled;
+                        categoryIndex <=> root.categoryIndex;
+                        sortFieldIndex <=> root.sortFieldIndex;
+                        sortOrderIndex <=> root.sortOrderIndex;
+                        searchChanged(value) => { root.searchChanged(value); }
+                        filterModeChanged(value) => { root.filterModeChanged(value); }
+                        taskPause(taskId) => { root.taskPause(taskId); }
+                        taskDelete(taskId) => { root.taskDelete(taskId); }
+                        taskToggle(taskId) => { root.taskToggle(taskId); }
+                        taskSelectFiles(taskId) => { root.taskSelectFiles(taskId); }
+                        taskChecksum(taskId) => { root.taskChecksum(taskId); }
+                        taskOpenFile(taskId) => { root.taskOpenFile(taskId); }
+                        taskOpenFolder(taskId) => { root.taskOpenFolder(taskId); }
+                        taskOpenDrawer(taskId) => { root.taskOpenDrawer(taskId); }
+                        categoryFilterChanged(index) => { root.categoryFilterChanged(index); }
+                        sortFieldChanged(index) => { root.sortFieldChanged(index); }
+                        sortOrderChanged(index) => { root.sortOrderChanged(index); }
+                    }
+
+                    SettingsPage {
+                        visible: root.currentRoute == "SettingPage";
+                        downloadFolder <=> root.downloadFolder;
+                        maxTaskNum <=> root.maxTaskNum;
+                        preBlockNum <=> root.preBlockNum;
+                        categoryEnabled <=> root.categoryEnabled;
+                        downloadFolderChanged(value) => { root.downloadFolderChanged(value); }
+                        maxTaskNumChanged(value) => { root.maxTaskNumChanged(value); }
+                        preBlockNumChanged(value) => { root.preBlockNumChanged(value); }
+                        categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
+                        speedLimitationKb <=> root.speedLimitationKb;
+                        speedLimitationChanged(kb) => { root.speedLimitationChanged(kb); }
+                        autoSpeedUp <=> root.autoSpeedUp;
+                        maxReassignSize <=> root.maxReassignSize;
+                        preserveLastModified <=> root.preserveLastModified;
+                        verifySsl <=> root.verifySsl;
+                        nameConflictIndex <=> root.nameConflictIndex;
+                        useSystemDns <=> root.useSystemDns;
+                        autoSpeedUpChanged(v) => { root.autoSpeedUpChanged(v); }
+                        maxReassignSizeChanged(v) => { root.maxReassignSizeChanged(v); }
+                        preserveLastModifiedChanged(v) => { root.preserveLastModifiedChanged(v); }
+                        verifySslChanged(v) => { root.verifySslChanged(v); }
+                        nameConflictChanged(v) => { root.nameConflictChanged(v); }
+                        useSystemDnsChanged(v) => { root.useSystemDnsChanged(v); }
+                        proxyChoice <=> root.proxyChoice;
+                        proxyProtocolIndex <=> root.proxyProtocolIndex;
+                        proxyHost <=> root.proxyHost;
+                        proxyPort <=> root.proxyPort;
+                        proxyUser <=> root.proxyUser;
+                        proxyPass <=> root.proxyPass;
+                        proxyChoiceChanged(c) => { root.proxyChoiceChanged(c); }
+                        proxyFieldsChanged(p, h, t, u, w) => { root.proxyFieldsChanged(p, h, t, u, w); }
+                        aria2Enabled <=> root.aria2Enabled;
+                        aria2RpcPort <=> root.aria2RpcPort;
+                        aria2RpcToken <=> root.aria2RpcToken;
+                        aria2EmulateFingerprint <=> root.aria2EmulateFingerprint;
+                        aria2EnabledChanged(v) => { root.aria2EnabledChanged(v); }
+                        aria2RpcPortChanged(v) => { root.aria2RpcPortChanged(v); }
+                        aria2RpcTokenChanged(t) => { root.aria2RpcTokenChanged(t); }
+                        aria2EmulateFingerprintChanged(v) => { root.aria2EmulateFingerprintChanged(v); }
+                        browserEnabled <=> root.browserEnabled;
+                        browserDraftTaken <=> root.browserDraftTaken;
+                        browserPort <=> root.browserPort;
+                        browserEnabledChanged(v) => { root.browserEnabledChanged(v); }
+                        browserDraftTakenChanged(v) => { root.browserDraftTakenChanged(v); }
+                        browserPortChanged(v) => { root.browserPortChanged(v); }
+                        copyPairToken() => { root.copyPairToken(); }
+                        regeneratePairToken() => { root.regeneratePairToken(); }
+                        openStoreUrl(url) => { root.openStoreUrl(url); }
+                        chromiumInstall() => { root.chromiumInstall(); }
+                        clientProfileIndex <=> root.clientProfileIndex;
+                        clientProfileChanged(i) => { root.clientProfileChanged(i); }
+                        headersPresetNames <=> root.headersPresetNames;
+                        headersPresetIndex <=> root.headersPresetIndex;
+                        headersPresetHeaderCount <=> root.headersPresetHeaderCount;
+                        headersPresetCanRemove <=> root.headersPresetCanRemove;
+                        headersPresetPicked(i) => { root.headersPresetPicked(i); }
+                        headersPresetRemoveRequested(i) => { root.headersPresetRemoveRequested(i); }
+                        identityPresets <=> root.identityPresets;
+                        identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
+                        identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
+                        identityEditVisible <=> root.identityEditVisible;
+                        identityEditIndex <=> root.identityEditIndex;
+                        identityEditName <=> root.identityEditName;
+                        identityEditHosts <=> root.identityEditHosts;
+                        identityEditHostsError <=> root.identityEditHostsError;
+                        identityEditProfile <=> root.identityEditProfile;
+                        identityEditProfileIndex <=> root.identityEditProfileIndex;
+                        identityEditProfileLabels <=> root.identityEditProfileLabels;
+                        identityEditProfileValues <=> root.identityEditProfileValues;
+                        identityEditUserAgent <=> root.identityEditUserAgent;
+                        identityEditHelpVisible <=> root.identityEditHelpVisible;
+                        identityPresetAddRequested() => { root.identityPresetAddRequested(); }
+                        identityPresetEditRequested(i) => { root.identityPresetEditRequested(i); }
+                        identityPresetEditClosed() => { root.identityPresetEditClosed(); }
+                        identityPresetEditAccepted(d) => { root.identityPresetEditAccepted(d); }
+                        categoryRows <=> root.categoryRows;
+                        categoryRuleCount <=> root.categoryRuleCount;
+                        categoryResetRequested() => { root.categoryResetRequested(); }
+                        categoryRemoveRequested(id) => { root.categoryRemoveRequested(id); }
+                        categoryIconChoices <=> root.categoryIconChoices;
+                        categoryEditVisible <=> root.categoryEditVisible;
+                        categoryEditId <=> root.categoryEditId;
+                        categoryEditName <=> root.categoryEditName;
+                        categoryEditIconIndex <=> root.categoryEditIconIndex;
+                        categoryEditExtensions <=> root.categoryEditExtensions;
+                        categoryEditFolder <=> root.categoryEditFolder;
+                        categoryAddRequested() => { root.categoryAddRequested(); }
+                        categoryEditRequested(id) => { root.categoryEditRequested(id); }
+                        categoryEditClosed() => { root.categoryEditClosed(); }
+                        categoryEditAccepted(d) => { root.categoryEditAccepted(d); }
+                        headersEditVisible <=> root.headersEditVisible;
+                        headersEditIndex <=> root.headersEditIndex;
+                        headersEditName <=> root.headersEditName;
+                        headersEditPairs <=> root.headersEditPairs;
+                        headersEditNameError <=> root.headersEditNameError;
+                        headersEditDuplicateWarning <=> root.headersEditDuplicateWarning;
+                        headersPresetAddRequested() => { root.headersPresetAddRequested(); }
+                        headersPresetEditRequested(i) => { root.headersPresetEditRequested(i); }
+                        headersPresetEditClosed() => { root.headersPresetEditClosed(); }
+                        headersPresetEditAccepted(d) => { root.headersPresetEditAccepted(d); }
+                        headersPresetPairsEdited(text) => { root.headersPresetPairsEdited(text); }
+                        exportCrx() => { root.exportCrx(); }
+                        urlSchemeEnabled <=> root.urlSchemeEnabled;
+                        checkUpdateAtStartup <=> root.checkUpdateAtStartup;
+                        runAtLogin <=> root.runAtLogin;
+                        closeModeIndex <=> root.closeModeIndex;
+                        clipboardListener <=> root.clipboardListener;
+                        urlSchemeEnabledChanged(v) => { root.urlSchemeEnabledChanged(v); }
+                        checkUpdateAtStartupChanged(v) => { root.checkUpdateAtStartupChanged(v); }
+                        runAtLoginChanged(v) => { root.runAtLoginChanged(v); }
+                        closeModeChanged(i) => { root.closeModeChanged(i); }
+                        clipboardListenerChanged(v) => { root.clipboardListenerChanged(v); }
+                        uiScalePercent <=> root.uiScalePercent;
+                        uiScaleChanged(v) => { root.uiScaleChanged(v); }
+                    }
+                }
             }
-            SettingsPage {
-                downloadFolder <=> root.downloadFolder;
-                maxTaskNum <=> root.maxTaskNum;
-                preBlockNum <=> root.preBlockNum;
-                categoryEnabled <=> root.categoryEnabled;
-                downloadFolderChanged(value) => { root.downloadFolderChanged(value); }
-                maxTaskNumChanged(value) => { root.maxTaskNumChanged(value); }
-                preBlockNumChanged(value) => { root.preBlockNumChanged(value); }
-                categoryEnabledChanged(value) => { root.categoryEnabledChanged(value); }
-                speedLimitationKb <=> root.speedLimitationKb;
-                speedLimitationChanged(kb) => { root.speedLimitationChanged(kb); }
-                autoSpeedUp <=> root.autoSpeedUp;
-                maxReassignSize <=> root.maxReassignSize;
-                preserveLastModified <=> root.preserveLastModified;
-                verifySsl <=> root.verifySsl;
-                nameConflictIndex <=> root.nameConflictIndex;
-                useSystemDns <=> root.useSystemDns;
-                autoSpeedUpChanged(v) => { root.autoSpeedUpChanged(v); }
-                maxReassignSizeChanged(v) => { root.maxReassignSizeChanged(v); }
-                preserveLastModifiedChanged(v) => { root.preserveLastModifiedChanged(v); }
-                verifySslChanged(v) => { root.verifySslChanged(v); }
-                nameConflictChanged(v) => { root.nameConflictChanged(v); }
-                useSystemDnsChanged(v) => { root.useSystemDnsChanged(v); }
-                proxyChoice <=> root.proxyChoice;
-                proxyProtocolIndex <=> root.proxyProtocolIndex;
-                proxyHost <=> root.proxyHost;
-                proxyPort <=> root.proxyPort;
-                proxyUser <=> root.proxyUser;
-                proxyPass <=> root.proxyPass;
-                proxyChoiceChanged(c) => { root.proxyChoiceChanged(c); }
-                proxyFieldsChanged(p, h, t, u, w) => { root.proxyFieldsChanged(p, h, t, u, w); }
-                aria2Enabled <=> root.aria2Enabled;
-                aria2RpcPort <=> root.aria2RpcPort;
-                aria2RpcToken <=> root.aria2RpcToken;
-                aria2EmulateFingerprint <=> root.aria2EmulateFingerprint;
-                aria2EnabledChanged(v) => { root.aria2EnabledChanged(v); }
-                aria2RpcPortChanged(v) => { root.aria2RpcPortChanged(v); }
-                aria2RpcTokenChanged(t) => { root.aria2RpcTokenChanged(t); }
-                aria2EmulateFingerprintChanged(v) => { root.aria2EmulateFingerprintChanged(v); }
-                browserEnabled <=> root.browserEnabled;
-                browserDraftTaken <=> root.browserDraftTaken;
-                browserPort <=> root.browserPort;
-                browserEnabledChanged(v) => { root.browserEnabledChanged(v); }
-                browserDraftTakenChanged(v) => { root.browserDraftTakenChanged(v); }
-                browserPortChanged(v) => { root.browserPortChanged(v); }
-                copyPairToken() => { root.copyPairToken(); }
-                regeneratePairToken() => { root.regeneratePairToken(); }
-                openStoreUrl(url) => { root.openStoreUrl(url); }
-                chromiumInstall() => { root.chromiumInstall(); }
-                clientProfileIndex <=> root.clientProfileIndex;
-                clientProfileChanged(i) => { root.clientProfileChanged(i); }
-                headersPresetNames <=> root.headersPresetNames;
-                headersPresetIndex <=> root.headersPresetIndex;
-                headersPresetHeaderCount <=> root.headersPresetHeaderCount;
-                headersPresetCanRemove <=> root.headersPresetCanRemove;
-                headersPresetPicked(i) => { root.headersPresetPicked(i); }
-                headersPresetRemoveRequested(i) => { root.headersPresetRemoveRequested(i); }
-                identityPresets <=> root.identityPresets;
-                identityPresetToggled(i, v) => { root.identityPresetToggled(i, v); }
-                identityPresetRemoveRequested(i) => { root.identityPresetRemoveRequested(i); }
-                identityEditVisible <=> root.identityEditVisible;
-                identityEditIndex <=> root.identityEditIndex;
-                identityEditName <=> root.identityEditName;
-                identityEditHosts <=> root.identityEditHosts;
-                identityEditHostsError <=> root.identityEditHostsError;
-                identityEditProfile <=> root.identityEditProfile;
-                identityEditProfileIndex <=> root.identityEditProfileIndex;
-                identityEditProfileLabels <=> root.identityEditProfileLabels;
-                identityEditProfileValues <=> root.identityEditProfileValues;
-                identityEditUserAgent <=> root.identityEditUserAgent;
-                identityEditHelpVisible <=> root.identityEditHelpVisible;
-                identityPresetAddRequested() => { root.identityPresetAddRequested(); }
-                identityPresetEditRequested(i) => { root.identityPresetEditRequested(i); }
-                identityPresetEditClosed() => { root.identityPresetEditClosed(); }
-                identityPresetEditAccepted(d) => { root.identityPresetEditAccepted(d); }
-                categoryRows <=> root.categoryRows;
-                categoryRuleCount <=> root.categoryRuleCount;
-                categoryResetRequested() => { root.categoryResetRequested(); }
-                categoryRemoveRequested(id) => { root.categoryRemoveRequested(id); }
-                categoryIconChoices <=> root.categoryIconChoices;
-                categoryEditVisible <=> root.categoryEditVisible;
-                categoryEditId <=> root.categoryEditId;
-                categoryEditName <=> root.categoryEditName;
-                categoryEditIconIndex <=> root.categoryEditIconIndex;
-                categoryEditExtensions <=> root.categoryEditExtensions;
-                categoryEditFolder <=> root.categoryEditFolder;
-                categoryAddRequested() => { root.categoryAddRequested(); }
-                categoryEditRequested(id) => { root.categoryEditRequested(id); }
-                categoryEditClosed() => { root.categoryEditClosed(); }
-                categoryEditAccepted(d) => { root.categoryEditAccepted(d); }
-                headersEditVisible <=> root.headersEditVisible;
-                headersEditIndex <=> root.headersEditIndex;
-                headersEditName <=> root.headersEditName;
-                headersEditPairs <=> root.headersEditPairs;
-                headersEditNameError <=> root.headersEditNameError;
-                headersEditDuplicateWarning <=> root.headersEditDuplicateWarning;
-                headersPresetAddRequested() => { root.headersPresetAddRequested(); }
-                headersPresetEditRequested(i) => { root.headersPresetEditRequested(i); }
-                headersPresetEditClosed() => { root.headersPresetEditClosed(); }
-                headersPresetEditAccepted(d) => { root.headersPresetEditAccepted(d); }
-                headersPresetPairsEdited(text) => { root.headersPresetPairsEdited(text); }
-                exportCrx() => { root.exportCrx(); }
-                urlSchemeEnabled <=> root.urlSchemeEnabled;
-                checkUpdateAtStartup <=> root.checkUpdateAtStartup;
-                runAtLogin <=> root.runAtLogin;
-                closeModeIndex <=> root.closeModeIndex;
-                clipboardListener <=> root.clipboardListener;
-                urlSchemeEnabledChanged(v) => { root.urlSchemeEnabledChanged(v); }
-                checkUpdateAtStartupChanged(v) => { root.checkUpdateAtStartupChanged(v); }
-                runAtLoginChanged(v) => { root.runAtLoginChanged(v); }
-                closeModeChanged(i) => { root.closeModeChanged(i); }
-                clipboardListenerChanged(v) => { root.clipboardListenerChanged(v); }
-                uiScalePercent <=> root.uiScalePercent;
-                uiScaleChanged(v) => { root.uiScaleChanged(v); }
+        }
+
+        // ---- 通知条：贴在标题栏下方（镜像 `InfoBar` 加进主布局）----
+        if root.infoBarVisible : ShellInfoBar {
+            x: 190px + 16px;
+            y: 48px + 8px;
+            width: parent.width - 190px - 32px;
+            title: root.infoBarTitle;
+            text: root.infoBarText;
+            buttons: root.infoBarButtons;
+            buttonClicked(index) => {
+                root.infoBarButtonClicked(index);
+            }
+            closeRequested => {
+                root.infoBarClosed();
             }
         }
 
@@ -419,6 +573,37 @@ export component AppWindow inherits Window {
             }
             revealInFolderRequested(taskId) => {
                 root.drawerRevealInFolderRequested(taskId);
+            }
+        }
+
+        // ---- 消息框（close-ask / exception / pair 共用）----
+        ShellMessageDialog {
+            width: 100%;
+            height: 100%;
+            opened: root.dialogVisible;
+            title: root.dialogTitle;
+            text: root.dialogText;
+            checkboxLabel: root.dialogCheckboxLabel;
+            checkboxChecked <=> root.dialogCheckboxChecked;
+            buttons: root.dialogButtons;
+            buttonClicked(index) => {
+                root.dialogButtonClicked(index);
+            }
+            checkboxToggled(checked) => {
+                root.dialogCheckboxToggled(checked);
+            }
+        }
+
+        // ---- 拖放区（镜像 `dragEnterEvent` / `dropEvent`）----
+        DropArea {
+            width: 100%;
+            height: 100%;
+            can-drop(event) => {
+                root.canDropPayload(event.data) ? DragAction.copy : DragAction.none
+            }
+            dropped(event) => {
+                root.dropPayload(event.data);
+                return event.proposed-action;
             }
         }
     }
