@@ -2,6 +2,7 @@
 //!
 //! 迁移期与 Python 实现共用同一份磁盘格式：两侧都能读写 `tasks.jsonl` 与 `.ghd`。
 
+pub mod config;
 pub mod container;
 pub mod ed2k;
 pub mod filename;

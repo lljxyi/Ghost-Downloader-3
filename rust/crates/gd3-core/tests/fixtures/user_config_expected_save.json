@@ -1,0 +1,14 @@
+{
+    "Category": {
+        "EnableCategory": "False",
+        "KeyboardCategory": "音频"
+    },
+    "GeneralDownload": {
+        "DownloadFolder": "C:/downloads",
+        "MaxTaskNum": "5",
+        "isSpeedLimitEnabled": "False"
+    },
+    "Network": {
+        "ClientProfile": "manual"
+    }
+}

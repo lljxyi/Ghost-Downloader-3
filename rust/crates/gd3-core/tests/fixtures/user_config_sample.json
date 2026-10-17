@@ -1,0 +1,14 @@
+{
+    "GeneralDownload": {
+        "MaxTaskNum": "3",
+        "isSpeedLimitEnabled": "False",
+        "DownloadFolder": "C:/downloads"
+    },
+    "Category": {
+        "EnableCategory": "True",
+        "KeyboardCategory": "视频"
+    },
+    "Network": {
+        "ClientProfile": "auto"
+    }
+}
