@@ -53,7 +53,8 @@ def parse(case: dict):
         return kelpieModule.parseProgress(case["message"])
 
 
-def test_switch_defaults_off():
+def test_switch_defaults_off(monkeypatch):
+    monkeypatch.delenv(SWITCH, raising=False)
     assert rust_progress.isEnabled() is False
 
 
