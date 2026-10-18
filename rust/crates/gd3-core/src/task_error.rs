@@ -78,6 +78,15 @@ impl TaskError {
         }
     }
 
+    /// 安装完运行时后仍找不到可执行文件
+    /// （`app/services/runtime_status.py:110` 的 `TaskError("安装后未找到 {name}")`）。
+    pub fn install_not_found(name: &str) -> Self {
+        TaskError {
+            message: "安装后未找到 {name}",
+            params: vec![("name", name.to_string())],
+        }
+    }
+
     pub fn io(error: impl fmt::Display) -> Self {
         TaskError {
             message: "发生了意外错误：{detail}",

@@ -972,10 +972,72 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **3180 行 / 72 单测**
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **3611 行 / 77 单测**
 （其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个、
-做种 9 个、校验与 `_rebalance` 9 个、删除/重下/分类/批量 7 个）；
-`task_actions.rs` **916 行 / 15 单测**（效果队列的顺序全部钉死）。
+做种 9 个、校验与 `_rebalance` 9 个、删除/重下/分类/批量 7 个、编辑与选择 5 个）；
+`task_actions.rs` **1116 行 / 18 单测**（效果队列的顺序全部钉死）。
+
+## 运行时状态（`gd3-ui::runtime_status`）
+
+`app/services/runtime_status.py`（195 行）的移植。它把「某个运行时（ffmpeg / yt-dlp /
+aria2 …）装没装、什么版本、有没有新版、正在装到几成」收在一处，设置页的 `RuntimeCard`
+只读它的快照。Python 侧靠协程运行器：`submit(coro, done=…, failed=…)` 拿 `workId`，
+`statusChanged.emit(status)` 通知 View。
+
+Rust 没有协程运行时，沿用第 100/101 步的做法：**服务只算状态与意图，副作用摊成
+`RuntimeEffect` 队列**，宿主按序消费：
+
+| 效果 | 宿主该做什么 |
+|---|---|
+| `Emit(status)` | 更新 `RuntimeCard`（`setting_cards::runtime_view`） |
+| `CancelWork(work_id)` | 取消对应工作（句柄由服务发号，宿主当不透明值） |
+| `Run { work_id, runtime_id, kind }` | 去跑 `probe_version` / `fetch_latest_version` / `install`，再回调 `on_*` |
+
+顺序与 Python 一致：`Emit` 总在 `Run` **之前**（`_probe` / `install` 都是先置状态再
+`submit`），`CancelWork` 在最前（Python 先 `cancel(workId)` 再改状态）。
+
+### 状态机（逐条对齐）
+
+| Python | Rust | 备注 |
+|---|---|---|
+| `status(runtime)` | `status(&dyn BinaryRuntime)` | 没登记过就现造一个只带 id/name/path 的 |
+| `refreshStatus` | `refresh_status` | 已知状态干净且路径没变 → **无效果**（不重复探测） |
+| `invalidate` | `invalidate` | 先 `CancelWork` 再 `probe` |
+| `install` | `install` | 已在装 → 无效果；版本号取当前状态的 `latestVersion`（可为 `""`） |
+| `cancelInstall` | `cancel_install` | 没在装 → 无效果 |
+| `_runInstall` 的 `reportProgress` | `report_progress` | 只在「正在装 + 整数进度变了」时 `Emit` |
+| `_runInstall` 尾巴的 `isAppManaged()` 检查 | `check_installed` | 失败返回 `TaskError::install_not_found(name)` |
+| `_onInstallFinished` | `on_install_finished` | 先摘 `workId` 再 `invalidate` → **不会**吐 `CancelWork` |
+| `_onInstallFailed` | `on_install_failed` | 不在装 → 忽略（迟到的失败回调） |
+| `_onProbeFinished` | `on_probe_finished` | `name` / `path` 是**探测时快照**；`isAppManaged()` 才继续 `fetchLatest` |
+| `_onProbeFailed` | `on_probe_failed` | 记 `error`、丢掉持有对象 |
+| `_onFetchFinished` | `on_fetch_finished` | 版本为空 → 不改状态；状态不存在 → 什么都不做 |
+| `_onFetchFailed` | `on_fetch_failed` | **只清账**，不吐效果（Python 也只有两行 `pop`） |
+
+### 关键决策
+
+- **`workId` 由服务自己发号**（`runtime-1` / `runtime-2` …，一个全局计数器）：Python 是
+  `coroutineRunner.submit` 的返回值，Rust 侧宿主就是运行器，服务替它发号才能记账
+  （同第 100 步 `task_actions`：宿主把它当不透明句柄原样交回 `CancelWork`）。
+- **`BinaryRuntime::runtime_id` 进 vtable**（去掉 `where Self: Sized`）：服务按
+  `runtimeId` 记账，手上是 `Rc<dyn BinaryRuntime>`（Python 是 `dict[str, BinaryRuntime]`），
+  带 `where Self: Sized` 就调不到。trait 仍然 object-safe。
+- **`_runtimes` 用 `Rc<dyn BinaryRuntime>`**：Python 在异步间隙里攥着对象引用，
+  `_onProbeFinished` 要问它 `isAppManaged()`、`_onInstallFinished` 要再 `invalidate`
+  一次。`Rc` 是这一层唯一能表达「服务与调用方共享同一份对象」的写法。
+- **`BinaryRuntime` 新增两个同步默认方法**：`fetch_latest_version`（缺省 `Ok("")`，
+  对齐基类 `return ""`）、`install`（缺省 `Unsupported`，对齐 `raise NotImplementedError`）。
+  两者在 Python 都是 `async`，Rust 同步阻塞，需要时由宿主丢线程。
+- **`report_progress` 的 `percent as i32`**：Python 是 `int(percent)`（向零截断），对
+  `NaN` 抛 `ValueError`；`as i32` 饱和到 `0`。实际无影响——进度由本仓自己的 `install`
+  实现回报。
+- **`to_card_status` / `card_view` 把本地化函数当参数**：`setting_cards::RuntimeStatus.error`
+  是**已本地化文本**（Python `toLocalizedError(status.error)`），而 `gd3-ui` 只有错误键
+  与参数、没有翻译表，所以翻译这一步由调用方注入。
+
+规模：`runtime_status.rs` **932 行 / 22 单测**；
+`gd3-core/src/pack.rs` 加两个默认方法 + `runtime_id` 进 vtable（**1180 行 / 38 单测**）；
+`task_error.rs` 加 `install_not_found`。
 
 ## 剩余工作（Phase 8）
 

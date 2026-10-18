@@ -51,8 +51,9 @@
 //! 4. `runtimeId` 是 `f"{cls.__module__}.{cls.__qualname__}"`；Rust 用
 //!    `std::any::type_name::<Self>()`（形如 `gd3_ui::runtime::FfmpegRuntime`），
 //!    两边都是「类型全名」，但**字符串不同**，不能混用作持久化键。
-//! 5. `probeVersion` 在 Python 是 `async`（`create_subprocess_exec`）；Rust 是
-//!    同步 `Command`，调用方需要时自己丢到线程里。
+//!    （[`BinaryRuntime::runtime_id`] 在 vtable 里，`&dyn BinaryRuntime` 也能调。）
+//! 5. `probeVersion` / `fetchLatestVersion` / `install` 在 Python 是 `async`；
+//!    Rust 全是同步阻塞，调用方需要时自己丢到线程里。
 //!
 //! 规格来源：`app/models/pack.py:22-247`、`app/install.py:15-25`。
 
@@ -365,11 +366,10 @@ pub trait BinaryRuntime {
 
     /// `runtimeId`：`f"{cls.__module__}.{cls.__qualname__}"` 的 Rust 对应物。
     ///
-    /// `where Self: Sized` 让它不进 vtable，trait 仍然 object-safe。
-    fn runtime_id(&self) -> &'static str
-    where
-        Self: Sized,
-    {
+    /// **进 vtable**：`gd3_ui::runtime_status` 要按 `runtimeId` 记账，而它拿到的
+    /// 是 `Rc<dyn BinaryRuntime>`（Python 那边是 `dict[str, BinaryRuntime]`），
+    /// 所以不能带 `where Self: Sized`。trait 仍然 object-safe。
+    fn runtime_id(&self) -> &'static str {
         type_name::<Self>()
     }
 
@@ -417,6 +417,25 @@ pub trait BinaryRuntime {
                 .unwrap_or_default(),
             detail: String::new(),
         })
+    }
+
+    /// `fetchLatestVersion()`：默认 `""`（Python 基类 `return ""`）。
+    ///
+    /// Python 是 `async`，Rust 同步阻塞；拿不到远端版本不是错误，返回 `Ok("")`。
+    fn fetch_latest_version(&self) -> io::Result<String> {
+        Ok(String::new())
+    }
+
+    /// `install(version, onProgress)`：默认 `Unsupported`（Python 基类
+    /// `raise NotImplementedError`）。
+    ///
+    /// `on_progress` 收 0–100 的百分比（Python `reportProgress(percent: float)`），
+    /// 由实现自己决定回调次数；调用方负责把它折进 `RuntimeStatus.progress`。
+    fn install(&self, _version: &str, _on_progress: &mut dyn FnMut(f64)) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this runtime cannot install itself",
+        ))
     }
 
     /// `delete()`：逐个 [`delete_installed`]。
@@ -920,6 +939,21 @@ dependencies = ["base"]
         assert!(!runtime.is_recommended());
         // `runtimeId` 是类型全名（与 Python 的 module.qualname 对应）。
         assert!(runtime.runtime_id().ends_with("ProbeRuntime"));
+    }
+
+    #[test]
+    fn binary_runtime_default_lifecycle_is_sync_and_inert() {
+        let runtime = ProbeRuntime::new(PathBuf::from("/tmp/none"), "gd3-probe");
+        // `fetchLatestVersion()`：基类 `return ""`。
+        assert_eq!(runtime.fetch_latest_version().expect("fetch"), "");
+        // `install()`：基类 `raise NotImplementedError`。
+        let error = runtime
+            .install("1.0", &mut |_| {})
+            .expect_err("base install is unsupported");
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        // `runtime_id()` 在 vtable 里：`&dyn BinaryRuntime` 也能调。
+        let dynamic: &dyn BinaryRuntime = &runtime;
+        assert!(dynamic.runtime_id().ends_with("ProbeRuntime"));
     }
 
     #[test]
