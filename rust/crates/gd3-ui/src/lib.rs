@@ -368,7 +368,10 @@ pub fn push_settings(
     let headers_presets =
         headers::parse_presets(config.get_str("Network", "HeadersPresets").unwrap_or(""));
     let headers_index = headers::current_index(
-        config.get_str("Network", "CurrentHeadersPreset"),
+        // 磁盘存的是 int（`"CurrentHeadersPreset": 0`），`get_str` 读不到。
+        config
+            .get_py_str("Network", "CurrentHeadersPreset")
+            .as_deref(),
         headers_presets.len(),
     );
     window.set_headersPresetNames(slint::ModelRc::new(slint::VecModel::from(
@@ -466,7 +469,9 @@ pub fn open_headers_preset_edit(
     let presets = headers::parse_presets(config.get_str("Network", "HeadersPresets").unwrap_or(""));
     let selected = index.unwrap_or_else(|| {
         headers::current_index(
-            config.get_str("Network", "CurrentHeadersPreset"),
+            config
+                .get_py_str("Network", "CurrentHeadersPreset")
+                .as_deref(),
             presets.len(),
         )
     });
@@ -2060,7 +2065,7 @@ mod smoke {
             r#"[{"name":"A","headers":{"x-a":"1"}},
                 {"name":"B","headers":{"y-b":"2","z-c":"3"}}]"#,
         );
-        config.set_str("Network", "CurrentHeadersPreset", "1");
+        config.set_i64("Network", "CurrentHeadersPreset", 1);
         // 第 43 步：身份预设（JSON 列表两项：完整百度预设 + 精简项）。
         config.set_str(
             "Network",
@@ -2715,7 +2720,7 @@ mod smoke {
             r#"[{"name": "A", "headers": {"x-a": "1"}},
                 {"name": "B", "headers": {"y-b": "2", "z-c": "3"}}]"#,
         );
-        config.set_str("Network", "CurrentHeadersPreset", "1");
+        config.set_i64("Network", "CurrentHeadersPreset", 1);
         // 添加（镜像 _onAddClicked：名称空 + currentHeaders() 起点）。
         crate::open_headers_preset_edit(&window, &config, None);
         assert!(window.get_headersEditVisible());

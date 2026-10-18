@@ -1,0 +1,20 @@
+{"value": {}, "dumps": "{}", "indent4": "{}"}
+{"value": [], "dumps": "[]", "indent4": "[]"}
+{"value": {"a": 1}, "dumps": "{\"a\": 1}", "indent4": "{\n    \"a\": 1\n}"}
+{"value": {"a": [1, 2, 3]}, "dumps": "{\"a\": [1, 2, 3]}", "indent4": "{\n    \"a\": [\n        1,\n        2,\n        3\n    ]\n}"}
+{"value": {"a": {"b": {"c": [true, false, null]}}}, "dumps": "{\"a\": {\"b\": {\"c\": [true, false, null]}}}", "indent4": "{\n    \"a\": {\n        \"b\": {\n            \"c\": [\n                true,\n                false,\n                null\n            ]\n        }\n    }\n}"}
+{"value": {"中文": "值", "emoji": "🎉"}, "dumps": "{\"中文\": \"值\", \"emoji\": \"🎉\"}", "indent4": "{\n    \"中文\": \"值\",\n    \"emoji\": \"🎉\"\n}"}
+{"value": {"quote": "a\"b", "backslash": "a\\b", "slash": "a/b"}, "dumps": "{\"quote\": \"a\\\"b\", \"backslash\": \"a\\\\b\", \"slash\": \"a/b\"}", "indent4": "{\n    \"quote\": \"a\\\"b\",\n    \"backslash\": \"a\\\\b\",\n    \"slash\": \"a/b\"\n}"}
+{"value": {"ctrl": "a\u0001b\u001fc", "tab": "a\tb", "nl": "a\nb", "cr": "a\rb"}, "dumps": "{\"ctrl\": \"a\\u0001b\\u001fc\", \"tab\": \"a\\tb\", \"nl\": \"a\\nb\", \"cr\": \"a\\rb\"}", "indent4": "{\n    \"ctrl\": \"a\\u0001b\\u001fc\",\n    \"tab\": \"a\\tb\",\n    \"nl\": \"a\\nb\",\n    \"cr\": \"a\\rb\"\n}"}
+{"value": {"bs": "a\bb", "ff": "a\fb"}, "dumps": "{\"bs\": \"a\\bb\", \"ff\": \"a\\fb\"}", "indent4": "{\n    \"bs\": \"a\\bb\",\n    \"ff\": \"a\\fb\"\n}"}
+{"value": {"del": "", "ls": " ", "ps": " "}, "dumps": "{\"del\": \"\", \"ls\": \" \", \"ps\": \" \"}", "indent4": "{\n    \"del\": \"\",\n    \"ls\": \" \",\n    \"ps\": \" \"\n}"}
+{"value": {"empty_str": "", "empty_list": [], "empty_dict": {}}, "dumps": "{\"empty_str\": \"\", \"empty_list\": [], \"empty_dict\": {}}", "indent4": "{\n    \"empty_str\": \"\",\n    \"empty_list\": [],\n    \"empty_dict\": {}\n}"}
+{"value": [[], {}, [[]]], "dumps": "[[], {}, [[]]]", "indent4": "[\n    [],\n    {},\n    [\n        []\n    ]\n]"}
+{"value": {"nested": [{"k": [1, [2, [3]]]}]}, "dumps": "{\"nested\": [{\"k\": [1, [2, [3]]]}]}", "indent4": "{\n    \"nested\": [\n        {\n            \"k\": [\n                1,\n                [\n                    2,\n                    [\n                        3\n                    ]\n                ]\n            ]\n        }\n    ]\n}"}
+{"value": {"float": 0.25, "int": 0, "neg": -17, "big": 104857600}, "dumps": "{\"float\": 0.25, \"int\": 0, \"neg\": -17, \"big\": 104857600}", "indent4": "{\n    \"float\": 0.25,\n    \"int\": 0,\n    \"neg\": -17,\n    \"big\": 104857600\n}"}
+{"value": {"float": 1.75, "whole": 3.0, "half": 0.5}, "dumps": "{\"float\": 1.75, \"whole\": 3.0, \"half\": 0.5}", "indent4": "{\n    \"float\": 1.75,\n    \"whole\": 3.0,\n    \"half\": 0.5\n}"}
+{"value": {"dup_like": {"a": "b"}, "arr": ["x", "y"]}, "dumps": "{\"dup_like\": {\"a\": \"b\"}, \"arr\": [\"x\", \"y\"]}", "indent4": "{\n    \"dup_like\": {\n        \"a\": \"b\"\n    },\n    \"arr\": [\n        \"x\",\n        \"y\"\n    ]\n}"}
+{"value": {"url": "http://a/1?b=2#c", "magnet": "magnet:?xt=1"}, "dumps": "{\"url\": \"http://a/1?b=2#c\", \"magnet\": \"magnet:?xt=1\"}", "indent4": "{\n    \"url\": \"http://a/1?b=2#c\",\n    \"magnet\": \"magnet:?xt=1\"\n}"}
+{"value": {"tabs": "\t", "spaces": "  "}, "dumps": "{\"tabs\": \"\\t\", \"spaces\": \"  \"}", "indent4": "{\n    \"tabs\": \"\\t\",\n    \"spaces\": \"  \"\n}"}
+{"value": ["单元素"], "dumps": "[\"单元素\"]", "indent4": "[\n    \"单元素\"\n]"}
+{"value": {"trailing": "x "}, "dumps": "{\"trailing\": \"x \"}", "indent4": "{\n    \"trailing\": \"x \"\n}"}

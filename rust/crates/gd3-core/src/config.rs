@@ -1,27 +1,60 @@
-//! UserConfig.json 存取（Phase 7c 设置页数据源下沉起步）。
+//! `UserConfig.json` 存取（第 78 步按真机磁盘格式重写）。
 //!
-//! 磁盘协议不变（qfluentwidgets `Config.save` 格式）：
-//! - 外形 `{group: {key: "serialized 字符串"}}`——每个项的值经
-//!   validator `format()` 后全为字符串（`BoolValidator.format`=
-//!   `str(True)` → `"True"`，`RangeValidator.format` → `str(value)`，
-//!   `JsonConfigSerializer` → `json.dumps`）。
-//! - 保存 = `json.dump(toDict(), f, ensure_ascii=False, indent=4)`，
-//!   无尾随换行。本文件手写等价 writer（serde_json pretty 是 2 空格、
-//!   `bool` 小写，都不兼容）。
-//! - 键序不名誉：Python 端 toDict 走 `dir()` 字母序存初档、此后文件
-//!   自身顺序往返——不用字段；
-//!   本模块用 BTreeMap 稳定排序写盘（语义键集不变、Python 端可读回）。
+//! ## 磁盘协议（实证，不是推测）
 //!
-//! 分层：只做存取与值串镜像（python repr 口径），**不做配置项盘点**
-//! ——设置页用到哪项、先验哪项，避免一次性几十项的双漂移浪费。
+//! 第 49 步按「每个项经 validator `format()` 后都是字符串」实现，**是错的**：
+//! qfluentwidgets 1.18 的 `ConfigItem.serialize()` 只有一句
+//! `self.serializer.serialize(self.value)`，而 `ConfigItem` 的默认 serializer
+//! 是恒等 —— 没显式传 serializer 的项，落盘就是**裸的 JSON 值**：
+//!
+//! ```json
+//! "EmulateFingerprint": false,     // BoolValidator，无 serializer
+//! "MaxTaskNum": 3,                 // RangeConfigItem，无 serializer
+//! "HistoryDownloadFolder": [],     // FolderListValidator，无 serializer
+//! "CategoryRules": "[]",           // JsonConfigSerializer → json.dumps 串
+//! "Language": "Auto",              // EnumSerializer → enum.value
+//! "Geometry": "0,0,0,0"            // GeometrySerializer → "x,y,w,h"
+//! ```
+//!
+//! 旧实现写 `"False"`/`"3"` 这类字符串，Python 侧读回是**灾难**：
+//! `BoolValidator.correct("False")` → `OptionsValidator.correct` →
+//! 不在 `[True, False]` 里 → 取 `options[0]` → **变成 True**；
+//! `RangeValidator.correct("7")` → `max(1, "7")` → `TypeError`，
+//! `QConfig.load` 被 `@exceptionHandler()` 兜住 → **整个 load 中断**，
+//! 后面所有项保持缺省（实测：`{"MaxTaskNum": "7", "PreBlockNum": 16}` 读入后
+//! `MaxTaskNum` 仍是缺省 3、`PreBlockNum` 仍是缺省 8）。所以本模块只写
+//! 真机同构的值类型。
+//!
+//! 其余协议不变：
+//! - 写盘 = `json.dump(toDict(), f, ensure_ascii=False, indent=4)`，无尾随换行；
+//! - 组/键序 = `dir(Config)` 的**属性名字母序**（组按首次出现排），
+//!   `serde_json` 开了 `preserve_order` → 本模块 `load` 保序、写回逐字节同构；
+//! - `QFluentWidgets` 组（`ThemeColor`/`FontFamilies`，继承自 `QConfig`）
+//!   也在 Python 的 `toDict()` 里，必须原样保留；
+//! - 平台分支键（`backgroundEffect` 仅 win32/darwin、三个 dock 键仅 darwin）
+//!   不在这里补 —— 缺键即缺省，读写都不造键。
+//!
+//! ## 与 Python 的已知差异
+//!
+//! - **容错策略**：Python 在首个非法值处中断整个 load（见上），本模块逐键跳过
+//!   非法/不可解析值、保留其余项。Rust 侧不该因为一个脏键丢掉整份配置。
+//! - `get_*` 接受「数字/布尔的字符串形式」这一遗留形态（手改文件、旧版
+//!   Rust 写出的档），Python 会拒收；写回时按 set 的入参类型落盘，不做批量归一。
+//!
+//! 金文件由 `tests/fixtures/generate_user_config_fixture.py` 在 venv 里跑出：
+//! `user_config_default_linux.json`（空目录 load 后 save）、
+//! `user_config_mutated_expected.json`（同一份再按固定改动 `qconfig.set` 后
+//! save）、`py_json_writer.jsonl`、`py_float_repr.jsonl`。
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
-/// group → (key → python 序列化字符串)。
-pub type GroupMap = BTreeMap<String, BTreeMap<String, String>>;
+use serde_json::{Map, Value};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// group → (key → 落盘值)。值类型是 JSON 原生标量/数组/对象，
+/// **不是**统一字符串（见模块头）。
+pub type GroupMap = Map<String, Value>;
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct UserConfig {
     pub groups: GroupMap,
 }
@@ -31,8 +64,7 @@ impl UserConfig {
         Self::default()
     }
 
-    /// 从磁盘读（qfluentwidgets 格式；非字符串值容错丢弃——磁盘正常
-    /// 全为字符串，异常形态不该让设置页崩）。
+    /// 从磁盘读。文件不存在/不可读 → `io::Error`（调用方决定缺省）。
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         Self::from_json(&text).map_err(|error| {
@@ -40,127 +72,136 @@ impl UserConfig {
         })
     }
 
-    /// 从同态 JSON 文本解析。组层级非对象 / 值非字符串的一律跳过。
+    /// 从同态 JSON 文本解析：保序（`preserve_order`），组层级非对象的一律跳过，
+    /// 值原样保留（标量/数组/对象都收）。
     pub fn from_json(text: &str) -> Result<Self, serde_json::Error> {
-        let value: serde_json::Value = serde_json::from_str(text)?;
+        let value: Value = serde_json::from_str(text)?;
         let mut groups = GroupMap::new();
-        if let serde_json::Value::Object(map) = &value {
+        if let Value::Object(map) = value {
             for (group, items) in map {
-                let serde_json::Value::Object(item_map) = items else {
-                    continue;
-                };
-                let mut entries: BTreeMap<String, String> = BTreeMap::new();
-                for (key, item) in item_map {
-                    if let serde_json::Value::String(s) = item {
-                        entries.insert(key.clone(), s.clone());
-                    }
+                if matches!(items, Value::Object(_)) {
+                    groups.insert(group, items);
                 }
-                groups.insert(group.clone(), entries);
             }
         }
         Ok(Self { groups })
     }
 
-    /// 写出 qfluentwidgets 同构 JSON：`json.dump(..., indent=4,
-    /// ensure_ascii=False)`，无尾随换行。手写 writer 以逐字节镜像
-    /// Python 输出（serde_json::to_string_pretty 缩进/布尔不符）。
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         std::fs::write(path, self.to_json_text())
     }
 
+    /// `json.dump(..., ensure_ascii=False, indent=4)` 的逐字节镜像。
     pub fn to_json_text(&self) -> String {
         let mut out = String::new();
-        out.push('{');
-        let group_count = self.groups.len();
-        for (group_index, (group, entries)) in self.groups.iter().enumerate() {
-            if group_index > 0 {
-                out.push(',');
-            }
-            out.push('\n');
-            out.push_str("    "); // indent 层 1（4 空格）
-            out.push_str(&py_json_string(group));
-            out.push_str(": {\n");
-            let entry_count = entries.len();
-            for (entry_index, (key, value)) in entries.iter().enumerate() {
-                out.push_str("        "); // indent 层 2
-                out.push_str(&py_json_string(key));
-                out.push_str(": ");
-                out.push_str(&py_json_string(value));
-                if entry_index + 1 < entry_count {
-                    out.push(',');
-                }
-                out.push('\n');
-            }
-            if entry_count > 0 {
-                out.push_str("    "); // 闭合缩进回到层 1
-            }
-            out.push('}');
-            let _ = group_index;
-        }
-        if group_count > 0 {
-            out.push('\n');
-        }
-        out.push('}');
+        write_indented(&Value::Object(self.groups.clone()), 0, &mut out);
         out
     }
 
-    fn entries(&self, group: &str) -> Option<&BTreeMap<String, String>> {
-        self.groups.get(group)
-    }
-
-    pub fn get_str(&self, group: &str, key: &str) -> Option<&str> {
-        self.entries(group)?.get(key).map(String::as_str)
-    }
-
-    /// python 口径字符串写盘（缺组自建）。
-    pub fn set_str(&mut self, group: &str, key: &str, value: &str) {
-        self.groups
-            .entry(group.to_string())
-            .or_default()
-            .insert(key.to_string(), value.to_string());
-    }
-
-    /// BoolValidator.format = str(bool) → `"True"`/`"False"`（python
-    /// repr，**不是** JSON 的 true/false）。
-    pub fn get_bool(&self, group: &str, key: &str) -> Option<bool> {
-        match self.get_str(group, key)? {
-            "True" => Some(true),
-            "False" => Some(false),
+    pub fn entries(&self, group: &str) -> Option<&Map<String, Value>> {
+        match self.groups.get(group)? {
+            Value::Object(map) => Some(map),
             _ => None,
         }
     }
 
-    pub fn set_bool(&mut self, group: &str, key: &str, value: bool) {
-        self.set_str(group, key, if value { "True" } else { "False" });
+    pub fn get(&self, group: &str, key: &str) -> Option<&Value> {
+        self.entries(group)?.get(key)
     }
 
-    /// RangeValidator.format = str(int)；python 可能存 `"3.0"`（float
-    /// 项），`"3"` 解析成功才返回值。
+    /// 只认 `Value::String`（`DownloadFolder`/`ProxyServer`/`CategoryRules`
+    /// 这类本来就是字符串的项）。
+    pub fn get_str(&self, group: &str, key: &str) -> Option<&str> {
+        match self.get(group, key)? {
+            Value::String(text) => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    /// python `str(value)` 口径：布尔 → `"True"`/`"False"`，数字 → 十进制文本，
+    /// 字符串原样；数组/对象 → `None`。给「磁盘存数字、调用方要文本」的项用
+    /// （`Network.CurrentHeadersPreset` 落盘是 `0`，不是 `"0"`）。
+    pub fn get_py_str(&self, group: &str, key: &str) -> Option<String> {
+        match self.get(group, key)? {
+            Value::String(text) => Some(text.clone()),
+            Value::Bool(flag) => Some(if *flag { "True" } else { "False" }.to_string()),
+            Value::Number(number) => Some(py_number_text(number)),
+            _ => None,
+        }
+    }
+
+    /// `BoolValidator` 项。容忍遗留的字符串布尔（`"True"`/`"False"`/小写），
+    /// 其余形态 `None`。
+    pub fn get_bool(&self, group: &str, key: &str) -> Option<bool> {
+        match self.get(group, key)? {
+            Value::Bool(flag) => Some(*flag),
+            Value::String(text) => match text.as_str() {
+                "True" | "true" => Some(true),
+                "False" | "false" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `RangeConfigItem` 项（磁盘是数字）。整数串也收（遗留档）。
     pub fn get_i64(&self, group: &str, key: &str) -> Option<i64> {
-        self.get_str(group, key)?.parse().ok()
+        match self.get(group, key)? {
+            Value::Number(number) => number.as_i64().or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|value| value.fract() == 0.0)
+                    .map(|value| value as i64)
+            }),
+            Value::String(text) => text.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// 浮点项（`Personalization.DpiScale` 落盘 `0` 或 `0.25`）。
+    pub fn get_f64(&self, group: &str, key: &str) -> Option<f64> {
+        match self.get(group, key)? {
+            Value::Number(number) => number.as_f64(),
+            Value::String(text) => text.parse().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn set(&mut self, group: &str, key: &str, value: Value) {
+        let entry = self
+            .groups
+            .entry(group.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(map) = entry {
+            map.insert(key.to_string(), value);
+        }
+    }
+
+    pub fn set_str(&mut self, group: &str, key: &str, value: &str) {
+        self.set(group, key, Value::String(value.to_string()));
+    }
+
+    pub fn set_bool(&mut self, group: &str, key: &str, value: bool) {
+        self.set(group, key, Value::Bool(value));
     }
 
     pub fn set_i64(&mut self, group: &str, key: &str, value: i64) {
-        self.set_str(group, key, &value.to_string());
+        self.set(group, key, Value::Number(value.into()));
     }
 
-    /// python `str(float)` 口径读：磁盘串 parse f64（`"0.25"`/`"3"`/
-    /// `"3.0"` 均可；非数字/缺键 None）。DpiScale 项（cfg.py:296，值域
-    /// 0-5、step 0.25，Python 端 cfg.set(x/100) 写浮点）消费。
-    pub fn get_f64(&self, group: &str, key: &str) -> Option<f64> {
-        self.get_str(group, key)?.parse().ok()
-    }
-
-    /// python `str(float)` 口径写：shortest repr；**整值浮点补 `.0`**
-    /// （python `str(2.0)` == `"2.0"`，Rust Display 只给 `"2"`）。本仓库
-    /// 数值域（0-5、二分步 0.25）无科学计数形态，Rust Display 也不产
-    /// 指数；NaN/Inf 不在项值域内（validator 侧守卫），原样落串。
+    /// `RangeConfigItem` 落盘浮点（DpiScale 的 0.25 步进）。NaN/Inf 不在项值域内
+    /// （validator 侧守卫），`serde_json::Number` 表示不了 → 落 `null`。
     pub fn set_f64(&mut self, group: &str, key: &str, value: f64) {
-        let mut text = format!("{}", value);
-        if value.is_finite() && value.fract() == 0.0 && !text.contains('.') {
-            text.push_str(".0");
-        }
-        self.set_str(group, key, &text);
+        let number = serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null);
+        self.set(group, key, number);
+    }
+
+    /// `JsonConfigSerializer` 项：先 `json.dumps(value, ensure_ascii=False)`
+    /// （紧凑、`", "`/`": "` 分隔），再当字符串存。
+    pub fn set_py_json(&mut self, group: &str, key: &str, value: &Value) {
+        self.set_str(group, key, &py_json_dumps(value));
     }
 }
 
@@ -196,110 +237,479 @@ pub fn py_json_string(text: &str) -> String {
     out
 }
 
+/// `repr(float)` 口径：最短往返表示；`|x| >= 1e16` 或 `< 1e-4` 切指数写法
+/// （指数至少两位、带符号），整值补 `.0`，`-0.0` 保留符号。
+///
+/// 金文件 `tests/fixtures/py_float_repr.jsonl`（20 条，CPython `repr`）。
+pub fn py_float_repr(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 { "inf" } else { "-inf" }.to_string();
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
+    }
+    let magnitude = value.abs();
+    if !(1e-4..1e16).contains(&magnitude) {
+        // Rust `{:e}` → "1e16"/"1.5e-7"；python → "1e+16"/"1.5e-07"。
+        let text = format!("{:e}", value);
+        let (mantissa, exponent) = text.split_once('e').unwrap_or((text.as_str(), "0"));
+        let (sign, digits) = match exponent.strip_prefix('-') {
+            Some(rest) => ('-', rest),
+            None => ('+', exponent),
+        };
+        let digits = if digits.len() < 2 {
+            format!("{:0>2}", digits)
+        } else {
+            digits.to_string()
+        };
+        return format!("{mantissa}e{sign}{digits}");
+    }
+    let mut text = format!("{}", value);
+    if !text.contains('.') {
+        text.push_str(".0");
+    }
+    text
+}
+
+/// `json.dumps(value, ensure_ascii=False)`（紧凑，默认分隔符 `", "` / `": "`）。
+pub fn py_json_dumps(value: &Value) -> String {
+    let mut out = String::new();
+    write_compact(value, &mut out);
+    out
+}
+
+fn py_number_text(number: &serde_json::Number) -> String {
+    if let Some(value) = number.as_i64() {
+        return value.to_string();
+    }
+    if let Some(value) = number.as_u64() {
+        return value.to_string();
+    }
+    py_float_repr(number.as_f64().unwrap_or(0.0))
+}
+
+fn write_compact(value: &Value, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&py_json_string(key));
+                out.push_str(": ");
+                write_compact(item, out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                write_compact(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&py_json_scalar(other)),
+    }
+}
+
+fn write_indented(value: &Value, level: usize, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                push_indent(level + 1, out);
+                out.push_str(&py_json_string(key));
+                out.push_str(": ");
+                write_indented(item, level + 1, out);
+            }
+            out.push('\n');
+            push_indent(level, out);
+            out.push('}');
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                push_indent(level + 1, out);
+                write_indented(item, level + 1, out);
+            }
+            out.push('\n');
+            push_indent(level, out);
+            out.push(']');
+        }
+        other => out.push_str(&py_json_scalar(other)),
+    }
+}
+
+fn push_indent(level: usize, out: &mut String) {
+    for _ in 0..level {
+        out.push_str("    ");
+    }
+}
+
+fn py_json_scalar(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(true) => "true".to_string(),
+        Value::Bool(false) => "false".to_string(),
+        Value::Number(number) => py_number_text(number),
+        Value::String(text) => py_json_string(text),
+        // write_indented / write_compact 已吃掉容器形态；这里防御性兜底。
+        Value::Array(_) | Value::Object(_) => "null".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn sample() -> UserConfig {
-        let path = std::path::Path::new("tests/fixtures/user_config_sample.json");
-        UserConfig::load(path).expect("sample 加载失败")
+    fn fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join(name);
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("读不到金文件 {}：{error}", path.display()))
     }
 
-    /// sample 解析：组/键齐、typed 取值对齐磁盘 python 串、缺键与非
-    /// 数字串容错返回 None。
+    fn jsonl(name: &str) -> Vec<Value> {
+        fixture(name)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("金文件行不是合法 JSON"))
+            .collect()
+    }
+
+    /// `cfg.py` 的 `BASE_HEADERS`（键序即 Python dict 字面量顺序，
+    /// `json.dumps` 保序 → 金文件里能逐字节对上）。
+    fn base_headers() -> Value {
+        json!({
+            "accept-encoding": "deflate, br, gzip",
+            "accept-language": "zh-CN,zh;q=0.9",
+            "cookie": "down_ip=1",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "none",
+            "sec-fetch-user": "?1",
+            "upgrade-insecure-requests": "1",
+        })
+    }
+
+    /// 空目录 `qconfig.load()` + `cfg.save()` 的逐字节回写。
+    ///
+    /// 这条测试同时钉住三件事：组序（`dir(Config)` 首次出现）、组内键序
+    /// （属性名字母序）、以及**值类型**（布尔/数字不落成字符串）。
     #[test]
-    fn load_sample_parses_groups_and_typed_values() {
-        let config = sample();
-        assert_eq!(config.groups.len(), 3);
-        assert_eq!(config.get_bool("Category", "EnableCategory"), Some(true));
+    fn default_fixture_round_trips_byte_exact() {
+        let text = fixture("user_config_default_linux.json");
+        let config = UserConfig::from_json(&text).expect("缺省金文件不是合法 JSON");
+        assert_eq!(config.to_json_text(), text);
+
+        let groups: Vec<&str> = config.groups.keys().map(String::as_str).collect();
+        assert_eq!(
+            groups,
+            [
+                "Aria2Rpc",
+                "GeneralDownload",
+                "Browser",
+                "Category",
+                "Network",
+                "Software",
+                "Personalization",
+                "UI",
+                "QFluentWidgets",
+            ],
+            "组序必须与 Python toDict() 一致"
+        );
+        let aria2: Vec<&str> = config
+            .entries("Aria2Rpc")
+            .expect("缺 Aria2Rpc 组")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(aria2, ["EmulateFingerprint", "Port", "Token", "Enabled"]);
+        // 值类型是磁盘协议的核心：旧实现写 "False"/"3"，Python 读回会炸。
+        assert_eq!(
+            config.get("Aria2Rpc", "EmulateFingerprint"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(config.get("GeneralDownload", "MaxTaskNum"), Some(&json!(3)));
+        assert_eq!(
+            config.get("GeneralDownload", "HistoryDownloadFolder"),
+            Some(&json!([]))
+        );
+        // JsonConfigSerializer 的三项才是字符串。
+        assert_eq!(config.get_str("Category", "CategoryRules"), Some("[]"));
+        assert_eq!(config.get_str("Personalization", "ThemeMode"), Some("Auto"));
+        assert_eq!(config.get_str("Software", "Geometry"), Some("0,0,0,0"));
+        // QFluentWidgets 组（继承自 QConfig）也在 toDict() 里。
+        assert_eq!(
+            config.get("QFluentWidgets", "ThemeColor"),
+            Some(&json!("#ff009faa"))
+        );
+    }
+
+    #[test]
+    fn mutated_fixture_round_trips_byte_exact() {
+        let text = fixture("user_config_mutated_expected.json");
+        let config = UserConfig::from_json(&text).expect("改动后金文件不是合法 JSON");
+        assert_eq!(config.to_json_text(), text);
+        assert_eq!(config.get_f64("Personalization", "DpiScale"), Some(0.25));
+        // 0.25 不是整数 → `get_i64` 不该给出截断值。
+        assert_eq!(config.get_i64("Personalization", "DpiScale"), None);
+        assert_eq!(
+            config.get("GeneralDownload", "HistoryDownloadFolder"),
+            Some(&json!(["/tmp", "/var/tmp"]))
+        );
+    }
+
+    /// Rust 侧同一组改动 → 逐字节等于 Python `qconfig.set` 后 `save()`。
+    ///
+    /// 改动清单镜像 `generate_user_config_fixture.py::mutated`。
+    #[test]
+    fn rust_mutation_matches_python_resave() {
+        let default_text = fixture("user_config_default_linux.json");
+        let mut config = UserConfig::from_json(&default_text).expect("缺省金文件不是合法 JSON");
+
+        config.set_bool("Category", "EnableCategory", true);
+        config.set_i64("GeneralDownload", "MaxTaskNum", 5);
+        config.set_f64("Personalization", "DpiScale", 0.25);
+        config.set_py_json(
+            "Category",
+            "CategoryRules",
+            &json!([{"name": "视频", "extensions": [".mp4", ".mkv"], "folder": "video"}]),
+        );
+        config.set_str("Network", "ClientProfile", "manual");
+        // `CloseMode.QUIT.value == "Quit"`（不是枚举成员名 "QUIT"）。
+        config.set_str("Software", "CloseMode", "Quit");
+        config.set_py_json(
+            "Network",
+            "HeadersPresets",
+            &json!([
+                {"name": "默认", "headers": base_headers()},
+                {"name": "自定义", "headers": {"a": "b", "x-trace": "1"}},
+            ]),
+        );
+        config.set_i64("Network", "CurrentHeadersPreset", 1);
+        config.set_str("GeneralDownload", "DownloadFolder", "/tmp");
+        // GeometrySerializer：元组 → "x,y,w,h"。
+        config.set_str("Software", "Geometry", "10,20,800,600");
+        config.set_str(
+            "GeneralDownload",
+            "ProxyServer",
+            "socks5://u:p@1.2.3.4:1080",
+        );
+        config.set_bool("GeneralDownload", "isSpeedLimitEnabled", true);
+        config.set_i64("GeneralDownload", "SpeedLimitation", 8_388_608);
+        config.set(
+            "GeneralDownload",
+            "HistoryDownloadFolder",
+            json!(["/tmp", "/var/tmp"]),
+        );
+        config.set(
+            "UI",
+            "ExpandedSettingGroups",
+            json!(["download", "network"]),
+        );
+
+        let expected = fixture("user_config_mutated_expected.json");
+        assert_eq!(config.to_json_text(), expected);
+    }
+
+    /// `get_*` 的类型口径必须跟磁盘一致：数字项不能当字符串读，
+    /// 反之亦然；`get_py_str` 才是 python `str()` 口径。
+    #[test]
+    fn typed_accessors_follow_python_scalar_kinds() {
+        let text = fixture("user_config_default_linux.json");
+        let config = UserConfig::from_json(&text).expect("缺省金文件不是合法 JSON");
+
+        assert_eq!(
+            config.get_bool("GeneralDownload", "AutoSpeedUp"),
+            Some(true)
+        );
+        assert_eq!(
+            config.get_bool("Aria2Rpc", "EmulateFingerprint"),
+            Some(false)
+        );
+        // 布尔项不是字符串。
+        assert_eq!(config.get_str("Aria2Rpc", "EmulateFingerprint"), None);
+        assert_eq!(
+            config.get_py_str("Aria2Rpc", "EmulateFingerprint"),
+            Some("False".to_string())
+        );
+        // 数字项：CurrentHeadersPreset 落盘是 0，不是 "0"。
+        assert_eq!(config.get_i64("Network", "CurrentHeadersPreset"), Some(0));
+        assert_eq!(config.get_str("Network", "CurrentHeadersPreset"), None);
+        assert_eq!(
+            config.get_py_str("Network", "CurrentHeadersPreset"),
+            Some("0".to_string())
+        );
+        // DpiScale 落盘是整数 0，`get_f64` 照样读得出。
+        assert_eq!(config.get_f64("Personalization", "DpiScale"), Some(0.0));
+        assert_eq!(config.get_i64("Personalization", "DpiScale"), Some(0));
+        // 字符串项。
+        assert_eq!(
+            config.get_str("GeneralDownload", "DownloadFolder"),
+            Some("//Downloads")
+        );
+        assert_eq!(
+            config.get_str("GeneralDownload", "NameConflict"),
+            Some("keepBoth")
+        );
+        assert_eq!(config.get_str("Network", "ClientProfile"), Some("auto"));
+        // 数组/对象 → `get_py_str` 无值（python `str()` 会给出 "[...]"，
+        // 但没有调用方需要，不实现）。
+        assert_eq!(
+            config.get_py_str("GeneralDownload", "HistoryDownloadFolder"),
+            None
+        );
+        // 缺键/缺组一律 None。
+        assert_eq!(config.get_bool("Nope", "Nope"), None);
+        assert_eq!(config.get_i64("GeneralDownload", "Nope"), None);
+        assert_eq!(config.get_str("GeneralDownload", "Nope"), None);
+    }
+
+    /// 遗留档（手改过的文件、旧版 Rust 写出的字符串档）不该让读方拿到 None。
+    /// 注意：`get_str` 对字符串一律原样返回，`"False"` 就是 `"False"`。
+    #[test]
+    fn legacy_string_values_are_tolerated() {
+        let text = r#"{
+            "GeneralDownload": {
+                "isSpeedLimitEnabled": "False",
+                "MaxTaskNum": "7",
+                "SpeedLimitation": "0.5",
+                "DownloadFolder": 3,
+                "ProxyServer": "Auto"
+            },
+            "Personalization": {"DpiScale": "0.25"}
+        }"#;
+        let mut config = UserConfig::from_json(text).expect("遗留档不是合法 JSON");
         assert_eq!(
             config.get_bool("GeneralDownload", "isSpeedLimitEnabled"),
             Some(false)
         );
-        assert_eq!(config.get_i64("GeneralDownload", "MaxTaskNum"), Some(3));
-        assert_eq!(config.get_str("Category", "KeyboardCategory"), Some("视频"));
-        assert_eq!(config.get_bool("GeneralDownload", "MaxTaskNum"), None);
-        assert_eq!(config.get_bool("GeneralDownload", "NoSuchKey"), None);
-        assert_eq!(config.entries("NoSuchGroup"), None);
-    }
-
-    /// typed 写 + 手写 writer：写盘文本与 `.venv` Python
-    /// `json.dumps(..., indent=4, ensure_ascii=False)` 生成的 fixture
-    /// 逐字节一致；再读回 typed 断言（round-trip）。
-    #[test]
-    fn typed_set_and_save_matches_python_dump() {
-        let mut config = sample();
-        config.set_bool("Category", "EnableCategory", false);
-        config.set_str("Category", "KeyboardCategory", "音频");
-        config.set_i64("GeneralDownload", "MaxTaskNum", 5);
-        config.set_str("Network", "ClientProfile", "manual");
-
-        let expected = std::fs::read_to_string(std::path::Path::new(
-            "tests/fixtures/user_config_expected_save.json",
-        ))
-        .expect("expected fixture 缺失");
-        assert_eq!(config.to_json_text(), expected, "写盘文本须逐字节镜像");
-        // 两次生成稳定（幂等）。
-        assert_eq!(config.to_json_text(), config.to_json_text());
-
-        let path = std::env::temp_dir().join("gd3_user_config_save_test.json");
-        config.save(&path).expect("save 失败");
-        let reloaded = UserConfig::load(&path).expect("reload 失败");
-        assert_eq!(reloaded.get_bool("Category", "EnableCategory"), Some(false));
+        // 小写形态也收。
+        config.set_str("GeneralDownload", "isSpeedLimitEnabled", "false");
         assert_eq!(
-            reloaded.get_str("Category", "KeyboardCategory"),
-            Some("音频")
+            config.get_bool("GeneralDownload", "isSpeedLimitEnabled"),
+            Some(false)
         );
-        assert_eq!(reloaded.get_i64("GeneralDownload", "MaxTaskNum"), Some(5));
-        // 未触及键原样保留。
+        assert_eq!(config.get_i64("GeneralDownload", "MaxTaskNum"), Some(7));
         assert_eq!(
-            reloaded.get_str("GeneralDownload", "DownloadFolder"),
-            Some("C:/downloads")
+            config.get_f64("GeneralDownload", "SpeedLimitation"),
+            Some(0.5)
         );
-        std::fs::remove_file(&path).ok();
+        assert_eq!(config.get_f64("Personalization", "DpiScale"), Some(0.25));
+        // 反向：数字项被当字符串读不到（`get_str` 只认 `Value::String`）。
+        assert_eq!(config.get_str("GeneralDownload", "DownloadFolder"), None);
+        assert_eq!(
+            config.get_py_str("GeneralDownload", "DownloadFolder"),
+            Some("3".to_string())
+        );
+        // 布尔项的字符串形态不会被 `get_str` 拦下——这是已知形态歧义。
+        assert_eq!(
+            config.get_str("GeneralDownload", "isSpeedLimitEnabled"),
+            Some("false")
+        );
     }
 
-    /// python str(float) 口径：整值浮点补 `.0`、小数原样 shortest、
-    /// 读回 round-trip；非数字串 get_f64 容错 None。
+    /// `py_json_dumps` 与 `write_indented` 逐字节对齐 python 的两种 dump 口径。
     #[test]
-    fn f64_python_repr_round_trip() {
-        let mut config = UserConfig::new();
-        config.set_f64("Personalization", "DpiScale", 0.25);
-        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("0.25"));
-        config.set_f64("Personalization", "DpiScale", 2.0);
-        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("2.0"));
-        config.set_f64("Personalization", "DpiScale", 5.0);
-        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("5.0"));
-        config.set_f64("Personalization", "DpiScale", 1.75);
-        assert_eq!(config.get_str("Personalization", "DpiScale"), Some("1.75"));
-        assert_eq!(config.get_f64("Personalization", "DpiScale"), Some(1.75));
-        // 缺键/非数字容错。
-        assert_eq!(config.get_f64("Personalization", "NoSuchKey"), None);
-        config.set_str("Personalization", "DpiScale", "weird");
-        assert_eq!(config.get_f64("Personalization", "DpiScale"), None);
-    }
-
-    /// 转义 writer 与 CPython `json.dumps(..., ensure_ascii=False)` 逐字节
-    /// 一致（金文件 28 条：`\b`/`\f` 短转义、其余控制字符 `\uXXXX`、
-    /// `\x7f`/`\u{2028}`/emoji 原样）；并自检解回原值（round-trip）。
-    #[test]
-    fn py_json_string_matches_python_dumps_fixture() {
-        let text = std::fs::read_to_string("tests/fixtures/json_escape.jsonl")
-            .expect("json_escape.jsonl 缺失");
-        let mut count = 0usize;
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let case: serde_json::Value =
-                serde_json::from_str(line).expect("金文件行不是合法 JSON");
-            let input = case["input"].as_str().expect("input 必须是字符串");
-            let expected = case["expected"].as_str().expect("expected 必须是字符串");
-            assert_eq!(py_json_string(input), expected, "输入：{input:?}");
-            // 解回原值：writer 产出的必须是合法 JSON 且语义无损。
-            let decoded: String =
-                serde_json::from_str(expected).expect("期望串应是合法 JSON 字符串");
-            assert_eq!(decoded, input, "金文件自检：{expected}");
-            count += 1;
+    fn py_json_writer_matches_python_dumps() {
+        let cases = jsonl("py_json_writer.jsonl");
+        assert_eq!(cases.len(), 20);
+        for case in cases {
+            let value = &case["value"];
+            let dumps = case["dumps"].as_str().expect("dumps 不是字符串");
+            let indent4 = case["indent4"].as_str().expect("indent4 不是字符串");
+            assert_eq!(py_json_dumps(value), dumps, "紧凑口径不一致：{value}");
+            let mut out = String::new();
+            write_indented(value, 0, &mut out);
+            assert_eq!(out, indent4, "indent=4 口径不一致：{value}");
         }
-        // 防「金文件被清空仍全绿」。
-        assert_eq!(count, 28, "金文件条数变化需同步更新断言");
+    }
+
+    #[test]
+    fn py_float_repr_matches_python() {
+        let cases = jsonl("py_float_repr.jsonl");
+        assert_eq!(cases.len(), 20);
+        for case in cases {
+            let value = case["value"].as_f64().expect("value 不是数字");
+            let expected = case["repr"].as_str().expect("repr 不是字符串");
+            assert_eq!(py_float_repr(value), expected, "repr({value})");
+        }
+    }
+
+    #[test]
+    fn py_json_string_matches_json_escape_fixture() {
+        let cases = jsonl("json_escape.jsonl");
+        assert_eq!(cases.len(), 28);
+        for case in cases {
+            let input = case["input"].as_str().expect("input 不是字符串");
+            let expected = case["expected"].as_str().expect("expected 不是字符串");
+            assert_eq!(py_json_string(input), expected, "转义不一致：{input:?}");
+        }
+    }
+
+    #[test]
+    fn save_load_round_trip() {
+        let text = fixture("user_config_mutated_expected.json");
+        let config = UserConfig::from_json(&text).expect("金文件不是合法 JSON");
+        let path = std::env::temp_dir().join(format!(
+            "gd3-user-config-{}-{:?}.json",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        config.save(&path).expect("写盘失败");
+        let raw = std::fs::read_to_string(&path).expect("读回失败");
+        assert_eq!(raw, text, "写盘要逐字节等于 python json.dump");
+        let loaded = UserConfig::load(&path).expect("load 失败");
+        assert_eq!(loaded, config);
+        std::fs::remove_file(&path).expect("清理失败");
+        // 文件不存在 → io::Error（调用方决定缺省），不是空配置。
+        assert!(UserConfig::load(&path).is_err());
+    }
+
+    #[test]
+    fn unknown_groups_and_non_object_values_are_skipped() {
+        let config = UserConfig::from_json(
+            r#"{"A": {"k": 1}, "B": 3, "C": [1], "D": null, "E": {"n": {"deep": true}}}"#,
+        )
+        .expect("合法 JSON");
+        let groups: Vec<&str> = config.groups.keys().map(String::as_str).collect();
+        assert_eq!(groups, ["A", "E"]);
+        assert_eq!(config.entries("B"), None);
+        assert_eq!(config.entries("C"), None);
+        assert_eq!(config.entries("D"), None);
+        assert_eq!(config.get("E", "n"), Some(&json!({"deep": true})));
+        // 空配置写出 `{}`（python `json.dump({})` 无换行）。
+        assert_eq!(UserConfig::new().to_json_text(), "{}");
     }
 }

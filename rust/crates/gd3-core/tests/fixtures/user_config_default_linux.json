@@ -1,0 +1,66 @@
+{
+    "Aria2Rpc": {
+        "EmulateFingerprint": false,
+        "Port": 16800,
+        "Token": "",
+        "Enabled": false
+    },
+    "GeneralDownload": {
+        "AutoSpeedUp": true,
+        "DownloadFolder": "//Downloads",
+        "isSpeedLimitEnabled": false,
+        "MaxReassignSize": 512,
+        "MaxTaskNum": 3,
+        "HistoryDownloadFolder": [],
+        "NameConflict": "keepBoth",
+        "PreBlockNum": 8,
+        "ProxyServer": "Auto",
+        "DeleteFilesOnRemove": false,
+        "PreserveLastModified": false,
+        "shouldVerifySsl": false,
+        "SpeedLimitation": 4194304
+    },
+    "Browser": {
+        "BrowserExtensionPairToken": "",
+        "Port": 14370,
+        "EnableBrowserExtension": true,
+        "UrlSchemeRegistered": true,
+        "EnableRaiseWindowWhenReceiveMsg": false
+    },
+    "Category": {
+        "CategoryRules": "[]",
+        "EnableCategory": false
+    },
+    "Network": {
+        "ClientProfile": "auto",
+        "CurrentHeadersPreset": 0,
+        "HeadersPresets": "[{\"name\": \"默认\", \"headers\": {\"accept-encoding\": \"deflate, br, gzip\", \"accept-language\": \"zh-CN,zh;q=0.9\", \"cookie\": \"down_ip=1\", \"sec-fetch-dest\": \"document\", \"sec-fetch-mode\": \"navigate\", \"sec-fetch-site\": \"none\", \"sec-fetch-user\": \"?1\", \"upgrade-insecure-requests\": \"1\"}}]",
+        "IdentityPresets": "[{\"name\": \"百度网盘客户端\", \"clientProfile\": \"raw\", \"userAgent\": \"pan.baidu.com\", \"hosts\": [\"*.pcs.baidu.com\"], \"isEnabled\": true}]",
+        "ShouldUseSystemDns": true
+    },
+    "Software": {
+        "CloseMode": "Ask",
+        "Geometry": "0,0,0,0",
+        "HasCompletedOobe": false,
+        "ClipboardListener": true,
+        "CheckUpdateAtStartUp": true,
+        "AutoRun": false
+    },
+    "Personalization": {
+        "DpiScale": 0,
+        "Language": "Auto",
+        "ThemeMode": "Auto"
+    },
+    "UI": {
+        "ExpandedSettingGroups": [],
+        "SettingGroupOrder": []
+    },
+    "QFluentWidgets": {
+        "FontFamilies": [
+            "Segoe UI",
+            "Microsoft YaHei",
+            "PingFang SC"
+        ],
+        "ThemeColor": "#ff009faa"
+    }
+}
