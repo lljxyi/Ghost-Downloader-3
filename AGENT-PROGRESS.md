@@ -4046,3 +4046,28 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   - commit `f6ca6d7`。
 - 下一步：更新 `rust/README.md` 完成状态 → 创建 `AGENT-DONE` → 停止推进等验收。
 - 卡点：无
+
+## 第 76 步：Phase 7 收尾（README 完成状态 + AGENT-DONE + 全量门禁）（2026-10-18 05:42）
+- 做了什么：
+  - `rust/README.md`：顶部「已完成」补 Phase 5–6 与 Phase 7；新增
+    **「## Phase 7：UI 层（`gd3-ui`）」**（定位、判定标准、P0–P6 阶段表、规模数字、
+    6 个 Slint 文件、无头冒烟、运行命令、已知偏差四条、尚未做的部分）；
+    原「## 下一步的顺序（已定）」改写为 **「## 剩余工作（Phase 8）」**
+    （cfg 读写必须与 Slint 成为唯一 UI 同一步落地）。
+  - 新建 `/root/Ghost-Downloader-3/AGENT-DONE`：做完什么（Phase 1–7 + 各阶段模块清单）、
+    验证数字、还剩什么没做（5 条）、已知差异与风险（语义偏差 5 条 / 技术风险 5 条 / 边界）。
+- 验证（本轮实跑）：
+  - `cargo test -p gd3-core` **89 passed**、`-p gd3-net` **132 passed**、
+    `-p gd3-servers` **29 passed**、`-p gd3-ui` **554 passed**，合计 **804 passed, 0 failed**；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 error**（增量 2m23s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 全量 `pytest -q --continue-on-collection-errors` →
+    **3 failed, 1347 passed, 8 skipped, 35 errors**，与基线逐条相同（本步只动文档）。
+  - 注：`pytest -q`（不带 `--continue-on-collection-errors`）会在
+    `tests/test_android_pack_import.py` 处收集中断，必须带该参数才是有效全量；
+    另外本机 `uv` 不在 PATH（在 `/root/.local/bin`），直接用 `.venv/bin/python -m pytest`。
+  - commit：`79fbf39`（README）。
+- 下一步：Phase 7 已收口，按 `AGENT-DONE` 停在这里等人工验收。
+  若要继续，Phase 8 的顺序建议是：Slint 入口 + 事件循环 → cfg 读写（`UserConfig.json`
+  两侧互读测试）→ `TaskService` 绑定 → 托盘/Dock 平台层。
+- 卡点：无

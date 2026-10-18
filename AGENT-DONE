@@ -1,0 +1,113 @@
+# AGENT-DONE — Ghost-Downloader-3 Rust 重写 Phase 1–7
+
+完成时间：2026-10-18 05:42
+最后提交：`79fbf39`（文档）；Phase 7 最后一步代码 `f6ca6d7`（第 75 步 `shell.rs`）
+
+---
+
+## 1. 做完了什么
+
+### Phase 1–4：内核（`gd3-core` / `gd3-net` / `gd3-servers` / `gd3-py`）
+
+| crate | 内容 | 单测 |
+|---|---|---|
+| `gd3-core` | 领域模型（`TaskRecord` / `TaskStep` / `TaskFile` / `TaskError`）、`tasks.jsonl` 持久化、`.ghd` 分片记录、fMP4/WebM 字节区间数学 | 89 |
+| `gd3-net` | HTTP 分片传输引擎：分片划分与续传、稀疏写入、重试与降级、运行中重新切分与自动加速、限流钩子、wreq TLS 指纹 | 132 |
+| `gd3-servers` | 回环端口监听（四态）、HTTP/1.1 头解析、aria2 JSON-RPC（HTTP + WebSocket）、浏览器扩展 WebSocket v2 握手与帧 | 29 |
+| `gd3-py` | PyO3 桥（cdylib，由 maturin 构建，`cargo test` 不覆盖） | — |
+
+TLS 指纹与 Python 对齐并已实测：`ja4 = t13d1516h2_8daaf6152771_d8a2da3f94cd`、HTTP/2 Akamai 指纹、UA 三项一致（`https://tls.peet.ws/api/all`，profile=chrome）。
+
+### Phase 5–6：影子开关终态
+
+26 个 `GD3_RUST_*` 开关，**全部默认关**，覆盖 storage / http / aria2 / probe / github /
+huggingface / bili / ftp / ed2k / m3u8 / filename / browser。每个开关只有一个接入点，
+两侧产物逐字节 / 逐断言对比（金文件 + 双模式回归）。扫尾评估已确认**无新下沉项**。
+开关全开与全关的 Python 全量结果逐条一致（失败/错误集合相同）。
+
+### Phase 7：UI 层（`gd3-ui`，Slint 1.18.1）
+
+`app/view`（约 11 200 行 Qt 代码）的**语义镜像层**，按 P0→P6 全部完成：
+
+| 阶段 | 内容 | 规模 |
+|---|---|---|
+| P0 主链路 | 主窗口状态机、任务卡片派生层、任务抽屉、行契约、过滤/排序/速度文案 | `window.rs` / `card.rs` / `drawer.rs` / `row.rs` / `facts.rs` / `actions.rs` / `filter.rs` / `sort.rs` / `speed.rs` |
+| P1 设置页 | 设置分组与规格表、全部设置卡片、折叠容器、草稿/选项卡片组、代理/身份/请求头/分类/关闭模式/菜单 | `settings_group.rs` / `settings_spec.rs` / `setting_cards.rs` / `setting_card_group.rs` / `card_groups.rs` / `option_cards.rs` / `category*.rs` / `proxy.rs` / `profile.rs` / `identity.rs` / `headers.rs` / `menu_view.rs` / `card_menu.rs` |
+| P2 建任务 | 任务草稿、计划、批量 URL、选文件、重名冲突 | `draft.rs` / `plan.rs` / `batch_url.rs` / `file_select.rs` / `name_conflict.rs` / `conflict.rs` |
+| P3 其它对话框 | 编辑任务、包信息、字幕选择、扩展安装、发行说明 | `edit_task.rs` / `pack_info.rs` / `subtitle_select.rs` / `extension_install.rs` / `release_info.rs` |
+| P4 组件库 | 范围滑块、选项卡、引导列表、Markdown、token 输入、标签、编辑器、进度提示、安装按钮、树视图、横幅、滚动区 | 13 个模块 |
+| P5 首次启动 | OOBE 六页向导（主题/语言/监听/运行时安装/扩展/更多选项 + 窗口状态机） | `oobe.rs`（1 895 行 / 38 测试） |
+| P6 平台外壳 | 托盘菜单与定位、Dock 文字排版与进度条、macOS 状态项 | `shell.rs`（848 行 / 21 测试） |
+
+Slint 文件 6 个（2 858 行）：`app_shell.slint`、`appwindow.slint`、`task_page.slint`、
+`task_drawer.slint`、`settings_page.slint`、`card_menu.slint`。
+无头冒烟测试在 `lib.rs` 的 `mod smoke`（`MinimalSoftwareWindow`）：组件树实例化 +
+属性读写、任务行模型往返、`TaskRecord → 行` 端到端推流。
+
+`gd3-ui` 合计：**53 个模块 / 32 252 行 `src/` / 554 个单测**。
+
+---
+
+## 2. 验证数字（全部在最后一轮实跑）
+
+| 项目 | 命令 | 结果 |
+|---|---|---|
+| Rust 单测 | `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` | **804 passed, 0 failed**（89 + 132 + 29 + 554） |
+| clippy（全工作区） | `cargo clippy --workspace --all-targets -- -D warnings` | **0 error**（2m23s） |
+| 格式 | `cargo fmt --all --check` | 通过 |
+| Python 全量 | `pytest -q --continue-on-collection-errors` | **3 failed, 1347 passed, 8 skipped, 35 errors** —— 与基线**完全相同** |
+
+Python 的 3 failed / 35 errors 是既有基线红灯（本机环境导致，非本次改动）：
+`test_aria2_rpc.py::TestTransport::test_getGlobalOption_over_http`（路径分隔符）、
+`test_port_listener.py::test_listens_on_ipv4_and_ipv6_loopback`（本机 `::1` 被拒）、
+`test_runtime_install.py` 3 项、`test_github_probe.py::testProxySiteGetsNoCredentials`、
+android 系列（Linux 上本来就不跑）。
+
+---
+
+## 3. 还剩什么没做
+
+1. **Slint 侧还不是可运行的应用**（Phase 8）。`gd3-ui` 是纯库：没有 `main`、没有事件循环、
+   没有接 `gd3-core` 的 `TaskService`、没有读写 `UserConfig.json`，`Ghost-Downloader-3.py`
+   的入口仍走 Qt。所有 UI 逻辑目前只能通过单测与无头冒烟验证，**没有人眼验收过真实渲染**。
+2. **cfg 读写没搬**。`app/config/cfg.py` 是 `QConfig` 子类，每次 `cfg.set()` 整文件回写；
+   只要 Qt 还在写，Rust 再写同一文件就会互相覆盖。所以它与「Slint 成为唯一 UI」必须同步落地。
+3. **`gd3-py` 不由 `cargo test` 覆盖**，要用 maturin 构建后由 Python 侧测试间接验证。
+4. **无像素级/交互级回归**。判定标准是语义镜像（配置键名、默认值、取值范围、格式化输出），
+   布局常量按 Python 源码抄下来并有断言，但视觉差异未逐像素比对。
+5. **P6 只有语义层，没有 Slint 托盘/Dock 组件**：`shell.rs` 产出菜单项、定位、文案与
+   `DockEffect` 序列，真正的托盘图标与 Dock 磁贴需要平台原生 API（`QSystemTrayIcon` /
+   AppKit / 任务栏 API），Slint 1.18 无对应能力，需另写平台层。
+
+---
+
+## 4. 已知差异与风险
+
+### 4.1 语义层的已知偏差（每条都在模块头或测试旁标注）
+
+- **无译文层**：`toLocalizedError` / `QCoreApplication.translate` 的文本按中文原文硬编码
+  或由调用方当入参传入。切换语言时 Rust 侧不会自动跟随。
+- **Python 抛异常处退化为缺省值**：`options.index()` 缺失 → 兜底 0；`size_hint` 高度为 0
+  → `(16,16)`；非法 IPv6 括号 → `is_subscription_url` 返回 `false`；Markdown 缺片段标记
+  → `None`（Python 抛 `IndexError`）。
+- **Qt 专有行为不模拟**：`QComboBox.currentText()` 用字符串承载、`nextCheckState` 的空实现
+  用返回值表达、`QWidget` 布局缓存用显式 `i32`（`0` = 未布局）承载、`QColor` 透明度用 `u8`。
+- **`icon_or_tag` 用白名单**（`category_settings`）：`ICON_CHOICES ∪ {"TAG"}`，是唯一已知的
+  枚举收敛偏差。
+- **`const { assert!(...) }` 不能比较元组/浮点**：涉及处拆成字段逐个比较。
+
+### 4.2 技术风险
+
+- **`wreq` 是预发布版本**：`FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，
+  升级 wreq 后必须重新核对（Python 侧有 Edge / Android 系列，wreq-util 3.0.0-rc.14 只有
+  chrome/firefox/safari/opera/okhttp 五族，这类 profile 会退回 Chrome 最新版）。
+- **ja3 每次随机**：wreq 会打乱 TLS 扩展顺序，验证指纹只能比 ja4 + HTTP/2(Akamai) + UA。
+- **稀疏文件**：Python 预分配前会 `FSCTL_SET_SPARSE`，Rust 只 `set_len`（NTFS 上功能等价）。
+- **磁盘满**：错误码表已与 Python 逐码对齐，但没有端到端注入测试。
+- **UI 单测依赖「Qt 实测值当入参」的约定**：窗口几何、字体测宽、暗色标志都由调用方传入。
+  真正接线时若传错（例如把逻辑像素当物理像素），单测不会报警——这是 Phase 8 的主要坑。
+
+### 4.3 边界（本次未触碰）
+
+磁盘格式（`tasks.jsonl`、`.ghd`、`UserConfig.json`）与线上协议（aria2 JSON-RPC、浏览器扩展
+WebSocket v2）**未变**，两侧可互相读写、随时可切回纯 Python。未 `git push`，未改 `.git` 历史。
