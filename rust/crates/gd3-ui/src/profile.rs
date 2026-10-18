@@ -79,6 +79,163 @@ pub fn label_of(value: &str) -> String {
     }
 }
 
+/// `app/client.py::buildRegistry()` 的实测快照：每个家族的版本名按
+/// 版本号**降序**（`entries.sort(key=lambda e: e[1], reverse=True)`），
+/// 家族顺序与 [`FAMILY_LABELS`] 一致（即 `profileFamilies()`）。
+///
+/// 数据来源是 `wreq::emulation::Emulation` 的成员名（`^([A-Za-z]+?)(\d[\d_]*)$`），
+/// 所以 wreq 升级后需要重新核对这张表。`option_cards::build_profile_menu`
+/// 用它生成二级菜单，`label_of` 把 `Safari26_4` 显示成 `Safari 26.4`。
+pub const FAMILY_VERSIONS: [(&str, &[&str]); 9] = [
+    (
+        "chrome",
+        &[
+            "Chrome149",
+            "Chrome148",
+            "Chrome147",
+            "Chrome146",
+            "Chrome145",
+            "Chrome144",
+            "Chrome143",
+            "Chrome142",
+            "Chrome141",
+            "Chrome140",
+            "Chrome139",
+            "Chrome138",
+            "Chrome137",
+            "Chrome136",
+            "Chrome135",
+            "Chrome134",
+            "Chrome133",
+            "Chrome132",
+            "Chrome131",
+            "Chrome130",
+            "Chrome129",
+            "Chrome128",
+            "Chrome127",
+            "Chrome126",
+            "Chrome124",
+            "Chrome123",
+            "Chrome120",
+            "Chrome119",
+            "Chrome118",
+            "Chrome117",
+            "Chrome116",
+            "Chrome114",
+            "Chrome110",
+            "Chrome109",
+            "Chrome108",
+            "Chrome107",
+            "Chrome106",
+            "Chrome105",
+            "Chrome104",
+            "Chrome101",
+            "Chrome100",
+        ],
+    ),
+    (
+        "edge",
+        &[
+            "Edge148", "Edge147", "Edge146", "Edge145", "Edge144", "Edge143", "Edge142", "Edge141",
+            "Edge140", "Edge139", "Edge138", "Edge137", "Edge136", "Edge135", "Edge134", "Edge131",
+            "Edge127", "Edge122", "Edge101",
+        ],
+    ),
+    (
+        "firefox",
+        &[
+            "Firefox151",
+            "Firefox150",
+            "Firefox149",
+            "Firefox148",
+            "Firefox147",
+            "Firefox146",
+            "Firefox145",
+            "Firefox144",
+            "Firefox143",
+            "Firefox142",
+            "Firefox139",
+            "Firefox136",
+            "Firefox135",
+            "Firefox133",
+            "Firefox128",
+            "Firefox117",
+            "Firefox109",
+        ],
+    ),
+    ("firefox-android", &["FirefoxAndroid135"]),
+    (
+        "opera",
+        &[
+            "Opera131", "Opera130", "Opera129", "Opera128", "Opera127", "Opera126", "Opera125",
+            "Opera124", "Opera123", "Opera122", "Opera121", "Opera120", "Opera119", "Opera118",
+            "Opera117", "Opera116",
+        ],
+    ),
+    (
+        "safari",
+        &[
+            "Safari26_4",
+            "Safari26_3",
+            "Safari26_2",
+            "Safari26_1",
+            "Safari26",
+            "Safari18_5",
+            "Safari18_3_1",
+            "Safari18_3",
+            "Safari18_2",
+            "Safari18",
+            "Safari17_6",
+            "Safari17_5",
+            "Safari17_4_1",
+            "Safari17_2_1",
+            "Safari17_0",
+            "Safari16_5",
+            "Safari16",
+            "Safari15_6_1",
+            "Safari15_5",
+            "Safari15_3",
+        ],
+    ),
+    (
+        "safari-ios",
+        &[
+            "SafariIos26_2",
+            "SafariIos26",
+            "SafariIos18_1_1",
+            "SafariIos17_4_1",
+            "SafariIos17_2",
+            "SafariIos16_5",
+        ],
+    ),
+    (
+        "safari-ipad",
+        &["SafariIpad26_2", "SafariIPad26", "SafariIPad18"],
+    ),
+    (
+        "okhttp",
+        &[
+            "OkHttp5",
+            "OkHttp4_12",
+            "OkHttp4_10",
+            "OkHttp4_9",
+            "OkHttp3_14",
+            "OkHttp3_13",
+            "OkHttp3_11",
+            "OkHttp3_9",
+        ],
+    ),
+];
+
+/// `profileVersions(family)`：未知家族返回空切片（Python 的
+/// `PROFILES_BY_FAMILY.get(family, [])`）。
+pub fn versions_of(family: &str) -> &'static [&'static str] {
+    FAMILY_VERSIONS
+        .iter()
+        .find(|(name, _)| *name == family)
+        .map_or(&[], |(_, versions)| *versions)
+}
+
 /// 索引 → profile 字面量：镜像 `_onPick`（auto/raw/家族字面量）。
 /// 越界兜底 auto（与 cfg.py ClientProfileValidator.correct 一致，
 /// 不复刻 UI 越界崩溃面）。

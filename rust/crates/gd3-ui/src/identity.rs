@@ -20,7 +20,7 @@
 
 use crate::pystr::py_strip;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct IdentityPreset {
     pub name: String,
     pub client_profile: String,
