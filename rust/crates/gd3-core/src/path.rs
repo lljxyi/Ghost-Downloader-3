@@ -110,9 +110,55 @@ pub fn posix_normpath(path: &str) -> String {
     normalised
 }
 
+/// 镜像 `PurePosixPath(p).relative_to(base)`：返回 `str(...)`，不可相对时 `None`
+/// （Python 抛 `ValueError`）。
+///
+/// 三处非显然口径：
+/// - 两边必须同为绝对或同为相对（`Path("/a/b").relative_to("")` 是 `ValueError`）；
+/// - 「根」是路径的第一段：`//a` 的根是 `//`，与 `/a` 的 `/` **不同**，所以
+///   `Path("//a/b").relative_to("/a")` 抛 `ValueError`；
+/// - 余下部分为空时返回 `"."`（`Path("/a/b").relative_to("/a/b")`）。
+///
+/// 期望值来自 CPython 3.13：
+///
+/// ```text
+/// "/a/b"  / "/a"   -> "b"      "/a/b"  / "/a/b" -> "."
+/// "/a/b/c"/ "/a"   -> "b/c"    "a"     / "a"    -> "."
+/// "//a/b" / "//a"  -> "b"      "//a/b" / "/a"   -> ValueError
+/// "///a/b"/ "/a"   -> "b"      "/a/b"  / ""     -> ValueError
+/// ```
+pub fn posix_relative_to(path: &str, base: &str) -> Option<String> {
+    let (path_root, path_parts) = split_root(path);
+    let (base_root, base_parts) = split_root(base);
+    if path_root != base_root || !path_parts.starts_with(&base_parts) {
+        return None;
+    }
+    let rest = &path_parts[base_parts.len()..];
+    if rest.is_empty() {
+        return Some(String::from("."));
+    }
+    Some(rest.join("/"))
+}
+
+/// `(根, 组件)`：根是 `"/"` / `"//"` / `""`，组件已去掉空段与 `.`。
+fn split_root(path: &str) -> (&str, Vec<&str>) {
+    let leading = path.bytes().take_while(|byte| *byte == b'/').count();
+    let (root, rest) = match leading {
+        0 => ("", path),
+        1 => ("/", &path[1..]),
+        2 => ("//", &path[2..]),
+        _ => ("/", path.trim_start_matches('/')),
+    };
+    let parts = rest
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    (root, parts)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{posix_join, posix_stem};
+    use super::{posix_join, posix_relative_to, posix_stem};
 
     #[test]
     fn matches_pure_posix_path_join() {
@@ -174,6 +220,35 @@ mod tests {
     fn drops_dot_and_empty_components() {
         assert_eq!(posix_join("./a/./b/.", "n"), "a/b/n");
         assert_eq!(posix_join("..", "n"), "../n");
+    }
+
+    #[test]
+    fn relative_to_matches_pathlib() {
+        // 期望值全部来自 CPython 3.13：`str(Path(p).relative_to(base))`
+        let cases = [
+            ("/a/b", "/a", Some("b")),
+            ("/a/b", "/a/b", Some(".")),
+            ("/a/b/c", "/a", Some("b/c")),
+            ("a/b", "a", Some("b")),
+            ("a", "a", Some(".")),
+            ("///a/b", "/a", Some("b")),
+            ("/a/./b", "/a", Some("b")),
+            ("/a/b/", "/a/", Some("b")),
+            ("//a/b", "//a", Some("b")),
+            // 下面全是 Python 的 `ValueError`：
+            ("/a", "/a/b", None),
+            ("//a/b", "/a", None),
+            ("/a/b", "//a", None),
+            ("a", "b", None),
+            ("/a/b", "", None),
+        ];
+        for (path, base, expected) in cases {
+            assert_eq!(
+                posix_relative_to(path, base).as_deref(),
+                expected,
+                "path={path:?} base={base:?}"
+            );
+        }
     }
 }
 

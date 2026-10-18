@@ -58,8 +58,10 @@
 //!   `tasks.jsonl` 不会被重新写一遍（字节内容等价，只是少了这次写盘）；
 //! - `featureService.activate`/`deactivate`、`runtimeStatusService`、功能包解析器、
 //!   `loadCrx`、`deleteRecoverably`、`fileWatcher` 全是桩：装配点保留，行为没有；
-//! - `probeConflict` 恒 `None`（`TaskStore.probeConflict` 依赖占位文件路径，尚未迁移），
-//!   所以冲突队列不会真的弹窗，见 [`Engine::on_name_conflicted`]；
+//! - `probeConflict` 已接线（第 96 步）：`TaskConflictActions::probe` 转调
+//!   [`TaskService::probe_conflict_by_id`]，即 `TaskStore.probeConflict` +
+//!   `categoryService.outputFolderOf`；Python 里队列拿到的是 `Task` 对象，Rust 侧
+//!   队列只存 `ConflictTask { task_id, file_size }`，所以按 id 回查；
 //! - **分类服务是克隆**：Python 的 `Engine` / `TaskService` / `FeatureService` 拿的是
 //!   同一个 `CategoryService` 实例，改规则立刻全处可见；Rust 侧
 //!   [`Engine::new`] 把 `category.clone()` 交给 `TaskService`，所以改完规则必须
@@ -652,10 +654,9 @@ impl Engine {
     /// 返回队列事件：`RefreshPosted` 表示「调用方须自己调
     /// [`Engine::refresh_conflicts`]」（Python 是 `coroutineRunner.post(self._refresh)`）。
     ///
-    /// **已知差异**：`probeConflict` 恒 `None`——`TaskStore.probeConflict` 要按
-    /// `task.placeholderPaths` 找已存在的文件，占位文件还没迁移。于是队列认为
-    /// 「没有冲突」，直接按 `keepBoth` 放行（`refresh` 里 `probe → None` 的分支），
-    /// 不会弹窗。等占位文件落地后只需换掉 [`TaskConflictActions::probe`]。
+    /// `probe` 走 [`TaskService::probe_conflict_by_id`]（`TaskStore.probeConflict`）：
+    /// 占位符**已存在且不属于未完成任务**才算冲突，此时队列不再放行，等
+    /// [`Engine::apply_dialog_outcome`] 收用户的选择。
     pub fn on_name_conflicted(&mut self, task: ConflictTask) -> Vec<ConflictEvent> {
         let mut actions = TaskConflictActions {
             tasks: &mut self.tasks,
@@ -679,8 +680,8 @@ impl Engine {
 
     /// `NameConflictPrompt` 的结论 → `queue.setChoice` / `queue.cancel`。
     ///
-    /// 当前 `probeConflict` 恒 `None`，队列里不会留下 `conflict`，所以这两个分支
-    /// 都是「直接 return」；等探测迁移后自动生效（队列侧语义第 65 步 b 已对齐）。
+    /// 队列里没有当前冲突（用户没被问过，或已被 `cancel` 清掉）时两个分支都是
+    /// 「直接 return」——语义在第 65 步 b 已对齐。
     pub fn apply_dialog_outcome(&mut self, outcome: &DialogOutcome) -> Vec<ConflictEvent> {
         let mut actions = TaskConflictActions {
             tasks: &mut self.tasks,
@@ -718,9 +719,10 @@ fn absorb_calls(trace: &mut Trace, actions: &mut TaskConflictActions<'_>) {
 }
 
 impl ConflictActions for TaskConflictActions<'_> {
-    /// `TaskService.probeConflict`：见 [`Engine::on_name_conflicted`] 的已知差异。
-    fn probe(&mut self, _task: &ConflictTask) -> Option<ProbeTarget> {
-        None
+    /// `TaskService.probeConflict(task)`：`outputFolderOf` 之后再
+    /// `TaskStore.probeConflict`，四列 `stat()` 一起带回来。
+    fn probe(&mut self, task: &ConflictTask) -> Option<ProbeTarget> {
+        self.tasks.probe_conflict_by_id(&task.task_id)
     }
 
     /// `TaskService.add(task, choice=choice)`：任务已经在列表里，所以 Python 在

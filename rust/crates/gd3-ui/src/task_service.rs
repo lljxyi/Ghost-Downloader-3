@@ -42,6 +42,9 @@
 //!   `TaskService` 拿的是 `Engine` 里**同一个** `CategoryService` 实例，Rust 侧
 //!   是克隆——改规则/设置后要 [`TaskService::set_categories`] 重新推
 //!   （引擎侧 [`crate::engine::Engine::push_categories`]）；
+//! - `probe_conflict()` 只 `stat()` **一次**（Python 是 `isExisting` 一次、队列
+//!   取 `st_size`/`st_mtime` 再一次，中间文件可能被删）；四列都来自同一次
+//!   `metadata`，所以不会出现「探测到存在、stat 时没了」的 `OSError`；
 //! - `pump()` 派发时用**空 workId** 占位（Python 在 `_dispatch` 里拿到协程 id 才
 //!   `queue.run(taskId, workId)`）：这里先 `run(id, "")` 把 `runningCount` 顶上去，
 //!   否则 `pump` 的循环条件与 `tasksAllCompleted` 的判定都不成立；引擎起来后由
@@ -56,6 +59,7 @@ use std::path::{Path, PathBuf};
 
 use gd3_core::filename::{DEFAULT_MAX_FILENAME_LENGTH, to_safe_filename};
 use gd3_core::filesystem::{delete_path, move_path};
+use gd3_core::path::{posix_join, posix_normpath, posix_relative_to};
 use gd3_core::placeholder::{
     CreateError, NameConflictChoice, PlaceholderRegistry, create_placeholders, delete_placeholder,
     resolve_conflict, sidecar_path,
@@ -67,6 +71,18 @@ use gd3_core::task::{TaskRecord, TaskStatus};
 use crate::AppWindow;
 use crate::card::CardRuntime;
 use crate::category::CategoryService;
+use crate::name_conflict::ProbeTarget;
+
+/// `st_mtime` 的浮点形态（Python 的 `stat_result.st_mtime`）。
+///
+/// 取不到时间戳（理论上不会：`metadata` 已经成功了）时退回 `0.0`——Python 那边
+/// 是 `AttributeError`，不值得为它引入一条错误路径。
+fn modified_seconds(info: &fs::Metadata) -> f64 {
+    info.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0, |delta| delta.as_secs_f64())
+}
 
 /// `TaskService.add()` 的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -522,6 +538,74 @@ impl TaskService {
             .position(|record| record.task_id == task_id)?;
         self.pending_flush = true;
         Some(self.records.remove(index))
+    }
+
+    /// `TaskService.probeConflict(task)`（`task_service.py:388-390`）：
+    /// `_, folder = categoryService.outputFolderOf(task)` 之后再探测。
+    ///
+    /// 供 `NameConflictQueue` 的 `probeConflict` 注入点使用（[`crate::name_conflict`]）。
+    pub fn probe_conflict(&self, record: &TaskRecord) -> Option<ProbeTarget> {
+        let folder = self.categories.output_folder_of(record).folder;
+        self.probe_conflict_in(record, &folder)
+    }
+
+    /// `TaskStore.probeConflict(task, folder)`（`task_service.py:126-128`）：
+    ///
+    /// ```python
+    /// paths = sorted(folder / path.relative_to(task.outputFolder)
+    ///                for path in task.placeholderPaths)
+    /// return next((path for path in paths
+    ///              if isExisting(path) and not self._isUnfinishedPlaceholder(path)), None)
+    /// ```
+    ///
+    /// 三处口径：
+    /// - **相对路径再拼到 `folder`**：占位符登记在 `task.outputFolder` 下，探测时
+    ///   要按「新的输出目录」重新定位（`add` 的第一步刚把分类目录算出来）；
+    /// - `sorted(...)`：`Path` 之间**按组件**比较（`/a/b` < `/a.b`），不是字符串比较；
+    /// - `isExisting(path) and not _isUnfinishedPlaceholder(path)`：先看 `stat()`
+    ///   成不成，再看登记表里该路径的**所属任务**是不是 `COMPLETED`——未完成的
+    ///   占位符是自己人，不算冲突。
+    pub fn probe_conflict_in(&self, record: &TaskRecord, folder: &Path) -> Option<ProbeTarget> {
+        let folder_text = folder.to_string_lossy();
+        let mut paths: Vec<PathBuf> = record
+            .placeholder_paths()
+            .iter()
+            .filter_map(|path| {
+                let text = path.to_string_lossy();
+                // `pathlib` 在不可相对时抛 `ValueError`；这里的占位符都是
+                // `outputFolder / name` 拼出来的，走不到 `None`。
+                let relative = posix_relative_to(&text, &record.output_folder)?;
+                // `Path(folder) / "."` 在 pathlib 里就是 `Path(folder)`。
+                Some(if relative == "." {
+                    PathBuf::from(posix_normpath(&folder_text))
+                } else {
+                    PathBuf::from(posix_join(&folder_text, &relative))
+                })
+            })
+            .collect();
+        // `Path` 的 `Ord` 是逐组件比较，与 CPython `PurePath._cparts` 同口径。
+        paths.sort();
+        paths.into_iter().find_map(|path| {
+            let info = fs::metadata(&path).ok()?;
+            if self
+                .placeholders
+                .is_unfinished(&path, |task_id| self.task(task_id).map(|task| task.status))
+            {
+                return None;
+            }
+            Some(ProbeTarget {
+                path: path.to_string_lossy().into_owned(),
+                is_folder: info.is_dir(),
+                existing_size: info.len() as i64,
+                modified_at: modified_seconds(&info),
+            })
+        })
+    }
+
+    /// [`TaskService::probe_conflict`]，按 id 取任务（`ConflictActions::probe` 只
+    /// 拿得到 `ConflictTask.task_id`）。任务不在列表里 → `None`。
+    pub fn probe_conflict_by_id(&self, task_id: &str) -> Option<ProbeTarget> {
+        self.probe_conflict(self.task(task_id)?)
     }
 
     /// `start(task)`：已在运行/等待则不动（Python 两条短路），否则入队等派发。
@@ -1772,5 +1856,90 @@ mod tests {
         assert_eq!(task.category, None, "关闭时连分类都不猜");
         assert_eq!(PathBuf::from(&task.output_folder), dir.path());
         assert!(dir.path().join("movie.mkv").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // 第 96 步：`probeConflict`（重名冲突探测）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_conflict_returns_none_when_nothing_exists() {
+        let dir = TempDir::new("probe-empty");
+        let service = TaskService::new();
+        let record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        assert_eq!(service.probe_conflict(&record), None);
+        assert_eq!(service.probe_conflict_by_id("a"), None, "任务不在列表里");
+    }
+
+    #[test]
+    fn probe_conflict_reports_the_existing_file() {
+        let dir = TempDir::new("probe-file");
+        let service = TaskService::new();
+        let record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, b"hello").expect("写文件");
+
+        let target = service.probe_conflict(&record).expect("有冲突");
+        assert_eq!(PathBuf::from(&target.path), path);
+        assert!(!target.is_folder);
+        assert_eq!(target.existing_size, 5);
+        assert!(target.modified_at > 0.0, "st_mtime 是正数");
+    }
+
+    #[test]
+    fn probe_conflict_reports_a_folder_placeholder() {
+        let dir = TempDir::new("probe-dir");
+        let service = TaskService::new();
+        let record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        let path = dir.path().join("a.bin");
+        std::fs::create_dir(&path).expect("建目录占位符");
+
+        let target = service.probe_conflict(&record).expect("有冲突");
+        assert!(target.is_folder, "多文件任务的占位符是目录");
+    }
+
+    #[test]
+    fn probe_conflict_skips_unfinished_placeholders() {
+        let dir = TempDir::new("probe-unfinished");
+        let mut service = TaskService::new();
+        // `add_with_conflict` 会真的建出 0 字节占位符并登记，正好当「自己人」。
+        service
+            .add_with_conflict(
+                record_in(dir.path(), "a", TaskStatus::Running),
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("不是错误");
+        let record = service.task("a").expect("任务在").clone();
+        assert!(
+            service.probe_conflict(&record).is_none(),
+            "未完成任务的占位符不算冲突"
+        );
+
+        service.task_mut("a").expect("任务在").status = TaskStatus::Completed;
+        let target = service.probe_conflict(&record).expect("完成之后才算冲突");
+        assert_eq!(target.existing_size, 0, "占位符是 0 字节");
+    }
+
+    #[test]
+    fn probe_conflict_looks_inside_the_category_folder() {
+        let dir = TempDir::new("probe-category");
+        let mut service = TaskService::new();
+        service.set_categories(categories(dir.path()));
+        let mut record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        record.name = "movie.mkv".to_string();
+        std::fs::create_dir(dir.path().join("Video")).expect("建分类目录");
+        let taken = dir.path().join("Video/movie.mkv");
+        std::fs::write(&taken, b"x").expect("写文件");
+
+        let target = service.probe_conflict(&record).expect("分类目录里有冲突");
+        assert_eq!(PathBuf::from(&target.path), taken);
+        assert_eq!(
+            service.probe_conflict_in(&record, dir.path()),
+            None,
+            "显式给默认目录时那边没有文件"
+        );
     }
 }

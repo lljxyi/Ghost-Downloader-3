@@ -299,6 +299,13 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   （分类功能开启且输出目录是默认下载目录时改道到分类目录），再做 `mkdir -p` /
   占位符 / 重名决策；`delete_recoverably` 由调用方注入（生产传
   `gd3_core::trash::delete_recoverably`，`Err` 按 `false` 处理）。
+- **冲突探测**（第 96 步）：`probe_conflict(record) -> Option<ProbeTarget>` 是
+  `TaskStore.probeConflict` 的镜像——先 `outputFolderOf` 拿到目录，再把每个占位符
+  「相对 `outputFolder` 的部分」拼到该目录下，`sort()`（`Path` 逐组件比较）后返回
+  **第一个**「`stat()` 成功且不属于未完成任务」的路径 + `is_folder` / `existing_size` /
+  `modified_at` 四列。`probe_conflict_in(record, folder)` 是显式给目录的版本，
+  `probe_conflict_by_id(id)` 给只拿得到 `taskId` 的调用方（冲突队列）。
+  差异：四列来自同一次 `metadata`（Python 是 `isExisting` 一次 + 队列 `stat()` 一次）。
 
 ### 引擎装配（`engine.rs`）
 
@@ -322,9 +329,12 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
 - **配置是快照**：Python 的 `cfg.*` 是活对象（`PortListener` 连 `valueChanged`），
   Rust 侧还没有响应式层，所以 `nameConflict` / `maxTaskNum` 每次用时现读（与 `lambda`
   同构），监听器端口在构造时取快照；
-- `probeConflict` 恒 `None`——`gd3-core::placeholder` 与
-  `TaskService::add_with_conflict` 都已就位（第 92/93 步），但 `Engine` 还没把
-  「冲突队列 → 重新 add」这条线接起来，所以冲突队列仍不弹窗、按 `keepBoth` 放行。
+- **冲突探测已接线**（第 96 步）：`TaskConflictActions::probe` 转调
+  `TaskService::probe_conflict_by_id`（`TaskStore.probeConflict` +
+  `categoryService.outputFolderOf`）。Python 的队列拿的是 `Task` 对象，Rust 侧只存
+  `ConflictTask { task_id, file_size }`，所以按 id 回查——「同一实例」这条差异的
+  又一例。占位符存在且不属于未完成任务时队列不再放行，等
+  `Engine::apply_dialog_outcome` 收用户的选择。
 
 ### 单实例锁（`single_instance.rs`）
 
@@ -824,7 +834,7 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1776 行 / 42 单测**
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1945 行 / 47 单测**
 （其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个）。
 
 ## 剩余工作（Phase 8）
