@@ -3773,3 +3773,118 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 - 下一步：P1 设置页收尾——`setting_cards.rs`(949)、`setting_card_group.rs`(290)、
   `card_groups.rs`(191)；然后 P5 OOBE（`oobe_window.py` 971 行）→ P6 平台外壳。
 - 卡点：无
+
+## 第 73 步：P1 设置页收尾三模块（setting_cards / setting_card_group / card_groups）（2026-10-18 04:58）
+- 做了什么：
+  - `card_groups.rs`（551 行，14 测试）：`card_groups.py`(191) 的
+    `DraftCardGroup` / `OptionCardGroup` 容器状态。
+    `TITLE_PREFIX "    "` / `HEADER_HEIGHT 30` / `GROUP_RADIUS 5.0` /
+    `GROUP_INSET (1,1,-1,-1)` / `STATS_FONT_SIZE 13` / `STATS_HEIGHT 30` /
+    `HEADER_ROW_SPACING 8` / `RIGHT_PAD_TEXT "  "` / `TITLE_DRAFT "解析结果"` /
+    `TITLE_OPTIONS "下载设置"` / `DRAFT_CARD_HEIGHT 35` / `DRAFT_MIN_VISIBLE 5`；
+    `group_background(dark)` 深 `(255,255,255,13)` / 浅 `(255,255,255,200)`、
+    `group_border` 96/24、`ratio_color` 深 `(252,169,3)` / 浅 `(196,53,1)`、
+    `inset_rect(w,h)` = `(w-2, h-2)`、`update_stats(success, fail, total_size) ->
+    DraftStats`；`DraftCardGroupState::{add_card, set_urls, clear, size_hint,
+    minimum_size_hint}`（同 url 先删后**追加尾部**；`set_urls` 先 retain 再按
+    urls 顺序重排）；`OptionCardGroupState::{add_card, insert_card, options,
+    reset}`（`insert_card` 手写 `list.insert` 的负索引语义；`options()` 用 Vec
+    保插入序，镜像 Python dict）。
+  - `setting_card_group.rs`（461 行，16 测试）：`CollapsibleSettingCard` /
+    `SettingCardGroup` 的折叠与省略号逻辑。`QWIDGETSIZE_MAX (1<<24)-1` /
+    `COLLAPSE_DURATION_MS 200` / `COLLAPSE_EASING "OutCubic"` /
+    `HEADER_MARGINS (16,10,8,10)` / `HEADER_SPACING 4` / `TITLE_HEIGHT 26` /
+    `MOVE_BUTTON_SIZE 30` / `MOVE_ICON_SIZE 10` / `EXPAND_ANGLE_COLLAPSED 0` /
+    `EXPAND_ANGLE_EXPANDED 180` / `CARD_STRETCH_FACTOR 1<<16` /
+    `LABEL_WORD_WRAP false`；`group_background(dark)` 深 13 / 浅 **170**（与
+    `card_groups` 的 200 不同，两文件本来就不同）、`separator_color` 96/24、
+    `separator_rect(w, container_y)` = `(1, y-1, w-2, 1)`、`expand_angle(collapsed)`、
+    `elide_lines(text, width, advance)`（`pystr::split_lines` + `labels::elide_right`
+    + `"\n"` 拼回，空文本 → `""`）、`container_max_height(collapsed)`、
+    `CollapseAnim` / `expand_anim` / `collapse_anim`、
+    `CollapsibleSettingCardState`（`set_expand` 幂等、`finish_anim` **仅展开**
+    时放 `QWIDGETSIZE_MAX`、`needs_group_separator(view_count)`）、
+    `GroupCollapseState`（`header_hit(y, container_top) = y < container_top`）。
+  - `setting_cards.rs`（1245 行，26 测试）：`setting_cards.py`(949) 的九类卡片
+    语义层。
+    - 校验正则：`host_pattern_ok`（IPv4 或域名，与 Python `HOST_PATTERN` 同源）、
+      `port_pattern_ok`（`^\d{1,5}$`，**与 `proxy::port_valid` 的 1..=65535
+      是两套口径**，前者只给红下划线）；
+    - `ErrorUnderline{x,y,width,height,radius}` + `underline_visible(has_focus,
+      is_error)` + `underline(width, height, ml, mr)`：Python 画的是
+      `addRoundedRect(ml, h-10, w, 10, 5, 5) - addRect(ml, h-10, w, 8)` 的可见带
+      → `y = h - 2`、`height = 2`、`radius = 1`；`ERROR_LINE_DEPTH 10` /
+      `ERROR_LINE_CUT 8` / `ERROR_LINE_RADIUS 5`；
+    - 数值卡：`spin_range` / `spin_display` / `spin_commit`（`int(v/division)`
+      向零截断）、`percent_range` / `percent_display` / `percent_commit`
+      （`/100` 不截断）、`WHEEL_ADJUSTS_VALUE false`（`eventFilter` 吞 Wheel）、
+      `PERCENT_SUFFIX " %"` / `PERCENT_DECIMALS 0` / `PERCENT_SINGLE_STEP 25.0`；
+    - `line_edit_commit`（`text()` 原样，不 strip）、`radio_label(choice)`；
+    - 代理卡：`PackCompat{pack_id, proxy_schemes}`、`incompatible_packs`
+      （`packId.upper()`，`proxySchemes is None` 视为全兼容）、
+      `compat_banner_text`（`"{0} 不支持当前代理协议，将直连；使用 SOCKS5
+      可兼容全部下载方式"`，`PACK_NAME_SEPARATOR "、"`）、
+      `url_scheme(url)`（CPython `urlsplit` 口径：lstrip C0+空格、删
+      `\t\r\n`、`:` 前不得含 `/?#`、首字符 ASCII 字母、其余
+      `[A-Za-z0-9+.-]`、转小写）；
+      `ProxyCardState::{load, radio_clicked, show_proxy_url, url, custom_enabled,
+      refresh_banner, field_changed, leave_commit}`；
+    - 身份预设行：`DescIcon{Globe,Fingerprint,People}`、`DescSegment`、
+      `desc_segments(preset)`（hosts 前 3 项 `", "` 连接 → `profile::label_of`
+      → `clip_user_agent`）、`row_enabled`、`UNNAMED_PRESET "未命名预设"`、
+      `preset_name`、`toggle_identity` / `remove_identity` / `add_identity`
+      （越界返回 `None`，Python 是静默 no-op）；
+    - 标头卡：`headers_count_label "{n} 条标头"`、`headers_row_state(index,
+      current, total) -> (is_current, total > 1)`、`HeadersRemoval{presets,
+      current_value, current_index, can_remove, choice_name}`、
+      `remove_headers_preset`；
+    - 路径卡：`folder_content` / `file_initial_content(value, hint)` /
+      `file_content(path, hint)`；
+    - 运行时卡：`parse_version` / `is_newer`（镜像 `app/update.py` 的
+      `lstrip("vV")` + 累积数字 + 去尾零）、`RuntimeStatus`、
+      `RuntimeCardView{content, install_text: Option, install_visible,
+      install_installing: Option, install_progress: Option, install_tooltip:
+      Option, delete_visible, refresh_enabled}`、`runtime_view(status,
+      can_install, is_managed)`（`Option<T>` 表达「Python 该分支没触碰该属性」）。
+  - `identity::clip_user_agent` 改 `pub`；`identity::IdentityPreset` 补
+    `PartialEq, Eq`；`headers::HeaderPreset` 补 `Debug, PartialEq, Eq`；
+    `lib.rs` 在 `setting_card_group` 与 `settings_group` 之间注册
+    `pub mod setting_cards;`。
+- 实证结论（写进模块头）：
+  - `_refreshCompatBanner` 每次都重新调 `proxy()`，**不缓存**系统代理 URL
+    → Rust 侧把 `detected: Option<&str>` 作为参数传给 `refresh_banner` /
+    `field_changed`，而不是在结构体里存一份 `detected_scheme`；
+  - `_onRadioClicked` 的 custom 分支先 `_onProxyFieldChanged()`（内部已刷新
+    banner）再 `_refreshCompatBanner()`，即**连刷两次**，幂等，Rust 照抄；
+  - `_loadProxy` 的三分支：`"Auto"` / `"Off"` 直接走 `_onRadioClicked`；
+    其余值先 `_showProxyUrl(value)` 再走 custom 分支 —— 此时 ip 已是主机名
+    （非占位串），所以不会触发清空；
+  - `_showProxyUrl(None)` 里 `protocolCombo.setCurrentText("")` 在不可编辑
+    下拉中落到 index -1（文本为空），不是保留 socks4；未知 scheme 走
+    `setCurrentText` 未命中 → 保留初值 `PROTOCOLS[0]`；
+  - `SpinBoxSettingCard` 的 `int(v / division)` 是**向零截断**（`-1.5 → -1`），
+    而 `PercentSpinBoxSettingCard` 的 `/100` 不截断，两者口径不同；
+  - `LineEditSettingCard.editingFinished` 直接 `cfg.set(..., text())`，
+    **不 strip**。
+- 修掉的**测试算错**（实现均与 Python 一致，是断言写错）：
+  - `card_groups::set_urls_with_duplicate_moves_twice_like_qt`：retain 在重排
+    **之前**，`urls = ["a","a"]` 会先把 b 删掉；
+  - `card_groups::option_group_insert_and_reset_follow_python_list_semantics`：
+    `dict.update` 是**后者覆盖**，同名键只看最后一张卡；
+  - 新增 `card_groups::option_group_reset_restores_each_card_initial_value`：
+    `SubworkerCountCard::reset()` 回 `default_value`(8)，不是构造时的
+    `initial`(4)。
+- 修掉的编译/clippy 问题：`ProxyFields` 未用导入；`manual_contains` ×2
+  （`urls.contains(&card.url)` / `schemes.contains(&scheme)`）；
+  `assertions_on_constants` ×2（改 `const { assert!(...) };`）。
+- 验证：
+  - `cargo fmt --all --check` 通过；
+  - `cargo test -p gd3-ui --lib`：**439 → 495 passed**（card_groups 14 +
+    setting_card_group 16 + setting_cards 26）；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings` 0 error；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` 全绿；
+  - commit `0a69a73`。
+- 下一步：P5 OOBE（`windows/oobe_window.py` 971 行）→ P6 平台外壳
+  （`shell/tray.py` 205 / `dock.py` 141 / `mac_status_item.py` 112）→ 更新
+  `rust/README.md` + `AGENT-DONE`。
+- 卡点：无
