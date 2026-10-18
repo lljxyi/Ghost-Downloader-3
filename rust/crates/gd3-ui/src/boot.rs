@@ -13,11 +13,14 @@
 //! 本步（第 80 步）只做「能跑起来」的最小闭环，其余按 Phase 8 后续小步补：
 //!
 //! ```text
-//! 路径解析 → 配置装载 → 窗口实例化（配置推送到 UI）→ 事件循环
+//! 路径解析 → 配置装载 → 单实例锁 → 窗口实例化（配置推送到 UI）→ 事件循环
 //! ```
 //!
-//! 未迁移（后续小步）：单实例锁、D-Bus/URL scheme 接收、`app/engine.py` 全部服务、
-//! 托盘/`desktop_keepalive`/通知、功能包加载、更新检查、OOBE 分支、多语言翻译器。
+//! 已迁移的单实例锁见 [`crate::single_instance`]（`APP_DATA_DIR/instance.sock`）。
+//!
+//! 未迁移（后续小步）：D-Bus 服务名注册（`org.freedesktop.Application`）、`app/engine.py`
+//! 剩余服务、托盘/`desktop_keepalive`/通知、功能包加载、更新检查、OOBE 分支、
+//! 多语言翻译器。
 //!
 //! # 路径语义（`app/config/paths.py` 58 行）
 //!
@@ -184,6 +187,14 @@ impl Paths {
     pub fn tasks_path(&self) -> PathBuf {
         self.app_data_dir.join(TASKS_FILE)
     }
+
+    /// 单实例锁的 socket 路径（`APP_DATA_DIR / "instance.sock"`）。
+    ///
+    /// Python 用 `QSharedMemory(DESKTOP_ID)` 这个全局 key；这里放在数据目录下，
+    /// 同样是「每用户一份」，但换 `--data-dir` 就换锁（见 [`crate::single_instance`]）。
+    pub fn lock_path(&self) -> PathBuf {
+        self.app_data_dir.join(crate::single_instance::LOCK_FILE)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +218,8 @@ pub struct Cli {
     pub version: bool,
     /// 位置参数里识别出的 URL / 文件 URI（`application.py::urisFromArgv`）。
     pub urls: Vec<String>,
+    /// 原始位置参数（不含开关）。单实例交接要它来判断「argv 里有没有 wake URI」。
+    pub positional: Vec<String>,
 }
 
 pub const HELP: &str = "\
@@ -325,6 +338,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
         cli.silent = true;
     }
     cli.urls = uris_from_argv(&positional);
+    cli.positional = positional;
     Ok(cli)
 }
 
@@ -405,19 +419,45 @@ pub struct RunSummary {
     pub task_load_failures: usize,
     /// `resumeSaved()` 重新入队的任务数。
     pub resumed: usize,
+    /// 运行期间第二个实例送来的交接消息（`take_handoffs` 的结果）。
+    pub handoffs: Vec<crate::single_instance::Handoff>,
 }
 
-/// 启动闭环：路径 → 配置 → 引擎 → 窗口 → 事件循环 → 停机。
+/// [`run`] 的两种结局。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// 本进程是主实例：跑完事件循环、停机、落盘。
+    Ran(RunSummary),
+    /// 已经有实例在跑：参数（尽力）已交接过去，调用方应当以
+    /// [`crate::single_instance::SECOND_INSTANCE_EXIT`] 退出。
+    AlreadyRunning(crate::single_instance::Secondary),
+}
+
+/// 启动闭环：路径 → 配置 → 单实例锁 → 引擎 → 窗口 → 事件循环 → 停机。
 ///
 /// 无头模式（`--headless` 或无显示服务）用 `MinimalSoftwareWindow` 跑 `frames` 帧后返回；
 /// 有显示服务时走 winit 后端、阻塞到窗口关闭（`window.run()`）。两条路径最后都走
 /// [`crate::engine::Engine::stop`]。
-pub fn run(cli: &Cli) -> Result<RunSummary, String> {
+pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     let paths = match &cli.data_dir {
         Some(dir) => Paths::with_app_data_dir(dir),
         None => Paths::resolve(Path::new("."), None, None),
     };
     let loaded = load_config(&paths);
+
+    // 单实例锁（`SingletonApplication._lockSingleInstance`）：Python 在
+    // `setupEnvironment()` 之后、`startApp()` 之前上锁。第二个实例把参数交接给主实例
+    // 之后直接退出（Python：`sys.exit(-1)`）。
+    let mut instance = match crate::single_instance::acquire_with_handoff(
+        &paths.lock_path(),
+        crate::single_instance::plan_from_argv(&cli.positional),
+    ) {
+        Ok(crate::single_instance::Acquire::Primary(instance)) => instance,
+        Ok(crate::single_instance::Acquire::Secondary(secondary)) => {
+            return Ok(RunOutcome::AlreadyRunning(secondary));
+        }
+        Err(err) => return Err(format!("单实例锁创建失败：{err}")),
+    };
     let default_download = paths.download_dir.to_string_lossy().to_string();
     let headless = cli.headless || !has_display();
     let frames = cli.frames.unwrap_or(1);
@@ -443,13 +483,19 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;
     }
 
+    // 交接消息（第二个实例送来的 URI / 唤醒）只能在这里取：消费方（打开链接 / 激活
+    // 窗口）要等任务草稿链路迁过来才有地方接。Python 在 `exec()` 的 `finally` 里解锁，
+    // 位置同样在停机序列之前。
+    let handoffs = instance.take_handoffs();
+    instance.release();
+
     // 停机序列（`engine.py:41-49`）：`taskService.stop` → flush → 速度表/监听器/功能包
     // 收尾 → 再 flush。窗口一关就走，与 Qt 的 `aboutToQuit` 同位置。
     engine
         .stop()
         .map_err(|err| format!("任务列表落盘失败：{err}"))?;
 
-    Ok(RunSummary {
+    Ok(RunOutcome::Ran(RunSummary {
         headless,
         frames: if headless { frames } else { 0 },
         config_created: loaded.created,
@@ -461,7 +507,8 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
         tasks: engine.tasks().len(),
         task_load_failures: started.load_failures.len(),
         resumed: started.resumed.len(),
-    })
+        handoffs,
+    }))
 }
 
 /// `main.rs` 的全部逻辑（放在 lib 里才能被测试与 `cargo run` 共用）。
@@ -485,7 +532,11 @@ pub fn main_entry(args: Vec<String>) -> std::process::ExitCode {
         return ExitCode::SUCCESS;
     }
     match run(&cli) {
-        Ok(summary) => {
+        Ok(RunOutcome::AlreadyRunning(_)) => {
+            // Python：`sys.exit(-1)`，静默退出（参数已经交接给主实例）。
+            ExitCode::from(crate::single_instance::SECOND_INSTANCE_EXIT)
+        }
+        Ok(RunOutcome::Ran(summary)) => {
             if summary.headless {
                 println!(
                     "Ghost Downloader v{} launched (headless, {} frame(s), config={}, data={}, tasks={}, resumed={})",
@@ -533,6 +584,16 @@ mod tests {
 
     fn args(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// 测试只关心「真的跑起来了」那一种结局。
+    fn ran(cli: &Cli) -> RunSummary {
+        match run(cli).expect("无头启动应成功") {
+            RunOutcome::Ran(summary) => summary,
+            RunOutcome::AlreadyRunning(secondary) => {
+                panic!("不该变成第二个实例：{secondary:?}")
+            }
+        }
     }
 
     #[test]
@@ -710,7 +771,7 @@ mod tests {
             urls: vec!["https://example.com/a".to_string()],
             ..Cli::default()
         };
-        let summary = run(&cli).expect("无头启动应成功");
+        let summary = ran(&cli);
         assert!(summary.headless);
         assert_eq!(summary.frames, 2);
         assert!(summary.config_created);
@@ -730,7 +791,7 @@ mod tests {
             data_dir: Some(dir),
             ..Cli::default()
         };
-        let summary = run(&cli).expect("无头启动应成功");
+        let summary = ran(&cli);
         assert_eq!(summary.frames, 0);
     }
 
@@ -748,6 +809,60 @@ mod tests {
         let cli = parse_args(args(&["--tasks-file=/tmp/t.jsonl"])).expect("解析应成功");
         assert_eq!(cli.tasks_file, Some(PathBuf::from("/tmp/t.jsonl")));
         assert!(parse_args(args(&["--tasks-file"])).is_err(), "缺取值应报错");
+    }
+
+    #[test]
+    fn lock_path_lives_in_app_data_dir() {
+        let dir = temp_dir("lock-path");
+        let paths = Paths::with_app_data_dir(&dir);
+        assert_eq!(
+            paths.lock_path(),
+            dir.join(crate::single_instance::LOCK_FILE)
+        );
+        assert_eq!(crate::single_instance::LOCK_FILE, "instance.sock");
+    }
+
+    #[test]
+    fn second_instance_in_the_same_data_dir_hands_off() {
+        use crate::single_instance::{Acquire, Handoff};
+
+        let dir = temp_dir("second");
+        let lock = dir.join(crate::single_instance::LOCK_FILE);
+        let mut instance = match crate::single_instance::acquire(&lock).expect("抢锁") {
+            Acquire::Primary(instance) => instance,
+            Acquire::Secondary(_) => panic!("应当抢到锁"),
+        };
+        let cli = Cli {
+            headless: true,
+            frames: Some(0),
+            data_dir: Some(dir.clone()),
+            positional: vec!["https://example.com/x".to_string()],
+            ..Cli::default()
+        };
+        match run(&cli).expect("第二个实例") {
+            RunOutcome::Ran(_) => panic!("第二个实例不该跑起来"),
+            RunOutcome::AlreadyRunning(secondary) => {
+                assert_eq!(
+                    secondary.handoff,
+                    Some(Handoff::OpenUris(vec!["https://example.com/x".to_string()]))
+                );
+                assert!(secondary.delivered, "载荷应当写进 socket");
+            }
+        }
+        // 收件箱由另一个线程填，等一会儿。
+        let mut handoffs = Vec::new();
+        for _ in 0..200 {
+            handoffs = instance.take_handoffs();
+            if !handoffs.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            handoffs,
+            vec![Handoff::OpenUris(vec!["https://example.com/x".to_string()])]
+        );
+        instance.release();
     }
 
     #[test]
@@ -778,7 +893,7 @@ mod tests {
             data_dir: Some(dir.clone()),
             ..Cli::default()
         };
-        let summary = run(&cli).expect("无头启动应成功");
+        let summary = ran(&cli);
         assert_eq!(summary.tasks, 3, "坏行不算任务");
         assert_eq!(summary.task_load_failures, 1, "坏行只计数");
         assert_eq!(summary.resumed, 2, "WAITING + RUNNING 重新入队");
@@ -805,7 +920,7 @@ mod tests {
             tasks_file: Some(tasks_path),
             ..Cli::default()
         };
-        let summary = run(&cli).expect("无头启动应成功");
+        let summary = ran(&cli);
         assert_eq!(summary.tasks, 1);
         assert_eq!(summary.resumed, 1);
     }

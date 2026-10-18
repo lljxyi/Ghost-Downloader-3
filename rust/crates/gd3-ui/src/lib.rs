@@ -64,6 +64,7 @@ pub mod setting_cards;
 pub mod settings_group;
 pub mod settings_spec;
 pub mod shell;
+pub mod single_instance;
 pub mod sort;
 pub mod speed;
 pub mod subtitle_select;

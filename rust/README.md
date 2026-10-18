@@ -150,8 +150,8 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
 | P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**58 个模块**（57 个 `pub` + 私有 `format`）/ **36 201 行 `src/`**（含 `lib.rs` 3 490 行）、
-**6 个 Slint 文件 2 858 行**、**642 个单测**（`cargo test -p gd3-ui --lib`）。
+规模：**59 个模块**（58 个 `pub` + 私有 `format`）/ **36 838 行 `src/`**（含 `lib.rs` 3 491 行）、
+**6 个 Slint 文件 2 858 行**、**653 个单测**（`cargo test -p gd3-ui --lib`）。
 
 `app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
 无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
@@ -164,7 +164,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（642）
+cargo test -p gd3-ui --lib                 # 只跑单测（653）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 
@@ -179,7 +179,7 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
 **尚未做**：引擎里的各服务实现（`BrowserService` / `Aria2RpcService` / `FeatureService` /
-`RuntimeStatusService` 都还是桩，见下一节），托盘、单实例锁；`Ghost-Downloader-3.py`
+`RuntimeStatusService` 都还是桩，见下一节），托盘；`Ghost-Downloader-3.py`
 的入口仍走 Qt。二进制入口见下一节。
 
 ## Phase 8：启动入口（`gd3-ui` 二进制）
@@ -188,11 +188,15 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 `crates/gd3-ui/src/boot.rs`，对应仓库根的 `Ghost-Downloader-3.py`（268 行）：
 
 ```text
-Paths（paths.py）→ load_config（qconfig.load）→ Engine::new（装配）
+Paths（paths.py）→ load_config（qconfig.load）→ 单实例锁（instance.sock）
+                  → Engine::new（装配）
                   → Engine::start（loadSaved + resumeSaved + 起监听器）
                   → 窗口 + push_settings + 任务行 → 事件循环
-                  → Engine::stop（taskService.stop → flush → 收尾 → flush）
+                  → 取交接消息 + 放锁 → Engine::stop（taskService.stop → flush → 收尾 → flush）
 ```
+
+抢不到锁 = 已经有实例在跑：参数交接过去后以 **255** 退出，`Engine` 根本不会构造
+（见「单实例锁」一节）。
 
 - **路径语义**照抄 Qt 的「字符串拼接」而不是 `Path::join`：本机 `HOME` 为空时
   `QStandardPaths` 给 `HomeLocation='/'`、`GenericDataLocation='//.local/share'`、
@@ -257,7 +261,31 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
   同构），监听器端口在构造时取快照；
 - `probeConflict` 恒 `None`（占位文件未迁移）→ 冲突队列不会弹窗，按 `keepBoth` 放行。
 
-未迁移（后续小步）：单实例锁（QSharedMemory）、D-Bus / URL scheme 接收、
+### 单实例锁（`single_instance.rs`）
+
+`app/platform/application.py::SingletonApplication` 是**两套机制叠加**：锁用
+`QSharedMemory(DESKTOP_ID)`（`attach()` 成功 = 已有实例 → `sys.exit(-1)`），通道用
+Windows `WM_COPYDATA` / Linux `org.freedesktop.Application.Open`+`Activate`。这里换成一个
+**Unix domain socket**（`APP_DATA_DIR/instance.sock`）：`bind()` 成功即抢到锁，
+`connect()` 成功即「已有实例」，同一条连接顺带把参数送过去——一个机制同时给出锁与通道，
+不依赖 D-Bus、不依赖显示器，构建机上能测。
+
+```text
+gd3-ipc/1 activate\n              ← 只唤醒已有窗口（Activate / WM_USER_WAKE）
+gd3-ipc/1 open\n<uri>\n<uri>\n    ← 把 URI 交给已有实例（Open / COPYDATA_OPEN_FILES）
+```
+
+- 第二个实例：`argv` 里有 wake URI → **一个字节都不发**（同 Python），否则有 URI 发
+  `open`、没 URI 发 `activate`；然后以 **255** 退出（`sys.exit(-1)` 的 `-1 & 0xff`）；
+- 主实例的收件箱由后台线程填，`Instance::take_handoffs()` 破坏性取出；消费方（打开链接 /
+  激活窗口）还没迁过来，所以消息先攒着，事件循环结束后进 `RunSummary.handoffs`；
+- **陈旧 socket**：`bind()` 报 `AddrInUse` 后先 `connect()` 探活，连不上（`ConnectionRefused`
+  /`NotFound`）就删掉重试一次（进程被 `SIGKILL` 的残留）；
+- 与 Python 的差异：锁在 `APP_DATA_DIR` 下（换 `--data-dir` 就换锁，Python 的
+  `QSharedMemory` key 是全局的）、Windows 后端没实现、**不注册 D-Bus 服务名**、
+  `SIGINT` 处理（`_onInterrupt`）没搬。
+
+未迁移（后续小步）：D-Bus 服务名注册（`org.freedesktop.Application`）、
 托盘 / keepalive / 通知、功能包加载、更新检查、OOBE 分支、翻译器。
 
 ## 剩余工作（Phase 8）
