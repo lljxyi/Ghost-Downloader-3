@@ -3704,7 +3704,7 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   `card_groups.rs` 191）。
 - 卡点：无（clippy 单轮 12 分钟，仍按「多模块攒一批再跑」推进）
 
-## 第 72 步：P4 收官五模块（range_slider / token_line_edit / option_cards / bootstrap_list / markdown_viewer）（2026-10-18 04:52）
+## 第 72 步：P4 收官五模块（range_slider / token_line_edit / option_cards / bootstrap_list / markdown_viewer）（2026-10-18 04:35）
 - 做了什么：
   - `range_slider.rs`（1074 行，19 测试）：`HANDLE_SIZE 22` / `HANDLE_RADIUS 11` /
     `INNER_RADIUS 5` / `GROOVE_HEIGHT 4` / `LABEL_HEIGHT 24` / `LABEL_GAP 4` /
