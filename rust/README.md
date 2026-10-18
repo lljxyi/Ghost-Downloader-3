@@ -1151,6 +1151,27 @@ URL 先去重（保序，留第一次出现），再跑 `SequenceMatcher(旧, �
 `on_tick_failed` **不清** `bytes` / `current_speed`（照抄 Python）：下一轮 `start()` 的第一次
 `tick` 会把残留量发出去，这是既有行为，不修。
 
+### 接线（`TaskService`）
+
+Python 的 `_refreshSpeedMeter()` 是四个方法的尾语句，实读 `grep -n` 只有四处：
+`stopSeeding`（:406）、`_seed`（:593）、`_onSeedingEnded`（:604）、`_pump`（:657）。
+**`pause` / `resume` 里没有**——暂停时走 `_cancelWork` + `setStatus` + `_pump`，`_pump`
+末尾那一发自然会算。
+
+Rust 侧 `TaskService` 自己持有 `SpeedMeter`（Python 里是 `Engine` 构造、`:320` 注入），
+四个调用点一一对应，另补三个宿主入口：`add_speed` / `tick_speed_meter` /
+`on_speed_tick_failed`，以及谓词 `speed_meter_should_wait(enabled, limit)`。
+
+**效果进缓冲而不是改四个返回类型**：那四个方法已经各有返回值（`CancelWork` /
+`Option<SeedingEvent>` / `SeedingEvent` / `Vec<String>`），包一层报告结构会牵动
+`engine.rs` 与既有轨迹断言，而语义收益为零。所以 `refresh_speed_meter()` 把
+`start()` / `stop()` 的效果攒进 `speed_effects`，宿主在本轮动作结束后调
+`take_speed_effects()` 一次取走——与 `pending_flush`（把 `_flushSoon()` 的 200ms 防抖
+退化成标记）同一手法。四个调用点因此与 Python 一字不差，调用方不需要记得「pump 之后
+还要再调一次」。
+
+`stop()` 在没跑时不吐效果，所以「队列本来就空」的 `pump` 不会产生噪声。
+
 ### 为什么不搬 `name_conflict_queue.py`
 
 `app/services/name_conflict_queue.py`（73 行）的队列**第 65 步 b 就搬过了**，落在
@@ -1164,7 +1185,8 @@ URL 先去重（保序，留第一次出现），再跑 `SequenceMatcher(旧, �
 搬新模块前先 `grep -n 'pub struct <名字>' crates/*/src/*.rs`：进度笔记的标题按**Python
 文件用途**起名（「重名冲突提示」），从标题看不出它把服务层队列一起搬了。
 
-规模：`speed_meter.rs` **330 行 / 13 单测**。
+规模：`speed_meter.rs` **330 行 / 13 单测**；`task_service.rs` 3611 → **3850 行 / 86 单测**
+（接线 + 9 条单测）。
 
 ## 剩余工作（Phase 8）
 

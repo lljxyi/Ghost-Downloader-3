@@ -57,7 +57,7 @@ pub enum SpeedEffect {
 ///
 /// `Default` 与 `new()` 等价（Python 的 `__init__` 只有 `coroutineRunner` 一个参数，
 /// 而它在 Rust 侧已经退化成效果队列，没有可存的东西）。
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SpeedMeter {
     /// `_bytes`：两次 tick 之间累加的字节数。
     bytes: Cell<i64>,

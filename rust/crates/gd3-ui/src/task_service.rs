@@ -95,6 +95,7 @@ use crate::card::CardRuntime;
 use crate::category::CategoryService;
 use crate::facts;
 use crate::name_conflict::ProbeTarget;
+use crate::speed_meter::{SpeedEffect, SpeedMeter};
 
 /// `st_mtime` 的浮点形态（Python 的 `stat_result.st_mtime`）。
 ///
@@ -334,6 +335,21 @@ pub struct TaskService {
     /// `ChecksumWork` 整体入库（不是只存 workId）：`checksumProgress(task)` 要读
     /// `progress`，而 `onProgress` 回调只拿得到 taskId。
     checksums: BTreeMap<String, ChecksumWork>,
+    /// `TaskService._speedMeter`（`engine.py:20` 构造、`:320` 注入）：全局速度表 +
+    /// 限速闸门（第 104 步的 [`SpeedMeter`]）。
+    ///
+    /// Python 侧 `Engine` 与 `TaskService` 拿的是同一个实例；Rust 侧服务自己持有一份，
+    /// 宿主从 [`TaskService::speed_meter`] 读 `current_speed` / `pending_bytes`。
+    speed_meter: SpeedMeter,
+    /// 速度表攒下的效果（[`SpeedEffect`]），宿主用
+    /// [`TaskService::take_speed_effects`] 取走。
+    ///
+    /// 为什么不直接返回：Python 的 `_refreshSpeedMeter()` 是四个方法
+    /// （`stopSeeding` / `_seed` / `_onSeedingEnded` / `_pump`）的**尾语句**，而那四个
+    /// 方法都已经有返回值（`CancelWork` / `Option<SeedingEvent>` / `SeedingEvent` /
+    /// `Vec<String>`）；把它们全改成「返回值 + 效果」会牵动 `engine.rs` 与既有断言。
+    /// 缓冲一队效果等价，且四个调用点一字不差。
+    speed_effects: Vec<SpeedEffect>,
 }
 
 /// `_canDeleteIn(folder)`（`task_service.py:606-615`）：macOS 上「删不掉已下载内容」
@@ -840,14 +856,16 @@ impl TaskService {
     /// `stopSeeding(task)`（`task_service.py:402-406`）：`shouldSeed = False` +
     /// 落盘 + `_cancelWork(task)` + `_refreshSpeedMeter()`。
     ///
-    /// `_refreshSpeedMeter()` 退化成「调用方读 [`TaskService::speed_meter_should_run`]」；
+    /// `_refreshSpeedMeter()` 的效果进 [`TaskService::take_speed_effects`] 的缓冲；
     /// `seedingStopped` 事件在 [`CancelWork::stopped_seeding`] 里。
     pub fn stop_seeding(&mut self, task_id: &str) -> CancelWork {
         if let Some(record) = self.task_mut(task_id) {
             record.should_seed = false;
             self.pending_flush = true;
         }
-        self.cancel_work(task_id)
+        let work = self.cancel_work(task_id);
+        self.refresh_speed_meter();
+        work
     }
 
     /// `pause(task)`（`task_service.py:429-436`）的记账部分。
@@ -1256,6 +1274,56 @@ impl TaskService {
         self.queue.running_count() > 0 || !self.seeding.is_empty()
     }
 
+    /// `self._speedMeter`（宿主读 `current_speed` / `pending_bytes` / `should_wait`）。
+    pub fn speed_meter(&self) -> &SpeedMeter {
+        &self.speed_meter
+    }
+
+    /// `task.run(self._speedMeter.addSpeed, …)`（`task_service.py:578`）的 `addSpeed`
+    /// 半边：任务每收一块数据就累加一次。
+    pub fn add_speed(&mut self, byte_count: i64) {
+        self.speed_meter.add_speed(byte_count);
+    }
+
+    /// `self._speedMeter.waitForSpeedLimit()`（`speed_meter.py:39-41`）的单次判断。
+    ///
+    /// `enabled` / `limit` 由调用方每轮现读
+    /// （`settings::read_bool(cfg, "isSpeedLimitEnabled")` /
+    /// `read_i64(cfg, "speedLimitation")`），等价于 Python 的每轮重读 `cfg`。
+    pub fn speed_meter_should_wait(&self, enabled: bool, limit_bytes: i64) -> bool {
+        self.speed_meter.should_wait(enabled, limit_bytes)
+    }
+
+    /// `_refreshSpeedMeter()`（`task_service.py:659-663`）：`start()` / `stop()` 的效果
+    /// 攒进缓冲。
+    ///
+    /// 四个调用点与 Python 一一对应：`stop_seeding`（:406）、`seed`（:593）、
+    /// `on_seeding_ended`（:604）、`pump`（:657）。`pause` / `resume` 里**没有**。
+    fn refresh_speed_meter(&mut self) {
+        let effects = if self.speed_meter_should_run() {
+            self.speed_meter.start()
+        } else {
+            self.speed_meter.stop()
+        };
+        self.speed_effects.extend(effects);
+    }
+
+    /// 取走攒下的速度表效果（`StartTicking` / `Cancel` / `Emit`），保持产生顺序。
+    pub fn take_speed_effects(&mut self) -> Vec<SpeedEffect> {
+        std::mem::take(&mut self.speed_effects)
+    }
+
+    /// `_tick()`（`speed_meter.py:48-53`）的落点：宿主每秒调一次，效果同样进缓冲。
+    pub fn tick_speed_meter(&mut self) {
+        let effects = self.speed_meter.tick();
+        self.speed_effects.extend(effects);
+    }
+
+    /// `_onTickFailed`（`speed_meter.py:55-56`）的落点：只置空 workId（无效果）。
+    pub fn on_speed_tick_failed(&mut self) {
+        self.speed_meter.on_tick_failed();
+    }
+
     /// `_seed(task, isManual)`（`task_service.py:585-593`）：登记 workId +
     /// `seedingStarted` + `_refreshSpeedMeter()`。
     ///
@@ -1274,6 +1342,7 @@ impl TaskService {
         self.task(task_id)?;
         self.seeding
             .insert(task_id.to_string(), work_id.to_string());
+        self.refresh_speed_meter();
         Some(SeedingEvent::Started)
     }
 
@@ -1296,6 +1365,7 @@ impl TaskService {
     pub fn on_seeding_ended(&mut self, task_id: &str) -> SeedingEvent {
         self.seeding.remove(task_id);
         self.pending_flush = true;
+        self.refresh_speed_meter();
         SeedingEvent::Stopped
     }
 
@@ -1361,6 +1431,7 @@ impl TaskService {
             self.queue.run(&task_id, "");
             started.push(task_id);
         }
+        self.refresh_speed_meter();
         started
     }
 
@@ -3607,5 +3678,177 @@ mod tests {
             "onStopped 末尾的 _schedule 把任务重新排上"
         );
         assert_eq!(service.running_count(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // 速度表接线（第 105 步）：`_refreshSpeedMeter()` 的四个调用点
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pump_starts_the_speed_meter() {
+        let mut service = TaskService::from_records(vec![record("b", TaskStatus::Waiting, 10)]);
+        assert!(
+            service.take_speed_effects().is_empty(),
+            "还没派发，没有效果"
+        );
+
+        assert!(service.start("b"));
+        assert_eq!(service.pump(8), vec!["b".to_string()]);
+
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![SpeedEffect::StartTicking {
+                work_id: "speed-1".to_string()
+            }],
+            "`_pump` 末尾的 `_refreshSpeedMeter` → start()"
+        );
+        assert!(service.speed_meter().is_running());
+    }
+
+    #[test]
+    fn pump_with_nothing_to_dispatch_leaves_the_meter_alone() {
+        let mut service = TaskService::new();
+
+        assert!(service.pump(8).is_empty());
+        assert!(
+            service.take_speed_effects().is_empty(),
+            "没在跑 → stop() 本身不吐效果"
+        );
+        assert!(!service.speed_meter().is_running());
+    }
+
+    #[test]
+    fn finishing_the_last_run_stops_the_meter() {
+        let mut service = TaskService::from_records(vec![record("b", TaskStatus::Waiting, 10)]);
+        service.start("b");
+        service.pump(8);
+        service.take_speed_effects();
+
+        let outcome = service.on_run_finished("b", 8);
+        assert!(outcome.started.is_empty());
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![
+                SpeedEffect::Cancel {
+                    work_id: "speed-1".to_string()
+                },
+                SpeedEffect::Emit { speed: 0 },
+            ],
+            "队列空了、也没做种 → stop()：先取消再发 0"
+        );
+        assert!(!service.speed_meter().is_running());
+    }
+
+    #[test]
+    fn seeding_starts_and_stops_the_meter() {
+        let mut service = TaskService::from_records(vec![seedable("a", TaskStatus::Completed)]);
+
+        assert_eq!(service.seed("a", "w1"), Some(SeedingEvent::Started));
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![SpeedEffect::StartTicking {
+                work_id: "speed-1".to_string()
+            }],
+            "`_seed` 末尾的 `_refreshSpeedMeter`"
+        );
+
+        service.on_seeding_ended("a");
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![
+                SpeedEffect::Cancel {
+                    work_id: "speed-1".to_string()
+                },
+                SpeedEffect::Emit { speed: 0 },
+            ],
+            "`_onSeedingEnded` 末尾的 `_refreshSpeedMeter`"
+        );
+    }
+
+    #[test]
+    fn stop_seeding_refreshes_the_meter() {
+        let mut service = TaskService::from_records(vec![seedable("a", TaskStatus::Completed)]);
+        service.start_seeding("a", "w1");
+        service.take_speed_effects();
+
+        let cancelled = service.stop_seeding("a");
+        assert!(cancelled.stopped_seeding);
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![
+                SpeedEffect::Cancel {
+                    work_id: "speed-1".to_string()
+                },
+                SpeedEffect::Emit { speed: 0 },
+            ],
+            "`stopSeeding` 是四个调用点里的第三个"
+        );
+    }
+
+    #[test]
+    fn add_speed_and_tick_flow_through_the_service() {
+        let mut service = TaskService::from_records(vec![record("b", TaskStatus::Waiting, 10)]);
+        service.start("b");
+        service.pump(8);
+        service.take_speed_effects();
+
+        service.add_speed(10);
+        service.add_speed(5);
+        assert_eq!(service.speed_meter().pending_bytes(), 15);
+
+        service.tick_speed_meter();
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![SpeedEffect::Emit { speed: 15 }],
+            "`_tick` 发布累加量"
+        );
+        assert_eq!(service.speed_meter().current_speed(), 15);
+        assert_eq!(service.speed_meter().pending_bytes(), 0);
+    }
+
+    #[test]
+    fn speed_meter_should_wait_delegates_to_the_meter() {
+        let mut service = TaskService::new();
+        service.add_speed(100);
+
+        assert!(
+            !service.speed_meter_should_wait(true, 100),
+            "等于上限不算超"
+        );
+        assert!(service.speed_meter_should_wait(true, 99));
+        assert!(
+            !service.speed_meter_should_wait(false, 1),
+            "限速关掉就永不等待"
+        );
+    }
+
+    #[test]
+    fn take_speed_effects_drains_the_buffer() {
+        let mut service = TaskService::from_records(vec![record("b", TaskStatus::Waiting, 10)]);
+        service.start("b");
+        service.pump(8);
+        assert_eq!(service.take_speed_effects().len(), 1);
+
+        assert!(service.take_speed_effects().is_empty(), "取过一次就空了");
+    }
+
+    #[test]
+    fn on_speed_tick_failed_lets_the_meter_start_again() {
+        let mut service = TaskService::from_records(vec![record("b", TaskStatus::Waiting, 10)]);
+        service.start("b");
+        service.pump(8);
+        service.take_speed_effects();
+
+        service.on_speed_tick_failed();
+        assert!(!service.speed_meter().is_running());
+
+        // 下一个 `pump` 会重新起一轮（新的 workId）。
+        service.pump(8);
+        assert_eq!(
+            service.take_speed_effects(),
+            vec![SpeedEffect::StartTicking {
+                work_id: "speed-2".to_string()
+            }]
+        );
     }
 }
