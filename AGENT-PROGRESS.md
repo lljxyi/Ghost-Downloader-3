@@ -5074,3 +5074,94 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
      `install` / `fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
   5. D-Bus / keepalive 仍排最后（`zbus` 缓存可用但编译代价大）。
 - 卡点：无
+
+## 第 92 步：gd3-core::placeholder（2026-10-18 12:13）
+
+- 做了什么：把 `TaskStore.add` 的「占位符 + 重名冲突决策」整条链路搬进
+  `gd3-core::placeholder`（**915 行 / 31 单测**）。
+  - `NameConflictChoice { KeepBoth, Overwrite, Ask }` + `as_str()`（`"keepBoth"` /
+    `"overwrite"` / `"ask"`）+ `parse()`；`Default = KeepBoth`。
+  - `placeholder_paths(output_folder, name) -> Vec<PathBuf>`：恒 `[folder/name]`。
+  - `sidecar_path(path)`：`Path(f"{path}.ghd")` 的等价物（`OsString::push`）。
+  - `delete_placeholder(path) -> io::Result<()>`：空目录 → `remove_dir`，
+    0 字节文件 → `remove_file`，其余一律不动。
+  - `create_placeholders(paths, existing, is_output_folder)
+    -> Result<Vec<PathBuf>, CreateError>`：`is_output_folder && index == 0` →
+    `create_dir`，否则 `create_new`；失败回滚本次已建成的；成功后 `delete_path`
+    清掉每个 `<path>.ghd`。
+  - `CreateError::{Taken(TakenPath), Io{path, error}}` + `taken_path()`。
+  - `resolve_conflict(name, choice, create, is_unfinished, delete_recoverably)
+    -> Result<Option<ConflictOutcome>, CreateError>`。
+  - `PlaceholderRegistry`（`by_task: BTreeMap<String, Placeholders>` +
+    `by_path: BTreeMap<PathBuf, String>`）：`set`/`remove`/`get`/`owner`/`len`/
+    `is_empty`/`is_unfinished(path, status_of)`/`replaced_tasks(paths)`。
+  - `lib.rs`：`pub mod placeholder;`（:23）+ 12 个 re-export。
+  - `rust/README.md` 新增「占位符与重名冲突（`gd3-core::placeholder`）」一节
+    （插在「剩余工作（Phase 8）」之前，README 现 759 行）。
+- 关键决策：
+  - **冲突决策做成「纯循环 + 闭包注入」。** `resolve_conflict` 不认识 `Task`，
+    只通过 `create` / `is_unfinished` / `delete_recoverably` 三个闭包与外界交互。
+    五个决策分支（建成 / `Ask` 放弃 / `Overwrite` 成功同名重试 / `Overwrite` 失败
+    退化 `KeepBoth` / 未完成占位符强制改名）全部在 core 层被单测钉住；
+    `TaskService` 的接线（含 `tasks.jsonl` 落盘与 `replacedTasks` 移除）留第 93 步。
+  - **`CreateError` 区分 `Taken` 与 `Io`。** Python 只有 `FileExistsError` 会被
+    `except` 抓住继续决策，其余 `OSError`（父目录没了、ENOSPC、EACCES）直接冒泡
+    把 `add` 打断。用同一个 `TakenPath` 表达两者会让「权限不足」被误当成「重名」，
+    在 `Overwrite` 分支里反复重试。
+  - **`PlaceholderRegistry` 存 `taskId` 而不是任务对象。** Python 的
+    `_taskByPlaceholder` 存 `Task`、`_isUnfinishedPlaceholder` 直接读 `task.status`；
+    core 层不认识 `TaskRecord` 的生命周期，所以 `is_unfinished` 收一个
+    `status_of: impl Fn(&str) -> Option<TaskStatus>`。
+  - **改名循环加了 `MAX_RENAME_ATTEMPTS = 10_000` 上限。** Python 的
+    `while True` 没有上限：文件名长到触发 `toSafeFilename` 的 200 字符截断时，
+    `name(1).ext` 与 `name(2).ext` 截断后可能完全相同 → 死循环。到达上限后返回
+    最后一次的 `Taken`（而不是静默给出错误名字）。
+- 复核过的 Python 口径（第 92 步调研已读完，本轮再确认一遍）：
+  - `add`（`task_service.py:62-90`）：`mkdir(parents=True, exist_ok=True)` →
+    `stem, ext = splitStemExt(task.name)`（取自**原始**名字）→ `while True`；
+    `Overwrite` 成功时 `continue`（同名重试，不改名），失败时
+    `isOverwriteFailed = True` + `choice = KEEP_BOTH`；
+    未完成占位符既不 `Ask` 放弃也不覆盖，直接 `index += 1` 改名。
+  - `setName` = `toSafeFilename(name, fallback=self.name or "download")` ——
+    每次改名的 fallback 都是**上一个** `current`，所以 `resolve_conflict` 里
+    `to_safe_filename(&format!("{stem}({index}){ext}"), &current, 200)`。
+  - `_createPlaceholders`（:135-155）：跳过已在 `existingPaths` 的；
+    `isOutputFolder and path == Path(task.outputPath)` → `mkdir`，否则
+    `touch(exist_ok=False)`；`FileExistsError` 时把本次 `created` 逐个
+    `deletePlaceholder` 再抛；成功后对每个 created `deletePath(f"{path}.ghd")`。
+  - `_isUnfinishedPlaceholder`（:130-133）：`task is not None and
+    task.status != COMPLETED`。
+  - `_setPlaceholders`（:156-162）：先 `_removePlaceholders(taskId)` 再写两张表。
+  - `_removePlaceholders`（:163-171）：pop 之后**只删 `by_path[path].taskId ==
+    taskId` 的项**（这个守卫有单测钉住：t2 抢走路径后移除 t1 不能清掉 t2 的登记）。
+  - `deletePlaceholder`（`task.py:20-25`）：`is_dir() and not any(iterdir())` →
+    `rmdir`；`elif is_file() and st_size == 0` → `unlink`。
+  - `Task.placeholderPaths`（`task.py:241-251`）：`[Path(outputPath)]` + step 循环；
+    step 循环因 `TaskStep.outputPath` 基类返回 `""` 且全仓无子类覆盖而永不追加。
+- 已知差异（都写进模块文档与 README）：
+  1. **`placeholder_paths` 只返回 `[outputFolder/name]`**，不遍历 `steps`；
+  2. **改名有 10_000 次上限**（Python 死循环）；
+  3. `delete_placeholder` 返回 `io::Result` 而不是静默 —— Python 的
+     `deletePlaceholder` 遇到 `OSError` 会抛，回滚循环也跟着中断。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**302 passed**（第 91 步 271 + 31）；
+  - `cargo test --workspace`：**1151 passed, 0 failed**（28 个 test result 段，
+    第 91 步 1120 + 31，约 11 分钟编译）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（1m15s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧没改一行，不需要跑 Python 全量；
+  - commit `c8dfd5e`。
+- 下一步：
+  1. **第 93 步：把 `placeholder` 接进 `gd3-ui::task_service`。** 目标形态
+     `TaskService::add_with_conflict(record, choice, auto_start) ->
+     Option<AddOutcome>`：`output_folder.mkdir(parents=True)` → 用
+     `create_placeholders` + `PlaceholderRegistry` 驱动 `resolve_conflict` →
+     `Ok(None)` 映射成「返回 `None`」→ 按 `replaced_tasks` 移除被替换任务 →
+     插入 → `registry.set` → 复用现有磁盘检查 + 入队逻辑；`delete_recoverably`
+     直接接 `trash::delete_recoverably`。`AddOutcome` 要补
+     `replaced_tasks` / `overwrite_failed` 两个字段（对应 `AddResult`）。
+  2. 之后候选（按价值/风险）：`buildFontFamilies`（`desktop.py:15-45`，纯函数）→
+     `TaskStore.updatePlaceholders`（改名/移动占位符）→
+     `app/services/runtime_status.py`（195 行，需先给 `pack::BinaryRuntime` 补
+     `install`/`fetch_latest_version` 的同步签名）→ D-Bus / keepalive 仍排最后。
+- 卡点：无
