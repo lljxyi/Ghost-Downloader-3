@@ -6494,3 +6494,210 @@ ZIP 中央目录解析、要么退化成 `Unsupported`——两条路都会把�
 **其余候选（按可行性排）**：`app/services/feature_service.py`（234 行，工厂，等主窗口）；
 `app/platform/desktop.py:15-45` `buildFontFamilies`（纯函数，但要先造 `QLocale.Script` /
 `Country` 的映射表）；`actions::UiHooks`（等主窗口）；D-Bus / keepalive（仍排最后）。
+
+## 第 103 步：任务草稿（`gd3-ui::task_draft` / `gd3-ui::sequence_matcher`）（2026-10-18 20:44）
+
+**目标**：`app/services/task_draft.py`（241 行）的移植。它是 P2「建任务链路」的状态机核心：
+批量 URL 面板往里面塞 URL，它做**增量 diff**（谁留下、谁取消、谁新提交解析），
+解析回调回来时把 `Task` 挂到草稿项上，确认时把整批草稿交给建任务链路。
+
+唯一的外部依赖是 `difflib.SequenceMatcher(a=previousUrls, b=urls, autojunk=False)`
+——`isjunk=None` + `autojunk=False` 是**全仓唯一用法**，所以只移植这一种配置。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-ui/src/sequence_matcher.rs` | **新文件 387 行 / 11 单测**：`OpTag` / `Opcode` / `Match` / `opcodes()` / `matching_blocks()` / `find_longest_match()` |
+| `gd3-ui/src/task_draft.rs` | **新文件 1073 行 / 32 单测**：`DraftItem` / `DraftEffect`（8 变体）/ `AddParsedReport` / `TaskDraft` |
+| `gd3-core/src/task.rs` | 493 → **513 行**：新增 `impl TaskOptions { pub fn from_options(&Map<String, Value>) -> Self }`；顺手修掉第 101 步遗留的错位 doc 注释 |
+| `gd3-ui/src/lib.rs` | 注册 `pub mod sequence_matcher;` / `pub mod task_draft;` |
+| `rust/README.md` | 1049 → **1131 行**：新增「任务草稿」一节 |
+
+### 逐条对齐 Python
+
+| Python（`task_draft.py`） | Rust | 备注 |
+|---|---|---|
+| `urls` :42 | `urls()` | 按 `items` 顺序现算 |
+| `items` / `itemByUrl` / `taskByUrl` :45-56 | `items()` / `item_by_url` / `task_by_url` | 后者只看 `task.is_some()` |
+| `failCount` :58 | `fail_count()` | |
+| `canConfirm` :61 | `can_confirm()` | 「有任一项在解析或有 task」且「不是全部失败」 |
+| `update` :64 | `update(url, mutate)` | 只对**已解析**的项生效，改完发 `Changed` |
+| `setBaseOptions` :71 | `set_base_options(&Map)` | 已解析的项同步重算 options |
+| `setUrlCategory` :78 | `set_url_category(url, Option<&str>)` | 同时改 `category_override` 与已解析 task |
+| `setUrls` :87-116 | `set_urls(&[String])` | 见下方 diff 表 |
+| `refresh` :118-126 | `refresh(url)` | 只重提**失败**的项 |
+| `_submit` :128-141 | `submit_at`（私有） | 先清 `error`，再发 `Parse`；无「提交异常」路径 |
+| `addParsedTasks` :143-172 | `add_parsed_tasks(&[TaskRecord])` | 见下方两遍循环 |
+| `confirm` :174-190 | `confirm(auto_start)` | 见下方两遍循环 |
+| `clear` :192-199 | `clear()` | 取消所有待解析项；**不动 `detached`** |
+| `_buildOptions` :201-205 | `build_options(base, item)`（自由函数） | `{**base, "url": url, "category": override}` |
+| `_isParsing` :207 | `is_parsing()` | 只看 `items`，不看 `detached` |
+| `_onParsed` :210-225 | `on_parsed(parse_id, task)` | 按 `parseId` 反查；反查不到就丢 |
+| `_onParseFailed` :227-241 | `on_parse_failed(parse_id, error)` | 同上；`detached` 里的项直接丢 |
+
+### `setUrls` 的 diff 口径
+
+`SequenceMatcher(a=旧 urls, b=新 urls, autojunk=False).get_opcodes()` 的每个 opcode：
+
+| tag | 动作 |
+|---|---|
+| `equal` | 旧项原样搬进 `next`（**不重提交**，`parseId` 保留） |
+| 其它 | 先对 `previous[oldStart:oldEnd]` 里 `parseId` 非空的项发 `CancelWork` 并清空 `parseId`；再对 `urls[newStart:newEnd]` 逐个 `DraftItem` + `submit_at` |
+
+收尾顺序固定：`Busy(is_parsing())` → 各 `Failed`（`submitErrors`）→ `Changed`。
+**Rust 没有 `submitErrors`**：`Parse` 只是入队、同步不会失败，所以退化成 `Busy → Changed`。
+
+### 关键决策
+
+- **选 `task_draft.py` + `SequenceMatcher` 而不是 `update_service.py`**：`update_service.py`（335 行）
+  依赖 `app/sources.py`（295 行，github/gitcode 双源 fallback 的 async HTTP）与
+  `zipfile` / `tarfile(r:xz)` / `hdiutil`；本机离线缓存里**没有 `zip` 与 `xz2`**。
+  `task_draft` 不碰网络、不碰解包，是纯状态机。
+- **`sequence_matcher` 只覆盖 `isjunk=None` + `autojunk=False`**：此时 `__chain_b` 退化成
+  「元素 → 下标列表」的普通 map，`find_longest_match` 的两条 junk 扩展循环是死代码，整体省略。
+  `get_opcodes()` 不缓存（Python 有 `_opcodes` 缓存，但这里每次都是新对象）。
+- **`matching_blocks` 的哨兵 `Match { a: a.len(), b: b.len(), size: 0 }` 必须保留**：
+  `get_opcodes` 靠它把「最后一个公共块之后的部分」也吐出来。丢掉哨兵会漏掉尾部 `delete`/`insert`。
+- **`Match` 的 `Ord` 派生顺序即 Python 元组排序口径**：字段声明顺序 `(a, b, size)`。
+- **`DraftEffect::Parse` 携带原始 options 字典（含 `"url"` 键），不在服务里转 `TaskOptions`**：
+  本仓 `TaskOptions` 只建模 `outputFolder` / `category`，提前转换会丢掉 `headers` /
+  `subworkerCount` 等尚未建模的键。转换放在宿主（真正建任务的那一侧）。
+- **`confirm()` 之后 `items` 清空，仍在解析的项移进独立的 `detached: Vec<DraftItem>`**：
+  Python 是 `self._items = []`，但协程仍持有 `item` 引用，回调照样会进来。Rust 没有「被协程持有」
+  这回事，必须自己留一份，否则迟到的回调无处可去。
+  `on_parsed` / `on_parse_failed` 先查 `detached` 再查 `items`（按 `parse_id` 定位）。
+- **`detached` 里的项必然 `confirmed_options.is_some()`**：`confirm()` 第二遍会取消
+  「`parse_id` 非空但 `confirmed_options` 为 None」的项，只有冻结过 options 的才进 `detached`。
+- **回调按 `parseId` 反查而不是闭包捕获 item**：取消时 `parse_id` 被清空，于是「取消后迟到的回调」
+  自然查不到，与 Python 的 `if not item.parseId: return` 等价。
+- **`build_options` 写成自由函数 `fn build_options(base: &Map, item: &DraftItem) -> Map`**：
+  避免「`&mut self.items` 与 `&self.base_options` 同时借」的借用冲突。
+- **`submitErrors` 判 N/A**：见上。
+- **`category_override: Option<String>`**（`None` = 不覆盖）：Python 是
+  `dict.get("category")`，同样表达不了「把 category 显式置 None」，口径一致。
+- **`DraftEffect::Confirmed` 携带 `TaskRecord` 的克隆**：Python 传活对象；效果队列的消费者本来就取所有权。
+- **`TaskDraft` 不持有 `coroutineRunner` / `featureService`**：两者分别退化成效果队列与宿主注入。
+- **`clear()` 不动 `detached`**：那里是已确认的任务，清草稿不该把它们的解析掐掉。
+- **`is_parsing()` 只看 `items` 不看 `detached`**：照抄 Python，`confirm()` 之后
+  `parsingBusyChanged` 仍发 `false`。
+- **`add_parsed_tasks` 的 `tasks` 非空但全被跳过时仍发 `Busy` + `Changed`**：Python 的两个 emit
+  在循环之外，不能因为「什么都没干」就跳过。
+- **`on_parsed` 必须把 `build_options` 应用到 task 上再入队 `Succeeded`**：首跑漏了这一句，
+  被 `unused variable: options` 警告抓出来（见下）。
+- **`work_id` 形如 `draft-N`，`N` 由一个 `u64` 计数器发号，永不复用**。
+
+### 单测（11 + 32 个）
+
+`sequence_matcher.rs`（11）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `empty_sequences_produce_no_opcodes` | `([], [])` → 空 |
+| `identical_sequences_produce_one_equal_opcode` | 全等 → 单个 `Equal{0,n,0,n}` |
+| `a_single_substitution_is_a_replace_between_two_equals` | `abc` vs `axc` → `Equal/Replace/Equal` |
+| `reversed_sequences_anchor_on_the_longest_block` | 反转 → 最长公共块优先，两侧各一 `Delete`+`Insert` |
+| `a_contiguous_slice_in_the_middle_is_one_delete_either_side` | 中段整体删除 → 两段 `Equal` 夹一个 `Delete` |
+| `shifting_a_window_produces_delete_equal_insert` | 窗口平移 → `Delete`/`Equal`/`Insert` |
+| `repeated_elements_keep_the_leftmost_longest_block` | 重复元素 → 取最左的最长块（`find_longest_match` 的 `besti` 只更新严格更长） |
+| `alternating_keeps_and_inserts_are_all_equal_length` | 交替序列 → 块长与 Python 一致 |
+| `adjacent_blocks_are_merged_into_one_equal_opcode` | 相邻块合并成一个 `Equal` |
+| `opcodes_are_contiguous_by_construction` | `i1<=i2`、`j1<=j2`、相邻 opcode 首尾相接、覆盖到末尾 |
+| `works_on_owned_strings_too` | `T = String` 也能用（泛型 `Eq + Hash`） |
+
+`task_draft.rs`（32）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `set_urls_submits_each_url_once_and_reports_busy` | 空 → 3 项：`Busy(true)` → 3×`Parse` → `Changed` |
+| `set_urls_dedupes_while_keeping_the_first_occurrence` | 重复 URL 只留第一次出现 |
+| `set_urls_keeps_equal_items_without_resubmitting` | 同列表 → 只有 `Changed`，`parse_id` 不变 |
+| `set_urls_with_an_identical_list_only_emits` | 同上（不同夹具） |
+| `set_urls_replaces_the_middle_span` | 中段替换 → 只取消被替换的那几项 |
+| `set_urls_cancels_the_tail` | 尾部删除 → `CancelWork` 只发给被删项 |
+| `set_urls_does_not_cancel_items_that_already_finished` | `parse_id` 已空的项**不发** `CancelWork` |
+| `set_urls_to_an_empty_list_cancels_everything` | 清空 → 每项一条 `CancelWork` |
+| `refresh_resubmits_only_the_failed_item` | 只重提 `error.is_some()` 的项 |
+| `refresh_ignores_healthy_and_unknown_items` | 健康项 / 未知 URL → 空效果 |
+| `add_parsed_tasks_appends_unknown_urls` | 新 URL 追加为新项并挂上 task |
+| `add_parsed_tasks_skips_urls_that_already_have_a_task` | 已有 task 的 URL 跳过 |
+| `add_parsed_tasks_cancels_a_pending_parse_and_takes_over` | 还在解析的项 → 先 `CancelWork` 再接管 |
+| `add_parsed_tasks_with_no_tasks_is_a_no_op` | `tasks` 为空 → 空效果（**连 `Changed` 都不发**） |
+| `on_parsed_stores_the_task_and_reports_success` | `Succeeded{url, task}` + `Busy(false)` + `Changed` |
+| `on_parsed_applies_the_base_options` | task 的 `output_folder` / `category` 来自 `base_options` |
+| `on_parsed_of_a_cancelled_parse_is_ignored` | `parse_id` 已清 → 空效果 |
+| `on_parse_failed_records_the_error` | `error` 落上 + `Failed` |
+| `confirm_hands_over_parsed_items_and_detaches_the_pending_ones` | 已解析的进 `Confirmed`，未解析的进 `detached` |
+| `confirm_carries_the_auto_start_flag` | `Confirmed{auto_start}` 透传 |
+| `confirm_freezes_the_options_of_a_pending_item` | 待解析项在 `confirm` 时冻结 options |
+| `on_parse_failed_of_a_detached_item_drops_it_silently` | `detached` 项失败 → 无效果（不再发 `Failed`） |
+| `clear_cancels_every_pending_parse` | 每项一条 `CancelWork` |
+| `clear_leaves_detached_items_alone` | `detached` 不受影响 |
+| `set_base_options_rewrites_parsed_tasks` | 改基准 options → 已解析 task 跟着改 |
+| `parse_carries_the_base_options_and_the_url` | `Parse{work_id, options}` 里含 `url` 与基准键 |
+| `a_category_override_wins_over_the_base_options` | 单项覆盖优先于基准 |
+| `set_url_category_updates_the_parsed_task_too` | 已解析 task 的 `category` 同步 |
+| `update_mutates_only_parsed_items` | 未解析项改不到 |
+| `can_confirm_is_true_while_anything_is_parsing_or_parsed` | 有在解析或有 task → `true` |
+| `can_confirm_is_false_when_every_item_failed` | 全失败 → `false` |
+| `work_ids_are_never_reused` | 取消/清空之后新发的号仍递增 |
+
+### 三次失败定位（第一次跑出 2 个红灯，第二次 1 个，第三次全绿）
+
+1. **首跑 794 passed / 2 failed**，其中一个暴露**真 bug**：
+   `on_parsed` 里算了 `build_options(...)` 却忘了 `task.set_options(...)`，
+   编译器给了 `unused variable: options` 警告——**这一条是 Rust 编译器替我发现的**，
+   否则会变成「草稿项显示的分类与最终任务不一致」的隐性缺陷。
+   另两条是**测试断言写错**（实现是对的）：
+   - `set_urls_does_not_cancel_items_that_already_finished`：夹具里 `b` 早已解析完
+     （`parse_id` 已空），本来就不该有 `Cancel`，断言却要求有一条；
+   - `add_parsed_tasks_skips_urls_that_already_have_a_task`：全跳过时仍会发
+     `Busy` + `Changed`（Python 的两个 emit 在循环之外），断言漏了这两条。
+2. **二跑 796 passed / 1 failed**：还是
+   `add_parsed_tasks_skips_urls_that_already_have_a_task`，断言写成 `busy == true`，
+   实际 `busy == false`——被跳过项的 `parse_id` 是空的，`is_parsing()` 自然是 `false`。
+   改断言。
+3. **三跑 797 passed / 0 failed**（`/tmp/ui_lib3.log`，2.58s）。
+
+**教训**：效果队列类测试的断言要把「emit 的时机在循环内还是循环外」写清楚；
+Python 里两个 emit 挨着写、看着像一次，但语义是「循环之后无条件发」。
+
+### clippy `-D warnings` 的 4 个红灯（首跑）
+
+| 位置 | lint | 修法 |
+|---|---|---|
+| `sequence_matcher.rs:75` | `needless_range_loop` | `for i in alo..ahi { a[i] }` → `for (i, av) in a.iter().enumerate().take(ahi).skip(alo)`，体内改读 `av` |
+| `task_draft.rs:211` | `unnecessary_unwrap` | `if item.task.is_some() { … item.task.as_mut().expect(…) }` → 保留外层判空、内层改 `if let Some(task) = item.task.as_mut()` |
+| `task_draft.rs:252` | `collapsible_if` | 嵌套 `if let Some(mut item) = slot.take() { if item.is_parsing() {…} }` → `if let Some(mut item) = slot.take() && item.is_parsing() {…}`（edition 2024 let-chain） |
+| `task_draft.rs:357` | `unnecessary_unwrap` | 同 211，且把 `effects.push(Confirmed{…})` 一起挪进 `if let` |
+
+**为什么不用 `#[allow]`**：这四处都是「写法可以更直接」，不是「工具误报」。
+`needless_range_loop` 那条尤其值得改——`av` 是 `&T`，比 `a[i]` 少一次边界检查，
+而且顺手消掉了「`i` 同时充当索引与位置」的双重身份。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过（`FMT_CHECK_EXIT=0`）；
+- `cargo test -p gd3-ui --lib`：**797 passed / 0 failed**（754 + 11 + 32）；
+- `cargo test --workspace`：**1300 passed / 0 failed**（28 段；第 102 步 1257 + 43）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（4m29s）；
+- 修完 clippy 的 4 处之后**重跑** `--workspace`：仍是 **1300 passed / 0 failed**（`/tmp/ws103b.log`）；
+- Python 侧没改一行，不跑 Python 全量。
+
+### 下一步（第 104 步）
+
+**选 `app/services/speed_meter.py`（56 行）+ `app/services/name_conflict_queue.py`（73 行）**：
+
+- 两者都是**引擎级小服务**，且都是当前 Rust 侧的真实缺口：
+  `SpeedMeter` 在 `engine.py:20` 构造、注入 `TaskService`（`:320`），`TaskService` 在
+  `:578` 把 `addSpeed` / `waitForSpeedLimit` 交给 `task.run(...)`、在 `_refreshSpeedMeter`
+  里 `start()` / `stop()`。Rust 侧第 81 步把这一整套**退化成了
+  `TaskService::speed_meter_should_run()`**（只回答「该不该跑」，不真的跑），
+  搬完 `speed_meter` 才能把引擎那一侧接上；
+- `NameConflictQueue` 是**重名冲突的串行化队列**：一次只弹一个冲突给 UI，
+  `setChoice(…, isAppliedToRest)` 把同一个选择套用到后面 `restCount` 个任务。
+  Rust 侧第 93 步只做到 `add_with_conflict`（单个任务），没有队列；
+  `probe_conflict_by_id`（第 96 步）与 `add_with_conflict(…, choice)`（第 93 步）都已就位，
+  端口齐了；
+- 两者都不碰网络、不碰解包，`coroutineRunner.post` 退化成「`refresh_posted` 标记 + 返回效果」，
+  与第 103 步同一形态。
