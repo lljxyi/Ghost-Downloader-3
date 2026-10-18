@@ -4071,3 +4071,63 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   若要继续，Phase 8 的顺序建议是：Slint 入口 + 事件循环 → cfg 读写（`UserConfig.json`
   两侧互读测试）→ `TaskService` 绑定 → 托盘/Dock 平台层。
 - 卡点：无
+
+## 第 77 步：补 Phase 7 覆盖缺口（`clipboard.rs` + `draft_card.rs`）（2026-10-18 06:04）
+- 为什么做这一步：第 76 步 `AGENT-DONE` 里写「Python 侧剩余：无」并不准确。
+  对 `app/view`(11 211 行) 逐文件对照后发现两个真实缺口：
+  - `shell/clipboard_listener.py`(67)：`draft.rs::clipboard_urls` 只镜像了
+    `task_draft.py::_clipboardUrls`（逐行过滤 + matcher），**没有** `ClipboardListener`
+    的状态机（自复制闩锁 / Wayland 去重 / 启停只连一次）；
+  - `cards/draft_cards.py`(195)：`card_groups.rs` 只管分组容器（卡片高度、统计行），
+    草稿卡片自己的改名 / 切分类 / 多文件摘要没有落点。
+  - `qfw_patch.py`(75) 判定 **N/A**：纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
+    无业务语义可镜像，不写 Rust 对应物。
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/clipboard.rs`（**507 行 / 12 测试**）：
+    `ClipboardListener{enabled,self_copied,last_urls,wayland}` +
+    `new`/`is_enabled`/`self_copied`/`last_urls`/`set_enabled -> Option<bool>`/
+    `set_urls -> String`/`on_data_changed -> Option<Vec<String>>`；
+    `downloadable_urls`；`url_roundtrip_ok` + 私有 `split_url`/`geturl`/
+    `uses_netloc`/`is_scheme_char`/`is_bracket_char`。
+  - 新增 `rust/crates/gd3-ui/src/draft_card.rs`（**650 行 / 18 测试**）：
+    常量（`DRAFT_CARD_HEIGHT 35`、`CARD_MARGINS (10,2,10,2)`、`CARD_SPACING 12`、
+    `ICON_SIZE 16`、`BUTTON_SIZE 28`、`EDIT_TOOLTIP`/`CONFLICT_TOOLTIP`/
+    `SELECT_FILES_TOOLTIP`/`UNCATEGORIZED_LABEL`/`UNCATEGORIZED_ID`/`FALLBACK_NAME`/
+    `MAX_NAME_LENGTH`）；`separator_color`/`size_label_text`/`name_edit_selection`/
+    `menu_anchor`/`conflict_visible`/`category_button`/`category_menu`；
+    `CategoryButton`/`DraftMenuEntry`/`DraftCardSignal`/`DraftCardState`（改名编辑态）/
+    `DraftFile`/`MultiFileDraftCardState`（摘要 + `apply_selection`）。
+  - `lib.rs` 注册 `pub mod clipboard;`（`category_settings` 与 `close_mode` 之间）、
+    `pub mod draft_card;`（`draft` 与 `drawer` 之间）。
+- 实证结论（本轮实读源码 + `.venv/bin/python` 核 `urlparse`）：
+  - `urlparse` 的判据是 **`parsed.geturl() == 原串`**，不是「URL 合法」：
+    `HTTP://x/` → scheme 被小写 → 丢弃；`http:/x` → `geturl` 为 `http:///x` → 丢弃；
+    `a:/b` → `a:/b` → **保留**（`http` 在 `uses_netloc` 里、`a` 不在，同形状结果相反）；
+    `http://a/1?` / `http://a/1#` → 空 query/fragment 被吃掉 → 丢弃；
+    `http://a b/1`、`http://A/1`、`http://a/./b/../c`、`mailto:a@b`、`a:b` → 保留；
+    `http://[::1` / `http://::1]` / `http://[zz]/` → `ValueError`；
+    `http://a\t/1` → `urlsplit` 删掉 `\t` → 丢弃。
+  - `setUrls` 只在 `_enabled` 时置 `_selfCopied`；`setEnabled` 只在翻转时连/断；
+    `_onDataChanged` **先消费闩锁再取链接**（无链接也消费）、空则返回、
+    只有 Wayland 才比 `_lastUrls` 快照（非 Wayland 同一段文本两次都发）。
+  - 草稿卡片改名走 **`task.setName()` → `toSafeFilename(name, fallback=self.name or "download")`**，
+    标签/编辑框显示的是**净化后**的名字；进入编辑时选中 `splitStemExt` 的词干（按字符数）。
+  - `MultiFileDraftCard._refreshSummary` 的 `<=1` 分支用 `toReadableSize(fileSize)`，
+    **没有**基类那条 `"--"` 兜底；`setSelection` 之后 `fileSize = Σ selected.size`。
+- 修掉的问题：
+  - clippy `if_same_then_else`：`geturl` 里「path 以 `//` 开头」与「`uses_netloc`」两条
+    分支体完全相同，合并成一个 `||` 条件；
+  - clippy `doc_lazy_continuation`：`draft_card` 模块头里 `——锚点…` 那行补 2 空格缩进。
+- 验证：
+  - `cargo test -p gd3-ui --lib clipboard::` 12 passed；
+  - `cargo test -p gd3-ui --lib draft_card::` 18 passed；
+  - `cargo test -p gd3-ui --lib` **554 → 584 passed, 0 failed**；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings` **0 error**（2m28s）；
+  - `cargo fmt --all --check` 通过；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers` 全绿；
+  - commit `dc78e5c`。
+  - `gd3-ui` 现状：56 个 `.rs`、**33 411 行 `src/`**、**584 单测**。
+- 下一步：修正 `AGENT-DONE` 与 `rust/README.md` 里「Python 侧剩余：无」的表述，
+  然后按 Phase 8 顺序推进（Slint 入口 + 事件循环 → cfg 读写 → `TaskService` 绑定 →
+  托盘/Dock 平台层）。
+- 卡点：无
