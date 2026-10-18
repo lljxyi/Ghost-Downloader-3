@@ -24,6 +24,7 @@ pub mod conflict;
 pub mod draft;
 pub mod drawer;
 pub mod facts;
+pub mod file_select;
 pub mod filter;
 mod format;
 pub mod headers;
