@@ -306,6 +306,24 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   `modified_at` 四列。`probe_conflict_in(record, folder)` 是显式给目录的版本，
   `probe_conflict_by_id(id)` 给只拿得到 `taskId` 的调用方（冲突队列）。
   差异：四列来自同一次 `metadata`（Python 是 `isExisting` 一次 + 队列 `stat()` 一次）。
+- **做种记账**（第 97 步）：`startSeeding` / `stopSeeding` / `_seed` / `_onSeeding*` 的
+  状态机整体搬过来，`task.runSeeding()` 本体（libtorrent）仍是桩。`_seeding`
+  （taskId → workId）同时充当 `Task.isSeeding`（Python 的非持久化字段）；
+  `shouldSeed` 是持久化字段，所以 `startSeeding`/`stopSeeding` 置 `pending_flush`
+  而 `_seed` 不置。信号同样退化成返回值：`seed` / `start_seeding` /
+  `on_seeding_done` / `on_seeding_ended` 返回 `SeedingEvent::{Started,Stopped}`，
+  `cancel_work` 返回 `CancelWork { work_id, stopped_seeding }`（协程取消归引擎）。
+  `_onRunDone` 尾部的判定抽成 `should_start_seeding(id)`（`COMPLETED` + `canSeed` +
+  `shouldSeed`），`resumeSaved` 的「已完成且文件还在 → 该做种」抽成
+  `resume_seeding_candidates()`（`canSeed`/`hasOutputFile` 走 `facts::task_kind`，
+  另加 `isExisting(outputPath)`）；`_refreshSpeedMeter` 退化成
+  `speed_meter_should_run()` = `runningCount() > 0 || !_seeding.is_empty()`。
+  **照抄了 Python 的一个缺陷**：`_cancelWork` 里
+  `queue.workIdOf(id) or self._seeding.pop(id)` 的 `or` 会短路——队列里有 workId 时
+  `_seeding` 里那条不会被摘掉（`isSeeding` 已清），残留项让速度表一直跑；
+  单测 `cancel_work_prefers_the_queue_work_id` 钉住。
+  `refresh()` 现在也把 `isSeeding` / `canSeed` / `hasOutputFile` 填成真实值
+  （之前一律 `CardRuntime::default()`）。
 
 ### 引擎装配（`engine.rs`）
 
@@ -834,8 +852,8 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1945 行 / 47 单测**
-（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个）。
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **2356 行 / 56 单测**
+（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个、做种 9 个）。
 
 ## 剩余工作（Phase 8）
 

@@ -49,10 +49,12 @@
 //!   `queue.run(taskId, workId)`）：这里先 `run(id, "")` 把 `runningCount` 顶上去，
 //!   否则 `pump` 的循环条件与 `tasksAllCompleted` 的判定都不成立；引擎起来后由
 //!   `on_run_started(id, work_id)` 回填真实 workId；
-//! - 不做 `_rebalance`（依赖 `Task.canPause` 这个运行时事实）、不做做种/校验/
-//!   文件监听/速度表（`_seed`/`_onSeeding*`/`startChecksum`/`_watchFile`/
-//!   `_refreshSpeedMeter` 全部留给引擎层）。
+//! - **做种只做记账**（第 97 步）：`_seed`/`_onSeeding*`/`startSeeding`/
+//!   `stopSeeding` 的状态机（`_seeding` 字典 + `isSeeding` + `shouldSeed`）已对齐，
+//!   但 `task.runSeeding()` 本体（libtorrent）与 `_watchFile` / 速度表计数仍归引擎层；
+//!   校验（`startChecksum`）与 `_rebalance`（依赖 `Task.canPause`）也还没做。
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -71,6 +73,7 @@ use gd3_core::task::{TaskRecord, TaskStatus};
 use crate::AppWindow;
 use crate::card::CardRuntime;
 use crate::category::CategoryService;
+use crate::facts;
 use crate::name_conflict::ProbeTarget;
 
 /// `st_mtime` 的浮点形态（Python 的 `stat_result.st_mtime`）。
@@ -140,6 +143,24 @@ pub struct RunOutcome {
     pub all_completed: bool,
 }
 
+/// `seedingStarted` / `seedingStopped`（`Signal(object)`）的返回值替身。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedingEvent {
+    /// `seedingStarted.emit(task)`
+    Started,
+    /// `seedingStopped.emit(task)`
+    Stopped,
+}
+
+/// `_cancelWork(task)` 的产物（协程取消本身归引擎）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CancelWork {
+    /// 要取消的协程 id：`queue.workIdOf(id) or self._seeding.pop(id)`。
+    pub work_id: Option<String>,
+    /// `if task.isSeeding: …; seedingStopped.emit(task)`。
+    pub stopped_seeding: bool,
+}
+
 /// 任务列表 + 队列记账（不含引擎）。
 #[derive(Debug, Clone, Default)]
 pub struct TaskService {
@@ -160,6 +181,10 @@ pub struct TaskService {
     /// `Default` = 空规则 + 分类功能关闭 → 不改 `category` / `outputFolder`
     /// （与 Python 里 `isCategoryEnabled` 缺省 `False` 的行为一致）。
     categories: CategoryService,
+    /// `TaskService._seeding`：taskId → 做种协程的 workId。
+    ///
+    /// 同时充当 `Task.isSeeding`（Python 的非持久化字段，`init=False, repr=False`）。
+    seeding: BTreeMap<String, String>,
 }
 
 impl TaskService {
@@ -530,7 +555,8 @@ impl TaskService {
     /// 文件删除/占位符清理由调用方做（`Task.deleteFiles` + `deletePlaceholders`），
     /// 「没有权限删」的提示走 `note_delete_denied()`。
     pub fn remove(&mut self, task_id: &str) -> Option<TaskRecord> {
-        self.cancel_work(task_id);
+        // `_cancelWork` 的协程取消归引擎；记账部分已由 cancel_work 做完。
+        let _ = self.cancel_work(task_id);
         self.placeholders.remove(task_id);
         let index = self
             .records
@@ -620,6 +646,32 @@ impl TaskService {
         true
     }
 
+    /// `startSeeding(task)`（`task_service.py:397-400`）：`shouldSeed = True` +
+    /// 落盘 + `_seed(task, isManual=True)`。
+    ///
+    /// 与 Python 的差别只在「谁提交协程」：`task.runSeeding(isManual)` 的 workId
+    /// 由引擎给，这里只登记。任务不在列表里 → `None`（Python 会 `AttributeError`）。
+    pub fn start_seeding(&mut self, task_id: &str, work_id: &str) -> Option<SeedingEvent> {
+        let record = self.task_mut(task_id)?;
+        record.should_seed = true;
+        // `_flushSoon()`：`shouldSeed` 是持久化字段（`isSeeding` 不是）。
+        self.pending_flush = true;
+        self.seed(task_id, work_id)
+    }
+
+    /// `stopSeeding(task)`（`task_service.py:402-406`）：`shouldSeed = False` +
+    /// 落盘 + `_cancelWork(task)` + `_refreshSpeedMeter()`。
+    ///
+    /// `_refreshSpeedMeter()` 退化成「调用方读 [`TaskService::speed_meter_should_run`]」；
+    /// `seedingStopped` 事件在 [`CancelWork::stopped_seeding`] 里。
+    pub fn stop_seeding(&mut self, task_id: &str) -> CancelWork {
+        if let Some(record) = self.task_mut(task_id) {
+            record.should_seed = false;
+            self.pending_flush = true;
+        }
+        self.cancel_work(task_id)
+    }
+
     /// `pause(task)` 的记账部分：`_cancelWork` + `setStatus(PAUSED)` + 待落盘。
     ///
     /// 返回任务是否存在（Python 对不存在的任务会 `AttributeError`，这里退化）。
@@ -627,7 +679,7 @@ impl TaskService {
         if self.task(task_id).is_none() {
             return false;
         }
-        self.cancel_work(task_id);
+        let _ = self.cancel_work(task_id);
         if let Some(record) = self.task_mut(task_id) {
             record.status = TaskStatus::Paused;
         }
@@ -635,9 +687,102 @@ impl TaskService {
         true
     }
 
-    /// `_cancelWork(task)` 的队列部分（协程取消/停做种归引擎）。
-    pub fn cancel_work(&mut self, task_id: &str) {
+    /// `_cancelWork(task)`（`task_service.py:629-639`）的记账部分。
+    ///
+    /// ```python
+    /// workId = self._queue.workIdOf(task.taskId) or self._seeding.pop(task.taskId, None)
+    /// self._queue.cancel(task.taskId)
+    /// if task.isSeeding:
+    ///     task.isSeeding = False
+    ///     self.seedingStopped.emit(task)
+    /// if workId is not None:
+    ///     self._coroutineRunner.cancel(workId, finished=finished)
+    /// ```
+    ///
+    /// 三处口径：
+    /// - **`or` 是短路的**：队列里有 workId 时 `_seeding.pop` 根本不会执行，
+    ///   `_seeding` 里那条会留下（而 `isSeeding` 已被清成 `False`）。这是 Python
+    ///   的既有缺陷，Rust 侧照抄——`speed_meter_should_run` 因此可能因为残留项
+    ///   恒为真，与 `_refreshSpeedMeter` 同病（单测
+    ///   `cancel_work_prefers_the_queue_work_id` 钉住）；
+    /// - `stopped_seeding` 取**入口处**的 `isSeeding`（= `_seeding` 里有这个 id），
+    ///   与 `pop` 是否真的摘掉无关；
+    /// - 协程取消本身归引擎（[`CancelWork::work_id`]）。
+    pub fn cancel_work(&mut self, task_id: &str) -> CancelWork {
+        let stopped_seeding = self.seeding.contains_key(task_id);
+        let work_id = match self.queue.work_id_of(task_id) {
+            Some(work_id) => Some(work_id.to_string()),
+            None => self.seeding.remove(task_id),
+        };
         self.queue.cancel(task_id);
+        CancelWork {
+            work_id,
+            stopped_seeding,
+        }
+    }
+
+    /// `Task.isSeeding`（Python 的非持久化字段）：`_seeding` 里有这个 id。
+    pub fn is_seeding(&self, task_id: &str) -> bool {
+        self.seeding.contains_key(task_id)
+    }
+
+    /// `_seeding[taskId]`：做种协程的 workId。
+    pub fn seeding_work_id(&self, task_id: &str) -> Option<&str> {
+        self.seeding.get(task_id).map(String::as_str)
+    }
+
+    /// `len(self._seeding)`。
+    pub fn seeding_count(&self) -> usize {
+        self.seeding.len()
+    }
+
+    /// `_refreshSpeedMeter()`（`task_service.py:659-663`）的判定：
+    /// `if self._queue.runningCount() or self._seeding: start() else: stop()`。
+    pub fn speed_meter_should_run(&self) -> bool {
+        self.queue.running_count() > 0 || !self.seeding.is_empty()
+    }
+
+    /// `_seed(task, isManual)`（`task_service.py:585-593`）：登记 workId +
+    /// `seedingStarted` + `_refreshSpeedMeter()`。
+    ///
+    /// ```python
+    /// task.isSeeding = True
+    /// self._seeding[task.taskId] = self._coroutineRunner.submit(task.runSeeding(isManual), ...)
+    /// self.seedingStarted.emit(task)
+    /// self._refreshSpeedMeter()
+    /// ```
+    ///
+    /// 不检查 `canSeed` / `shouldSeed`——Python 的 `_seed` 也不检查（调用点
+    /// [`TaskService::should_start_seeding`] 已经判过）；`isManual` 只影响
+    /// `runSeeding` 本体，不落账。任务不在列表里 → `None`（Python 那边 `_seed`
+    /// 只从 `_tasks` 里取到过的 `task` 调用，走不到这条）。
+    pub fn seed(&mut self, task_id: &str, work_id: &str) -> Option<SeedingEvent> {
+        self.task(task_id)?;
+        self.seeding
+            .insert(task_id.to_string(), work_id.to_string());
+        Some(SeedingEvent::Started)
+    }
+
+    /// `_onSeedingDone(task)`（`task_service.py:595-597`）：做种协程正常结束 →
+    /// `shouldSeed = False` + `_onSeedingEnded(task)`。
+    ///
+    /// 不单独 `_flushSoon()`：`_onSeedingEnded` 里已经有一次。
+    pub fn on_seeding_done(&mut self, task_id: &str) -> SeedingEvent {
+        if let Some(record) = self.task_mut(task_id) {
+            record.should_seed = false;
+        }
+        self.on_seeding_ended(task_id)
+    }
+
+    /// `_onSeedingEnded(task)`（`task_service.py:599-604`）：摘 `_seeding` +
+    /// `isSeeding = False` + 落盘 + `seedingStopped` + `_refreshSpeedMeter()`。
+    ///
+    /// Python 无条件 `emit`（哪怕 `_seeding` 里本来就没有这条），所以返回的不是
+    /// `Option`；`pop(taskId, None)` 的缺省在这里等价于 `remove` 的忽略。
+    pub fn on_seeding_ended(&mut self, task_id: &str) -> SeedingEvent {
+        self.seeding.remove(task_id);
+        self.pending_flush = true;
+        SeedingEvent::Stopped
     }
 
     /// 引擎真的开始跑了（`_dispatch` 里 `queue.run(taskId, workId)` 的 workId 回填）。
@@ -685,7 +830,8 @@ impl TaskService {
     ///
     /// Python 的 `resumeSaved()` 还做两件引擎侧的事：已完成任务的
     /// `_watchFile`/`_seed`，以及每个任务发 `taskAdded`。这里只做
-    /// 「`RUNNING` → `WAITING` + `queue.wait`」，返回重新入队的 id。
+    /// 「`RUNNING` → `WAITING` + `queue.wait`」，返回重新入队的 id；
+    /// 「该做种」的那半边见 [`TaskService::resume_seeding_candidates`]。
     ///
     /// Python 的 `_schedule` 会顺带 `_pump()`，但没有引擎时「派发」无意义，
     /// 所以**不在这里 pump**——调用方在引擎就绪后自己 `pump(maxTaskNum)`。
@@ -703,6 +849,47 @@ impl TaskService {
             self.queue.wait(task_id);
         }
         resumed
+    }
+
+    /// `_onRunDone` 尾部（`task_service.py:672-673`）：`status == COMPLETED and
+    /// task.canSeed and task.shouldSeed` → 该 `_seed(task)`。
+    ///
+    /// 判定顺序与 Python 一致（`status` 先判，短路掉 `canSeed`/`shouldSeed`）；
+    /// 协程 workId 由调用方补。
+    pub fn should_start_seeding(&self, task_id: &str) -> bool {
+        let Some(record) = self.task(task_id) else {
+            return false;
+        };
+        record.status == TaskStatus::Completed
+            && facts::task_kind(record.type_name.as_deref()).can_seed
+            && record.should_seed
+    }
+
+    /// `resumeSaved()` 里「已完成且文件还在 → 该做种」的那半边
+    /// （`task_service.py:529-531`）。
+    ///
+    /// ```python
+    /// if task.status == COMPLETED and task.hasOutputFile and isExisting(task.outputPath):
+    ///     self._watchFile(task)
+    ///     if task.canSeed and task.shouldSeed:
+    ///         self._seed(task)
+    /// ```
+    ///
+    /// `_watchFile` 归引擎；这里只返回「该 `_seed` 的 taskId」（workId 由调用方补）。
+    /// `hasOutputFile` 恒为真（`facts::task_kind`），留着是为了跟 Python 的形状对齐。
+    pub fn resume_seeding_candidates(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .filter(|record| {
+                let kind = facts::task_kind(record.type_name.as_deref());
+                record.status == TaskStatus::Completed
+                    && kind.has_output_file
+                    && facts::is_existing(&record.output_path())
+                    && kind.can_seed
+                    && record.should_seed
+            })
+            .map(|record| record.task_id.clone())
+            .collect()
     }
 
     /// `stop()`：把在跑/等待的任务标成 `PAUSED`。
@@ -786,12 +973,23 @@ impl TaskService {
         Ok(true)
     }
 
-    /// 把当前记录推成 UI 行（运行时事实走 `CardRuntime::default()`）。
+    /// 把当前记录推成 UI 行。
     ///
-    /// `isSeeding`/`outputExists`/`lastError` 这些记录里没有的事实，
-    /// 等引擎迁过来后由调用方换成真实取值。
+    /// `isSeeding` 走 [`TaskService::is_seeding`]（第 97 步的做种记账），
+    /// `canSeed`/`hasOutputFile` 走 `facts::task_kind`（类属性，按 `type` 反查）；
+    /// `canPause`（要读步骤状态）、`completedAtText`（要时区）、`outputExists`
+    /// （要 stat）、`lastError`（要挑失败步骤）仍由调用方换成真实取值——
+    /// `push_task_records` 的注入点就是为它们留的。
     pub fn refresh(&self, window: &AppWindow) {
-        crate::push_task_records(window, &self.records, |_| CardRuntime::default());
+        crate::push_task_records(window, &self.records, |record| {
+            let kind = facts::task_kind(record.type_name.as_deref());
+            CardRuntime {
+                can_seed: kind.can_seed,
+                has_output_file: kind.has_output_file,
+                is_seeding: self.is_seeding(&record.task_id),
+                ..CardRuntime::default()
+            }
+        });
     }
 }
 
@@ -1941,5 +2139,216 @@ mod tests {
             None,
             "显式给默认目录时那边没有文件"
         );
+    }
+
+    /// 可做种的任务（`BTTask.canSeed = True`，`features/bittorrent_pack/task.py:28`）。
+    fn seedable(task_id: &str, status: TaskStatus) -> TaskRecord {
+        let mut record = record(task_id, status, 10);
+        record.type_name = Some("features.bittorrent_pack.task.BTTask".to_string());
+        record
+    }
+
+    #[test]
+    fn start_seeding_marks_should_seed_and_registers_the_work() {
+        // `from_records` 而不是 `add`：Python 的 `add` 会强制 `shouldSeed = True`，
+        // 那样就测不出 `startSeeding` 自己那一句。
+        let mut input = seedable("a", TaskStatus::Completed);
+        input.should_seed = false;
+        let mut service = TaskService::from_records(vec![input]);
+        assert!(!service.is_seeding("a"));
+
+        assert_eq!(
+            service.start_seeding("a", "w1"),
+            Some(SeedingEvent::Started)
+        );
+        assert!(service.task("a").expect("任务在").should_seed);
+        assert!(service.pending_flush(), "shouldSeed 是持久化字段");
+        assert!(service.is_seeding("a"), "`_seed` 里置 isSeeding = True");
+        assert_eq!(service.seeding_work_id("a"), Some("w1"));
+        assert_eq!(service.seeding_count(), 1);
+        assert!(service.speed_meter_should_run(), "做种中速度表要跑");
+
+        // 任务不在列表里 → `None`，且不登记。
+        assert_eq!(service.start_seeding("nope", "w2"), None);
+        assert_eq!(service.seeding_count(), 1);
+    }
+
+    #[test]
+    fn seed_requires_the_task_to_exist() {
+        let mut service = TaskService::new();
+        assert_eq!(service.seed("a", "w1"), None);
+        assert_eq!(service.seeding_count(), 0);
+        assert!(!service.is_seeding("a"));
+
+        // 任务在 → 直接登记：`_seed` 自己不看 canSeed / shouldSeed。
+        let mut service = TaskService::from_records(vec![record("a", TaskStatus::Completed, 10)]);
+        assert_eq!(service.seed("a", "w1"), Some(SeedingEvent::Started));
+        assert!(service.is_seeding("a"));
+        assert!(!service.task("a").expect("任务在").should_seed);
+    }
+
+    #[test]
+    fn stop_seeding_clears_should_seed_and_returns_the_work() {
+        let mut input = seedable("a", TaskStatus::Completed);
+        input.should_seed = true;
+        let mut service = TaskService::from_records(vec![input]);
+        service.seed("a", "w1");
+        assert!(!service.pending_flush(), "`_seed` 不落盘");
+
+        let cancelled = service.stop_seeding("a");
+        assert!(!service.task("a").expect("任务在").should_seed);
+        assert!(service.pending_flush(), "`shouldSeed` 改了要 `_flushSoon`");
+        // 队列里没有 workId → `_seeding.pop` 兜底。
+        assert_eq!(cancelled.work_id.as_deref(), Some("w1"));
+        assert!(cancelled.stopped_seeding);
+        assert!(!service.is_seeding("a"));
+        assert_eq!(service.seeding_count(), 0);
+        assert!(!service.speed_meter_should_run());
+    }
+
+    #[test]
+    fn on_seeding_ended_flushes_and_clears() {
+        let mut input = seedable("a", TaskStatus::Completed);
+        input.should_seed = true;
+        let mut service = TaskService::from_records(vec![input]);
+        service.seed("a", "w1");
+        assert!(!service.pending_flush());
+        assert_eq!(service.on_seeding_ended("a"), SeedingEvent::Stopped);
+        assert!(!service.is_seeding("a"));
+        assert!(service.pending_flush(), "`_onSeedingEnded` 里 `_flushSoon`");
+        // 再调一次也不炸（Python 的 `pop(taskId, None)` 带缺省）。
+        assert_eq!(service.on_seeding_ended("a"), SeedingEvent::Stopped);
+
+        // `_onSeedingDone` 先清 `shouldSeed` 再走 `_onSeedingEnded`。
+        let mut input = seedable("b", TaskStatus::Completed);
+        input.should_seed = true;
+        let mut service = TaskService::from_records(vec![input]);
+        service.seed("b", "w2");
+        assert_eq!(service.on_seeding_done("b"), SeedingEvent::Stopped);
+        assert!(!service.task("b").expect("任务在").should_seed);
+        assert!(!service.is_seeding("b"));
+        assert!(service.pending_flush());
+    }
+
+    #[test]
+    fn cancel_work_prefers_the_queue_work_id() {
+        let mut input = seedable("a", TaskStatus::Completed);
+        input.should_seed = true;
+        let mut service = TaskService::from_records(vec![input]);
+        service.seed("a", "seed-1");
+        // 极端情形：同一个任务既挂着队列 workId、又在做种。
+        assert!(service.start("a"));
+        service.on_run_started("a", "run-1");
+
+        let cancelled = service.cancel_work("a");
+        assert_eq!(
+            cancelled.work_id.as_deref(),
+            Some("run-1"),
+            "`queue.workIdOf(id) or …` 里队列优先"
+        );
+        assert!(cancelled.stopped_seeding, "入口处 isSeeding 为真");
+        assert_eq!(service.running_count(), 0);
+
+        // Python 的 `or` 短路：`_seeding.pop` 没执行，那条留在字典里
+        // （`isSeeding` 已经清了）——既有缺陷，Rust 照抄。
+        assert!(service.is_seeding("a"));
+        assert_eq!(service.seeding_count(), 1);
+        assert!(
+            service.speed_meter_should_run(),
+            "残留项让速度表一直跑，与 Python 的 `_refreshSpeedMeter` 同病"
+        );
+    }
+
+    #[test]
+    fn speed_meter_runs_while_seeding() {
+        let mut service = TaskService::from_records(vec![
+            seedable("a", TaskStatus::Completed),
+            record("b", TaskStatus::Waiting, 10),
+        ]);
+        assert!(!service.speed_meter_should_run());
+
+        // 队列在跑 → 跑。派发走 `pump`：`queue.run` 本身不出等待队列。
+        assert!(service.start("b"));
+        assert_eq!(service.pump(8), vec!["b".to_string()]);
+        assert!(service.speed_meter_should_run());
+        let outcome = service.on_run_finished("b", 8);
+        assert_eq!(outcome.started, Vec::<String>::new());
+        assert!(!service.speed_meter_should_run(), "队列空了、也没做种");
+
+        // 只有做种 → 也跑。
+        service.seed("a", "w2");
+        assert!(service.speed_meter_should_run());
+        service.on_seeding_ended("a");
+        assert!(!service.speed_meter_should_run());
+    }
+
+    #[test]
+    fn should_start_seeding_requires_completed_and_seedable_type() {
+        let mut service = TaskService::from_records(vec![
+            seedable("bt", TaskStatus::Completed),
+            seedable("bt-waiting", TaskStatus::Waiting),
+            record("plain", TaskStatus::Completed, 10),
+        ]);
+        // `from_records` 不强制 `shouldSeed`，与 `add` 不同。
+        assert!(!service.should_start_seeding("bt"));
+
+        service.task_mut("bt").expect("任务在").should_seed = true;
+        assert!(service.should_start_seeding("bt"));
+
+        // 状态不是 COMPLETED。
+        service.task_mut("bt-waiting").expect("任务在").should_seed = true;
+        assert!(!service.should_start_seeding("bt-waiting"));
+
+        // 类型不可做种（`type_name` 为 None → `canSeed = False`）。
+        service.task_mut("plain").expect("任务在").should_seed = true;
+        assert!(!service.should_start_seeding("plain"));
+
+        assert!(!service.should_start_seeding("nope"));
+    }
+
+    #[test]
+    fn resume_seeding_candidates_needs_an_existing_output_file() {
+        let dir = TempDir::new("resume-seed");
+        // 1. 该做种：已完成 + 可做种 + shouldSeed + 文件在。
+        let mut present = record_in(dir.path(), "present", TaskStatus::Completed);
+        present.type_name = Some("features.bittorrent_pack.task.BTTask".to_string());
+        present.should_seed = true;
+        std::fs::write(dir.path().join("present.bin"), b"data").expect("写文件");
+        // 2. 文件不在 → `isExisting` 为假。
+        let mut missing = record_in(dir.path(), "missing", TaskStatus::Completed);
+        missing.type_name = Some("features.bittorrent_pack.task.BTTask".to_string());
+        missing.should_seed = true;
+        // 3. 文件在但没开 `shouldSeed`。
+        let mut no_seed = record_in(dir.path(), "no-seed", TaskStatus::Completed);
+        no_seed.type_name = Some("features.bittorrent_pack.task.BTTask".to_string());
+        std::fs::write(dir.path().join("no-seed.bin"), b"data").expect("写文件");
+        // 4. 文件在、shouldSeed 也真，但类型不可做种。
+        let mut plain = record_in(dir.path(), "plain", TaskStatus::Completed);
+        plain.should_seed = true;
+        std::fs::write(dir.path().join("plain.bin"), b"data").expect("写文件");
+
+        let service = TaskService::from_records(vec![present, missing, no_seed, plain]);
+        assert_eq!(
+            service.resume_seeding_candidates(),
+            vec!["present".to_string()]
+        );
+    }
+
+    #[test]
+    fn refresh_reflects_the_seeding_state() {
+        use slint::Model as _;
+
+        let window = crate::create_headless();
+        let mut service = TaskService::from_records(vec![seedable("bt", TaskStatus::Completed)]);
+
+        service.refresh(&window);
+        let row = window.get_tasks().row_data(0).expect("首行缺失");
+        assert_eq!(row.toggleIcon, "PLAY", "COMPLETED 未做种 → 沿用 PLAY");
+        assert!(row.toggleEnabled, "BTTask.canSeed 为真");
+
+        service.seed("bt", "w1");
+        service.refresh(&window);
+        let row = window.get_tasks().row_data(0).expect("首行缺失");
+        assert_eq!(row.toggleIcon, "PAUSE", "做种中 → PAUSE");
     }
 }
