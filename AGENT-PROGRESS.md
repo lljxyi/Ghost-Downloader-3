@@ -4423,3 +4423,69 @@ Phase 7 收口时 `gd3-ui` 只有 lib（58 个 `.rs`、无 `main`、无事件循
 - 下一步：第 83 步做 `app/engine.py`（只有 74 行，是纯装配门面）的 Rust 对应物 ——
   把「哪个服务依赖哪个服务」的构造顺序固定下来，即使引擎内部还是桩，也能先钉住装配契约。
 - 卡点：无
+
+## 第 83 步：`gd3-ui::engine`（镜像 `app/engine.py` 的装配门面）（2026-10-18 07:56）
+
+`app/engine.py` 只有 74 行，零业务逻辑：按固定顺序拼服务 + 唯一一条信号连线，再按固定
+顺序 `start`/`stop`。这一步把这份**装配契约**搬成 Rust，服务内部仍是桩，但「谁在谁之后、
+谁连谁、停机什么顺序」从此有测试钉住。
+
+- 做了什么：
+  - `engine.rs`（1189 行，17 单测）：`EngineConfig::from_config`（六项，每项过
+    `Spec::read` 的 `correct()` 口径）、`SpeedMeter`（整类）、`CategoryService`（只搬
+    `_load`）、`RuntimeStatusService`/`FeatureService`/`BrowserService`/`Aria2RpcService`
+    （桩）、`Listener` + `ListenerBackend` + `ListenerSettings` + 两个工厂、
+    `Engine`（13 字段 + 全套访问器）、`StartOutcome`、`TaskConflictActions`（`ConflictActions`
+    的引擎侧实现）；
+  - `task_service.rs`：新增 `load_into(&Path)`（`*self = load(...)` 的就地版）与
+    `stop()`（`RUNNING`/`WAITING` → `PAUSED` + 置 `pending_flush`）；
+  - `boot::run`：`Engine::new(&loaded.config, tasks_path)` → `Engine::start()` →
+    `engine.tasks().refresh(&window)` → 事件循环 → `Engine::stop()`；
+  - `rust/README.md`：规模 58 模块 / 36 201 行 / 642 单测，新增「引擎装配（`engine.rs`）」。
+- 实证结论（源码级）：
+  - `TaskService.stop()`（`task_service.py:536-540`）只 `setStatus(PAUSED)`：**不动队列**、
+    不 `_flushSoon()`；而 `TaskStore.flush()`（:179-201）**没有脏标记**、每次都整文件重写。
+    所以 Python 停机时 PAUSED 是被 `Engine.stop()` 里那次 `flush()` 写下去的。Rust 的
+    `flush()` 有 `pending_flush` 短路 → `TaskService::stop()` 必须显式置脏，否则停机状态
+    永远不落盘（单测 `stop_flush_persists_paused_status` 钉住）。
+  - `Engine.stop()` 里 `flush()` 出现两次（`engine.py:44` 与 `:49`），第二次是给
+    `featureService.deactivate()` 可能产生的改动兜底；Rust 保留「两次都在」的顺序事实，
+    第二次通常因脏标记已清而 `Ok(false)`（字节等价，少了那次空写）。
+  - `PortListener` 存的是 `ConfigItem` 引用、`start()` 时才读值并连 `valueChanged`；
+    `rust_browser.isEnabled()` 精确等于 `os.environ.get("GD3_RUST_BROWSER") == "1"`
+    （`rust_aria2` 同构）→ `flag_is_on` 只认 `"1"`（`"true"`/`"01"`/`"1 "` 全 false）。
+  - `nameConflicted.emit` 发生在 `_store.add` **之后**，所以队列回调 `TaskService.add`
+    第一行 `if task.taskId in self._store.tasks: return True` 必然命中 → Rust 侧
+    `TaskConflictActions::add` 走 `AddOutcome::Duplicate` 分支。
+  - `TaskStore.flush()` 无条件写 → Python 侧「启动完立刻退出」也会留下 `tasks.jsonl`。
+    所以 `boot::run` 的**无头模式也走 `Engine::stop()`**；第 82 步那条「跑完文件字节不变」
+    的断言随之改成「停机后 `RUNNING`/`WAITING` 变 `PAUSED`、`COMPLETED` 不动」。
+- 已知差异（写进模块头）：
+  - 配置是快照：`nameConflict`/`maxTaskNum` 每次用时现读（与 `lambda` / `_pump` 同构），
+    监听器端口在构造时取快照，改配置不会自动重开端口；
+  - `probeConflict` 恒 `None`（占位文件未迁移）→ 冲突队列不会弹窗、按 `keepBoth` 放行；
+  - `TaskService::stop()` 不动队列（Python 也不动）→ 停机后 `running_count()` 仍可能 >0；
+  - `_pump` 不自动跑（`resume_saved` 只入队），由调用方显式 `Engine::pump()`。
+- 测试（`engine::tests`，17 个）：装配顺序 16 条 trace 逐条比对、`start` 5 条、
+  `stop` 7 条 + 监听器状态、装载/坏行/resume、缺文件不算错、停机只改 RUNNING/WAITING、
+  `pump` 按 `maxTaskNum` 派发、`nameConflict` 现读、监听器配置四项、后端开关、
+  `flag_is_on`、速度表 tick/stop、冲突入队→`refresh`→`nameConflictQueue.add(a, keepBoth)`、
+  无冲突时对话框结论是 no-op、`categoryRules` 装载。
+- 验证：
+  - `cargo test -p gd3-ui --lib engine::`：**17 passed**；`boot::`：**19 passed**；
+  - `cargo test --workspace`：**924 passed, 0 failed**（第 82 步 907 + 17）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m35s）；
+  - `cargo fmt --all --check` 通过；
+  - 二进制实跑（无 `DISPLAY`，2 条 WAITING/RUNNING）：
+    ```text
+    $ ./target/debug/gd3-ui --headless --frames 1 --data-dir /tmp/tmp.PfGIRAz12d
+    Ghost Downloader v4.4.0 launched (headless, 1 frame(s), config=default,
+      data=/tmp/tmp.PfGIRAz12d, tasks=2, resumed=2)
+    ```
+    跑完 `tasks.jsonl` 两条都变 `"status": "PAUSED"`（md5 变了），目录里没有 `UserConfig.json`。
+  - commit `46f52b7`。
+- 下一步：Phase 8 按 VPS-MIGRATION 第 12 节优先级 —— 单实例锁（`QSharedMemory` /
+  `desktop_keepalive.py`）、托盘（`shell/tray.py`）、D-Bus / URL scheme 接收、
+  更新检查。这几项都是「Rust 侧可以独立立起来、且不碰 `UserConfig.json` 写权」的，
+  顺序上单实例锁最靠前（它决定「第二个实例该把 URL 交给谁」）。
+- 卡点：无
