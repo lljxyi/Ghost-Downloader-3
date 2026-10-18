@@ -3889,7 +3889,7 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   `rust/README.md` + `AGENT-DONE`。
 - 卡点：无
 
-## 第 74 步：P5 OOBE 向导语义层（2026-10-18 05:20）
+## 第 74 步：P5 OOBE 向导语义层（2026-10-18 05:18）
 - 做了什么：
   - 新增 `gd3-ui/src/oobe.rs`（**1895 行 / 38 测试**），镜像
     `app/view/windows/oobe_window.py`(971)；`lib.rs` 在 `name_conflict` 与
