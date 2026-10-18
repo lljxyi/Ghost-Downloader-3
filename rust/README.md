@@ -148,9 +148,14 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P4 组件库 | `components/` 下 12 个文件 | `range_slider.rs`、`track_bar.rs`、`band_selector.rs`、`bootstrap_list.rs`、`markdown_viewer.rs`、`token_line_edit.rs`、`labels.rs`、`editors.rs`、`progress_toast.rs`、`install_button.rs`、`tree_view.rs`、`banners.rs`、`scroll_area.rs` |
 | P5 首次启动 | `windows/oobe_window.py` | `oobe.rs` |
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
+| P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**53 个模块**（52 个 `pub` + 私有 `format`）/ **32 252 行 `src/`**（含 `lib.rs` 3 480 行）、
-**6 个 Slint 文件 2 858 行**、**554 个单测**。
+规模：**55 个模块**（54 个 `pub` + 私有 `format`）/ **33 411 行 `src/`**（含 `lib.rs` 3 482 行）、
+**6 个 Slint 文件 2 858 行**、**584 个单测**。
+
+`app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
+无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
+`clipboard.rs` / `draft_card.rs` 覆盖（P7 补漏）。
 
 Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.slint`（主窗口）、
 `task_page.slint`、`task_drawer.slint`、`settings_page.slint`、`card_menu.slint`。
@@ -159,7 +164,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（554）
+cargo test -p gd3-ui --lib                 # 只跑单测（584）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 

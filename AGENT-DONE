@@ -38,13 +38,18 @@ huggingface / bili / ftp / ed2k / m3u8 / filename / browser。每个开关只有
 | P4 组件库 | 范围滑块、选项卡、引导列表、Markdown、token 输入、标签、编辑器、进度提示、安装按钮、树视图、横幅、滚动区 | 13 个模块 |
 | P5 首次启动 | OOBE 六页向导（主题/语言/监听/运行时安装/扩展/更多选项 + 窗口状态机） | `oobe.rs`（1 895 行 / 38 测试） |
 | P6 平台外壳 | 托盘菜单与定位、Dock 文字排版与进度条、macOS 状态项 | `shell.rs`（848 行 / 21 测试） |
+| P7 补漏 | 剪贴板监听状态机、草稿卡片交互（改名/分类/多文件摘要） | `clipboard.rs`（507 行 / 12 测试）、`draft_card.rs`（650 行 / 18 测试） |
 
 Slint 文件 6 个（2 858 行）：`app_shell.slint`、`appwindow.slint`、`task_page.slint`、
 `task_drawer.slint`、`settings_page.slint`、`card_menu.slint`。
 无头冒烟测试在 `lib.rs` 的 `mod smoke`（`MinimalSoftwareWindow`）：组件树实例化 +
 属性读写、任务行模型往返、`TaskRecord → 行` 端到端推流。
 
-`gd3-ui` 合计：**53 个模块 / 32 252 行 `src/` / 554 个单测**。
+`app/view` 已逐文件对照完毕：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets`
+内部行为），无业务语义可镜像，判定 **N/A**；`shell/clipboard_listener.py`(67) 与
+`cards/draft_cards.py`(195) 首轮收口时漏掉，已补成 `clipboard.rs` / `draft_card.rs`（见 P7 行）。
+
+`gd3-ui` 合计：**55 个模块 / 33 411 行 `src/` / 584 个单测**。
 
 ---
 
@@ -52,7 +57,7 @@ Slint 文件 6 个（2 858 行）：`app_shell.slint`、`appwindow.slint`、`tas
 
 | 项目 | 命令 | 结果 |
 |---|---|---|
-| Rust 单测 | `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` | **804 passed, 0 failed**（89 + 132 + 29 + 554） |
+| Rust 单测 | `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` | **834 passed, 0 failed**（89 + 132 + 29 + 584） |
 | clippy（全工作区） | `cargo clippy --workspace --all-targets -- -D warnings` | **0 error**（2m23s） |
 | 格式 | `cargo fmt --all --check` | 通过 |
 | Python 全量 | `pytest -q --continue-on-collection-errors` | **3 failed, 1347 passed, 8 skipped, 35 errors** —— 与基线**完全相同** |
