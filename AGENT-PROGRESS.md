@@ -5653,3 +5653,147 @@ placeholderPaths: ['/tmp/…/a.bin']
 ### 卡点
 
 无。
+
+## 第 97 步：TaskService 做种记账半边（2026-10-18 15:30）
+
+**目标**：补上 `TaskService` 的做种（seeding）记账半边——`startSeeding` / `stopSeeding` /
+`_seed` / `_onSeedingDone` / `_onSeedingEnded` / `_cancelWork` 的 workId 兜底 /
+`_refreshSpeedMeter` 的判定 / `_onRunDone` 尾部的自动做种 / `resumeSaved` 的做种分支
+（`app/services/task_service.py:395-420`、`:585-604`、`:629-639`、`:659-673`、`:529-531`）。
+`task.runSeeding()` 本体（libtorrent）与 `_watchFile` 仍归引擎侧——本步只做**记账**：
+谁在做种、workId 是谁、`shouldSeed` 落不落盘、速度表该不该跑。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-ui/src/task_service.rs` | 1945 → **2356 行 / 47 → 56 单测**；新增 `SeedingEvent` / `CancelWork` 两个类型、`seeding: BTreeMap<String, String>` 字段、11 个方法（`start_seeding` / `stop_seeding` / `seed` / `on_seeding_done` / `on_seeding_ended` / `is_seeding` / `seeding_work_id` / `seeding_count` / `speed_meter_should_run` / `should_start_seeding` / `resume_seeding_candidates`）；`cancel_work` 返回值从 `()` 改成 `CancelWork`；`refresh()` 不再一律 `CardRuntime::default()`（填真实 `isSeeding` / `canSeed` / `hasOutputFile`）；9 个新单测 |
+| `rust/README.md` | 837 → **865 行**；「任务记账」补「做种记账（第 97 步）」一节（含 `or` 短路缺陷说明）；规模行改 **2356 行 / 56 单测** |
+
+### 逐条对齐 Python
+
+```python
+# startSeeding (task_service.py:397-400)
+task.shouldSeed = True; self._flushSoon(); self._seed(task, isManual=True)
+
+# stopSeeding (:402-406)
+task.shouldSeed = False; self._flushSoon(); self._cancelWork(task); self._refreshSpeedMeter()
+
+# _seed (:585-593)
+task.isSeeding = True
+self._seeding[task.taskId] = self._coroutineRunner.submit(task.runSeeding(isManual),
+                                                          done=_onSeedingDone, failed=_onSeedingEnded)
+self.seedingStarted.emit(task); self._refreshSpeedMeter()
+
+# _onSeedingDone (:595-597) -> _onSeedingEnded (:599-604)
+task.shouldSeed = False
+self._seeding.pop(task.taskId, None); task.isSeeding = False
+self._flushSoon(); self.seedingStopped.emit(task); self._refreshSpeedMeter()
+
+# _cancelWork (:629-639)
+workId = self._queue.workIdOf(task.taskId) or self._seeding.pop(task.taskId, None)
+self._queue.cancel(task.taskId)
+if task.isSeeding: task.isSeeding = False; self.seedingStopped.emit(task)
+if workId is not None: self._coroutineRunner.cancel(workId, finished=finished)
+
+# _refreshSpeedMeter (:659-663)
+if self._queue.runningCount() or self._seeding: start() else: stop()
+
+# _onRunDone 尾部 (:672-673)
+if task.status == COMPLETED and task.canSeed and task.shouldSeed: self._seed(task)
+
+# resumeSaved (:529-531)
+if task.status == COMPLETED and task.hasOutputFile and isExisting(task.outputPath):
+    self._watchFile(task)
+    if task.canSeed and task.shouldSeed: self._seed(task)
+```
+
+### 关键决策
+
+- **`seeding` 一个 map 顶两个 Python 字段。** `_seeding`（dict）与 `Task.isSeeding`
+  （bool）在 Python 里是同生同死的：`_seed` 同时置两者，`_onSeedingEnded` 同时清两者。
+  唯一的例外是 `_cancelWork` 的 `or` 短路（见下），那里两者会分叉——Rust 侧用
+  「`_seeding` 里有这个 id」当 `isSeeding`，分叉的那一半靠 `CancelWork::stopped_seeding`
+  在入口处快照，行为与 Python 一致。
+- **`_cancelWork` 的 `or` 短路缺陷照抄，不修。** 队列里有 workId 时
+  `self._seeding.pop(...)` 根本不会执行：`isSeeding` 被清成 `False`，但 `_seeding`
+  里那条留下 → `_refreshSpeedMeter` 永远为真（速度表一直跑）。Python 实测见下，
+  Rust 单测 `cancel_work_prefers_the_queue_work_id` 钉住。**改行为会与 Python 漂移**，
+  这是迁移不是修 bug。
+- **`should_seed` 是持久化字段，`is_seeding` 不是。** 所以 `start_seeding` /
+  `stop_seeding` / `on_seeding_ended` 置 `pending_flush`，`seed` 不置——对应
+  Python 的 `_flushSoon()` 出现位置（`_seed` 里没有）。
+- **`_flushSoon()` 的 200ms 防抖仍是 `pending_flush` 标记**（第 81 步的既定退化）。
+- **`_seed` 不校验 `canSeed` / `shouldSeed`**：Python 也不校验，判定在调用点
+  （`should_start_seeding` / `resume_seeding_candidates`）。
+- **`on_seeding_ended` 返回 `SeedingEvent` 而不是 `Option`**：Python 无条件 `emit`
+  （`pop(taskId, None)` 带缺省），哪怕本来没在做种。
+- **`resume_seeding_candidates()` 返回 id 列表而不是就地 `_seed`**：workId 只有引擎
+  能给；`_watchFile` 也归引擎。`hasOutputFile` 恒真（`facts::task_kind`），保留是为了
+  与 Python 的形状对齐。
+- **`refresh()` 顺带接上三个运行时事实**：`isSeeding` 来自本步的记账，`canSeed` /
+  `hasOutputFile` 来自 `facts::task_kind`（按 `type` 反查类属性）。`canPause`（要读
+  步骤状态）、`completedAtText`（要时区）、`outputExists`（要 stat）、`lastError`
+  仍留给调用方——`push_task_records` 的注入点就是为它们留的。
+
+### Python 侧实测（`TaskService.__new__` + 假 runner/meter/watcher，不碰真配置）
+
+```text
+1 startSeeding : shouldSeed=True  isSeeding=True  seeding={'t1': 'w2'} events=[started]        meter=True  flush=w1
+2 stopSeeding  : shouldSeed=False isSeeding=False seeding={}          events=[started,stopped] meter=False
+3 _cancelWork（队列有 workId）
+               : isSeeding=False  seeding={'t1': 'w1'}（残留！）        events=[started,stopped] meter=True  cancelled=['run-1']
+3b _cancelWork（队列没有 workId）
+               : isSeeding=False  seeding={}                          events=[started,stopped] cancelled=['w1']
+4 _onSeedingDone: shouldSeed=False isSeeding=False seeding={}          events=[started,stopped] meter=False
+5 _onRunDone COMPLETED + shouldSeed=True  -> isSeeding=True  seeding={'t1':'w2'} events=[completed,started,allCompleted]
+5 _onRunDone COMPLETED + shouldSeed=False -> isSeeding=False seeding={}            events=[completed,allCompleted]
+5 _onRunDone FAILED    + shouldSeed=True  -> isSeeding=False seeding={}            events=[completed,allCompleted]
+6 meter: 空闲 False -> 队列有任务 True -> done 后 False -> 只做种 True
+```
+
+第 3 条是 `or` 短路的直接证据（`seeding` 没被摘、`meter` 还在跑）；第 6 条对应
+`speed_meter_should_run`。
+
+### 单测（9 个，全部 hermetic）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `start_seeding_marks_should_seed_and_registers_the_work` | `shouldSeed=True` + 置脏 + `_seeding` 登记 + `seedingStarted` + 速度表该跑；任务不在 → `None` 且不登记 |
+| `seed_requires_the_task_to_exist` | `seed` 只登记、不看 `canSeed`/`shouldSeed`；任务不在 → `None` |
+| `stop_seeding_clears_should_seed_and_returns_the_work` | `shouldSeed=False` + 置脏 + `work_id` 从 `_seeding` 兜底 + `stopped_seeding` + 速度表停 |
+| `on_seeding_ended_flushes_and_clears` | `_onSeedingEnded` 摘 `_seeding` + 置脏 + 幂等；`_onSeedingDone` 先清 `shouldSeed` |
+| `cancel_work_prefers_the_queue_work_id` | 队列 workId 优先 + `stopped_seeding` 取入口值 + **`_seeding` 残留、速度表仍跑**（照抄缺陷） |
+| `speed_meter_runs_while_seeding` | `runningCount()>0` 或 `_seeding` 非空 → 跑；两者都空 → 停 |
+| `should_start_seeding_requires_completed_and_seedable_type` | 三种否决：`shouldSeed` 假、状态不是 `COMPLETED`、`type_name` 不可做种 |
+| `resume_seeding_candidates_needs_an_existing_output_file` | 四种记录里只挑「已完成 + 可做种 + `shouldSeed` + 文件在」 |
+| `refresh_reflects_the_seeding_state` | 做种前 `toggleIcon == "PLAY"`、`toggleEnabled` 为真（`BTTask.canSeed`）；`seed` 后 `"PAUSE"` |
+
+`record()` 之外加了一个 `seedable(task_id, status)` 帮手（`type_name =
+"features.bittorrent_pack.task.BTTask"`）；用 `from_records` 而不是 `add`，因为
+Python 的 `add` 会强制 `shouldSeed = True`，那样就测不出 `startSeeding` 自己那一句。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --lib --tests`：50s 通过；
+- `cargo test -p gd3-ui --lib`：**693 passed / 0 failed**（684 + 9）；
+- `cargo test --workspace`：**1195 passed / 0 failed**（28 段，第 96 步 1186 + 9）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（5m19s）；
+- Python 侧没改一行，不跑 Python 全量（探针脚本在 scratch，未入库）。
+
+### 下一步（第 98 步候选，按价值/风险）
+
+1. **`actions::TaskService` 的接线**：`start_seeding`/`stop_seeding` 已经有真实实现，
+   但 `engine.rs` 还没 `impl actions::TaskService`——现在整条卡片动作链（pause/start/
+   delete/redownload/…）都还没落到 `TaskService` 上，这是「引擎装配」的下一块硬骨头；
+2. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：造 `Script`/`Territory`
+   枚举后可搬，纯函数；
+3. **`startChecksum` 记账半边**：`_checksums` + `checksumProgress` + 三个信号；
+4. `app/services/runtime_status.py`（195 行）：需先给 `pack::BinaryRuntime` 补
+   `install`/`fetch_latest_version` 的同步签名；
+5. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
