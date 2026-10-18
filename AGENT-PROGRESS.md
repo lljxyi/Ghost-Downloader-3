@@ -5959,3 +5959,163 @@ Rust 侧的对应：
 ### 卡点
 
 无。
+
+## 第 99 步：TaskService 删除/重下/分类/批量记账 + pause 补 _pump()（2026-10-18 17:09）
+
+**目标**：把 `TaskService` 剩下五个「卡片动作」的记账半边补齐——`pause`（补尾部
+`_pump()`）、`delete`、`redownload`、`setCategory`、`startAll` / `pauseAll`
+（`app/services/task_service.py:429-480`、`:530-539`、`:606-615`）。文件删除
+（`Task.deleteFiles`）、文件监听器（`_unwatchFile`）、协程取消仍归引擎层——本步只做
+**记账 + 顺序**：谁被摘掉、谁的校验协程要取消、能不能删、删完之后让出的空位派发给谁。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-ui/src/task_service.rs` | 2717 → **3122 行 / 65 → 72 单测**；新增 `PauseReport` / `DeleteReport` / `RedownloadReport` 三个类型、模块级私有 `can_delete_in`（`#[cfg]` 双实现）、6 个方法（`pause` 改签名 + `delete` / `redownload` / `set_category` / `start_all` / `pause_all`）；模块 doc 改写「为什么还没做 `actions::TaskService` 的 `impl`」一段 + 「删除/重下也只做记账」一条；7 个新单测 + 1 个旧单测改断言 |
+| `rust/README.md` | 888 → **909 行**；「任务记账」补「删除 / 重下 / 分类 / 批量（第 99 步）」一节；规模行改 **3122 行 / 72 单测** |
+
+### 逐条对齐 Python
+
+```python
+# pause (task_service.py:429-436)
+self._cancelWork(task); task.setStatus(TaskStatus.PAUSED); self._flushSoon()
+self.taskPaused.emit(task); self._pump()          # ← 尾部 pump 不能省
+
+# delete (:438-452)
+self.cancelChecksum(task); self._unwatchFile(task)
+canDelete = shouldDeleteFiles and self._canDeleteIn(task.outputFolder)
+if shouldDeleteFiles and not canDelete and not self._hasNotifiedDeleteDenied:
+    self._hasNotifiedDeleteDenied = True; self.fileDeleteDenied.emit()
+def onStopped():
+    if canDelete: task.deleteFiles()
+    task.deletePlaceholders()
+self._cancelWork(task, finished=onStopped)
+self._store.remove(task.taskId); self._flushSoon()
+self.taskRemoved.emit(task.taskId); self._pump()
+
+# redownload (:454-463)
+self.cancelChecksum(task); self._unwatchFile(task)
+def onStopped():
+    task.deleteFiles(); task.reset(); self._flushSoon(); self._schedule(task)
+self._cancelWork(task, finished=onStopped)
+
+# setCategory (:478-480)
+task.category = categoryId; self._flushSoon()     # 不重算 outputFolder、不动占位符
+
+# startAll (:530-534) / _schedule (:569-571)
+for task in tasks:
+    if status in {PAUSED, WAITING, FAILED}: self._schedule(task)   # wait + pump
+# pauseAll (:536-539)
+for task in list(tasks.values()):
+    if _queue.isRunning(id) or _queue.isWaiting(id): self.pause(task)
+
+# _canDeleteIn (:606-615)
+if sys.platform != "darwin": return True
+try: next(folder.iterdir(), None); return True
+except PermissionError: return False
+except OSError: return True
+```
+
+Rust 侧的对应：
+
+| Python | Rust | 差异 |
+|---|---|---|
+| `pause` + 尾部 `_pump()` | `pause(id, max_task_num) -> Option<PauseReport>` | 签名从 `-> bool` 改了；`None` = 任务不在（Python `AttributeError`） |
+| `delete` 的 `onStopped` / `_store.remove` / `taskRemoved` | `delete(id, should_delete_files, max_task_num) -> Option<DeleteReport>` | 返回值带 `removed`（`taskRemoved` 的载荷）、`delete_files`、`delete_denied`、`checksum_work`、`started` |
+| `_canDeleteIn(folder)` | 模块级 `can_delete_in(&Path)` | 非 macOS 恒 `true`（`#[cfg]` 两条实现），macOS 才 `read_dir` 判 `PermissionDenied` |
+| `redownload` 的 `onStopped` | `redownload(id, max_task_num) -> Option<RedownloadReport>` | `reset()` + `queue.wait` + `pump` 同步做完（见决策） |
+| `setCategory` | `set_category(id, &str) -> bool` | `""` 落成 `Some("")` 而不是 `None` |
+| `startAll` 逐任务 `_schedule` | `start_all(max_task_num) -> Vec<String>` | 同序聚合 `started`；**不改状态** |
+| `pauseAll` | `pause_all(max_task_num) -> Vec<String>` | 先快照 id 再遍历；`started` 聚合各次 `pause` 的结果 |
+
+### 关键决策
+
+- **`pause` 的返回类型从 `bool` 改成 `Option<PauseReport>`**：尾部 `_pump()` 是
+  Python 语义的一部分（暂停让出空位要立刻补位），漏了就得让每个调用方自己 pump；
+  只有 1 个旧单测受影响，改动成本低。
+- **`delete` 就地删占位符文件、已下载内容留给调用方**：`delete_placeholder` 只删
+  「空目录 / 零字节文件」，不会碰真数据；`Task.deleteFiles`（截断/清空）在 Python 里
+  放在 `finished` 回调里等协程真的停下，Rust 侧对应 `DeleteReport::delete_files` 标志。
+- **`can_delete_in` 用 `#[cfg]` 双实现**：非 macOS 恒 `true`（Python
+  `sys.platform != "darwin"` 直接返回 `True`），macOS 才 `fs::read_dir` 判
+  `PermissionDenied`（`next(iterdir())` 只在打开目录时可能抛）。本机 Linux 上
+  `delete_denied` 永远为 `false`，无法单测，只在文档里说明。
+- **`redownload` 同步做完 `reset()` + `queue.wait` + `pump`**：Python 把这段放在
+  `finished` 回调里，但 `_pump()` 只**返回**该派发的 id，真正派发归调用方；
+  调用方拿到 `started` 后、提交协程前删旧文件即可，顺序等价。
+- **`start_all` 不改状态**：`_dispatch` 才 `setStatus(RUNNING)`；Rust 的 `pump` 本来就
+  不碰状态（第 81 步的约定），排队期间保持 `PAUSED`/`FAILED`。
+- **`set_category("")` 落成 `Some("")` 而非 `None`**：`outputFolderOf` 用
+  `categoryId is None` 判「要不要按名字猜分类」，两种空值语义不同。
+- **`pause_all` 先快照 id 再遍历**：`pause` 里的 `_pump` 会改动队列，边迭代边改会
+  漏/重；返回的 `started` 会包含「被 pump 派发又立刻被 pause」的中间任务（Python 同，
+  见实测第 8 条）。
+- **`DeleteReport` 不 `derive(PartialEq)`**：`removed` 是 `TaskRecord`，`gd3-core`
+  侧没给它 `PartialEq`。首跑 `E0369`/`E0277` 就是这个（`#[derive(Debug, Clone)]`）。
+- **`Task.deletePlaceholders` 的第一段仍镜像不了**：未完成步骤的 `step.outputPath`
+  在基类恒为 `""`，真实路径来自 `HttpStep`/`yt_dlp`/`bittorrent` 等**步骤子类**，
+  Rust 的 `TaskStep` 只是数据行。与第 93 步 `placeholder_paths()` 只返回
+  `[outputPath]` 是同一个缺口，记入模块 doc 与 README。
+
+### Python 实测（`TaskService.__new__` + 假 store/queue/runner，脚本在 scratch `probe99.py`）
+
+```text
+1 pause       : status=[PAUSED, RUNNING] events=[('paused','a'), ('runStarted','b')] waiting=[] running=['b']
+2 delete(True) : log=['deleteFiles','deletePlaceholders'] events=[('removed','a'), ('runStarted','b')] store=['b'] running=['b']
+3 delete(False): log=['deletePlaceholders'] events=[('removed','a')] store=[]
+4 denied twice: log(a)=['deletePlaceholders'] log(b)=['deletePlaceholders'] events=[('deleteDenied',), ('removed','a'), ('removed','b')] notified=True
+5 redownload  : log=['deleteFiles','reset'] status=RUNNING completedAt=0 shouldSeed=True checksums={} events=[('runStarted','a')]
+6 setCategory : category='' outputFolder=/tmp/gd3-probe outputPath=/tmp/gd3-probe/a.bin
+6b setCategory: category='video'
+7 startAll    : status=[RUNNING,WAITING,FAILED,COMPLETED] waiting=['w','f'] events=[('runStarted','p')]
+8 pauseAll    : status=[PAUSED,PAUSED,COMPLETED] events=[('paused','a'), ('runStarted','b'), ('paused','b')] running=[]
+9 canDeleteIn : platform=linux result=True
+```
+
+要点：第 1 条证明 `pause` 尾部的 `_pump()` 会把 `b` 派发出去；第 2/3 条证明
+`deleteFiles` 只在 `canDelete` 时调用、`deletePlaceholders` **无条件**调用；第 4 条是
+`fileDeleteDenied` 只提示一次的现场（`deleteFiles` 两次都没调）；第 5 条证明
+`redownload` 走 `deleteFiles → reset → _schedule`（`completedAt=0`、`shouldSeed=True`、
+`checksums` 清空）；第 6 条证明 `setCategory("")` 保留空串、不动输出目录；第 7 条证明
+`startAll` 只排三种状态、派发的那个被 `_dispatch` 改成 `RUNNING`；第 8 条证明
+`pauseAll` 的中间态（`b` 先被 pump 派发再被自己暂停）；第 9 条证明 Linux 上恒可删。
+
+### 单测（7 个新增 + 1 个改断言）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `pause_cancels_queue_and_marks_record_paused`（改） | `PauseReport.cancel.work_id` + `PAUSED` + 置脏；任务不在 → `None` |
+| `pause_pumps_the_freed_slot` | 上限 1、`a` 运行中、`b` 等待 → `pause(a)` 的 `started == ["b"]` |
+| `delete_reports_checksum_cancel_and_pumps` | `checksum_work` / `cancel.work_id` / `removed` / `delete_files=false` / `delete_denied=false` / `started == ["b"]` / 校验登记项被摘 |
+| `delete_removes_placeholders_but_keeps_content` | 零字节占位符 + `.ghd` 被删；**有内容的文件保留**（`delete_placeholder` 口径） |
+| `redownload_resets_and_requeues` | `reset()` 后 `completed_at=0` / `should_seed=true` / `checksums` 空 / step 回 `WAITING` / 重新入队并被派发 |
+| `set_category_writes_the_raw_string_and_flushes` | `""` → `Some("")`、`"video"` → `Some("video")`、置脏；先 `flush` 清脏以证明「是它置的」；任务不在 → `false` |
+| `start_all_queues_paused_waiting_and_failed` | 只排 `PAUSED`/`WAITING`/`FAILED`、保持记录顺序、排队期间不改状态、`COMPLETED` 不动 |
+| `pause_all_pauses_running_and_waiting` | 快照遍历：`started == ["b"]`（`pause(a)` 的 pump 先派发 `b`）、两者都 `PAUSED`、`COMPLETED` 不动 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**709 passed / 0 failed**（702 + 7）；
+- `cargo test --workspace`：**1211 passed / 0 failed**（28 段，第 98 步 1204 + 7）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（5m57s）；
+- Python 侧没改一行，不跑 Python 全量（探针脚本在 scratch，未入库）。
+
+### 下一步（第 100 步候选，按价值/风险）
+
+1. **`actions::TaskService` 接线**：`engine.rs` 仍无 `impl actions::TaskService`
+   （11 个方法）。trait 收 `&self`、`TaskService` 要 `&mut self` →
+   `impl actions::TaskService for RefCell<TaskService>` 适配器；第 97–99 步已把记账
+   半边补齐，接引擎只剩协程提交 + 文件监听 + `deleteFiles` 三块；
+2. `edit`（`_cancelWork(finished=onStopped)` + `replaceWith` + `setOptions` +
+   `updatePlaceholders`）与 `update_selection` 的记账半边；
+3. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：造 `Script`/`Territory`
+   枚举后可搬，纯函数；
+4. `app/services/runtime_status.py`（195 行）：需先给 `pack::BinaryRuntime` 补
+   `install`/`fetch_latest_version` 的同步签名；
+5. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
