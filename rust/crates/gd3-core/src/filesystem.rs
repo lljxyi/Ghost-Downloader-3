@@ -97,6 +97,18 @@ pub fn find_executable(install_folder: &Path, name: &str) -> String {
     }
 }
 
+/// 镜像 `shutil.which(name)`：只在 `PATH` 里找（不看当前目录、不认安装目录）。
+///
+/// [`find_executable`] 会先试 `install_folder/<name>`，`install_folder` 传空路径时
+/// 那条分支就退化成「相对当前目录」的 `is_file()` 检查；`shutil.which` 没有这一步。
+/// 需要纯粹按 `PATH` 判定「命令在不在」的调用方（比如 `openChromiumUrl`）用这个。
+///
+/// 与 Python 的已知差异：`shutil.which` 在 `PATH` 未设置时退回 `os.defpath`
+/// （`/bin:/usr/bin`），这里退回空串（= 什么都不查）—— 与 [`find_executable`] 一致。
+pub fn which(name: &str) -> Option<PathBuf> {
+    which_in(name, &env::var("PATH").unwrap_or_default())
+}
+
 /// 镜像 `deletePath`：目录整棵删、其余 `unlink`；不存在与失败都静默。
 ///
 /// `is_dir()` 跟随符号链接，`is_symlink()` 不跟 —— 所以「指向目录的符号链接」走
@@ -632,5 +644,14 @@ mod tests {
         assert!(!is_existing(&link));
         assert!(is_folder(&target));
         assert!(is_existing(target.join("keep.txt")));
+    }
+
+    #[test]
+    fn which_only_searches_path() {
+        // `sh` 一定在 PATH 里
+        assert!(which("sh").is_some());
+        assert_eq!(which("gd3-no-such-command-xyz"), None);
+        // `shutil.which` 认 `/` 时不搜 PATH：给绝对路径就按那条路径判
+        assert!(which("/bin/sh").is_some());
     }
 }

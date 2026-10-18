@@ -531,6 +531,66 @@ SHA-2 增量一致性）。
 
 规模：`file_association.rs` **548 行 / 14 单测**、`run_at_login.rs` **415 行 / 14 单测**。
 
+## 桌面动作（`gd3-core::desktop`）
+
+`app/platform/desktop.py`（405 行）里大半是 `QDesktopServices` / `QProcess` / `ctypes`
++ COM，能搬的只有「选哪条命令、参数是什么」这一层：
+
+| Python | Rust | 要点 |
+|---|---|---|
+| `shutdown`（:145-153） | `desktop::shutdown_command` | `shutdown -h now` / `osascript … shut down` / `shutdown /s /t 0` |
+| `restart`（:156-164） | `desktop::restart_command` | `shutdown -r now` / `osascript … restart` / `shutdown /r /t 0` |
+| `sleep`（:167-175） | `desktop::sleep_command` | `systemctl suspend` / `pmset sleepnow` / `rundll32.exe powrprof.dll,SetSuspendState` |
+| `openFile`（:121-123） | `desktop::open_file_command` | Linux `xdg-open`、macOS `open`；Windows 未迁移 |
+| `openFolder`（:126-127） | `desktop::open_folder_command` | 同上 |
+| `revealInFolder`（:130-142） | `desktop::reveal_in_folder` | 三分支：存在 → 打开父目录（macOS `open -R`）；父目录存在 → `openFolder(parent)`；都没有 → 不做 |
+| `openChromiumUrl`（:178-234） | `desktop::open_chromium_url` | 按表序命中第一个，`chrome://` 换成该浏览器的 scheme |
+| `Popen` / `QProcess.startDetached` | `desktop::spawn_detached` | `setsid(2)`（`pre_exec`）+ 三路 `Stdio::null()`，**不等**子进程 |
+| `buildFontFamilies`（:15-45） | **未迁移** | 入参是 `QLocale` 的 `script()` / `territory()`，Slint 侧没有对应概念 |
+| `deleteRecoverably`（:112-114） | **未迁移** | `QFile.moveToTrash` 要 freedesktop 回收站实现 |
+| `_sendForegroundInput` / `_revealInFolderShell` / `requestForeground` / `raiseWindow` / `startFileDrag` | **N/A** | 纯 Win32 `ctypes` + Qt 窗口 |
+
+三个决策：
+
+1. **`*_on(os, ...)` 纯函数 + 不带 `_on` 的包装。** 包装只做
+   `std::env::consts::OS` 分发，所以三条平台的命令表都能在本机（Linux）被单测钉住，
+   而不是靠 `cfg!` 分支——`cfg!` 在 CI 上只能覆盖一个平台。
+2. **`openChromiumUrl` 的「浏览器装没装」用 `which: impl Fn(&str) -> bool` 注入。**
+   单测传假 `which`，不依赖本机装了什么浏览器；`open_chromium_url` 用
+   `filesystem::which`（新增，`shutil.which` 的纯 `PATH` 版）查真实 `PATH`。
+   之所以不沿用 `find_executable(Path::new(""), name)`：那条路径会先试
+   `""/<name>`，也就是**相对当前目录**的 `is_file()`，`shutil.which` 没这一步。
+3. **`shutdown` / `restart` / `sleep` 返回 `Vec<String>` 而不是 `Option`。**
+   Python 的 `match sys.platform` 只有 `win32` / `darwin` 两个具名分支，其余全部落进
+   `case _`（POSIX 分支）——所以 `"freebsd13"`、`"openbsd7"` 甚至空串拿到的都是
+   `shutdown -h now`，不是「不支持」。`openFile` / `openFolder` / `revealInFolder` /
+   `openChromiumUrl` 的 `Option` 只用来表示**Windows 未迁移**（`None`）。
+
+两个易错点：
+
+- **`str(Path("foo").parent)` 是 `"."`**，而 Rust 的 `Path::new("foo").parent()` 是空路径
+  （`display()` 出来是空串）；`Path::new("/").parent()` 是 `None`，Python 的
+  `Path("/").parent` 还是 `Path("/")`。`revealInFolder` 的 Linux 分支把这个值直接塞进
+  `xdg-open`，所以两种边界都用 `parent_display` 对齐了（有单测）；
+- **`toBrowserUrl` 只剥一次 `chrome://`、大小写敏感**：`"chrome://"`（长度 9）换出来是
+  `"{scheme}://"`；`"Chrome://x"` 原样返回。
+
+与 Python 的已知差异：
+
+1. **Windows 的 `openFile` / `openFolder` / `revealInFolder` / `openChromiumUrl` 未迁移**：
+   Python 分别走 `QDesktopServices`（内部 `ShellExecute`）、`SHOpenFolderAndSelectItems`、
+   `winreg` 查 `App Paths`，都要 Win32 API；三个电源命令是纯命令表，三平台都在；
+2. `openFile` / `openFolder` 在 Linux 上直接写 `xdg-open`，而 Qt 在 `xdg-open` 缺失时会退回
+   `gio open` / 桌面环境自己的 handler——这里 `spawn_detached` 返回 `NotFound`；
+3. `openChromiumUrl` 只负责**挑**命令：Python 在 `Popen` 抛 `OSError` 时 `continue` 试下一个，
+   这里把 `spawn_detached` 的 `Err` 交给调用方；
+4. macOS 分支 Python 是 `subprocess.run(["open", "-a", app, url])` 看返回码（同步试装），
+   这里统一抽象成 `which(app)`，不真去 `open -a` 试；
+5. 与 Python 的 `Popen` 一样不等子进程，子进程退出后会短暂留一个僵尸直到父进程退出
+   （未做 `SIGCHLD` 处理）。
+
+规模：`desktop.rs` **604 行 / 14 单测**；`filesystem.rs` 新增 `which`（1 单测）。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

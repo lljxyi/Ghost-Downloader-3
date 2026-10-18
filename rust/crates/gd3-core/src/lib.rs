@@ -5,6 +5,7 @@
 pub mod checksum;
 pub mod config;
 pub mod container;
+pub mod desktop;
 pub mod ed2k;
 pub mod file_association;
 pub mod filename;
@@ -35,6 +36,12 @@ pub use container::{
     ContainerError, SegmentRange, build_mp4_segment_range, build_webm_segment_range,
     parse_mp4_boxes, parse_sidx,
 };
+pub use desktop::{
+    LINUX_BROWSERS, MACOS_BROWSERS, browser_url, open_chromium_url, open_chromium_url_on,
+    open_file_command, open_file_command_on, open_folder_command, open_folder_command_on,
+    restart_command, restart_command_on, reveal_in_folder, reveal_in_folder_on, shutdown_command,
+    shutdown_command_on, sleep_command, sleep_command_on, spawn_detached,
+};
 pub use file_association::{
     MIME_PREFIX, desktop_entry_text, desktop_file_path, load_mime_types, register_file_types,
     register_url_scheme, save_mime_types, service_entry_text, service_file_path,
@@ -42,7 +49,7 @@ pub use file_association::{
 };
 pub use filename::{DEFAULT_MAX_FILENAME_LENGTH, split_stem_ext, to_safe_filename};
 pub use filesystem::{
-    delete_path, find_executable, is_existing, is_folder, local_file_path, to_posix_path,
+    delete_path, find_executable, is_existing, is_folder, local_file_path, to_posix_path, which,
 };
 pub use ghd::PartRecord;
 pub use install::{delete_installed, install_file};
