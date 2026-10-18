@@ -5523,3 +5523,133 @@ if categoryId and Path(folder) == Path(cfg.downloadFolder.value):   # 分支 3
 ### 卡点
 
 无。
+
+## 第 96 步：probeConflict 接线（冲突队列真的能探测了，2026-10-18 14:31）
+
+**目标**：补上 `TaskStore.probeConflict`（`app/services/task_service.py:126-128`）与
+`TaskService.probeConflict`（`:388-390`）。第 65 步就把 `NameConflictQueue` 搬完了、
+第 92/93 步占位符也落地了，但 `Engine` 的 `ConflictActions::probe` 一直恒 `None`
+——队列因此永远认为「没有冲突」，按 `keepBoth` 放行、不弹窗。这条线是重名冲突
+对话框（`name_conflict.rs` + `draft_card.rs` 的冲突图标）唯一的触发源。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-core/src/path.rs` | 210 → **285 行**；新增 `posix_relative_to(path, base) -> Option<String>` + 私有 `split_root`；`relative_to_matches_pathlib` 单测（15 条金值） |
+| `gd3-ui/src/task_service.rs` | 1776 → **1945 行 / 47 单测**；新增 `probe_conflict` / `probe_conflict_in` / `probe_conflict_by_id` + 私有 `modified_seconds`；模块 doc「已知差异」补一条；5 个新单测 |
+| `gd3-ui/src/engine.rs` | 1176 → 1178 行；`TaskConflictActions::probe` 从恒 `None` 改为 `self.tasks.probe_conflict_by_id(&task.task_id)`；模块 doc / `on_name_conflicted` / `apply_dialog_outcome` 三处文档同步 |
+| `rust/README.md` | 「任务记账」补 `probe_conflict` 一条；「引擎装配」的「`probeConflict` 恒 `None`」改写为「已接线」；规模行 `task_service.rs` **1945 行 / 47 单测** |
+
+### 逐条对齐 Python
+
+```python
+# TaskStore.probeConflict (task_service.py:126-128)
+paths = sorted(folder / path.relative_to(task.outputFolder) for path in task.placeholderPaths)
+return next((path for path in paths if isExisting(path) and not self._isUnfinishedPlaceholder(path)), None)
+
+# TaskService.probeConflict (:388-390)
+_, folder = self._categoryService.outputFolderOf(task)
+return self._store.probeConflict(task, folder)
+```
+
+```text
+1. folder = categories.output_folder_of(record).folder      # outputFolderOf
+2. paths = [ folder / rel | rel = p.relative_to(record.output_folder), p in placeholder_paths ]
+3. paths.sort()                                             # Path 逐组件比较
+4. 取第一个 fs::metadata 成功、且 placeholders.is_unfinished(p) 为假的路径
+5. 返回 ProbeTarget { path, is_folder, existing_size, modified_at }
+```
+
+`isExisting` = `Path(path).stat()` 不抛异常（`app/platform/filesystem.py:24`）；
+`_isUnfinishedPlaceholder` = 登记表里该路径的**所属任务**存在且 `status != COMPLETED`
+（`_taskByPlaceholder`，由 `_setPlaceholders` 逐路径登记）。
+
+### 关键决策
+
+- **`posix_relative_to` 放进 `gd3-core::path`。** 它是 `PurePosixPath.relative_to` 的
+  镜像，与 `posix_join` / `posix_normpath` 同一族；`probeConflict` 只是第一个用户
+  （`file_select` / 未来的路径展示都会用）。
+- **`split_root` 单独抽出来，返回 `("/" | "//" | "", parts)`。** Python 的根是第一段：
+  `Path("//a").parts == ('//', 'a')`，与 `/a` 的 `'/'` **不相等**，所以
+  `Path("//a/b").relative_to("/a")` 抛 `ValueError`、`relative_to("//a")` 得 `b`。
+  把「压斜杠」和「比根」混在一起就会把这两种情况判成同一件事（`posix_normpath`
+  压成单根是另一回事，不能复用）。
+- **`Option<String>` 而不是 `Result`。** Python 的 `ValueError` 在 Rust 里没有调用方
+  会处理：占位符路径都是 `posix_join(output_folder, name)` 拼出来的，`None` 只可能
+  出现在「调用方手写了不一致的 record」这种病态输入上——`filter_map` 直接跳过比
+  引入错误路径更省事（doc 里写明）。
+- **`relative == "."` 单独处理。** `pathlib` 里 `Path(folder) / "."` 就是
+  `Path(folder)`，而 `posix_join(folder, ".")` 会拼出 `folder/.`（`metadata` 能读，
+  但返回的 `path` 字符串与 Python 不同）。`posix_join` 的入参约定是「任务名」，
+  所以在这个调用点补分支，不动 `posix_join`。
+- **`paths.sort()` 用 `PathBuf` 的 `Ord`（逐组件）。** CPython 的 `PurePath.__lt__`
+  比的是 `_cparts`，实测 `Path("/a/b") < Path("/a.b")` 为 `True`——字符串比较会
+  给出相反结论（`'.'` < `'/'`）。虽然当前 `placeholder_paths()` 只返回一个路径
+  （第 92 步的已知差异：不遍历 `steps`），语义仍按 Python 写。
+- **四列 `stat()` 用同一次 `fs::metadata`。** Python 是 `isExisting` 一次、队列
+  `takenPath.stat()` 再一次，中间文件被删会 `OSError`；Rust 侧一次拿全，顺带
+  消掉这个竞态（记在模块 doc 的「已知差异」）。
+- **`probe_conflict_by_id` 单独开一个方法。** Python 的队列持有 `Task` 对象，
+  Rust 的 `ConflictTask` 只有 `task_id` / `file_size`——「同一实例」差异的又一例
+  （同第 95 步的分类服务）。查不到任务 → `None`（Python 那边 `Task` 一定在
+  `_tasks` 里，不存在这条路径）。
+- **`modified_seconds` 退回 `0.0`。** `metadata` 已经成功时 `modified()` 几乎不可能
+  失败；Python 那边是 `AttributeError`，不值得为它加错误类型。
+
+### 单测
+
+`gd3-core::path`（1 个）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `relative_to_matches_pathlib` | 15 条金值：`/a/b`→`b`、自反→`.`、`///a/b`→`b`、`//a/b`/`//a`→`b`，以及 5 种 `ValueError`（`/a`←`/a/b`、`//a/b`←`/a`、`/a/b`←`//a`、`a`←`b`、`/a/b`←``） |
+
+`gd3-ui::task_service`（5 个，全部 hermetic）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `probe_conflict_returns_none_when_nothing_exists` | 文件不存在 → `None`；任务不在列表里 → `probe_conflict_by_id` 也是 `None` |
+| `probe_conflict_reports_the_existing_file` | 5 字节文件 → `path` 精确、`!is_folder`、`existing_size == 5`、`modified_at > 0` |
+| `probe_conflict_reports_a_folder_placeholder` | 目录型占位符（多文件任务）→ `is_folder == true` |
+| `probe_conflict_skips_unfinished_placeholders` | `add_with_conflict` 建出的 0 字节占位符：`RUNNING` → `None`；改成 `COMPLETED` → `Some(existing_size == 0)` |
+| `probe_conflict_looks_inside_the_category_folder` | 分类开启 + `movie.mkv` → 探测的是 `…/Video/movie.mkv`；显式 `probe_conflict_in(dir)` 在默认目录下 → `None` |
+
+Python 侧实测（`TaskStore(lambda p: False)` + `_setPlaceholders`，不碰真配置）：
+
+```text
+placeholderPaths: ['/tmp/…/a.bin']
+1 文件不存在                        -> None
+2 文件存在 + status WAITING          -> None      # 未完成 → 自己人
+3 文件存在 + status COMPLETED        -> /tmp/…/a.bin  size=5
+4 换一个目录（folder=…/sub）         -> /tmp/…/sub/a.bin
+5 目录型占位符 + 已登记且未完成       -> None
+```
+
+第 5 条第一次跑出 `None` 是因为探针把任务登记进了 `_taskByPlaceholder`（默认
+`WAITING`）——Rust 单测里那个服务没有登记项，对应「登记表为空」的情形，两边不矛盾。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --lib --tests`：55s 通过；
+- `cargo test -p gd3-core --lib path::`：6 passed；
+- `cargo test -p gd3-ui --lib`：**684 passed**（679 + 5）；
+- `cargo test --workspace`：**1186 passed / 0 failed**（28 段，第 95 步 1180 + 5 + 1）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（2m32s）；
+- Python 侧没改一行，不跑 Python 全量；
+- 代码 commit `4438b6c`。
+
+### 下一步（第 97 步候选，按价值/风险）
+
+1. **`TaskService` 的 `startSeeding` / `_seed` 记账半边**（`task_service.py:395-420`）：
+   做种开关 + `isSeeding` 状态 + `seedingStateChanged`，libtorrent 本体仍是桩；
+2. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：造 `Script` / `Territory`
+   枚举后可搬，纯函数、无 I/O；
+3. **`app/services/runtime_status.py`（195 行）**：需先给 `pack::BinaryRuntime` 补
+   `install` / `fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
+4. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
