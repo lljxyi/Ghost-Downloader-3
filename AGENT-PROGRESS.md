@@ -6362,3 +6362,135 @@ Rust 侧的对应：
    `install` / `fetch_latest_version` 的同步签名；
 3. `actions::UiHooks` 实现：等 Slint 主窗口；
 4. D-Bus / keepalive：仍排最后。
+
+## 第 102 步：运行时状态服务（`gd3-ui::runtime_status`）（2026-10-18 20:06）
+
+**目标**：`app/services/runtime_status.py`（195 行）的移植。它是设置页
+`RuntimeCard` 的唯一数据源——「某个运行时装没装 / 什么版本 / 有没有新版 / 正在装到几成」。
+第 95 步搬 `setting_cards.rs` 时只搬了**渲染**（`runtime_view(status, can_install,
+is_managed)`，输入是快照），产生快照的那个服务一直缺着。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-core/src/pack.rs` | 1165 → **1180 行**：`BinaryRuntime` 新增 `fetch_latest_version`（缺省 `Ok("")`）与 `install`（缺省 `Unsupported`）两个同步默认方法；`runtime_id` 去掉 `where Self: Sized` 进 vtable；+1 单测 |
+| `gd3-core/src/task_error.rs` | 新增 `TaskError::install_not_found(name)`（`安装后未找到 {name}`） |
+| `gd3-ui/src/runtime_status.rs` | **新文件 932 行 / 22 单测**：`RuntimeStatus` / `RuntimeWorkKind` / `RuntimeEffect` / `RuntimeStatusService` |
+| `gd3-ui/src/lib.rs` | 注册 `pub mod runtime_status;` |
+| `rust/README.md` | 987 → **1049 行**：新增「运行时状态」一节 + 修上一节过期的规模行 |
+
+### 逐条对齐 Python
+
+| Python（`runtime_status.py`） | Rust | 备注 |
+|---|---|---|
+| `status(runtime)` :38-42 | `status(&dyn BinaryRuntime)` | 没登记过就现造一个只带 id/name/path 的 |
+| `refreshStatus` :44-51 | `refresh_status` | 已知状态干净且路径没变 → **无效果** |
+| `invalidate` :53-60 | `invalidate` | 先 `CancelWork` 再 `probe` |
+| `install` :62-88 | `install` | 已在装 → 无效果；版本号取当前状态的 `latestVersion` |
+| `cancelInstall` :90-101 | `cancel_install` | 没在装 → 无效果 |
+| `_runInstall` 的 `reportProgress` :106-113 | `report_progress` | 只在「正在装 + 整数进度变了」时 `Emit` |
+| `_runInstall` 尾巴 :115-117 | `check_installed`（关联函数） | 失败返回 `TaskError::install_not_found(name)` |
+| `_onInstallFinished` :119-124 | `on_install_finished` | 先摘 `workId` 再 `invalidate` → **不吐** `CancelWork` |
+| `_onInstallFailed` :126-137 | `on_install_failed` | 不在装 → 忽略（迟到的失败回调） |
+| `_probe` :139-154 | `probe`（私有） | 置「检测中」→ `Emit` → 派 `Probe` |
+| `_onProbeFinished` :156-172 | `on_probe_finished` | `name`/`path` 是探测时快照；`isAppManaged()` 才 `_fetchLatest` |
+| `_onProbeFailed` :174-180 | `on_probe_failed` | 记 `error`、丢掉持有对象 |
+| `_fetchLatest` :182-189 | `fetch_latest`（私有） | 只派活，不动状态 |
+| `_onFetchFinished` :191-199 | `on_fetch_finished` | 版本为空 → 不改状态；状态不存在 → 什么都不做 |
+| `_onFetchFailed` :201-203 | `on_fetch_failed` | **只清账**，不吐效果（Python 也只有两行 `pop`，`error` 直接丢） |
+
+### 关键决策
+
+- **副作用摊成 `RuntimeEffect` 队列**（`Emit` / `CancelWork` / `Run`）：沿用第 100/101 步
+  的形态。Python 的 `coroutineRunner.submit(coro, done=…, failed=…)` 在 Rust 里没有对应
+  物，宿主就是运行器——它拿到 `Run` 去跑 `probe_version` / `fetch_latest_version` /
+  `install`，跑完回调 `on_*`。
+- **`workId` 由服务自己发号**（`runtime-1` / `runtime-2` …，**一个全局计数器**）：Python
+  拿的是 `submit` 的返回值；服务替宿主发号才能记账（`_workIds[runtimeId]`），宿主把它当
+  **不透明句柄**原样交回 `CancelWork`（同第 100 步 `task_actions`）。
+- **`BinaryRuntime::runtime_id` 进 vtable**：服务按 `runtimeId` 记账，手上是
+  `Rc<dyn BinaryRuntime>`（Python 是 `dict[str, BinaryRuntime]`）；带
+  `where Self: Sized` 时 `dyn` 调不到。去掉后 trait 仍 object-safe（`&'static str` 返回值）。
+  `grep` 过全仓：`runtime_id` 只在 `pack.rs` 内用过，改动面为零。
+- **`_runtimes` 用 `Rc<dyn BinaryRuntime>`**：Python 在异步间隙里攥着对象引用，
+  `_onProbeFinished` 要问它 `isAppManaged()`、`_onInstallFinished` 要再 `invalidate` 一次。
+  `Rc` 是唯一能表达「服务与调用方共享同一份对象」的写法（`Box` 做不到，`dyn` 不能 clone）。
+- **`BinaryRuntime` 新增两个同步默认方法**：`fetch_latest_version`（缺省 `Ok("")`，对齐基类
+  `return ""`）、`install`（缺省 `Unsupported`，对齐 `raise NotImplementedError`）。两者在
+  Python 都是 `async`，Rust 同步阻塞——与 `probe_version` 同一口径（`pack.rs` 模块 doc 第 5 条）。
+- **`report_progress` 的 `percent as i32`**：Python 是 `int(percent)`（向零截断），对 `NaN`
+  抛 `ValueError`；`as i32` 饱和到 `0`。实际无影响：进度只由本仓自己的 `install` 实现回报。
+- **`install` 的「安装中」状态 `path` 为空**：照抄 Python
+  `RuntimeStatus(runtimeId, runtime.name, isInstalling=True)`——`path` 不传，走缺省 `""`。
+  所以装的过程中卡片显示「正在下载… N%」而不是版本号。
+- **`cancel_install` 的状态 `path` 现读 `runtime.path()`**：Python 是
+  `RuntimeStatus(runtimeId, runtime.name, path=runtime.path())`，与 `install` 不同。
+- **`to_card_status` / `card_view` 把本地化函数当参数**：`setting_cards::RuntimeStatus.error`
+  是**已本地化文本**（Python `toLocalizedError(status.error)`），而 `gd3-ui` 只有错误键与
+  参数、没有翻译表。所以翻译由调用方注入（`|e| e.format()` 是当前唯一可用的近似）。
+
+### 单测（22 个）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `status_falls_back_to_a_bare_snapshot` | 没探测过 → `status()` 现造 id/name/path，`is_busy=false`，不持有对象 |
+| `refresh_status_emits_busy_then_runs_a_probe` | 效果序 `Emit(busy) → Run{Probe, runtime-1}`；`work_id` / `held_runtimes` 同步 |
+| `refresh_status_is_a_no_op_when_the_path_is_unchanged` | 干净状态 + 路径没变 → 空效果 |
+| `refresh_status_probes_again_after_the_path_moves` | 路径变了 → 重新探测，且 `Emit` 里带新路径 |
+| `refresh_status_probes_again_after_a_failed_probe` | 上次带 `error` → 重新探测 |
+| `on_probe_finished_fetches_the_latest_version_for_managed_runtimes` | 托管运行时 → `Emit(version/detail) → Run{FetchLatest, runtime-2}` |
+| `on_probe_finished_drops_unmanaged_runtimes` | 非托管 → 只有 `Emit`，持有对象清空、`workId` 摘掉 |
+| `on_probe_failed_records_the_error_and_drops_the_runtime` | `error` 落上、`path` 用快照值、对象清空 |
+| `install_emits_installing_then_runs_with_the_latest_version` | `Emit(is_installing, path="") → Run{Install{version: "2.0"}}` |
+| `install_is_ignored_while_already_installing` | 重复 `install` 无效果 |
+| `report_progress_only_emits_when_the_integer_progress_changes` | 0.5 → 无（0 == 0）；12.7 → 12；12.9 → 无；未知 id → 无 |
+| `report_progress_ignores_statuses_that_are_not_installing` | 非安装中 → 无效果 |
+| `cancel_install_cancels_the_work_then_restores_the_idle_status` | `CancelWork → Emit(空状态)`；再取消无效果 |
+| `on_install_finished_invalidates_and_probes_again` | **不吐 `CancelWork`**（先摘 `workId`），`Emit(busy) → Run{Probe, runtime-2}` |
+| `on_install_finished_of_an_unknown_runtime_does_nothing` | 没有持有对象 → 空效果 |
+| `on_install_failed_marks_the_error_and_clears_the_flag` | `is_installing=false` + `error`；迟到回调被忽略 |
+| `on_fetch_finished_skips_the_emit_for_an_empty_version` | `""` → 无效果；`"3.0"` → `Emit`；未知 id → 无 |
+| `on_fetch_failed_only_clears_the_bookkeeping` | 不吐效果、状态不动（仍是 `is_busy`） |
+| `check_installed_reports_the_runtime_name` | 非托管 → `Err(安装后未找到 ffmpeg)`；托管 → `Ok(())` |
+| `card_status_bridges_to_the_setting_card_snapshot` | 本地化函数被调用一次；`content` = 错误文本；按钮态由 `can_install` 决定 |
+| `the_host_can_drive_install_and_fold_progress_back` | 宿主循环：`runtime.install(version, report)` → `report_progress` 折回 `Emit(progress=40)` |
+| `work_ids_are_unique_across_kinds` | 探测 / 拉版本 / 安装三类 workId 互不相同 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过（`FMT_OK` / `FMT_CHECK_OK`）；
+- `cargo check -p gd3-ui --tests`：干净（无 warning）；
+- `cargo test -p gd3-ui --lib`：**754 passed / 0 failed**（732 + 22）；
+  首跑 1 个失败：`install_emits_installing_then_runs_with_the_latest_version` 断言
+  `workId == runtime-3`，实际拿到 `runtime-2`。原因是 `fake()` 默认**非托管**，
+  `on_probe_finished` 不会去拉最新版本，只发了 1 个号。修法不是改断言而是改夹具：
+  该测试把 `managed` 置真，走完整的「探测 → 拉版本 → 安装」三步，`runtime-3` 才成立；
+  这也让 `on_fetch_finished` 的调用有了真实来源。
+- `cargo test --workspace`：**1257 passed / 0 failed**（28 段，第 101 步 1234 + 22 + 1）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（6m51s）；
+- Python 侧没改一行，不跑 Python 全量。
+
+### 下一步（第 103 步）
+
+**选 `app/services/task_draft.py`（241 行）+ `difflib.SequenceMatcher` 的最小移植**
+（`gd3-ui::task_draft` / `gd3-ui::sequence_matcher`）。理由：
+
+- 它是 P2「建任务链路」的状态机核心，`setUrls` 的**增量 diff** 直接决定哪些草稿被
+  取消、哪些被提交解析；不搬它，主窗口的批量 URL 面板无法接线；
+- 不碰网络：`featureService.parse(options)` 是端口，宿主注入；
+- 唯一的硬骨头是 `SequenceMatcher(a=旧 urls, b=新 urls, autojunk=False)`——`isjunk=None`
+  + `autojunk=False` 时 `__chain_b` 退化成「元素 → 下标列表」的普通 map，`find_longest_match`
+  的两条 junk 扩展循环也整体消失，只剩「最长公共块 + 队列切分 + 相邻块合并」三步，
+  可以逐行照抄（`/usr/lib/python3.13/difflib.py`）；
+- 预期测试向量已用 Python 现算（含 `[]`/单边空/全等/交换/重复元素等 13 组 opcodes）。
+
+**暂缓 `update_service.py`（335 行）**：它依赖 `app/sources.py`（295 行，github/gitcode
+双源 fallback 的 async HTTP）与 `zipfile` / `tarfile(r:xz)` / `hdiutil` 三种解包。
+本机离线缓存里只有 `flate2` / `tar` / `zstd`，**没有 `zip` 与 `xz2`**，硬做要么手写
+ZIP 中央目录解析、要么退化成 `Unsupported`——两条路都会把这一步拖成两步。等
+`gd3-net` 侧的 sources 端口成形后再搬。
+
+**其余候选（按可行性排）**：`app/services/feature_service.py`（234 行，工厂，等主窗口）；
+`app/platform/desktop.py:15-45` `buildFontFamilies`（纯函数，但要先造 `QLocale.Script` /
+`Country` 的映射表）；`actions::UiHooks`（等主窗口）；D-Bus / keepalive（仍排最后）。
