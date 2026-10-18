@@ -4799,3 +4799,75 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
   3. `app/services/runtime_status.py`（195 行）接线：现在有 `pack::BinaryRuntime` 可依赖；
   4. D-Bus / keepalive 仍排在最后（`zbus` 缓存可用但编译代价大）。
 - 卡点：无
+
+## 第 88 步：gd3-core::checksum（2026-10-18 10:51）
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/checksum.rs`（**914 行 / 10 单测**）：
+    `CHUNK_SIZE` / `COMMON_ALGORITHMS` / `SUPPORTED_ALGORITHMS` / `SHAKE_LENGTHS` /
+    `ChecksumError`（两变体，`Display` 照抄 `ValueError: unsupported hash type xxx`）/
+    `parse_checksum` / `match_checksum` / `to_checksum` +
+    私有 `read_chunk` / `py_isspace` / `to_hex` / `Hasher` /
+    私有 `mod sha256`（FIPS 180-4，64 项 K 表）/ `mod sha512`（80 项 K 表）。
+  - `Cargo.toml`：`cargo add --offline` 加了 `md-5 = "0.11"` / `sha1 = "0.11"`
+    （**零下载**，本来就在 `Cargo.lock` 里）；`lib.rs` 加 `pub mod checksum;` + 8 个 re-export。
+  - `rust/README.md` 新增「文件校验（`gd3-core::checksum`）」一节。
+- 关键决策：
+  - **手写 SHA-256 / SHA-512，而不是放弃这两个算法**：`sha2` 不在离线缓存里，
+    但 `sha256` 是下载校验最常用的算法，缺位等于功能回归。K 表 / 初始状态**由 Python
+    按定义现算生成**（素数立方根小数部分），避免手抄常量；向量对着 `hashlib` 钉住。
+    模块头写明「`sha2` 可用后应整体替换这两个私有模块」。
+  - `shake_128` / `shake_256` **不实现**：Keccak 代码量与风险远高于 SHA-2，
+    `to_checksum` 返回 `ChecksumError::Unsupported`；`SHAKE_LENGTHS` 常量保留，
+    好让调用方能识别这两个名字而不是当成未知算法。
+  - `ALGORITHMS`（`sorted(hashlib.algorithms_available)`，本机 40 项、**环境相关**）
+    不迁移，改用 `SUPPORTED_ALGORITHMS`（= `COMMON_ALGORITHMS` 四项）→ 记为已知差异
+    （任务卡的算法菜单将只有主菜单那四项，没有「更多」子菜单）。
+  - `to_checksum` **同步阻塞**（Python 是 `async` + 每块 `asyncio.to_thread`），
+    取消靠调用方丢弃任务。
+  - `match_checksum` 收 `(&算法, &值)` 的迭代器：Python 入参是保序 `dict[str, str]`，
+    泛型迭代器让 `serde_json::Map` / `BTreeMap` / 数组都能直接传。
+- 实证结论（源码级 + CPython 3.13 实测，全部有单测钉住）：
+  - `parseChecksum` = `(text.split() or [""])[0].lower()`：无参 `split()` 按「一段连续
+    空白」切、丢空段 → 前导空白不影响；空白口径是 `str.isspace()`，**包含** `\x1c`-`\x1f`
+    （Rust 的 `char::is_whitespace` 不含）→ 私有 `py_isspace`；只取第一段。
+  - `f.read(CHUNK_SIZE)` 走 `BufferedReader`，**除非 EOF 否则返回满块**；
+    直接用 `File::read` 的短读会让进度回调的次数与取值和 Python 不一致
+    → `read_chunk` 循环填满 buffer。
+  - `size = path.stat().st_size` 在**开文件之前**取；空文件一块都读不到，
+    `done * 100 // size` 根本不执行（Python 侧也就不存在 `ZeroDivisionError`）。
+  - 向量全部用 CPython 的 `hashlib` 重算核对过一遍（11 组 × 4 算法 + 4MiB+7 大文件）：
+    空串、`abc`、`hello world\n`、55/56/63/64/111/112/127/128 字节
+    （SHA-256 的 55/56 与 SHA-512 的 111/112 是两条填充边界），**逐字一致**。
+- 修掉的两处自己写的问题：
+  - 测试里 `matches!(error, Unsupported { ref algorithm } if algorithm == algorithm.as_str())`
+    是**恒真**的（模式变量遮蔽了外层 `algorithm`）→ 改成 `match &error` + `assert_eq!`；
+  - clippy `useless_conversion`：`self.state.iter_mut().zip([a,..,h].into_iter())`
+    两处 `.into_iter()` 是多余的（`zip` 收 `IntoIterator`）→ 删掉。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**205 passed**（第 87 步 195 + 10）；
+  - `cargo test --workspace`：**1054 passed, 0 failed**（第 87 步 1044 + 10）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（1m17s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧没改一行，不需要跑 Python 全量；
+  - commit `888154d`。
+- 环境记录：`nohup cmd &` 起的长任务会被 Bash 工具在命令结束时**整组杀掉**
+  （日志 0 字节、进程消失）；改用 `setsid env ... > log 2>&1 < /dev/null & disown`
+  才能真正常驻，然后轮询日志。本轮 `cargo test --workspace`（`CARGO_BUILD_JOBS=1`）
+  约 6 分钟，clippy 1m17s。
+- 下一步：
+  1. `app/platform/run_at_login.py`（79 行）+ `app/platform/file_association.py`（148 行）
+     的 Linux 分支：`.desktop` 自动启动项、`loadMimeTypes` / `saveMimeTypes`
+     （`~/.local/share/applications` + `dbus-1/services` 两份文件）、
+     `registerUrlScheme` / `unregisterUrlScheme`；`home` / `executable_path` / `desktop_id`
+     / `version` 全部作参数传入（照第 87 步 `app_version` 的做法）；
+     Windows 注册表 / macOS plist 的**文本**可以做纯函数，注册表 API 判 N/A；
+  2. `app/platform/sysio.py`（131 行）**判 N/A**：POSIX 分支就是
+     `from os import pwrite, ftruncate`，Rust 侧对应 `FileExt::write_at` / `File::set_len`，
+     没有可搬的逻辑；Windows 分支是 `ctypes` 调 `WriteFile` / `FSCTL_SET_SPARSE`；
+  3. `app/services/runtime_status.py`（195 行）暂时做不了：`install` /
+     `fetchLatestVersion` 在 Python 是 `async` 且 `pack::BinaryRuntime` 里**还没搬**
+     （它们要网络），需要先把这两个抽象方法定成同步签名；
+  4. `app/services/speed_meter.py`（56 行）/ `plan.py`（53 行）都太小，
+     可以顺手并进相邻步骤。
+- 卡点：无
