@@ -317,6 +317,55 @@ Python 侧**没有**加影子开关：这几个函数都是一次 syscall 的包
 性能动机；`localFilePath` 目前在 Python 里还没有调用方，等 `pack.py` 的
 `BinaryRuntime` 搬过来再一起接。
 
+## 插件清单与运行时（`gd3-core::pack` / `gd3-core::install`）
+
+`app/models/pack.py` 里**不依赖 Qt** 的那半截，加上 `app/install.py` 的换文件逻辑：
+
+| Python | Rust | 要点 |
+|---|---|---|
+| `FileType`（:22-27） | `pack::FileType` | 纯数据（后缀 / 展示名 / MIME / 图标） |
+| `UriScheme`（:30-33） | `pack::UriScheme` | 纯数据 |
+| `VersionInfo`（:114-117） | `pack::VersionInfo` | `detail` 默认空串 |
+| `PackManifest.fromDir`（:186-247） | `pack::PackManifest::from_dir` | 失败 `None`；要日志文本用 `from_dir_detailed` |
+| `BinaryRuntime`（:120-177） | `pack::BinaryRuntime`（trait） | 类属性 → 带默认实现的 trait 方法 |
+| `deleteInstalled`（`install.py:15`） | `install::delete_installed` | 改名 `<name>.<8hex>.old`，再扫同名残留 |
+| `installFile`（`install.py:21`） | `install::install_file` | `deleteInstalled` + `os.replace` |
+| `installArchive`（`install.py:27-79`） | **未迁移** | 要 `zipfile` / `tarfile("r:gz")`，随 `update_service` 排期 |
+
+`TaskParser` / `PackConfig` / `FeaturePack` / `PackPage` / `PackServices` 不搬：
+`PackConfig.__init_subclass__` 把子类里的 `ConfigItem` 注册进 `cfg`（键名前缀
+`pack_<类名>_`），`FeaturePack` 的方法返回 Qt 控件与信号——插件加载本身留在 Python，
+这里只钉住**跨语言要共享的数据形状**。
+
+`fromDir` 的七条校验（先到先错，`ManifestError` 的 `Display` 逐字照抄日志格式串）：
+
+1. 缺 `manifest.toml`；2. 读 / UTF-8 解码 / TOML 解析失败；3. 顶层没有 `[pack]` 表；
+4. `entry` 非字符串或 `strip()` 后为空（**默认 `"pack.py"`**）；5. 入口文件不存在
+（只有 `.py` 才退到同名 `.pyc`，报错路径仍是原始的 `packDir/entry`）；6. `class`
+非字符串或 `strip()` 后为空；7. `dependencies` 非数组，或含非字符串 / 空字符串。
+`version` / `gdMinVersion` 非字符串时**静默**退化成 `""`。
+
+几个容易写错的点（都有单测钉住）：
+
+- `strip()` 只用于**判空**：拼路径用的是未 strip 的 `entry`，所以
+  `entry = " pack.py "` 会去找带空格的文件名；`class` 也是原样保留（含前后空格）；
+- `BinaryRuntime::runtime_id` 用 `std::any::type_name::<Self>()`，`where Self: Sized`
+  让它不进 vtable，trait 仍然 object-safe（Python 那边是 `list[BinaryRuntime]`
+  异构实例）；两边都是「类型全名」但**字符串不同**，不能混用作持久化键；
+- `probe_version` 是同步 `Command`（Python 是 `async`）：起进程失败给 `Err`
+  （Python 的 `FileNotFoundError` 冒到 `_onProbeFailed`），非 0 退出码给
+  `Ok(VersionInfo::default())`；stdout 按 `errors="ignore"` 丢非法序列（**不**插
+  `U+FFFD`），再取第一行 `strip()`；
+- `delete_installed` 的残留扫描按「前缀 + 后缀 + 长度」判定，等价于
+  `glob.escape(name) + ".*.old"`：`glob.escape` 只把 `[` / `]` / `*` / `?` 包成
+  字符类，真通配符只剩那一个 `*`，而目录项不含 `/`；
+- `path` 为空 / `/` / `.` 时 Python 的 `with_name` 抛 `ValueError`（整个函数中断），
+  Rust 的 `file_name()` 是 `None` → 直接返回 `Ok(())`（记为已知差异）。
+
+规模：`pack.rs` **1146 行 / 37 单测**、`install.rs` **286 行 / 12 单测**。
+`pack.rs` 里另有一份私有的 `py_isspace` / `py_strip` / `split_lines` / `decode_ignore`
+——`gd3-core::hls` 与 `gd3-ui::pystr` 已各有一份，抽公共模块会牵动既有调用点，留作后续。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

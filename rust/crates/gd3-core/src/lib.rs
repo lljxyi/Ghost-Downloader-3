@@ -11,7 +11,9 @@ pub mod ghd;
 pub mod github;
 pub mod hls;
 pub mod http_pack;
+pub mod install;
 pub mod m3u8;
+pub mod pack;
 pub mod pair_token;
 pub mod path;
 pub mod queue;
@@ -29,6 +31,8 @@ pub use filesystem::{
     delete_path, find_executable, is_existing, is_folder, local_file_path, to_posix_path,
 };
 pub use ghd::PartRecord;
+pub use install::{delete_installed, install_file};
+pub use pack::{BinaryRuntime, FileType, ManifestError, PackManifest, UriScheme, VersionInfo};
 pub use path::{posix_join, posix_normpath};
 pub use queue::TaskQueue;
 pub use store::{LoadOutcome, load_records, save_records, to_line};
