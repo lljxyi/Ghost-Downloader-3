@@ -2,7 +2,7 @@
 
 Python 实现的 Rust 迁移，按阶段推进。
 
-**已完成**：Phase 1（领域模型 + 持久化）、Phase 2（PyO3 影子模式）、Phase 3（HTTP 传输引擎 + 接入 pack + wreq 指纹）、Phase 4（回环监听 + aria2 JSON-RPC + 浏览器扩展 WebSocket v2，均已接入 Python）。
+**已完成**：Phase 1（领域模型 + 持久化）、Phase 2（PyO3 影子模式）、Phase 3（HTTP 传输引擎 + 接入 pack + wreq 指纹）、Phase 4（回环监听 + aria2 JSON-RPC + 浏览器扩展 WebSocket v2，均已接入 Python）、Phase 5–6（26 个 `GD3_RUST_*` 影子开关，全部默认关，扫尾评估确认无新下沉项）、Phase 7（`gd3-ui`：`app/view` 的语义镜像层 + 6 个 Slint 文件）。
 
 ## 结构
 
@@ -128,15 +128,60 @@ Python 的 `buildClient(readTimeout=30)` 是**读阶段空闲超时**，对应 w
 - 新分片不会立刻开跑，`SplitScheduler` 按 `SPLIT_START_INTERVAL`（0.2 秒）错开启动时刻；
 - 门槛与开关来自 `cfg.maxReassignSize` / `cfg.autoSpeedUp`，由 `features/http_pack/rust_engine.py` 传给 `gd3_py.http_run`。
 
-## 下一步的顺序（已定）
+## Phase 7：UI 层（`gd3-ui`）
 
-**Phase 5：pack 的 parse 层**（URL → 任务）。挑它的原因是依赖最干净：pack 只**读** `cfg`
-（clientProfile、代理、并发数），这些值从 Python 侧当参数传进来就行。
-先从 `http_pack` 开始（它的传输引擎已经在 Rust 里），再按「纯 HTTP + JSON」的顺序推
-github / huggingface / bili，最后才是 m3u8 / ftp / ed2k / bittorrent。
+`crates/gd3-ui` 是 `app/view`（约 11 200 行 Qt 代码）的**语义镜像层**。它**不**替换 Qt：
+Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没有事件循环），每个 Python
+组件的「决策部分」被抽成可断言的纯函数与状态机。
 
-**配置（`UserConfig.json`）排在 UI 阶段一起搬**，不提前。`app/config/cfg.py` 是
+判定标准不是像素一致，而是**语义一致**：配置键名、默认值、取值范围、格式化输出
+（`toReadableSize` / `toDockSpeed` / 速度与 ETA 文案）必须逐条对上，`UserConfig.json`
+两侧可互相读写。Qt 的实测值（窗口几何、字体测宽、暗色标志、剪贴板内容）一律当**入参**
+传进函数，不在 Rust 侧重算——这样单测不需要 Qt，也不需要显示器。
+
+| 阶段 | Python 源 | Rust 模块 |
+|---|---|---|
+| P0 主链路 | `windows/main_window.py`、`cards/task_cards.py`、`dialogs/task_drawer.py` | `window.rs`、`card.rs`、`drawer.rs`、`row.rs`、`facts.rs`、`actions.rs`、`filter.rs`、`sort.rs`、`speed.rs` |
+| P1 设置页 | `pages/setting_page.py`、`components/setting_cards.py`、`setting_card_group.py`、`card_groups.py` | `settings_group.rs`、`settings_spec.rs`、`setting_cards.rs`、`setting_card_group.rs`、`card_groups.rs`、`option_cards.rs`、`category.rs`、`category_settings.rs`、`close_mode.rs`、`proxy.rs`、`profile.rs`、`identity.rs`、`headers.rs`、`menu_view.rs`、`card_menu.rs` |
+| P2 建任务 | `dialogs/task_draft.py`、`plan_task.py`、`batch_url.py`、`file_select.py`、`name_conflict.py` | `draft.rs`、`plan.rs`、`batch_url.rs`、`file_select.rs`、`name_conflict.rs`、`conflict.rs` |
+| P3 其它对话框 | `edit_task.py`、`pack_info.py`、`subtitle_select.py`、`extension_install.py`、`release_info.py` | 同名模块 |
+| P4 组件库 | `components/` 下 12 个文件 | `range_slider.rs`、`track_bar.rs`、`band_selector.rs`、`bootstrap_list.rs`、`markdown_viewer.rs`、`token_line_edit.rs`、`labels.rs`、`editors.rs`、`progress_toast.rs`、`install_button.rs`、`tree_view.rs`、`banners.rs`、`scroll_area.rs` |
+| P5 首次启动 | `windows/oobe_window.py` | `oobe.rs` |
+| P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
+
+规模：**53 个模块**（52 个 `pub` + 私有 `format`）/ **32 252 行 `src/`**（含 `lib.rs` 3 480 行）、
+**6 个 Slint 文件 2 858 行**、**554 个单测**。
+
+Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.slint`（主窗口）、
+`task_page.slint`、`task_drawer.slint`、`settings_page.slint`、`card_menu.slint`。
+无头冒烟测试在 `lib.rs` 的 `mod smoke`（`MinimalSoftwareWindow`），覆盖组件树实例化与
+属性读写、任务行模型往返、`TaskRecord → 行` 的端到端推流。
+
+```bash
+cargo test -p gd3-ui                       # 库 + 冒烟
+cargo test -p gd3-ui --lib                 # 只跑单测（554）
+cargo clippy -p gd3-ui --all-targets -- -D warnings
+```
+
+已知偏差（每条都在模块头或测试旁标注）：
+
+- **无译文层**：`toLocalizedError` / `QCoreApplication.translate` 的文本按中文原文硬编码，
+  或由调用方当入参传入；
+- **Qt 专有行为不模拟**：`QComboBox.currentText()` 用字符串承载、`nextCheckState` 的空实现
+  用返回值表达、`QWidget` 的布局缓存用显式 `i32`（`0` = 未布局）承载、`QColor` 透明度用 `u8`；
+- **Python 会抛异常的地方退化为缺省值**：`options.index()` 缺失、`size_hint` 高度为 0、
+  非法 IPv6 括号、Markdown 缺片段标记——都在注释里写明与 Python 的差异；
+- `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
+
+**尚未做**：把 Slint 侧真正跑起来——没有 `main` / 事件循环，没有接 `gd3-core` 的
+`TaskService` 与 `UserConfig.json`，`Ghost-Downloader-3.py` 的入口仍走 Qt。
+这是 Phase 8 的内容。
+
+## 剩余工作（Phase 8）
+
+**配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
 `qfluentwidgets.QConfig` 的子类：每一项都是 Qt 的 `ConfigItem`，设置页直接绑它的
-`valueChanged`，而且**每次 `cfg.set()` 都会整文件回写**。在 UI 还是 Qt 的期间，
-Rust 再写同一个文件只会互相覆盖——所以它是 UI 的伴生物，不是独立的一步。
-同理，凡是「持久化进 cfg」的服务（`category_service` 的 `categoryRules` 等）都要排在它后面。
+`valueChanged`，而且**每次 `cfg.set()` 都会整文件回写**。只要 Qt 侧还在写这个文件，
+Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读写必须与「Slint 成为唯一 UI」
+同一步落地，不能提前。同理，凡是「持久化进 cfg」的服务（`category_service` 的
+`categoryRules` 等）都要排在它后面。
