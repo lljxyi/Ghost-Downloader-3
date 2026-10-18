@@ -6701,3 +6701,134 @@ Python 里两个 emit 挨着写、看着像一次，但语义是「循环之后�
   端口齐了；
 - 两者都不碰网络、不碰解包，`coroutineRunner.post` 退化成「`refresh_posted` 标记 + 返回效果」，
   与第 103 步同一形态。
+
+## 第 104 步：速度表（`gd3-ui::speed_meter`）
+
+> 时间：2026-10-18 21:19（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 选型：为什么是 `speed_meter.py`
+
+`app/services/speed_meter.py` 只有 56 行，但它是**引擎级真实缺口**：第 81 步搬
+`task_service.rs` 时把整个速度表退化成了一个谓词
+`TaskService::speed_meter_should_run()`（只回答「该不该跑」），`engine.py:20` 那句
+`self._speedMeter = SpeedMeter(coroutineRunner)` 一直没有对应物。任务侧的两个注入点
+（`task_service.py:578` 的 `task.run(self._speedMeter.addSpeed,
+self._speedMeter.waitForSpeedLimit)`）也因此缺一半。
+
+原计划同批搬 `app/services/name_conflict_queue.py`，**实际做的时候发现重复，已放弃**，
+原因见下一节。
+
+### 放弃 `name_conflict_queue.py`：它已经搬过了
+
+第 65 步 b（`gd3-ui::name_conflict`，1180 行里的一节）就把
+`name_conflict_queue.py` 的队列搬完了，第 96 步把 `probeConflict` 接上、
+`engine.rs` 里 `on_name_conflicted` / `refresh_conflicts` / `apply_dialog_outcome`
+三个入口全在跑：
+
+| Python | Rust（既有） |
+|---|---|
+| `add(task)` | `name_conflict::NameConflictQueue::add` |
+| `setChoice(...)` | `::set_choice` |
+| `cancel(taskId)` | `::cancel` |
+| `_refresh()` | `::refresh` |
+| `_post(self._refresh)` | `ConflictEvent::RefreshPosted` |
+| `conflictChanged.emit(...)` | `ConflictEvent::ConflictChanged(Option<NameConflict>)` |
+| `probeConflict` / `add` 注入 | `trait ConflictActions` |
+
+本轮我一度新写了 `gd3-ui::name_conflict_queue`（556 行 / 13 单测，`TaskRecord` 载荷 +
+`Box<dyn Fn>` 闭包注入），编译前对照 `name_conflict.rs:341` 才发现是**同一状态机的第二份
+实现**——而且 `engine.rs` 已经用 `TaskConflictActions` 把 `ConflictTask` 载荷的缺口补掉了
+（`add` 里按 `task_id` 反查 `TaskRecord` 再 `tasks.add(record, true)`）。留着就是两份
+`NameConflictQueue` 同名并存、13 条单测重复覆盖同一段逻辑。**删掉**，不留 `#[allow]`
+式的将就。
+
+> 教训记在这里：搬一个新模块之前，先 `grep -n 'pub struct <名字>' crates/*/src/*.rs`，
+> 别只看进度笔记里的「Rust 侧还没有」——第 65 步 b 的笔记标题写的是「重名冲突提示」，
+> 不翻内容看不出来它把服务层队列一起搬了。
+
+### 逐条对齐（`speed_meter.py` 56 行 → `speed_meter.rs`）
+
+| Python | Rust | 备注 |
+|---|---|---|
+| `__init__(coroutineRunner)`（:11-15） | `new()` / `Default` | 运行器退化成效果队列，无可存之物 |
+| `currentSpeed` 属性（:17-19） | `current_speed()` | `&self` |
+| `_bytes`（无公开读法） | `pending_bytes()` | 测试与诊断用 |
+| `_tickWorkId is not None` | `is_running()` | |
+| `start()`（:21-25） | `start() -> Vec<SpeedEffect>` | 已在跑 → 空效果；否则发 `StartTicking{work_id}` |
+| `stop()`（:27-34） | `stop() -> Vec<SpeedEffect>` | `[Cancel, Emit(0)]`，**无条件**发 0 |
+| `addSpeed(n)`（:36-37） | `add_speed(n)` | 不看「在不在跑」，照抄 |
+| `waitForSpeedLimit()`（:39-41） | `should_wait(enabled, limit)` | 谓词化，见下 |
+| `_tickLoop()`（:43-46） | `StartTicking` 效果 | 1 秒周期由宿主起 |
+| `_tick()`（:48-53） | `tick() -> Vec<SpeedEffect>` | 先发布再清零；循环已停 → 空 |
+| `_onTickFailed(err)`（:55-56） | `on_tick_failed()` | 只置空 workId，不清 `bytes` / `current_speed` |
+
+### 关键决策
+
+1. **字段全用 `Cell<T>`，方法分 `&self` / `&mut self` 两档**。`current_speed` /
+   `pending_bytes` / `is_running` / `should_wait` 只要 `&self`——宿主在
+   `while meter.should_wait(..)` 里持有的是不可变借用，改状态的四个方法
+   （`start` / `stop` / `add_speed` / `tick` / `on_tick_failed`）才要 `&mut self`。
+   `add_speed` 也走 `&mut self`：它虽然只碰一个 `Cell`，但语义上是写操作，
+   保留 `&mut` 让「谁在累加」这件事在类型上可见。
+
+2. **`_tickLoop` 摊成 `StartTicking{work_id}`，模块内不留计时器**。宿主拿到效果后起一个
+   1 秒周期，每周期调 `tick()`；周期本身失败就调 `on_tick_failed()`。这与第 100~103 步
+   「副作用摊成效果队列」的口径一致，也让单测不必等真实时间。
+
+3. **`waitForSpeedLimit` 退化成谓词 `should_wait(enabled, limit_bytes)`**。
+   Python 每轮重读 `cfg.isSpeedLimitEnabled.value` / `cfg.speedLimitation.value`；
+   Rust 侧由调用方每轮读 `settings::read_bool(cfg, "isSpeedLimitEnabled")` /
+   `settings::read_i64(cfg, "speedLimitation")` 再传进来——**等价于每轮重读，且模块不持有
+   配置快照**。宿主的口径是 `while meter.should_wait(e, l) { sleep(0.1) }`。
+
+4. **`should_wait` 是严格大于**（`bytes > limit`，等于上限不算超），照抄 `:40`。
+
+5. **`stop()` 无条件 `Emit(0)`**：即使 `current_speed` 本来就是 0 也发——界面靠这一发把
+   数字抹掉（单测 `stop_emits_zero_even_when_the_speed_is_already_zero`）。
+
+6. **workId 由服务发号**（`speed-1` / `speed-2` …，一个只增不减的 `issued`）。
+   与第 100 步 `TaskActions`（`run-1` / `seed-2`）、第 102 步 `RuntimeStatus`
+   （`runtime-1`）同一形态：宿主把 workId 当不透明值，`Cancel` 时原样交回。
+
+7. **`on_tick_failed` 不清 `bytes` / `current_speed`**（照抄 Python）：下一轮 `start()` 的
+   第一次 `tick` 会把残留量当成速度发出去——这是 Python 的既有行为，照抄不修。
+
+### 13 条单测
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `start_runs_the_tick_loop_once` | `start` → 恰好一条 `StartTicking{speed-1}` |
+| `start_twice_is_a_no_op` | 第二次 `start` → 空（`:22` 判重） |
+| `stop_cancels_then_resets_and_emits_zero` | 效果顺序 `[Cancel, Emit(0)]` + 双清零 |
+| `stop_without_start_does_nothing` | 没在跑 → 空（`:28` 判空） |
+| `stop_emits_zero_even_when_the_speed_is_already_zero` | 0 也要发 |
+| `tick_publishes_the_accumulated_bytes_and_clears_them` | 10+5 → 发 15；下一轮从 0 重新累加（无滑动平均） |
+| `tick_without_a_running_loop_is_ignored` | 迟到的 tick 不发，且**不清** `bytes` |
+| `a_failed_tick_loop_lets_start_run_again` | `on_tick_failed` 后可重新 `start`，workId 递增 |
+| `add_speed_accumulates_while_stopped` | 没在跑时累加的量会留给下一轮 |
+| `should_wait_compares_strictly_greater_than_the_limit` | 等于上限不算超；关掉永不等待 |
+| `should_wait_reads_the_pending_bytes_not_the_published_speed` | 闸门看本轮累加量，不看上一轮发布值 |
+| `current_speed_is_zero_until_the_first_tick` | `addSpeed` 不发布 |
+| `work_ids_are_never_reused` | 三轮 `start`/`stop` → `speed-1..3` |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过（`FMT_CHECK_EXIT=0`）；
+- `cargo test -p gd3-ui --lib`：**810 passed / 0 failed**（第 103 步 797 + 13；12m21s 编译 + 2.88s 跑完）；
+- `cargo test --workspace`：**1313 passed / 0 failed**（28 段；第 103 步 1300 + 13）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（4m44s，首跑即干净，`speed_meter.rs` 的 `Cell` 用法没触 lint）；
+- Python 侧没改一行，不跑 Python 全量；
+- `rust/README.md` 1131 → **1176 行**：新增「速度表（`gd3-ui::speed_meter`）」一节，
+  含「为什么不搬 `name_conflict_queue.py`」小节。
+
+### 下一步（第 105 步）
+
+`SpeedMeter` 目前只是**可用的模块**，还没接回引擎。下一步把它接上：
+
+- `Engine` 加 `speed_meter: SpeedMeter` 字段（`engine.py:20` 的构造顺序）；
+- `_refreshSpeedMeter()`（`task_service.py:659-663`）→ `Engine::refresh_speed_meter()`：
+  `if tasks.speed_meter_should_run() { meter.start() } else { meter.stop() }`，
+  返回 `Vec<SpeedEffect>`。Python 侧只有**四个**调用点（实读 `grep -n`）：
+  `stopSeeding`（:406）、`_seed`（:593）、`_onSeedingEnded`（:604）、`_pump`（:657）
+  ——注意 `pause` / `resume` 里**没有**，它们只改状态；
+- 引擎轨迹（`Trace`）里补 `construct:SpeedMeter`，与既有 `construct:NameConflictQueue` 同形。
