@@ -4321,3 +4321,57 @@ Phase 7 收口时 `gd3-ui` 只有 lib（58 个 `.rs`、无 `main`、无事件循
   任务的增删改、`runningCount`/`tasksAllCompleted`、运行时事实（`CardRuntime`）的维护，
   把 `boot::run` 里 `push_settings` 之后的「推任务行」接上。
 - 卡点：无
+
+## 第 81 步：`gd3-ui::task_service`（`TaskService` 引擎无关半边）（2026-10-18 07:20）
+
+`app/services/task_service.py`（705 行）把「存储/队列记账 + 引擎交互 + 19 个信号」揉在
+一个类里。这一步只搬**引擎无关**的那一半：任务列表、队列记账、`pump`/`allCompleted`
+的判定、`runningProgress`、落盘防抖。引擎半边（协程、速度表、文件监听、做种、校验）
+等 `app/engine.py` 迁过来再接。
+
+- 做了什么（`rust/crates/gd3-ui/src/task_service.rs`，新增 675 行，21 个测试）：
+  - `TaskService { records: Vec<TaskRecord>, queue: TaskQueue, loaded, pending_flush,
+    delete_denied_notified }`；`records` 用 `Vec` 保**插入序**（Python `dict` 迭代序）。
+  - `new`/`from_records`/`load`（`loadSaved`）/`records`/`task`/`task_mut`/`len`/
+    `is_empty`/`is_loaded`/`mark_dirty`/`pending_flush`。
+  - `add`/`add_with_free_space`、`remove`、`start`、`pause`、`cancel_work`、
+    `on_run_started`、`on_run_finished`、`pump`、`running_count`、`waiting_order`、
+    `move_to_front`、`running_progress`、`note_delete_denied`、`flush`、`refresh`。
+  - `AddOutcome::{Duplicate, DiskSpaceInsufficient{free}, Added{queued}}`；
+    `RunOutcome { started, all_completed }`。
+- 实证结论（逐条对着源码核对，**不是照抄我自己上一版的假设**）：
+  - **`add()` 的入队条件与 `fileSize` 无关**。Python 的 `if task.fileSize > 0:` 只包住
+    「磁盘空间检查」，`self._schedule(task)` 在 `if` **块外**无条件调用。所以
+    `autoStart=True` + `fileSize=0` 也会 `queue.wait`。我上一版写的
+    `queued = auto_start && file_size > 0` 是错的，被这条源码阅读推翻（有单测钉住）。
+  - `diskSpaceInsufficient` 是 `return True`（记录**已经在列表里**，只是不入队），
+    所以 `DiskSpaceInsufficient` 之后 `len()` 仍然 +1。
+  - `_onRunDone` 里 `if runningCount() == 0: tasksAllCompleted.emit()` 在 `_pump()`
+    **之后**：`pump` 会 `queue.run()` 把 `runningCount` 顶上去，所以「刚做完一个、
+    正好接上下一个等待任务」**不发** `tasksAllCompleted`。这就是 `on_run_finished`
+    返回 `RunOutcome { started, all_completed }` 而不是一个裸 bool 的原因（第一版是裸
+    bool，会漏掉 pump 的影响）。
+  - `_pump` 的 `while runningCount() < maxTaskNum` 依赖 `_dispatch` 里立刻 `queue.run`；
+    本模块没有引擎，所以 `pump()` 用 **空 workId** 占位 `queue.run(id, "")`，
+    引擎起来后由 `on_run_started(id, work_id)` 回填真实 workId。
+  - `_pump` 里 `task is None` 的 id 会被 `nextWaiting()` 弹出但**不派发**（有单测
+    `pump_skips_waiting_ids_without_a_record` 钉住「弹出但不跑」）。
+  - `pause(task)` 除 `_cancelWork` 外只有 `setStatus(PAUSED)` + `_flushSoon`，全部引擎无关
+    → 一并搬了。
+  - `TaskStore.loadSaved` 在文件不存在时也是 `_loaded = True`（之后 `flush()` 会真写盘），
+    `TaskService::load` 保留这个语义（`store::load_records` 缺失即空）。
+- 已知差异（写进模块头）：不做重名冲突解决（`FileExistsError` 重试 + `deleteRecoverably`
+  + `nameConflicted`/`overwriteFailed`）、不建输出目录与占位文件、不算磁盘剩余空间
+  （由调用方传 `free_space`，`None` = `OSError`）、不做 `_rebalance`（依赖
+  `Task.canPause` 运行时事实）、不做做种/校验/文件监听/速度表。
+- 验证：
+  - `cargo test -p gd3-ui --lib task_service::`：**21 passed**；
+  - `cargo test --workspace`：**902 passed, 0 failed**（第 80 步 881 + 21）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m25s）；
+  - `cargo fmt --all --check` 通过；
+  - commit `38ca14a`（含 `rust/README.md`：新增「任务记账（`task_service.rs`）」小节，
+    规模改为 57 模块 / 34 790 行 / 620 单测）。
+- 下一步：第 82 步把 `TaskService` 接进 `boot::run`（启动时 `TaskService::load(
+  APP_DATA_DIR/tasks.jsonl)` → `refresh(window)`），并给无头模式加 `--tasks-file`
+  之类的可测入口。
+- 卡点：无
