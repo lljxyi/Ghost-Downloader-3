@@ -4195,3 +4195,70 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 - 下一步：第 79 步做 typed config 语义层（`settings.rs`：41 项 schema + 缺省值 +
   validator 边界 + `to_proxy_url`/`current_headers`），随后进 Phase 8 主链路。
 - 卡点：无
+
+## 第 79 步：`gd3-core::settings` typed 语义层（2026-10-18 06:39）
+
+第 78 步的 `config::UserConfig` 只懂「组 → 键 → 裸 JSON 值」，不懂类型/缺省/约束。
+这一步把 `app/config/cfg.py` 的 40 个 `ConfigItem` + `QConfig` 自带的 2 个
+（`ThemeColor`/`FontFamilies`）搬成一张 42 项的静态表，并把每个 validator /
+serializer 逐个镜像过来。
+
+- 做了什么（`rust/crates/gd3-core/src/settings.rs`，新增 1665 行）：
+  - `static SPECS: &[Spec]`（42 项，`attr`/`group`/`key`/`kind`），**顺序 = `dir(Config)`
+    的属性名字母序** —— 这是落盘顺序的协议，不是排版偏好。
+  - `enum Kind`：`Bool`/`Int`/`Float`/`Text`/`Options`/`Proxy`/`Profile`/`Folder`/
+    `FolderList`/`StringList`/`StrList`/`JsonList`/`Geometry`/`Color`，每个变体自带
+    `raw_default()`（源码字面量）/`correct()`（validator 镜像）/`deserialize()`/
+    `serialize()`（落盘形态）。
+  - `default_config()` / `default_config_with_download_folder()`：**纯 Rust 造出与
+    Python 逐字节相同的 `UserConfig.json`**（缺省值先过 `correct()` 再 `serialize()`）。
+  - `read`/`write`（按 python 属性名，通用）+ `read_bool`/`read_i64`/`read_f64`/`read_text`。
+  - `to_proxy_url`、`current_headers_preset_index`、`current_headers`、`base_headers`、
+    `default_headers_preset`、`proxy_valid`、`folder_stored`、`color_hex_argb`。
+- 实证结论（在 venv 里逐条跑 `validator.correct()` 验证，**不是读源码猜的**）：
+  - `BoolValidator` 继承 `OptionsValidator([True, False])` → 非法值取 `options[0]`：
+    磁盘写字符串 `"False"` 读回来是 **`true`**；而 `0`/`1` 因为 `0 == False` 命中白名单，
+    **原样保留数字形态**。
+  - `OptionsValidator(Language)` 的 options 是 **enum 成员**，`options[0]` 是
+    `Language.CHINESE_SIMPLIFIED` → 非法 `Language` 落回 `"zh_CN"`（**不是 `"Auto"`**）；
+    `Theme` 同理落回 `"Light"`，`CloseMode` 落回 `"Ask"`。我第一版测试按「落回 Auto」
+    写，被实测推翻。
+  - `RangeValidator.correct(0.0)` 返回 **int `0`**（`max(0, 0.0)` 相等时返回第一个参数，
+    而边界是 int 字面量），`correct(2.0)` 仍是 float `2.0`。这就是 `DpiScale` 缺省落盘
+    是 `0` 而不是 `0.0` 的原因；`Kind::Float` 的缺省回落也走 `bound_value()` 保 int 形态。
+  - `RangeValidator.correct("7")` → `TypeError`（`max(1, "7")`）→ `@exceptionHandler()`
+    中断整个 `load`，该项保持缺省 → Rust 侧 `clamp_number` 返回 `None` 后退回缺省。
+  - `Path(...).absolute()` 只做 `PurePath` 归一（丢空段与 `.`、保留**恰好两个**前导斜杠、
+    `///a` → `/a`），**不解析 `..`**（`a/../b` 原样保留），也不检查存在性。第一版我按
+    `posixpath.normpath` 写了会解析 `..` 的版本，实测 `Path("Downloads/./x/../y/").absolute()`
+    → `.../Downloads/x/../y` 后改掉。
+  - `ProxyValidator` 的密码字符集 `[\w!@#$%^&*()]` **含 `@`** → `socks5h://user:p@ss@1.2.3.4:1080`
+    合法；用「最后一个 `@`」近似 CPython 正则回溯，15 个非法样例 + 11 个合法样例与
+    Python 逐条对照，**两侧零分歧**。
+  - `fontFamilies` 是 `ConfigItem` **没有 validator**（不是 `StringListValidator`）→
+    拆成 `Kind::StrList { default }`（恒等）与 `Kind::StringList`（过滤非字符串）两个变体，
+    否则缺省会落成 `[]`。
+- 测试（`settings::tests`，26 个全绿）：
+  - `defaults_are_byte_identical_to_python`：`default_config().to_json_text()` 与
+    `tests/fixtures/user_config_default_linux.json` **逐字节相同** —— 一条测试同时钉住
+    42 项缺省值 + 每个 validator 的 `correct()` + 序列化方式 + 落盘顺序。
+  - `specs_are_in_python_dir_order`（42 项 attr 顺序与 `dir(Config)` 实测一致，第一版
+    `dpiScale`/`downloadFolder` 顺序写反，被这条抓住）、
+    `specs_cover_every_group_and_key_of_the_fixture`（组序 + 组内键序）。
+  - range clamp / float 形态 / 非数字回落、bool 回落、options 回落、proxy 26 例、
+    headers 过滤与回落、identity 无回落、category 全有全无、geometry 往返、
+    color 归一、str list、folder 绝对化、folder list 只留存在路径、`to_proxy_url`、
+    `current_headers`、存读往返、`spec()` 查表。
+- 已知差异（写进模块头）：
+  - **不建目录**（`FolderValidator.correct` 会 `mkdir`）、**不抛异常**（Python 在首个非法
+    值处中断整个 `load`，Rust 逐键跳过）、`Color` 不认 Qt 颜色名、`get_*`/`read` 对
+    遗留字符串形态的容错与 Python 不完全一致（已在模块头逐条列出）。
+- 验证：
+  - `cargo test -p gd3-core`：**121 passed**（lib 86，其中 `settings::` 26；第 78 步 lib 60）；
+  - `cargo test --workspace`：**866 passed, 0 failed**（第 78 步 840 + 新增 26）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m38s）；
+  - `cargo fmt --all --check` 通过；
+  - commit `abd23c6`。
+- 下一步：第 80 步起进 Phase 8 主链路 —— `gd3-ui` 目前**没有二进制**（`Cargo.toml` 只有 lib），
+  先加 `main.rs` + Slint 事件循环 + `TaskService` 绑定，再接托盘/Dock。
+- 卡点：无
