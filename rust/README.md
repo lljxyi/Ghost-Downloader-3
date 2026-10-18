@@ -236,6 +236,20 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   由调用方用 `disk_usage` 算，`None` 等价于 Python 的 `except OSError: pass`；
 - **`autoStart` 即入队，与 `fileSize` 无关**——Python 的 `if task.fileSize > 0:` 只包住
   磁盘检查，`_schedule()` 在块外无条件调用（首版按「`fileSize > 0` 才入队」写错了）。
+- **重名冲突单独开一个入口**（第 93 步）：
+  `add_with_conflict(record, choice, auto_start, free_space, delete_recoverably) ->
+  Result<AddReport, CreateError>` 才是 Python `TaskService.add` 的完整口径——`mkdir -p`
+  输出目录 → `create_placeholders` + `resolve_conflict` → 按 `replaced_tasks` 移除旧任务
+  → `PlaceholderRegistry::set` → 复用 `schedule_add` 的磁盘检查与入队。
+  `add()` / `add_with_free_space()` 保留「不建占位符、不碰磁盘」的旧语义，给启动恢复
+  与测试用；
+- `AddReport { name, replaced, overwrite_failed, outcome: Option<AddOutcome> }`：
+  `outcome == None` 精确对应 Python 的 `nameConflicted` + `return False`（任务**没**加
+  进去，等用户重新选），`replaced` 是 `taskRemoved` 要发的旧任务 id（按占位符顺序去重），
+  `overwrite_failed` 是 `overwriteFailed` 信号的条件；
+- 已知差异：`add_with_conflict()` **不调** `CategoryService.outputFolderOf()`（分类目录
+  规则还没搬），输出目录由调用方填好；`delete_recoverably` 由调用方注入（生产传
+  `gd3_core::trash::delete_recoverably`，`Err` 按 `false` 处理）。
 
 ### 引擎装配（`engine.rs`）
 
@@ -259,7 +273,9 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
 - **配置是快照**：Python 的 `cfg.*` 是活对象（`PortListener` 连 `valueChanged`），
   Rust 侧还没有响应式层，所以 `nameConflict` / `maxTaskNum` 每次用时现读（与 `lambda`
   同构），监听器端口在构造时取快照；
-- `probeConflict` 恒 `None`（占位文件未迁移）→ 冲突队列不会弹窗，按 `keepBoth` 放行。
+- `probeConflict` 恒 `None`——`gd3-core::placeholder` 与
+  `TaskService::add_with_conflict` 都已就位（第 92/93 步），但 `Engine` 还没把
+  「冲突队列 → 重新 add」这条线接起来，所以冲突队列仍不弹窗、按 `keepBoth` 放行。
 
 ### 单实例锁（`single_instance.rs`）
 
@@ -708,6 +724,7 @@ while True:
 | `_placeholders` + `_taskByPlaceholder` | `PlaceholderRegistry` |
 | `_isUnfinishedPlaceholder` | `PlaceholderRegistry::is_unfinished` |
 | `add` 里的 `replacedTasks` 去重 | `PlaceholderRegistry::replaced_tasks` |
+| `Task.outputPath` 算出来的路径 | `placeholder_paths_of(output_path)` |
 
 冲突决策的五个分支，`resolve_conflict` 全部覆盖（都有单测钉住）：
 
@@ -747,7 +764,15 @@ while True:
 3. `delete_placeholder` 返回 `io::Result` 而不是静默：Python 的 `deletePlaceholder`
    遇到 `OSError` 会抛，`_createPlaceholders` 的回滚循环里也会跟着中断。
 
-规模：`placeholder.rs` **915 行 / 31 单测**。
+接线（第 93 步）：`gd3_ui::task_service::TaskService::add_with_conflict` 把上面这些串成
+Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`create` 闭包对每个候选
+名字重算 `record.output_path_for(name)`，`is_unfinished` 闭包查 `PlaceholderRegistry` +
+`TaskRecord.status`）→ `replaced_tasks` 逐个 `remove()` → `PlaceholderRegistry::set`。
+`placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
+多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
+
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1271 行 / 32 单测**
+（其中 `add_with_conflict` 10 个）。
 
 ## 剩余工作（Phase 8）
 

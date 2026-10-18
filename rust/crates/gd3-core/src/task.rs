@@ -231,13 +231,18 @@ impl TaskRecord {
     /// `outputFolder / Path(name).stem`——分集任务下载到以任务名（去掉扩展名）
     /// 命名的目录里。
     pub fn output_path(&self) -> String {
+        self.output_path_for(&self.name)
+    }
+
+    /// `Task.outputPath`，但用给定名字代替 `self.name`。
+    ///
+    /// 重名冲突改名时要用「新名字算出来的 outputPath」，而 `BilibiliTask` 多文件时
+    /// 取的是 `Path(name).stem`，所以不能只换路径最后一段。
+    pub fn output_path_for(&self, name: &str) -> String {
         if self.is_output_folder() && self.short_type_name() == Some("BilibiliTask") {
-            return crate::path::posix_join(
-                &self.output_folder,
-                crate::path::posix_stem(&self.name),
-            );
+            return crate::path::posix_join(&self.output_folder, crate::path::posix_stem(name));
         }
-        crate::path::posix_join(&self.output_folder, &self.name)
+        crate::path::posix_join(&self.output_folder, name)
     }
 
     /// `type` 标签的最后一段（旧文件可能只存裸类名）。

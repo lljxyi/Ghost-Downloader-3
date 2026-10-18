@@ -151,6 +151,16 @@ pub fn placeholder_paths(output_folder: &Path, name: &str) -> Vec<PathBuf> {
     vec![output_folder.join(name)]
 }
 
+/// 从**已经算好的** `Task.outputPath` 构造占位符列表。
+///
+/// 与 `placeholder_paths` 的区别：`BilibiliTask` 多文件时 `outputPath` 取的是
+/// `outputFolder / Path(name).stem`（见 `TaskRecord::output_path_for`），不能由
+/// `output_folder` + `name` 直接拼出来。改名重试时每个候选名字都要重算一次
+/// `outputPath`，所以调用方用这个而不是 `placeholder_paths`。
+pub fn placeholder_paths_of(output_path: &str) -> Vec<PathBuf> {
+    vec![PathBuf::from(output_path)]
+}
+
 /// `<path>.ghd` —— Python 用 `Path(f"{path}.ghd")`，即整串路径直接拼后缀。
 pub fn sidecar_path(path: &Path) -> PathBuf {
     let mut raw = OsString::from(path.as_os_str());

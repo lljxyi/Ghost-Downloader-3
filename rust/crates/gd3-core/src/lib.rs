@@ -64,7 +64,7 @@ pub use path::{posix_join, posix_normpath};
 pub use placeholder::{
     ConflictOutcome, CreateError, MAX_RENAME_ATTEMPTS, NameConflictChoice, PlaceholderRegistry,
     Placeholders, TakenPath, create_placeholders, delete_placeholder, placeholder_paths,
-    resolve_conflict, sidecar_path,
+    placeholder_paths_of, resolve_conflict, sidecar_path,
 };
 pub use queue::TaskQueue;
 pub use run_at_login::{

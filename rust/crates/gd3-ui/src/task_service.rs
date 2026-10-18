@@ -30,12 +30,15 @@
 //!
 //! # 已知差异
 //!
-//! - `add()` 不做**重名冲突解决**（`TaskStore.add` 的 `FileExistsError` 重试循环 +
-//!   `deleteRecoverably` + `nameConflicted`/`overwriteFailed` 两个信号）；
+//! - `add()` / `add_with_free_space()` 不做**重名冲突解决**：不建输出目录、不建
+//!   占位文件。要那套语义用 `add_with_conflict()`（第 93 步接上
+//!   `gd3_core::placeholder`）；
 //! - **不自己算磁盘剩余空间**：`disk_usage(task.outputFolder)` 是文件系统事实，
 //!   由调用方算好后走 `add_with_free_space(..., free_space)`；`free_space == None`
 //!   等价于 Python 的 `except OSError: pass`（跳过检查），`add()` 是它的简写；
-//! - 不建输出目录、不建占位文件（Python 的 `TaskStore.add` 会 `mkdir` + 建 `.ghd`）；
+//! - `add_with_conflict()` 不调 `CategoryService.outputFolderOf()`（Python 在
+//!   `TaskService.add` 里先用它改写 `task.category` / `task.outputFolder`），
+//!   输出目录由调用方在 `TaskRecord` 上设好；
 //! - `pump()` 派发时用**空 workId** 占位（Python 在 `_dispatch` 里拿到协程 id 才
 //!   `queue.run(taskId, workId)`）：这里先 `run(id, "")` 把 `runningCount` 顶上去，
 //!   否则 `pump` 的循环条件与 `tasksAllCompleted` 的判定都不成立；引擎起来后由
@@ -44,9 +47,15 @@
 //!   文件监听/速度表（`_seed`/`_onSeeding*`/`startChecksum`/`_watchFile`/
 //!   `_refreshSpeedMeter` 全部留给引擎层）。
 
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use gd3_core::filename::{DEFAULT_MAX_FILENAME_LENGTH, to_safe_filename};
+use gd3_core::placeholder::{
+    CreateError, NameConflictChoice, PlaceholderRegistry, create_placeholders,
+    placeholder_paths_of, resolve_conflict,
+};
 use gd3_core::queue::TaskQueue;
 use gd3_core::store;
 use gd3_core::task::{TaskRecord, TaskStatus};
@@ -65,6 +74,22 @@ pub enum AddOutcome {
     /// 已加入。`queued` = 是否进了等待队列（`auto_start == true` 即入队，
     /// 与 `fileSize` 无关——`_schedule` 在磁盘检查块之后**无条件**调用）。
     Added { queued: bool },
+}
+
+/// `add_with_conflict()` 的结果。
+///
+/// 对应 Python `TaskService.add` 的两处额外信号：`overwriteFailed`（选了覆盖但
+/// 回收站移入失败，已退化成改名）与 `taskRemoved`（被同一个占位符替换掉的旧任务）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddReport {
+    /// 最终采用的名字（`Overwrite` 成功时与入参相同，`KeepBoth` 时带 `(n)`）。
+    pub name: String,
+    /// 被替换掉的旧任务 id，按占位符顺序去重（Python `AddResult.replacedTasks`）。
+    pub replaced: Vec<String>,
+    /// `overwriteFailed` 信号的条件。
+    pub overwrite_failed: bool,
+    /// `None` = Python 的 `nameConflicted` 分支（`return False`，等用户重新选）。
+    pub outcome: Option<AddOutcome>,
 }
 
 /// `_onRunDone` / `_onRunFailed` 末尾那一段的记账结果。
@@ -88,6 +113,8 @@ pub struct TaskService {
     pending_flush: bool,
     /// `_hasNotifiedDeleteDenied`：只提示一次。
     delete_denied_notified: bool,
+    /// `TaskStore._placeholders` + `_taskByPlaceholder`。
+    placeholders: PlaceholderRegistry,
 }
 
 impl TaskService {
@@ -153,6 +180,11 @@ impl TaskService {
         self.loaded
     }
 
+    /// 占位符登记表（`TaskStore._placeholders` + `_taskByPlaceholder`）。
+    pub fn placeholders(&self) -> &PlaceholderRegistry {
+        &self.placeholders
+    }
+
     /// 标记「有未落盘改动」（`_flushSoon()` 的立即部分）。
     pub fn mark_dirty(&mut self) {
         self.pending_flush = true;
@@ -188,6 +220,20 @@ impl TaskService {
         let file_size = record.file_size;
         self.records.push(record);
         self.pending_flush = true;
+        self.schedule_add(&task_id, file_size, auto_start, free_space)
+    }
+
+    /// `add` 的尾段：入队 + 磁盘检查（`_flushSoon()` 之后的全部记账）。
+    ///
+    /// 记录必须**已经在** `self.records` 里 —— Python 的 `TaskStore.add` 也是先把
+    /// 任务放进 `_tasks`，再回到 `TaskService.add` 做磁盘检查与 `_schedule`。
+    fn schedule_add(
+        &mut self,
+        task_id: &str,
+        file_size: i64,
+        auto_start: bool,
+        free_space: Option<i64>,
+    ) -> AddOutcome {
         if !auto_start {
             return AddOutcome::Added { queued: false };
         }
@@ -197,8 +243,108 @@ impl TaskService {
         {
             return AddOutcome::DiskSpaceInsufficient { free };
         }
-        self.queue.wait(&task_id);
+        self.queue.wait(task_id);
         AddOutcome::Added { queued: true }
+    }
+
+    /// 带**重名冲突解决**的 `add`：镜像 `TaskService.add` 里 `TaskStore.add` 那一段
+    /// （`app/services/task_service.py:62-90` + `:358-383`）。
+    ///
+    /// 与 `add_with_free_space` 的区别：
+    ///
+    /// - 先 `mkdir -p` 输出目录（Python 的 `task.outputFolder.mkdir(parents=True,
+    ///   exist_ok=True)`）；
+    /// - 建占位符（输出是目录时建目录，否则建 0 字节文件），撞上已存在就走
+    ///   `gd3_core::placeholder::resolve_conflict` 的决策循环；
+    /// - 用 `PlaceholderRegistry` 记账，`replaced` 里的旧任务会被移出服务；
+    /// - `Ok(AddReport { outcome: None })` = Python 的 `nameConflicted` +
+    ///   `return False`（任务**没**加进去，等用户重新选）。
+    ///
+    /// `delete_recoverably` 由调用方注入，生产环境传
+    /// `gd3_core::trash::delete_recoverably`（`Err` 一律按 `false` 处理即可）。
+    ///
+    /// `Err(CreateError)` = Python 里会冒泡打断 `add` 的 `OSError`：
+    /// `CreateError::Io` 是建占位符/建目录的真实失败，`CreateError::Taken`
+    /// 是改名循环用尽 `MAX_RENAME_ATTEMPTS` 仍未成功。
+    pub fn add_with_conflict<D>(
+        &mut self,
+        mut record: TaskRecord,
+        choice: NameConflictChoice,
+        auto_start: bool,
+        free_space: Option<i64>,
+        delete_recoverably: D,
+    ) -> Result<AddReport, CreateError>
+    where
+        D: FnMut(&Path) -> bool,
+    {
+        if self.task(&record.task_id).is_some() {
+            return Ok(AddReport {
+                name: record.name,
+                replaced: Vec::new(),
+                overwrite_failed: false,
+                outcome: Some(AddOutcome::Duplicate),
+            });
+        }
+        // `Task.__post_init__` 的口径：`toSafeFilename(name, fallback="download")`。
+        // 这里补一次，避免调用方塞进来的名字带分隔符把占位符建到输出目录之外。
+        record.name = to_safe_filename(&record.name, "download", DEFAULT_MAX_FILENAME_LENGTH);
+        record.should_seed = true;
+        // Python 的 `mkdir(parents=True, exist_ok=True)` 抛 `OSError`，冒泡打断 `add`。
+        fs::create_dir_all(&record.output_folder).map_err(|error| CreateError::Io {
+            path: PathBuf::from(&record.output_folder),
+            error,
+        })?;
+        let is_output_folder = record.is_output_folder();
+        let probe = record.clone();
+        let registry = &self.placeholders;
+        let records = &self.records;
+        let resolved = resolve_conflict(
+            &record.name,
+            choice,
+            |name| {
+                // 每个候选名字都要重算 outputPath：`BilibiliTask` 多文件时取
+                // `Path(name).stem`，不是简单换路径最后一段。
+                let paths = placeholder_paths_of(&probe.output_path_for(name));
+                create_placeholders(&paths, &[], is_output_folder).map(|_| ())
+            },
+            |path| {
+                registry.is_unfinished(path, |task_id| {
+                    records
+                        .iter()
+                        .find(|record| record.task_id == task_id)
+                        .map(|record| record.status)
+                })
+            },
+            delete_recoverably,
+        )?;
+        let Some(resolved) = resolved else {
+            return Ok(AddReport {
+                name: record.name,
+                replaced: Vec::new(),
+                overwrite_failed: false,
+                outcome: None,
+            });
+        };
+        record.name = resolved.name.clone();
+        let paths = placeholder_paths_of(&record.output_path());
+        let replaced = self.placeholders.replaced_tasks(&paths);
+        for task_id in &replaced {
+            self.remove(task_id);
+        }
+        let task_id = record.task_id.clone();
+        let file_size = record.file_size;
+        let output_folder = record.output_folder.clone();
+        self.records.push(record);
+        self.placeholders
+            .set(&task_id, Path::new(&output_folder), &resolved.name, &paths);
+        self.pending_flush = true;
+        let outcome = self.schedule_add(&task_id, file_size, auto_start, free_space);
+        Ok(AddReport {
+            name: resolved.name,
+            replaced,
+            overwrite_failed: resolved.overwrite_failed,
+            outcome: Some(outcome),
+        })
     }
 
     /// `delete(task, ...)` 的记账部分：`_cancelWork` → 从列表移除 → 待落盘。
@@ -207,6 +353,7 @@ impl TaskService {
     /// 「没有权限删」的提示走 `note_delete_denied()`。
     pub fn remove(&mut self, task_id: &str) -> Option<TaskRecord> {
         self.cancel_work(task_id);
+        self.placeholders.remove(task_id);
         let index = self
             .records
             .iter()
@@ -405,6 +552,9 @@ impl TaskService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use gd3_core::task::{Progress, TaskStep};
     use serde_json::Map;
 
@@ -766,5 +916,360 @@ mod tests {
         assert_eq!(first.taskId.as_str(), "a");
         let second = slint::Model::row_data(&window.get_tasks(), 1).expect("次行");
         assert_eq!(second.taskId.as_str(), "b");
+    }
+
+    /// 临时目录（`gd3-ui` 的 dev-dependencies 里没有 `tempfile`）。
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let index = NEXT.fetch_add(1, Ordering::SeqCst);
+            let path =
+                std::env::temp_dir().join(format!("gd3ui-ts-{tag}-{}-{index}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("建临时目录");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// 输出目录在 `dir` 里的记录（`fileSize` 默认 10）。
+    fn record_in(dir: &Path, task_id: &str, status: TaskStatus) -> TaskRecord {
+        let mut record = record(task_id, status, 10);
+        record.output_folder = dir.to_string_lossy().into_owned();
+        record
+    }
+
+    /// 占位符一律「删除失败」：单测不动真回收站。
+    fn never_trash(_path: &Path) -> bool {
+        false
+    }
+
+    fn placeholder(dir: &Path, name: &str) -> PathBuf {
+        dir.join(name)
+    }
+
+    fn file(index: i64, relative_path: &str) -> gd3_core::task::TaskFile {
+        gd3_core::task::TaskFile {
+            index,
+            relative_path: relative_path.to_string(),
+            size: 0,
+            selected: true,
+            downloaded_bytes: 0,
+            completed: false,
+            extra: Map::new(),
+        }
+    }
+
+    #[test]
+    fn add_with_conflict_creates_placeholder_and_registers_it() {
+        let dir = TempDir::new("create");
+        let mut service = TaskService::new();
+        // 输出目录还不存在：Python 先 `mkdir(parents=True, exist_ok=True)`。
+        let output = dir.path().join("nested/deep");
+        let mut input = record_in(&output, "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(input, NameConflictChoice::KeepBoth, true, None, never_trash)
+            .expect("建占位符");
+        assert_eq!(report.name, "a.bin");
+        assert!(report.replaced.is_empty());
+        assert!(!report.overwrite_failed);
+        assert_eq!(report.outcome, Some(AddOutcome::Added { queued: true }));
+        assert!(output.is_dir(), "输出目录应被建出来");
+        let path = placeholder(&output, "a.bin");
+        assert!(path.is_file(), "单文件任务的占位符是 0 字节文件");
+        assert_eq!(std::fs::metadata(&path).expect("metadata").len(), 0);
+        assert_eq!(service.placeholders().owner(&path), Some("a"));
+        assert_eq!(service.len(), 1);
+    }
+
+    #[test]
+    fn add_with_conflict_renames_when_placeholder_is_taken() {
+        let dir = TempDir::new("rename");
+        let mut service = TaskService::new();
+        let mut first = record_in(dir.path(), "a", TaskStatus::Waiting);
+        first.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                first,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("第一个任务");
+        let mut second = record_in(dir.path(), "b", TaskStatus::Waiting);
+        second.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                second,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("第二个任务");
+        assert_eq!(report.name, "a(1).bin");
+        assert!(report.replaced.is_empty());
+        assert!(!report.overwrite_failed);
+        let renamed = placeholder(dir.path(), "a(1).bin");
+        assert!(renamed.is_file());
+        assert_eq!(service.placeholders().owner(&renamed), Some("b"));
+        assert_eq!(service.len(), 2);
+    }
+
+    #[test]
+    fn add_with_conflict_ask_leaves_the_task_out() {
+        let dir = TempDir::new("ask");
+        // 磁盘上的无主占位符：`_isUnfinishedPlaceholder` 查不到任务 → 视为已完成。
+        let taken = placeholder(dir.path(), "a.bin");
+        std::fs::write(&taken, b"x").expect("写已存在文件");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(input, NameConflictChoice::Ask, true, None, never_trash)
+            .expect("Ask 不是错误");
+        assert_eq!(report.outcome, None, "Ask 撞上无主占位符 → 放弃本次添加");
+        assert_eq!(report.name, "a.bin");
+        assert!(report.replaced.is_empty());
+        assert!(!report.overwrite_failed);
+        assert_eq!(service.len(), 0, "任务没加进去");
+        assert!(service.waiting_order().is_empty());
+        assert!(service.placeholders().is_empty());
+        assert!(
+            !service.pending_flush(),
+            "nameConflicted 分支不碰 _flushSoon"
+        );
+        assert_eq!(std::fs::metadata(&taken).expect("metadata").len(), 1);
+    }
+
+    #[test]
+    fn add_with_conflict_overwrite_reuses_the_name() {
+        let dir = TempDir::new("overwrite");
+        let taken = placeholder(dir.path(), "a.bin");
+        std::fs::write(&taken, b"old").expect("写已存在文件");
+        let mut trashed: Vec<PathBuf> = Vec::new();
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::Overwrite,
+                true,
+                None,
+                |path: &Path| {
+                    trashed.push(path.to_path_buf());
+                    std::fs::remove_file(path).is_ok()
+                },
+            )
+            .expect("覆盖");
+        assert_eq!(report.name, "a.bin", "覆盖成功不改名");
+        assert!(!report.overwrite_failed);
+        assert_eq!(trashed, vec![taken.clone()], "只对撞上的那一个路径动手");
+        assert_eq!(report.outcome, Some(AddOutcome::Added { queued: true }));
+        assert_eq!(std::fs::metadata(&taken).expect("metadata").len(), 0);
+        assert_eq!(service.placeholders().owner(&taken), Some("a"));
+    }
+
+    #[test]
+    fn add_with_conflict_overwrite_failure_degrades_to_keep_both() {
+        let dir = TempDir::new("overwrite-failed");
+        let taken = placeholder(dir.path(), "a.bin");
+        std::fs::write(&taken, b"old").expect("写已存在文件");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::Overwrite,
+                true,
+                None,
+                never_trash,
+            )
+            .expect("删除失败不是错误");
+        assert_eq!(report.name, "a(1).bin", "删除失败 → 退化成 KeepBoth");
+        assert!(report.overwrite_failed, "overwriteFailed 信号");
+        assert_eq!(report.outcome, Some(AddOutcome::Added { queued: true }));
+        assert_eq!(std::fs::metadata(&taken).expect("metadata").len(), 3);
+    }
+
+    #[test]
+    fn add_with_conflict_reports_replaced_task() {
+        let dir = TempDir::new("replaced");
+        let mut service = TaskService::new();
+        let mut first = record_in(dir.path(), "a", TaskStatus::Completed);
+        first.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                first,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("旧任务");
+        let mut second = record_in(dir.path(), "b", TaskStatus::Waiting);
+        second.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                second,
+                NameConflictChoice::Overwrite,
+                false,
+                None,
+                |path: &Path| std::fs::remove_file(path).is_ok(),
+            )
+            .expect("新任务");
+        assert_eq!(report.replaced, vec!["a".to_string()]);
+        assert_eq!(report.name, "a.bin");
+        assert!(service.task("a").is_none(), "被替换的旧任务应移出服务");
+        assert!(service.task("b").is_some());
+        assert_eq!(service.len(), 1);
+        assert_eq!(
+            service
+                .placeholders()
+                .owner(&placeholder(dir.path(), "a.bin")),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn add_with_conflict_short_circuits_on_duplicate() {
+        let dir = TempDir::new("duplicate");
+        let mut service = TaskService::new();
+        let mut first = record_in(dir.path(), "a", TaskStatus::Waiting);
+        first.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                first,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("首个");
+        let mut calls = 0;
+        let mut again = record_in(dir.path(), "a", TaskStatus::Waiting);
+        again.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                again,
+                NameConflictChoice::Overwrite,
+                true,
+                None,
+                |_: &Path| {
+                    calls += 1;
+                    true
+                },
+            )
+            .expect("重复不是错误");
+        assert_eq!(report.outcome, Some(AddOutcome::Duplicate));
+        assert!(report.replaced.is_empty());
+        assert!(!report.overwrite_failed);
+        assert_eq!(calls, 0, "重复任务不进冲突循环");
+        assert_eq!(service.len(), 1);
+    }
+
+    #[test]
+    fn add_with_conflict_never_overwrites_unfinished_task() {
+        let dir = TempDir::new("unfinished");
+        let mut service = TaskService::new();
+        let mut first = record_in(dir.path(), "a", TaskStatus::Running);
+        first.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                first,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("运行中的任务");
+        let mut calls = 0;
+        let mut second = record_in(dir.path(), "b", TaskStatus::Waiting);
+        second.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                second,
+                NameConflictChoice::Overwrite,
+                false,
+                None,
+                |_: &Path| {
+                    calls += 1;
+                    true
+                },
+            )
+            .expect("未完成占位符只能改名");
+        assert_eq!(report.name, "a(1).bin");
+        assert!(!report.overwrite_failed);
+        assert_eq!(calls, 0, "未完成任务的占位符不许覆盖");
+        assert_eq!(service.len(), 2);
+    }
+
+    #[test]
+    fn add_with_conflict_creates_a_directory_for_multi_file_tasks() {
+        let dir = TempDir::new("folder");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        input.files = Some(vec![file(0, "a.mp4"), file(1, "b.mp4")]);
+        let report = service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("多文件任务");
+        assert_eq!(report.name, "a.bin");
+        let path = placeholder(dir.path(), "a.bin");
+        assert!(path.is_dir(), "isOutputFolder → 占位符是目录");
+        assert_eq!(service.placeholders().owner(&path), Some("a"));
+    }
+
+    #[test]
+    fn add_with_conflict_uses_the_same_tail_as_plain_add() {
+        let dir = TempDir::new("tail");
+        let mut service = TaskService::new();
+        let mut low = record_in(dir.path(), "a", TaskStatus::Waiting);
+        low.name = "a.bin".to_string();
+        let report = service
+            .add_with_conflict(
+                low,
+                NameConflictChoice::KeepBoth,
+                true,
+                Some(5),
+                never_trash,
+            )
+            .expect("磁盘不足");
+        assert_eq!(
+            report.outcome,
+            Some(AddOutcome::DiskSpaceInsufficient { free: 5 })
+        );
+        assert_eq!(service.len(), 1, "记录仍在列表里（先 add 再查磁盘）");
+        assert!(service.waiting_order().is_empty(), "磁盘不足不入队");
+        let mut idle = record_in(dir.path(), "b", TaskStatus::Waiting);
+        idle.name = "b.bin".to_string();
+        let report = service
+            .add_with_conflict(idle, NameConflictChoice::KeepBoth, false, None, never_trash)
+            .expect("不自动开始");
+        assert_eq!(report.outcome, Some(AddOutcome::Added { queued: false }));
+        assert!(service.pending_flush());
     }
 }
