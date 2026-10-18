@@ -14,6 +14,7 @@ pub mod m3u8;
 pub mod pair_token;
 pub mod path;
 pub mod queue;
+pub mod settings;
 pub mod store;
 pub mod task;
 pub mod task_error;
