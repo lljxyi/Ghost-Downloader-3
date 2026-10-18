@@ -4131,3 +4131,67 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   然后按 Phase 8 顺序推进（Slint 入口 + 事件循环 → cfg 读写 → `TaskService` 绑定 →
   托盘/Dock 平台层）。
 - 卡点：无
+
+## 第 78 步：按真机磁盘格式重写 `gd3-core::config`（2026-10-18 06:25）
+- 为什么做这一步：第 49 步的 `config.rs` 建立在「每个配置项落盘都是字符串」的假设上，
+  **该假设是错的**。本步读 qfluentwidgets 1.18 源码 + 跑真机 `UserConfig.json` 推翻它。
+- 实证结论（本轮实读 `qfluentwidgets/common/config.py` 与 `app/config/cfg.py`）：
+  - `ConfigItem.serialize()` 只有一句 `self.serializer.serialize(self.value)`，
+    默认 serializer 是恒等 —— **没显式传 serializer 的项，落盘就是裸 JSON 值**：
+    `"EmulateFingerprint": false`、`"MaxTaskNum": 3`、`"HistoryDownloadFolder": []`、
+    `"DpiScale": 0`、`"CurrentHeadersPreset": 0`。
+  - 只有三类项被转成字符串：`JsonConfigSerializer`（`CategoryRules` /
+    `HeadersPresets` / `IdentityPresets` → `json.dumps(..., ensure_ascii=False)` 紧凑串）、
+    `EnumSerializer`（`Language`/`ThemeMode`/`CloseMode`/`ClientProfile` → **enum 的 value**，
+    `CloseMode.QUIT.value` 是 `"Quit"` 不是 `"QUIT"`）、
+    `GeometrySerializer`（元组 → `"x,y,w,h"`）。
+  - **旧实现会毁掉 Python 配置**（本轮实测）：
+    `BoolValidator.correct("False")` → 不在 `[True, False]` → `options[0]` → **变成 True**；
+    `RangeValidator.correct("7")` → `max(1, "7")` → `TypeError` →
+    `@exceptionHandler()` 兜住 → **整个 `QConfig.load` 中断**，后续项全部保持缺省
+    （实测 `{"MaxTaskNum": "7", "PreBlockNum": 16}` 读入后仍是 3 / 8）。
+  - 落盘顺序：`toDict()` 遍历 `dir(self._cfg.__class__)`（属性名**字母序**），
+    组在首次出现时创建 → 组序 = 各组首项的出现次序，组内键序 = 属性名字母序。
+    `serde_json` 已开 `preserve_order` → Rust 侧可逐字节同构。
+  - `QFluentWidgets` 组（`ThemeColor`/`FontFamilies`，继承自 `QConfig`）也在
+    `toDict()` 里，必须原样保留；`qconfig.load()` 文件不存在时**不写盘**；
+    `cfg.save()` 是 `json.dump(..., ensure_ascii=False, indent=4)`，**无尾随换行**。
+- 做了什么：
+  - 新增 `tests/fixtures/generate_user_config_fixture.py`（183 行），在 venv 里跑出
+    4 个金文件（**金文件由 Python 生成，不手写** —— 第 49 步手写 fixture 就是错误源头）：
+    `user_config_default_linux.json`(2166B)、`user_config_mutated_expected.json`(2456B)、
+    `py_json_writer.jsonl`(20 条)、`py_float_repr.jsonl`(20 条)。
+  - 重写 `src/config.rs`（+602/−215，707 行）：`GroupMap = Map<String, Value>`、
+    `UserConfig{groups}`；`load`/`from_json`/`save`/`to_json_text`/`entries`/`get`；
+    typed 读 `get_str`/`get_py_str`/`get_bool`/`get_i64`/`get_f64`；
+    typed 写 `set`/`set_str`/`set_bool`/`set_i64`/`set_f64`/`set_py_json`；
+    writer `py_json_string`/`py_float_repr`/`py_json_dumps`/`write_compact`/
+    `write_indented`/`push_indent`/`py_json_scalar`/`py_number_text`。
+  - 新增 `get_py_str`（python `str()` 口径）：解决「磁盘存 int、调用方要文本」的
+    `Network.CurrentHeadersPreset`；新增 `set_py_json`：`JsonConfigSerializer` 三项必须存串。
+  - `py_float_repr` 手写 python `repr` 口径：`|x| >= 1e16` 或 `< 1e-4` 切指数
+    （Rust `{:e}` → `1e16`/`1.5e-7`，python → `1e+16`/`1.5e-07`，指数补两位 + 带符号）、
+    整值补 `.0`、`-0.0` 保符号。
+  - 10 个测试（`config::tests`）：缺省/改动金文件逐字节回写、**Rust 侧镜像
+    `MUTATIONS` 后与 python `qconfig.set`+`save` 逐字节相同**、typed 取值口径、
+    遗留字符串档容错、`py_json_dumps`+`write_indented` 对 20 条金文件、
+    `py_float_repr` 20 条、`py_json_string` 28 条、存读往返、非对象组跳过。
+  - `gd3-ui/src/lib.rs` 3 处：`push_settings` 与 `open_headers_preset_edit` 的
+    `CurrentHeadersPreset` 改走 `get_py_str(...).as_deref()`（`get_str` 读不到 int），
+    两处测试的 `set_str(..., "1")` → `set_i64(..., 1)` 对齐磁盘形态。
+  - 删除废弃金文件 `user_config_sample.json`、`user_config_expected_save.json`。
+- 已知差异（写进模块头）：
+  - **容错策略不同**：Python 在首个非法值处中断整个 load，Rust 逐键跳过、保留其余项；
+  - `get_*` 接受「数字/布尔的字符串形式」这一遗留形态（Python 会拒收），
+    写回按 set 的入参类型落盘，**不做批量归一**；
+  - `get_py_str` 对数组/对象返回 `None`（python `str()` 会给出 `"[...]"`，无调用方需要）。
+- 验证：
+  - `cargo test -p gd3-core`：**95 passed**（lib 60，其中 `config::` 10）；
+  - `cargo test -p gd3-ui --lib`：**584 passed, 0 failed**（无新增失败）；
+  - `cargo test --workspace`：**840 passed, 0 failed**（第 76 步 834 + 新增 6）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m32s）；
+  - `cargo fmt --all --check` 通过；
+  - commit `9e7dbb4`。
+- 下一步：第 79 步做 typed config 语义层（`settings.rs`：41 项 schema + 缺省值 +
+  validator 边界 + `to_proxy_url`/`current_headers`），随后进 Phase 8 主链路。
+- 卡点：无
