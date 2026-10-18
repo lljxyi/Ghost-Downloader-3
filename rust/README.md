@@ -461,10 +461,17 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
 
 - **真的搬了**：`TaskService`（第 81/82 步）、`SpeedMeter`（整类在
   `speed_meter.rs`，第 104 步；由 `TaskService` 持有，第 105 步）、
-  `NameConflictQueue`（复用 `name_conflict.rs`）、`CategoryService` 的 `_load`；
-- **桩**：`RuntimeStatusService` / `FeatureService` / `BrowserService` / `Aria2RpcService`
-  只保留装配点；监听器只保留后端开关（`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` == `"1"`
-  → `RustBrowserListener`，否则 `PortListener`）与配置快照，套接字层在 `gd3-servers`；
+  `NameConflictQueue`（复用 `name_conflict.rs`）、`CategoryService` 的 `_load`、
+  `RuntimeStatusService`（第 102 步的 `runtime_status.rs`，第 107 步删掉空壳桩改为
+  `pub use`）；
+- **桩**：`FeatureService` / `BrowserService` / `Aria2RpcService` 只保留装配点。三者共用
+  一条 `parse` 端口（`featureService.parse` 被 `browser_service.py:496` 与
+  `aria2_rpc.py:218` 各调一次），而它的默认实现是 **Python 插件**——`features/` 下
+  `FeaturePack` 子类的 `pack.parsers` / `pack.pages()` / `pack.config` /
+  `taskCardClass`，Rust 无法加载；`gd3-core::loader`（第 87 步）只搬了「按依赖排序
+  manifest 列表」。监听器只保留后端开关（`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` ==
+  `"1"` → `RustBrowserListener`，否则 `PortListener`）与配置快照，套接字层在
+  `gd3-servers`；
 - **配置是快照**：Python 的 `cfg.*` 是活对象（`PortListener` 连 `valueChanged`），
   Rust 侧还没有响应式层，所以 `nameConflict` / `maxTaskNum` 每次用时现读（与 `lambda`
   同构），监听器端口在构造时取快照；
@@ -1217,6 +1224,30 @@ Python 的 `Engine.stop()` 里也有一发 `self.speedMeter.stop()`（`engine.py
 （接线 + 9 条单测 + `stop_speed_meter`）；`engine.rs` 1195 → **1161 行 / 17 单测**
 （删掉第 83 步那份弱化 `SpeedMeter` 与 2 条重复单测，补 `drain_speed_effects` 与 2 条
 引擎级测试）。
+
+## 身份预设命中（`gd3-ui::identity`）
+
+`app/client.py::matchIdentityPreset(host)`（:83-94）是 `FeatureService.parse()` 的前置：
+`options.clientProfile` 为空时，按 host 找一条预设，把 `clientProfile` / `userAgent` 补进
+options。第 107 步把它搬成纯函数：
+
+```rust
+pub fn match_identity_preset<'a>(
+    host: &str,
+    presets: &'a [IdentityPreset],
+) -> Option<&'a IdentityPreset>
+```
+
+三条口径（与 Python 逐条对齐）：
+
+- **第一个命中就返回**，不是「最具体的那条」——`*.a.com` 排在 `x.a.com` 前面时，
+  `x.a.com` 命中的是通配那条（Python 就是顺序遍历 + `return`）；
+- `*.a.b` 同时匹配 `a.b`（裸后缀）与 `x.a.b`，但**不匹配** `xa.b`；
+- `isEnabled` 为假整条跳过；空模式串只在 host 为空时命中（走 `elif host == pattern`）。
+
+`presets` 由调用方给（`cfg.identityPresets` 的现值），模块不持有配置快照——与
+`speed_meter::should_wait` 同一个口径。`host` 也由调用方从 URL 取
+（`urlparse(options.url).hostname`），本函数不做 URL 解析。
 
 ## 剩余工作（Phase 8）
 

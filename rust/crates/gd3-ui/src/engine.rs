@@ -43,6 +43,8 @@
 //! - [`CategoryService`]：规则装载 + 匹配 + 输出目录推导（第 95 步起整类都在
 //!   [`crate::category`]，这里 `pub use` 转出口）；`TaskService` 持有的是一份
 //!   **克隆**，改规则后要 [`Engine::push_categories`] 推过去（见「已知差异」）；
+//! - [`RuntimeStatusService`]：第 102 步起整类都在 [`crate::runtime_status`]，这里
+//!   `pub use` 转出口（第 107 步删掉了第 83 步那份空壳桩）；
 //! - 监听器：`PortListener` / `RustBrowserListener` / `RustAria2Listener` 三个实现
 //!   都还没迁（套接字层在 `gd3-servers`），这里只保留**后端开关点**与配置快照。
 //!
@@ -58,8 +60,13 @@
 //! - `TaskStore.flush()` 没有脏标记（每次都整文件重写），Rust 的 `flush()` 有
 //!   `pending_flush` 短路：停机时若一个 `RUNNING`/`WAITING` 任务都没有，
 //!   `tasks.jsonl` 不会被重新写一遍（字节内容等价，只是少了这次写盘）；
-//! - `featureService.activate`/`deactivate`、`runtimeStatusService`、功能包解析器、
-//!   `loadCrx`、`deleteRecoverably`、`fileWatcher` 全是桩：装配点保留，行为没有；
+//! - `featureService` / `browserService` / `aria2RpcService` 仍是桩：装配点保留，
+//!   行为没有。三者共用一条 `parse` 端口（`featureService.parse` 被
+//!   `browser_service.py:496` 与 `aria2_rpc.py:218` 各调一次），而它的默认实现是
+//!   **Python 插件**（`features/` 下 `FeaturePack` 子类的 `pack.parsers` /
+//!   `pack.pages()` / `pack.config` / `taskCardClass`），Rust 无法加载；
+//!   `gd3-core::loader`（第 87 步）只搬了「按依赖排序 manifest 列表」；
+//!   `loadCrx` / `deleteRecoverably` / `fileWatcher` 同理；
 //! - `probeConflict` 已接线（第 96 步）：`TaskConflictActions::probe` 转调
 //!   [`TaskService::probe_conflict_by_id`]，即 `TaskStore.probeConflict` +
 //!   `categoryService.outputFolderOf`；Python 里队列拿到的是 `Task` 对象，Rust 侧
@@ -83,6 +90,7 @@ use crate::name_conflict::{
     ConflictActions, ConflictEvent, ConflictTask, DialogOutcome, NameConflictChoice,
     NameConflictQueue, ProbeTarget,
 };
+pub use crate::runtime_status::RuntimeStatusService;
 use crate::speed_meter::{SpeedEffect, SpeedMeter};
 use crate::task_service::{AddOutcome, TaskService};
 
@@ -154,17 +162,6 @@ fn max_task_num(config: &UserConfig) -> usize {
 // ---------------------------------------------------------------------------
 // 桩服务
 // ---------------------------------------------------------------------------
-
-/// `app/services/runtime_status.py`（195 行）的桩：运行时（aria2/ffmpeg…）的
-/// 探测、安装进度与 `statusChanged` 都未迁移。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeStatusService;
-
-impl RuntimeStatusService {
-    pub fn new() -> Self {
-        RuntimeStatusService
-    }
-}
 
 /// `app/services/feature_service.py`（约 240 行）的桩：功能包装载、解析器链、
 /// `parse` 都未迁移。
@@ -504,6 +501,14 @@ impl Engine {
 
     pub fn runtime_status(&self) -> &RuntimeStatusService {
         &self.runtime_status
+    }
+
+    /// 运行时状态的写入口（`install` / `cancelInstall` / `refreshStatus`）。
+    ///
+    /// Python 里 `RuntimeCard`（`setting_cards.py:804`）与 OOBE 向导直接调
+    /// `runtimeStatusService`；Rust 侧那些卡片还没接线，这里先留出口。
+    pub fn runtime_status_mut(&mut self) -> &mut RuntimeStatusService {
+        &mut self.runtime_status
     }
 
     pub fn features(&self) -> &FeatureService {

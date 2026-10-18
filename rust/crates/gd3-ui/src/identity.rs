@@ -150,6 +150,52 @@ pub fn hosts_valid(hosts: &[String]) -> bool {
 /// profile 选择项（`buildProfileMenu(includeAuto=False)` 的扁平化：菜单首项
 /// 传空串 = 跟随全局默认，再是 raw 与九家族「最新」）。索引 0 即磁盘里的
 /// 空串字面量——Python 侧 `_refreshProfileLabel` 对它显示「跟随全局默认」。
+/// `app/client.py::matchIdentityPreset(host)`（:83-94）：按顺序找第一个命中的预设。
+///
+/// ```python
+/// for preset in cfg.identityPresets.value:
+///     if not preset.get("isEnabled", True):
+///         continue
+///     for pattern in preset.get("hosts", []):
+///         if pattern.startswith("*."):
+///             suffix = pattern[2:]
+///             if host == suffix or host.endswith("." + suffix):
+///                 return preset
+///         elif host == pattern:
+///             return preset
+/// return None
+/// ```
+///
+/// 三条口径：
+///
+/// - **第一个命中就返回**，不是「最具体的那条」——`*.a.com` 排在 `x.a.com` 前面时，
+///   `x.a.com` 命中的是通配那条；
+/// - `*.a.b` 同时匹配 `a.b`（裸后缀）与 `x.a.b`，但**不匹配** `xa.b`；
+/// - 空模式串只在 host 为空时命中（Python 走 `elif host == pattern`，照抄）。
+///
+/// `presets` 由调用方给（`cfg.identityPresets` 的现值），模块不持有配置快照。
+pub fn match_identity_preset<'a>(
+    host: &str,
+    presets: &'a [IdentityPreset],
+) -> Option<&'a IdentityPreset> {
+    presets
+        .iter()
+        .find(|preset| preset.is_enabled && preset.hosts.iter().any(|pat| host_matches(pat, host)))
+}
+
+/// `pattern.startswith("*.")` 两个分支的判定（`matchIdentityPreset` 的内层）。
+fn host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(suffix) => {
+            host == suffix
+                || host
+                    .strip_suffix(suffix)
+                    .is_some_and(|head| head.ends_with('.'))
+        }
+        None => host == pattern,
+    }
+}
+
 pub fn profile_index_of(value: &str) -> Option<i64> {
     match value {
         "" => Some(0),
@@ -317,5 +363,70 @@ mod tests {
         for i in 0..11 {
             assert_eq!(profile_index_of(profile_value_of(i)), Some(i));
         }
+    }
+
+    fn preset_of(name: &str, hosts: &[&str], is_enabled: bool) -> IdentityPreset {
+        IdentityPreset {
+            name: name.to_string(),
+            client_profile: "chrome".into(),
+            user_agent: "ua".into(),
+            hosts: hosts.iter().map(|host| host.to_string()).collect(),
+            is_enabled,
+        }
+    }
+
+    #[test]
+    fn match_identity_preset_skips_disabled_entries() {
+        let presets = [
+            preset_of("off", &["a.com"], false),
+            preset_of("on", &["a.com"], true),
+        ];
+        let hit = match_identity_preset("a.com", &presets).expect("命中启用项");
+        assert_eq!(hit.name, "on");
+    }
+
+    #[test]
+    fn wildcard_matches_bare_suffix_and_subdomains_only() {
+        let presets = [preset_of("baidu", &["*.pcs.baidu.com"], true)];
+        assert!(match_identity_preset("pcs.baidu.com", &presets).is_some());
+        assert!(match_identity_preset("a.pcs.baidu.com", &presets).is_some());
+        assert!(match_identity_preset("a.b.pcs.baidu.com", &presets).is_some());
+        assert!(match_identity_preset("xpcs.baidu.com", &presets).is_none());
+        assert!(match_identity_preset("baidu.com", &presets).is_none());
+        assert!(match_identity_preset("", &presets).is_none());
+    }
+
+    #[test]
+    fn plain_patterns_are_exact_matches() {
+        let presets = [preset_of("p", &["a.com", "b.com"], true)];
+        assert_eq!(
+            match_identity_preset("b.com", &presets).map(|hit| hit.name.as_str()),
+            Some("p")
+        );
+        assert!(match_identity_preset("x.b.com", &presets).is_none());
+    }
+
+    #[test]
+    fn first_hit_wins_not_the_most_specific() {
+        let presets = [
+            preset_of("wild", &["*.a.com"], true),
+            preset_of("exact", &["x.a.com"], true),
+        ];
+        assert_eq!(
+            match_identity_preset("x.a.com", &presets).map(|hit| hit.name.as_str()),
+            Some("wild")
+        );
+    }
+
+    #[test]
+    fn default_presets_match_baidu_pcs_hosts() {
+        let presets = parse_presets(None);
+        let hit = match_identity_preset("d.pcs.baidu.com", &presets).expect("命中缺省预设");
+        assert_eq!(hit.client_profile, "raw");
+        assert_eq!(hit.user_agent, "pan.baidu.com");
+        assert!(
+            match_identity_preset("pan.baidu.com", &presets).is_none(),
+            "hosts 只有 *.pcs.baidu.com"
+        );
     }
 }
