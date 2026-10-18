@@ -4624,3 +4624,106 @@ Python 是**两套机制叠加**——锁用 `QSharedMemory(DESKTOP_ID)`（`atta
   另外 `app/models/pack.py`（310 行，`BinaryRuntime` / `FeaturePack`）现在只差
   `find_executable` 这一个依赖了，可以考虑排进 Phase 8。
 - 卡点：无
+
+## 第 86 步：`gd3-core::pack` + `gd3-core::install`（2026-10-18 10:28）
+
+Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬的只有不依赖 Qt 的那半截**
+（`FileType` / `UriScheme` / `VersionInfo` / `PackManifest.fromDir` / `BinaryRuntime`）：
+`TaskParser` / `PackConfig` / `FeaturePack` / `PackPage` / `PackServices` 是「插件由 Python
+模块实现」这层协议（`PackConfig.__init_subclass__` 把子类的 `ConfigItem` 注册进 `cfg`、
+`FeaturePack` 的方法返回 Qt 控件与信号），Rust 侧没有对应概念，插件加载本身留在 Python。
+顺带把 `app/install.py` 的 `deleteInstalled` / `installFile` 也搬了——它们是
+`BinaryRuntime.delete()` 的唯一依赖。
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/pack.rs`（**1146 行 / 37 单测**）：
+    `FileType`、`UriScheme`、`VersionInfo`、`PackManifest`（`from_dir` / `from_dir_detailed`）、
+    `ManifestError`（七种失败原因，`Display` 逐字照抄 Python 的日志格式串）、
+    `BinaryRuntime` trait（`name` / `binary_name` / `can_install` / `title` / `description` /
+    `icon` / `is_recommended` 是带默认实现的类属性；`install_folder` / `installed_paths`
+    是抽象方法；`runtime_id` / `path` / `is_app_managed` / `probe_version` / `delete`
+    给默认实现）；私有 `str_field` / `read_toml` / `py_isspace` / `py_strip` /
+    `split_lines` / `decode_ignore`；
+  - 新增 `rust/crates/gd3-core/src/install.rs`（**286 行 / 12 单测**）：
+    `delete_installed`（改名 `<name>.<8hex>.old` + 按 `<name>.*.old` 扫残留）、
+    `install_file`（`deleteInstalled` + `os.replace`）、私有 `is_leftover` / `parent_dir`；
+    `installArchive` 标注未迁移；
+  - `Cargo.toml`：`gd3-core` 加 `toml = "1.1.8"`（**离线零下载**，见下）；
+  - `lib.rs`：`pub mod install;` / `pub mod pack;` + 六个类型的 re-export；
+  - `rust/README.md`：新增「插件清单与运行时（`gd3-core::pack` / `gd3-core::install`）」一节
+    （对照表 + 七条校验 + 五个易错点 + 规模）。
+- 调研结论（推翻了先前的候选）：
+  - **「新建 `gd3-core::update`」作废**：`app/update.py` 的纯逻辑已经迁完 ——
+    `parseVersion` / `isNewer` 在 `gd3-ui::setting_cards`（:611，有单测
+    `parse_version_mirrors_update_py`），`Release` / `ReleaseAsset` / `assetScore` /
+    `bestAsset` 在 `gd3-ui::release_info`。剩下的只有网络请求；
+  - **`toml` crate 离线可用**：`Cargo.lock` 里本来就有 `toml 1.1.8`（别的 crate 拉的），
+    `~/.cargo/registry/cache` 里有 `toml-1.1.8+spec-1.1.0`、`zbus-5.19.0`、`md-5`、
+    `digest`，`cargo add toml --offline -p gd3-core` 成功、零下载
+    （`static.crates.io` 根路径返回 403，所以别试在线）；
+  - **`D-Bus 名字注册` 继续往后排**：它的净效果已被第 84 步的 `single_instance` socket
+    覆盖（桌面唤起 = 起新进程 → 交接），手写线协议数百行高风险，`zbus` 编译代价又大；
+    `pack` / `install` 是运行时状态卡、`loader`、`update_service` 的共同依赖，先做这个。
+- 实证结论（源码级 + CPython 3.13 实测，全部有单测钉住）：
+  - `fromDir` 七条校验**先到先错**：缺 `manifest.toml` → 读/UTF-8/TOML 解析失败 →
+    无 `[pack]` 表 → `entry` 非 str 或 `strip()` 空（**默认 `"pack.py"`**）→ 入口文件不存在
+    （只有 `.py` 才退到同名 `.pyc`，**报错路径仍是原始的 `packDir/entry`**）→ `class`
+    非 str 或 strip 空 → `dependencies` 非 list 或含非 str/空串；`version` / `gdMinVersion`
+    非 str 时**静默**变 `""`；`name = packDir.name`；
+  - `strip()` **只用于判空**：拼路径用未 strip 的 `entry`，所以 `entry = " pack.py "`
+    会去找带空格的文件名；`class` 也原样保留（含前后空格）；
+  - `BinaryRuntime.path()` = `findExecutable(installFolder(), binaryName or name)`；
+    `isAppManaged()` = `bool(p) and Path(p).is_relative_to(installFolder())` ——
+    CPython 实测 `Path("ffmpeg").is_relative_to(Path("/opt/x"))` 是 `False`（不抛）、
+    `/opt/xy/...` 相对 `/opt/x` 是 `False`，所以 Rust 侧 `Path::starts_with` 直接等价；
+  - `probeVersion()`：`<path> --version`、stdin/stderr `DEVNULL`、非 0 退出码 →
+    `VersionInfo("")`、`stdout.decode(errors="ignore").splitlines()[0].strip()`；
+    `errors="ignore"` 是**丢字节**不是插 `U+FFFD`，所以 `decode_ignore` 手写
+    （`from_utf8_lossy` 会给 `�`）；
+  - `deleteInstalled` 用 `path.exists() or path.is_symlink()` 判存在 —— 等价于
+    `symlink_metadata().is_ok()`（断链符号链接只后者为真）；
+  - `Path.glob(glob.escape(name) + ".*.old")` 的 `glob.escape` 只把 `[` / `]` / `*` / `?`
+    包成字符类（`a[1]*?.old` → `a[[]1][*][?].old`），真通配符只剩那一个 `*`，
+    而目录项不含 `/` → 「前缀 + 后缀 + 长度」判定与 `fnmatch` 等价；
+  - `Path(".").with_name("x")` / `Path("").with_name(...)` / `Path("/").with_name(...)`
+    在 CPython 全抛 `ValueError`（Python 侧整个函数中断），`Path("..").name == ".."`
+    且 `with_name("x") == Path("x")`；
+  - `os.replace` **不建父目录**（父目录缺失 = `FileNotFoundError`）——Rust 的 `fs::rename`
+    同构，第 86 步有一条单测专门钉这个（原先那条「目标不存在也能装」的断言是错的，
+    跑全量时暴露出来，改成「父目录存在 → 成功」+「父目录缺失 → `NotFound`」两条）。
+- 已知差异（写进模块头）：
+  - `tomllib.loads` 与 `toml` crate 对**非法文档**的接受面不完全一致（例如 `tomllib`
+    拒绝 BOM 而 `toml` crate 接受）；合法 manifest 两侧结果一致；
+  - `read_text` 失败时 Python 抛 `UnicodeDecodeError`、`repr(e)` 的文本无法逐字复刻
+    （`reason` 用 Rust 的 `Display`），归到同一个「无法读取」分支；
+  - `packDir.name` 对非 UTF-8 目录名：Python 走 `surrogateescape` 原样保留，
+    Rust 走 `to_string_lossy()`；
+  - `runtimeId` 两边都是「类型全名」但**字符串不同**（`gd3_ui::runtime::FfmpegRuntime`
+    vs `xxx.FfmpegRuntime`），不能混用作持久化键；
+  - `probeVersion` 在 Python 是 `async`，Rust 是同步 `Command`，调用方自己丢线程；
+  - `delete_installed` 对空 / `/` / `.` 路径直接 `Ok(())`（Python 抛 `ValueError` 中断）；
+  - `pack.rs` 里另有一份私有的 `py_isspace` / `py_strip` / `split_lines` / `decode_ignore`
+    ——`gd3-core::hls` 与 `gd3-ui::pystr` 已各有一份，抽公共模块会牵动既有调用点，留作后续。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**154 passed**（第 85 步 105 + 37 pack + 12 install）；
+  - `cargo test --workspace`：**1003 passed, 0 failed**（第 85 步 954 + 49）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（1m23s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧**没改一行**，不需要跑 Python 全量；
+  - commit `a2efbc3`。
+- 环境记录（重要）：本机只有 **939MB 内存 + 4GB swap**，`cargo test --workspace`
+  默认并行会把 `gd3-ui` 的 lib 与 lib-test 两个 rustc 同时拉起来（各 300~630MB），
+  然后**双双掉进 swap 抖动**（CPU 3~4%、13 分钟没编完，最后 1300s 超时被杀）。
+  改成 `CARGO_BUILD_JOBS=1` 后单进程能跑到 60% CPU，全量编译约 10 分钟；
+  `cargo clippy` 元数据缓存热的时候只要 1m23s。**以后 Rust 全量一律带
+  `CARGO_BUILD_JOBS=1`**，并且用 `nohup ... &` + 轮询日志，别让工具调用阻塞。
+- 下一步（Phase 8）：
+  1. `gd3-core::loader`（`app/loader.py` 140 行）：`orderedByDependency`（拓扑排序 + 环检测）、
+     `loadPacks` 的目录扫描 + `gdMinVersion` 门禁、`seedPacks`（`rmtree` + `copytree`）——
+     纯逻辑 + 文件系统，依赖刚做完的 `PackManifest`；`loadManifest`（importlib）N/A；
+  2. `gd3-core::checksum`（`app/checksum.py` 33 行）：`parseChecksum` / `matchChecksum` 纯逻辑；
+     `toChecksum` 需要 md5/sha1/sha256/sha512/shake（`md-5` / `digest` 已缓存，
+     `sha1` / `sha2` 未见缓存 → 需先验证离线可用）；
+  3. `app/models/serialization.py`（94 行）：`TaskRecord` ↔ JSON 的字段映射；
+  4. D-Bus / keepalive 仍排在最后（`zbus` 缓存可用但编译代价大）。
+- 卡点：无
