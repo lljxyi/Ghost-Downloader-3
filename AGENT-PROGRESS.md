@@ -4375,3 +4375,51 @@ Phase 7 收口时 `gd3-ui` 只有 lib（58 个 `.rs`、无 `main`、无事件循
   APP_DATA_DIR/tasks.jsonl)` → `refresh(window)`），并给无头模式加 `--tasks-file`
   之类的可测入口。
 - 卡点：无
+
+## 第 82 步：`TaskService` 接进 `boot::run`（2026-10-18 07:33）
+
+第 81 步的 `task_service.rs` 只有库，启动序列还没用它。这一步把「启动时装载任务列表
+→ 重新入队 → 推成 UI 行」接进 `boot::run`，Slint 侧第一次带着真实任务列表起来。
+
+- 做了什么：
+  - `boot.rs`：`Paths::tasks_path()`（`APP_DATA_DIR / "tasks.jsonl"`，与
+    `TaskStore._path` 同路径）+ 常量 `TASKS_FILE`；`Cli` 新增 `--tasks-file <PATH>`
+    （Rust 侧可测性开关，两种写法都支持，缺值报错）；`RunSummary` 新增
+    `tasks` / `task_load_failures` / `resumed`；`run()` 在配置之后、窗口之前
+    `TaskService::load(&tasks_path)` → `resume_saved()`，两个分支都在
+    `push_settings` 之后 `service.refresh(&window)`；无头摘要行追加
+    `tasks={}, resumed={}`。
+  - `task_service.rs`：新增 `resume_saved() -> Vec<String>`。
+- 实证结论：
+  - `resumeSaved()` 的真实语义（`task_service.py:520-532`）：已完成的任务走
+    `_watchFile`/`_seed`，`WAITING`/`RUNNING` 的**先把状态改成 `WAITING`** 再
+    `_schedule`（= `queue.wait` + `_pump`）。所以启动后「正在下」的任务会变成「等待中」。
+  - 没有引擎时「派发」是假的：`_pump` 之后 `runningCount()` 会 >0、但没有任何协程在跑，
+    而且 `_dispatch` 里 `task.setStatus(RUNNING)` 这一步也没人做（记录状态与队列状态会
+    不一致）。所以 `resume_saved()` **只入队不 pump**，把 `pump(maxTaskNum)` 留给引擎层。
+  - `setStatus` 不落盘：Python 的 `resumeSaved` 改完状态也不 `_flushSoon`，Rust 侧同样
+    不置 `pending_flush`（有单测钉住）。启动因此**不会回写** `tasks.jsonl`。
+- 测试：
+  - `task_service::tests::resume_saved_requeues_waiting_and_running_only`（只重排
+    WAITING/RUNNING、保插入序、不 pump、不置脏）；
+  - `boot::tests`：`parses_tasks_file_flag_in_both_forms`、`tasks_path_defaults_to_app_data_dir`、
+    `headless_run_loads_tasks_from_app_data_dir`（3 有效行 + 1 坏行 → `tasks=3`、
+    `failures=1`、`resumed=2`，且跑完文件字节不变）、
+    `tasks_file_override_wins_over_app_data_dir`。
+- 二进制实跑（`target/debug/gd3-ui`，无 `DISPLAY`）：
+  ```text
+  $ ./target/debug/gd3-ui --headless --frames 1 --data-dir /tmp/tmp.P98YEjL99E
+  Ghost Downloader v4.4.0 launched (headless, 1 frame(s), config=default,
+    data=/tmp/tmp.P98YEjL99E, tasks=2, resumed=2)
+  ```
+  跑完 `tasks.jsonl` 的 md5 不变（`a3bdd49b…`），目录里也没有多出 `UserConfig.json`。
+- 验证：
+  - `cargo test -p gd3-ui --lib boot::`：**19 passed**；
+  - `cargo test --workspace`：**907 passed, 0 failed**（第 81 步 902 + 5）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m24s）；
+  - `cargo fmt --all --check` 通过；
+  - commit `f317c23`（含 `rust/README.md`：启动流程图加 `TaskService` 一行、CLI 清单
+    加 `--tasks-file`、规模改为 34 964 行 / 625 单测）。
+- 下一步：第 83 步做 `app/engine.py`（只有 74 行，是纯装配门面）的 Rust 对应物 ——
+  把「哪个服务依赖哪个服务」的构造顺序固定下来，即使引擎内部还是桩，也能先钉住装配契约。
+- 卡点：无
