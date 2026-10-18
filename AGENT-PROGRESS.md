@@ -4524,7 +4524,7 @@ Python 是**两套机制叠加**——锁用 `QSharedMemory(DESKTOP_ID)`（`atta
     是同一条语义，所以 `parse_payload` 直接镜像了 `_DesktopBusReceiver.Open` 的过滤：
     空行/ wake URI 丢掉 → 空则丢弃 → 含启动 URI 则升级成 `Activate`；
   - `desktop_keepalive.py`（113 行）是**睡眠抑制**（`SetThreadExecutionState` /
-    `IOPauseAssertion`），与单实例锁无关，别混；
+    `IOPMAssertionCreateWithName`），与单实例锁无关，别混；
   - `_unlockSingleInstance` 在 `exec()` 的 `finally` 里，即**停机序列之前**——Rust 侧
     `release()` 也放在 `Engine::stop()` 之前（有注释钉住顺序）；
   - 陈旧 socket：Python 的 `QSharedMemory` 用「先 `attach`/`detach` 清一遍」处理残留；
