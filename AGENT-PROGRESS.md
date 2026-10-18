@@ -5282,3 +5282,112 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
 ### 卡点
 
 无。
+
+## 第 94 步：TaskService::update_placeholders（改名/移动占位符，2026-10-18 13:03）
+
+**目标**：补齐 Python `TaskStore.updatePlaceholders`（`app/services/task_service.py:91-121`）——
+第 93 步只做了「新建占位符 + 重名决策」，改名/移动这条路径还缺。它是编辑任务
+（`edit_task`）、改输出目录、以及 `add` 之后用户改名的唯一落地点。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-core/src/task.rs` | 新增 `output_path_in(output_folder, name)`；`output_path_for(name)` 改为委托；新增 `placeholder_paths()` 与 `placeholder_paths_at(folder, name)` |
+| `gd3-core/src/filesystem.rs` | 新增 `pub fn move_path(from, to) -> io::Result<()>` + 私有 `copy_dir_all`；文档表补 `shutil.move` 一行；3 单测 |
+| `gd3-core/src/lib.rs` | `filesystem` re-export 补 `move_path` |
+| `gd3-ui/src/task_service.rs` | 新增 `UpdateReport` + `pub fn update_placeholders`；`add_with_conflict` 改用 `placeholder_paths_at` / `placeholder_paths`；6 单测（1410 → 1622 行，32 → 38 单测） |
+| `rust/README.md` | 「任务记账」补 `update_placeholders`/`UpdateReport` 两条 bullet；filesystem 表补 `move_path`；规模行更新 |
+
+### `update_placeholders` 的执行顺序（逐条对齐 Python）
+
+```text
+1. 无登记项                    -> Ok(None)            # Python 是 KeyError
+2. current == 登记 paths       -> Ok(Some(空 report)) # 直接 return，不置 pending_flush
+3. fs::create_dir_all(outputFolder)                   # mkdir(parents=True, exist_ok=True)
+4. resolve_conflict(name, KeepBoth,
+       create = |候选| create_placeholders(placeholder_paths_at(folder, 候选), &旧 paths, isOutputFolder),
+       is_unfinished = |_| false, delete_recoverably = |_| false)
+5. (outputFolder, name) != (登记值) 时：
+     oldPaths = placeholder_paths_at(旧目录, 旧名字)
+     for (oldPath, newPath) in zip(oldPaths, newPaths):
+         if oldPath not in 登记 paths: continue
+         for (old, new) in [(oldPath, newPath), (oldPath.ghd, newPath.ghd)]:
+             if old.exists(): delete_path(new); move_path(old, new)
+6. 登记 paths 里不在 newPaths 的 -> delete_placeholder
+7. placeholders.set(...) + 写回 record + pending_flush = true
+```
+
+### 关键决策
+
+- **`output_path_in` 而不是「临时改字段再取 property」。** Python 的
+  `Task.placeholderPathsAt(outputFolder, name)` 是 `with` 式临时改字段；Rust 侧
+  `TaskRecord` 是纯数据，直接传参更省事，也顺带让 `add_with_conflict` 复用同一条路径。
+- **复用 `resolve_conflict(KeepBoth, …)` 而不是另写一个改名循环。** Python 这里只有
+  `except FileExistsError: index += 1; setName(f"{stem}({index}){ext}")`——既不查
+  `_isUnfinishedPlaceholder`，也不进回收站，恰好等于 `KeepBoth` 分支的全部语义
+  （`stem`/`ext` 都取自**原始**名字，index 单调递增，不会 `a(1)(1).bin`）。
+- **`create` 闭包传 `&existing = 旧登记 paths`。** Python 的 `_createPlaceholders`
+  会跳过 `placeholders.paths` 里已登记的路径（`if path in existingPaths: continue`），
+  否则「只改目录不改名字」时会把已存在的占位符当成 `FileExistsError` 白白改名。
+- **`UpdateReport` 暴露 `created` / `moved` / `removed`。** Python 只改对象、不发信号，
+  调用方（卡片重绘 / 日志）无从知道「到底动没动、动了哪些」。三个 `Vec` 让 `Ok(None)`
+  与「无变化」这两种情形也能被区分（前者是没登记项，后者是三个 Vec 全空）。
+- **`move_path` 抽进 `gd3-core::filesystem`。** `shutil.move` 跨设备会 copy+delete，
+  直接 `fs::rename` 在 `/tmp` → `/root`（不同 tmpfs/overlay 层）会 `EXDEV`。回退只在
+  `ErrorKind::CrossesDevices` 触发，其余错误原样冒泡（见 doc 里的三条差异：不做
+  `except OSError` 全量回退、不保 mtime、符号链接按内容复制）。
+- **先 `delete_path(新)` 再 `move_path`。** Python 是 `deletePath(new); move(old, new)`：
+  第 4 步刚 `create_new` 出来的 0 字节占位符必须先删掉，否则 `rename` 到已存在文件在
+  某些平台会失败；目录型占位符同理。
+- **置 `pending_flush = true`。** Python 由调用方 `edit()` / `updateSelection()` 触发的
+  `_flushSoon()` 落盘；Rust 侧改名结果必须能被持久化，不能靠调用方记得。
+- **`old_paths` 用「当前 record + 旧目录/旧名字」算。** Python 的
+  `placeholderPathsAt` 也是拿**当前** task 的其他字段（`isOutputFolder`、`files`）算的，
+  只有 `outputFolder` / `name` 被替换——不能拿登记时快照里的旧 record 重算。
+
+### 单测
+
+`gd3-core::filesystem`（3 个）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `move_path_renames_within_one_device` | 同设备 `rename`，源消失、内容不变 |
+| `move_path_moves_a_whole_directory` | 目录整体搬走（含子文件） |
+| `move_path_reports_missing_source` | 源不存在 → `Err(NotFound)`，不是静默 |
+
+`gd3-ui::task_service`（6 个，全部 hermetic：`TempDir` + `AtomicU32` + `Drop`）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `update_placeholders_returns_none_for_unknown_task` | 空服务 + 有任务但没登记项，都 `Ok(None)` |
+| `update_placeholders_is_a_noop_when_paths_match` | 路径没变 → 三个 Vec 全空、**不**置 `pending_flush` |
+| `update_placeholders_renames_and_moves_the_file` | `a.bin` → `b.bin`：`created == [b.bin]`、`moved == [(a.bin, b.bin)]`、内容跟着走、登记转给新路径 |
+| `update_placeholders_moves_the_ghd_sidecar` | `.ghd` 分片一起搬，`moved` 里两对 |
+| `update_placeholders_moves_across_folders` | 只改 `outputFolder`（名字不变）→ 文件搬进新目录、旧目录不留 |
+| `update_placeholders_renames_again_on_collision` | 目标名字被别人占着 → `b(1).bin`，占位文件原样不动、不进回收站 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --lib --tests`：50s 通过（无 warning）；
+- `cargo test -p gd3-ui --lib`：**669 passed**（663 + 6）；
+- `cargo test --workspace`：**1170 passed / 0 failed**（28 个 test result 段，
+  第 93 步 1161 + 6 + 3）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（1m18s）；
+- Python 侧没改一行，不跑 Python 全量；
+- 代码 commit `3286fff`。
+
+### 下一步（第 95 步候选，按价值/风险）
+
+1. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：`QLocale.Script` × 平台
+   字体链，造 `Script` 枚举后可搬，纯函数、无 I/O；
+2. **`app/services/runtime_status.py`（195 行）**：需先给 `pack::BinaryRuntime` 补
+   `install` / `fetch_latest_version` 的**同步签名**（Python 是 `async` 且要网络）；
+3. **`NameConflictQueue` 与 UI 的接线**：`name_conflict.rs` + `add_with_conflict` 都已
+   就位，但 `Engine` 还没把 `nameConflicted` 事件接到卡片上；
+4. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
