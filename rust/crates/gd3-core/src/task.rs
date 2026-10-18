@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -239,10 +240,28 @@ impl TaskRecord {
     /// 重名冲突改名时要用「新名字算出来的 outputPath」，而 `BilibiliTask` 多文件时
     /// 取的是 `Path(name).stem`，所以不能只换路径最后一段。
     pub fn output_path_for(&self, name: &str) -> String {
+        self.output_path_in(&self.output_folder, name)
+    }
+
+    /// `Task.outputPath`，但用给定的 `outputFolder` 与 `name`。
+    ///
+    /// `Task.placeholderPathsAt(outputFolder, name)` 会临时改掉这两个字段再取
+    /// `placeholderPaths`；Rust 侧不原地改，直接把它们传进来。
+    pub fn output_path_in(&self, output_folder: &str, name: &str) -> String {
         if self.is_output_folder() && self.short_type_name() == Some("BilibiliTask") {
-            return crate::path::posix_join(&self.output_folder, crate::path::posix_stem(name));
+            return crate::path::posix_join(output_folder, crate::path::posix_stem(name));
         }
-        crate::path::posix_join(&self.output_folder, name)
+        crate::path::posix_join(output_folder, name)
+    }
+
+    /// `Task.placeholderPaths`（差异：只返回 `[outputPath]`，不遍历 `steps`）。
+    pub fn placeholder_paths(&self) -> Vec<PathBuf> {
+        crate::placeholder::placeholder_paths_of(&self.output_path())
+    }
+
+    /// `Task.placeholderPathsAt(outputFolder, name)`。
+    pub fn placeholder_paths_at(&self, output_folder: &str, name: &str) -> Vec<PathBuf> {
+        crate::placeholder::placeholder_paths_of(&self.output_path_in(output_folder, name))
     }
 
     /// `type` 标签的最后一段（旧文件可能只存裸类名）。

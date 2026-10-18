@@ -51,7 +51,8 @@ pub use file_association::{
 };
 pub use filename::{DEFAULT_MAX_FILENAME_LENGTH, split_stem_ext, to_safe_filename};
 pub use filesystem::{
-    delete_path, find_executable, is_existing, is_folder, local_file_path, to_posix_path, which,
+    delete_path, find_executable, is_existing, is_folder, local_file_path, move_path,
+    to_posix_path, which,
 };
 pub use ghd::PartRecord;
 pub use install::{delete_installed, install_file};

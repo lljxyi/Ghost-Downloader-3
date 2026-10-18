@@ -52,9 +52,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use gd3_core::filename::{DEFAULT_MAX_FILENAME_LENGTH, to_safe_filename};
+use gd3_core::filesystem::{delete_path, move_path};
 use gd3_core::placeholder::{
-    CreateError, NameConflictChoice, PlaceholderRegistry, create_placeholders,
-    placeholder_paths_of, resolve_conflict,
+    CreateError, NameConflictChoice, PlaceholderRegistry, create_placeholders, delete_placeholder,
+    resolve_conflict, sidecar_path,
 };
 use gd3_core::queue::TaskQueue;
 use gd3_core::store;
@@ -90,6 +91,24 @@ pub struct AddReport {
     pub overwrite_failed: bool,
     /// `None` = Python 的 `nameConflicted` 分支（`return False`，等用户重新选）。
     pub outcome: Option<AddOutcome>,
+}
+
+/// `update_placeholders()` 的结果。
+///
+/// Python 的 `updatePlaceholders` 只改对象、不发信号；这里把「实际动了什么」返回出来，
+/// 方便调用方决定要不要重绘卡片。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateReport {
+    /// 最终名字（撞名时会被继续改名，与调用方传进来的可能不同）。
+    pub name: String,
+    /// 最终占位符列表（= `record.placeholder_paths()`）。
+    pub paths: Vec<PathBuf>,
+    /// 本次新建成占位符的路径。
+    pub created: Vec<PathBuf>,
+    /// 被搬走的 `(旧, 新)` 对，含 `<path>.ghd`。
+    pub moved: Vec<(PathBuf, PathBuf)>,
+    /// 被 `delete_placeholder` 清掉的旧占位符（调用前确实存在的）。
+    pub removed: Vec<PathBuf>,
 }
 
 /// `_onRunDone` / `_onRunFailed` 末尾那一段的记账结果。
@@ -304,7 +323,7 @@ impl TaskService {
             |name| {
                 // 每个候选名字都要重算 outputPath：`BilibiliTask` 多文件时取
                 // `Path(name).stem`，不是简单换路径最后一段。
-                let paths = placeholder_paths_of(&probe.output_path_for(name));
+                let paths = probe.placeholder_paths_at(&probe.output_folder, name);
                 create_placeholders(&paths, &[], is_output_folder).map(|_| ())
             },
             |path| {
@@ -326,7 +345,7 @@ impl TaskService {
             });
         };
         record.name = resolved.name.clone();
-        let paths = placeholder_paths_of(&record.output_path());
+        let paths = record.placeholder_paths();
         let replaced = self.placeholders.replaced_tasks(&paths);
         for task_id in &replaced {
             self.remove(task_id);
@@ -345,6 +364,122 @@ impl TaskService {
             overwrite_failed: resolved.overwrite_failed,
             outcome: Some(outcome),
         })
+    }
+
+    /// 带**改名/移动**的占位符更新：镜像 `TaskStore.updatePlaceholders`
+    /// （`app/services/task_service.py:91-121`）。
+    ///
+    /// 调用方先通过 `task_mut(task_id)` 改好 `output_folder` / `name`，再调这里：
+    ///
+    /// 1. 占位符没变（`placeholder_paths() == 登记值`）→ 直接返回，什么都不做；
+    /// 2. `mkdir -p` 输出目录 → 按 `KeepBoth` 走 `resolve_conflict`（Python 这里只
+    ///    `except FileExistsError` 改名，既不查「未完成」也不进回收站）；
+    /// 3. 名字或目录变了 → 把旧占位符与 `<path>.ghd` 逐个搬到新位置
+    ///    （先 `delete_path(新)` 再 `move_path`）；
+    /// 4. 旧占位符里没搬走的，`delete_placeholder` 清掉；
+    /// 5. 重新登记并置 `pending_flush`（Python 由调用方 `_flushSoon()`）。
+    ///
+    /// 与 Python 的差异：任务没有登记项时返回 `Ok(None)`（Python 是 `KeyError`）；
+    /// 改名重试仍有 `MAX_RENAME_ATTEMPTS` 上限。
+    pub fn update_placeholders(
+        &mut self,
+        task_id: &str,
+    ) -> Result<Option<UpdateReport>, CreateError> {
+        let Some(old) = self.placeholders.get(task_id).cloned() else {
+            return Ok(None);
+        };
+        let Some(mut record) = self.task(task_id).cloned() else {
+            return Ok(None);
+        };
+        let current = record.placeholder_paths();
+        if current == old.paths {
+            return Ok(Some(UpdateReport {
+                name: record.name.clone(),
+                paths: current,
+                ..Default::default()
+            }));
+        }
+        fs::create_dir_all(&record.output_folder).map_err(|error| CreateError::Io {
+            path: PathBuf::from(&record.output_folder),
+            error,
+        })?;
+        let is_output_folder = record.is_output_folder();
+        let existing = old.paths.clone();
+        let probe = record.clone();
+        let mut created: Vec<PathBuf> = Vec::new();
+        let resolved = resolve_conflict(
+            &record.name,
+            NameConflictChoice::KeepBoth,
+            |name| {
+                let paths = probe.placeholder_paths_at(&probe.output_folder, name);
+                create_placeholders(&paths, &existing, is_output_folder)
+                    .map(|done| created.extend(done))
+            },
+            |_| false,
+            |_| false,
+        )?;
+        let Some(resolved) = resolved else {
+            return Ok(None);
+        };
+        record.name = resolved.name.clone();
+        let new_paths = record.placeholder_paths();
+        let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let renamed = record.name != old.name;
+        let moved_folder = Path::new(&record.output_folder) != old.output_folder.as_path();
+        if renamed || moved_folder {
+            // `placeholderPathsAt(旧目录, 旧名字)`：注意其余字段仍取**当前** record
+            // （`BilibiliTask` 的 `isOutputFolder` 可能已经变了），Python 也是这么算的。
+            let old_folder = old.output_folder.to_string_lossy().into_owned();
+            let old_paths = record.placeholder_paths_at(&old_folder, &old.name);
+            for (old_path, new_path) in old_paths.iter().zip(new_paths.iter()) {
+                if !old.paths.contains(old_path) {
+                    continue;
+                }
+                for (from, to) in [
+                    (old_path.clone(), new_path.clone()),
+                    (sidecar_path(old_path), sidecar_path(new_path)),
+                ] {
+                    if !from.exists() {
+                        continue;
+                    }
+                    delete_path(&to);
+                    move_path(&from, &to).map_err(|error| CreateError::Io {
+                        path: to.clone(),
+                        error,
+                    })?;
+                    moved.push((from, to));
+                }
+            }
+        }
+        let mut removed: Vec<PathBuf> = Vec::new();
+        for path in &old.paths {
+            if new_paths.contains(path) {
+                continue;
+            }
+            let existed = path.is_dir() || path.is_file();
+            delete_placeholder(path).map_err(|error| CreateError::Io {
+                path: path.clone(),
+                error,
+            })?;
+            if existed {
+                removed.push(path.clone());
+            }
+        }
+        let new_folder = PathBuf::from(&record.output_folder);
+        let name = record.name.clone();
+        self.placeholders
+            .set(task_id, &new_folder, &name, &new_paths);
+        if let Some(slot) = self.task_mut(task_id) {
+            *slot = record;
+        }
+        self.pending_flush = true;
+        Ok(Some(UpdateReport {
+            name,
+            paths: new_paths,
+            created,
+            moved,
+            removed,
+        }))
     }
 
     /// `delete(task, ...)` 的记账部分：`_cancelWork` → 从列表移除 → 待落盘。
@@ -1271,5 +1406,217 @@ mod tests {
             .expect("不自动开始");
         assert_eq!(report.outcome, Some(AddOutcome::Added { queued: false }));
         assert!(service.pending_flush());
+    }
+
+    #[test]
+    fn update_placeholders_returns_none_for_unknown_task() {
+        let dir = TempDir::new("update-unknown");
+        let mut service = TaskService::new();
+        assert_eq!(
+            service.update_placeholders("nope").expect("不是错误"),
+            None,
+            "Python 是 KeyError，Rust 退化成 Ok(None)"
+        );
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        assert!(
+            service
+                .update_placeholders("nope")
+                .expect("不是错误")
+                .is_none(),
+            "没有登记项的任务同样返回 None"
+        );
+    }
+
+    #[test]
+    fn update_placeholders_is_a_noop_when_paths_match() {
+        let dir = TempDir::new("update-noop");
+        let log = dir.path().join("tasks.jsonl");
+        let (mut service, _) = TaskService::load(&log).expect("load");
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        service.flush(&log).expect("flush");
+        assert!(!service.pending_flush());
+
+        let report = service
+            .update_placeholders("a")
+            .expect("不是错误")
+            .expect("有登记项");
+        assert_eq!(report.name, "a.bin");
+        assert_eq!(report.paths, vec![placeholder(dir.path(), "a.bin")]);
+        assert!(report.created.is_empty());
+        assert!(report.moved.is_empty());
+        assert!(report.removed.is_empty());
+        assert!(!service.pending_flush(), "无变化不落盘");
+    }
+
+    #[test]
+    fn update_placeholders_renames_and_moves_the_file() {
+        let dir = TempDir::new("update-rename");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Completed);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        // 模拟下载完成：占位符被写满
+        let old = placeholder(dir.path(), "a.bin");
+        std::fs::write(&old, b"data").expect("写内容");
+        service.task_mut("a").expect("任务在").name = "b.bin".to_string();
+
+        let report = service
+            .update_placeholders("a")
+            .expect("不是错误")
+            .expect("有登记项");
+        let new = placeholder(dir.path(), "b.bin");
+        assert_eq!(report.name, "b.bin");
+        assert_eq!(report.paths, vec![new.clone()]);
+        assert_eq!(report.created, vec![new.clone()], "新名字先建成占位符");
+        assert_eq!(report.moved, vec![(old.clone(), new.clone())]);
+        assert!(report.removed.is_empty());
+        assert!(!old.exists());
+        assert_eq!(std::fs::read(&new).expect("读回"), b"data");
+        assert_eq!(service.task("a").expect("任务在").name, "b.bin");
+        assert_eq!(service.placeholders().owner(&new), Some("a"));
+        assert_eq!(
+            service
+                .placeholders()
+                .get("a")
+                .expect("登记项")
+                .output_folder,
+            dir.path()
+        );
+        assert!(service.pending_flush());
+    }
+
+    #[test]
+    fn update_placeholders_moves_the_ghd_sidecar() {
+        let dir = TempDir::new("update-ghd");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Running);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        let old = placeholder(dir.path(), "a.bin");
+        let old_part = sidecar_path(&old);
+        std::fs::write(&old, b"data").expect("写内容");
+        std::fs::write(&old_part, b"part").expect("写分片");
+        service.task_mut("a").expect("任务在").name = "b.bin".to_string();
+
+        let report = service
+            .update_placeholders("a")
+            .expect("不是错误")
+            .expect("有登记项");
+        let new = placeholder(dir.path(), "b.bin");
+        let new_part = sidecar_path(&new);
+        assert_eq!(report.moved, vec![(old, new), (old_part, new_part.clone())]);
+        assert_eq!(std::fs::read(&new_part).expect("读回"), b"part");
+    }
+
+    #[test]
+    fn update_placeholders_moves_across_folders() {
+        let dir = TempDir::new("update-folder");
+        let other = dir.path().join("other");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Completed);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        let old = placeholder(dir.path(), "a.bin");
+        std::fs::write(&old, b"data").expect("写内容");
+        service.task_mut("a").expect("任务在").output_folder = other.to_string_lossy().into_owned();
+
+        let report = service
+            .update_placeholders("a")
+            .expect("不是错误")
+            .expect("有登记项");
+        let new = other.join("a.bin");
+        assert_eq!(report.name, "a.bin");
+        assert_eq!(report.moved, vec![(old.clone(), new.clone())]);
+        assert!(!old.exists(), "旧目录里的文件被搬走");
+        assert_eq!(std::fs::read(&new).expect("读回"), b"data");
+        assert_eq!(
+            service
+                .placeholders()
+                .get("a")
+                .expect("登记项")
+                .output_folder,
+            other
+        );
+    }
+
+    #[test]
+    fn update_placeholders_renames_again_on_collision() {
+        let dir = TempDir::new("update-collision");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        // 别人的文件占着目标名字：`updatePlaceholders` 只改名，不覆盖、不进回收站。
+        let occupied = placeholder(dir.path(), "b.bin");
+        std::fs::write(&occupied, b"occupied").expect("写占用文件");
+        service.task_mut("a").expect("任务在").name = "b.bin".to_string();
+
+        let report = service
+            .update_placeholders("a")
+            .expect("不是错误")
+            .expect("有登记项");
+        let renamed = placeholder(dir.path(), "b(1).bin");
+        assert_eq!(report.name, "b(1).bin");
+        assert_eq!(report.paths, vec![renamed.clone()]);
+        assert_eq!(
+            report.moved,
+            vec![(placeholder(dir.path(), "a.bin"), renamed.clone())]
+        );
+        assert!(report.removed.is_empty());
+        assert_eq!(std::fs::read(&occupied).expect("读回"), b"occupied");
+        assert_eq!(service.task("a").expect("任务在").name, "b(1).bin");
+        assert_eq!(service.placeholders().owner(&renamed), Some("a"));
     }
 }

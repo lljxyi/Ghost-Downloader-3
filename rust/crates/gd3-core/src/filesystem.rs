@@ -9,6 +9,7 @@
 //! | `localFilePath` | [`local_file_path`] |
 //! | `findExecutable` | [`find_executable`] |
 //! | `deletePath` | [`delete_path`] |
+//! | `shutil.move` | [`move_path`] |
 //!
 //! ## 与 Python 的已知差异
 //!
@@ -28,6 +29,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::path::posix_normpath;
@@ -122,6 +124,50 @@ pub fn delete_path(path: &Path) {
     } else {
         let _ = fs::remove_file(path);
     }
+}
+
+/// 镜像 `shutil.move` 的「目标不存在」分支：先 `rename`，跨设备退化成「复制 + 删除」。
+///
+/// 调用方（`TaskService::update_placeholders`）总是先 `delete_path(to)`，所以不用处理
+/// `shutil.move` 的「`dst` 是已存在目录 → 移进去」那条分支。
+///
+/// 与 Python 的差异：
+///
+/// 1. 只在 `EXDEV`（`ErrorKind::CrossesDevices`）时回退；CPython 是 `except OSError`
+///    全量回退，但其余错误（`EACCES`、`ENOENT`）回退后同样失败，只是错误信息不同。
+/// 2. 回退用 `fs::copy`（保留权限位、不保留 mtime），`shutil.move` 用 `copy2`
+///    （连 atime/mtime 一起保留）。
+/// 3. 符号链接跨设备时不复刻 `os.readlink` + `os.symlink`，而是按 `fs::copy` 跟随链接
+///    复制内容再删链接 —— 占位符场景不会出现符号链接。
+pub fn move_path(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
+            if fs::symlink_metadata(from)?.is_dir() {
+                copy_dir_all(from, to)?;
+                fs::remove_dir_all(from)
+            } else {
+                fs::copy(from, to)?;
+                fs::remove_file(from)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `copytree` 的最小版：建目录 + 逐项递归复制（不保留元数据，见 [`move_path`]）。
+fn copy_dir_all(from: &Path, to: &Path) -> io::Result<()> {
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// 镜像 `localFilePath` 里 netloc 的三分支：空 / `localhost` / 其余。
@@ -644,6 +690,40 @@ mod tests {
         assert!(!is_existing(&link));
         assert!(is_folder(&target));
         assert!(is_existing(target.join("keep.txt")));
+    }
+
+    #[test]
+    fn move_path_renames_within_one_device() {
+        let dir = TempDir::new("move-file");
+        let from = dir.path().join("a.txt");
+        touch(&from, b"data");
+        let to = dir.path().join("b.txt");
+        move_path(&from, &to).expect("同设备 rename");
+        assert!(!is_existing(&from));
+        assert_eq!(fs::read(&to).expect("读回"), b"data");
+    }
+
+    #[test]
+    fn move_path_moves_a_whole_directory() {
+        let dir = TempDir::new("move-dir");
+        let from = dir.path().join("src");
+        fs::create_dir_all(from.join("nested")).expect("mkdir");
+        touch(&from.join("nested").join("b.txt"), b"x");
+        let to = dir.path().join("dst");
+        move_path(&from, &to).expect("目录 rename");
+        assert!(!is_existing(&from));
+        assert_eq!(
+            fs::read(to.join("nested").join("b.txt")).expect("读回"),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn move_path_reports_missing_source() {
+        let dir = TempDir::new("move-missing");
+        let error = move_path(&dir.path().join("nope"), &dir.path().join("dst"))
+            .expect_err("源不存在应报错");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

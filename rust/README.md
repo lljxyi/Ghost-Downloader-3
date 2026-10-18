@@ -247,6 +247,16 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   `outcome == None` 精确对应 Python 的 `nameConflicted` + `return False`（任务**没**加
   进去，等用户重新选），`replaced` 是 `taskRemoved` 要发的旧任务 id（按占位符顺序去重），
   `overwrite_failed` 是 `overwriteFailed` 信号的条件；
+- **改名/移动占位符单独开一个入口**（第 94 步）：调用方先用 `task_mut(id)` 改好
+  `output_folder` / `name`，再 `update_placeholders(id) -> Result<Option<UpdateReport>,
+  CreateError>`。顺序对齐 `TaskStore.updatePlaceholders`（`task_service.py:91-121`）：
+  路径没变直接返回 → `mkdir -p` 输出目录 → `resolve_conflict(KeepBoth, …)`（Python
+  这里只 `except FileExistsError` 改名，既不查「未完成」也不进回收站）→ 名字或目录变了就
+  把旧占位符与 `<path>.ghd` 逐个搬过去（先 `delete_path(新)` 再 `move_path`）→ 没搬走的
+  旧占位符 `delete_placeholder` 清掉 → 重新登记 + 置 `pending_flush`。
+  `UpdateReport { name, paths, created, moved, removed }` 把「实际动了什么」交给调用方
+  （`name` 是最终名字，撞名时与传入的不同）；任务没有登记项时返回 `Ok(None)`
+  （Python 是 `KeyError`）。
 - 已知差异：`add_with_conflict()` **不调** `CategoryService.outputFolderOf()`（分类目录
   规则还没搬），输出目录由调用方填好；`delete_recoverably` 由调用方注入（生产传
   `gd3_core::trash::delete_recoverably`，`Err` 按 `false` 处理）。
@@ -317,6 +327,7 @@ gd3-ipc/1 open\n<uri>\n<uri>\n    ← 把 URI 交给已有实例（Open / COPYDA
 | `localFilePath` | `local_file_path` | 自带 `urlsplit` + `url2pathname`（`unquote`） |
 | `findExecutable` | `find_executable` | 先看 `installFolder/`，再走 `shutil.which` 的 POSIX 分支 |
 | `deletePath` | `delete_path` | 目录 `rmtree`、其余 `unlink`；指向目录的符号链接只删链接 |
+| `shutil.move` | `move_path` | 先 `rename`；只有 `ErrorKind::CrossesDevices` 才回退成复制 + 删除 |
 
 搬过来的几个 CPython 细节（都有单测钉住）：
 
@@ -328,6 +339,9 @@ gd3-ipc/1 open\n<uri>\n<uri>\n    ← 把 URI 交给已有实例（Open / COPYDA
   依赖，只为 `access(2)`（std 没有对应物，自己看 mode 位在非 root 下会判错）；
 - `str(Path(p))` 的归一（`posix_normpath`，加在 `gd3-core::path`）只去空组件与 `.`、
   压缩斜杠，**不消解 `..`**，恰好两个前导斜杠保留。
+- `move_path` 只对 `ErrorKind::CrossesDevices` 回退（`shutil.move` 是 `except OSError`
+  全量回退），回退时目录递归复制 / 文件 `fs::copy`，**不保留 mtime**，符号链接按内容
+  复制而不是重建链接——现有调用点只搬占位符与 `.ghd` 分片，这两条差异不影响行为。
 
 Python 侧**没有**加影子开关：这几个函数都是一次 syscall 的包装，两侧行为一致，也没有
 性能动机；`localFilePath` 目前在 Python 里还没有调用方，等 `pack.py` 的
@@ -771,8 +785,8 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1271 行 / 32 单测**
-（其中 `add_with_conflict` 10 个）。
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1622 行 / 38 单测**
+（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个）。
 
 ## 剩余工作（Phase 8）
 
