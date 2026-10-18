@@ -6119,3 +6119,125 @@ Rust 侧的对应：
 ### 卡点
 
 无。
+
+## 第 100 步：`actions::TaskService` 接线（`gd3-ui::task_actions`）（2026-10-18 18:13）
+
+**目标**：把 `actions::TaskService` 的 11 个方法真正落到 `TaskService` 上。trait 收
+`&self`、`TaskService` 要 `&mut self`；每个动作的第一步又是「取消协程 / 停做种 / 删文件」，
+没有协程运行时只能假装——这一层把两个缺口一起补掉，判定标准是
+`app/services/task_service.py` 的**调用序列**与**信号发射顺序**。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-ui/src/task_actions.rs` | **新文件 916 行 / 15 单测**；模块 doc（Python 调用序列表 + 两个缺口 + 顺序约定）、`TaskAction`（12 变体）、`TaskStore` 端口（3 个 `impl`）、`TaskActions<S>`、`impl actions::TaskService`、`start_all` / `pause_all` / `pump` / `rebalance` / `on_run_finished` / `status_of` |
+| `gd3-ui/src/task_service.rs` | 3170 → **3180 行 / 72 单测**（无新单测）；新增 `schedule` / `dispatch` 两个记账原语 + `is_running` / `is_waiting` 两个只读访问器；`pause` / `stop` / `resume_saved` / `rebalance` 四处 `record.status = …` 改成 `record.set_status(…)`；模块 doc 改写「为什么还没做 impl」一段 + 新增 `set_status` 口径一条 |
+| `gd3-ui/src/lib.rs` | `pub mod task_actions;`（字母序，`task_service` 之前） |
+| `gd3-ui/src/engine.rs` | `use std::cell::RefCell;` + `Engine::task_actions() -> TaskActions<RefCell<&mut TaskService>>` |
+| `rust/README.md` | 909 → **969 行**；新增「动作层接线（`task_actions.rs`）」一节；规模行更新 |
+
+### 逐条对齐 Python
+
+```python
+pause(task)        _cancelWork → setStatus(PAUSED) → _flushSoon → taskPaused → _pump
+start(task)        (guard) → _schedule = queue.wait + _pump
+startSeeding(task) shouldSeed=True → _flushSoon → _seed(isManual=True)
+stopSeeding(task)  shouldSeed=False → _flushSoon → _cancelWork → _refreshSpeedMeter
+delete(task, df)   cancelChecksum → _unwatchFile → [fileDeleteDenied] → _cancelWork
+                   → onStopped{deleteFiles, deletePlaceholders} → _store.remove
+                   → _flushSoon → taskRemoved → _pump
+redownload(task)   cancelChecksum → _unwatchFile → _cancelWork
+                   → onStopped{deleteFiles, reset, _flushSoon, _schedule}
+setCategory(t, c)  task.category = c → _flushSoon
+moveToFront(ids)   if queue.moveToFront(ids): queueChanged
+startChecksum(t,a) _checksums[t]=work → submit(toChecksum(...)) → checksumStarted
+cancelChecksum(t)  if work: cancel(workId) → checksumStopped(t, None)
+```
+
+Rust 侧的对应：
+
+| Python | Rust | 差异 |
+|---|---|---|
+| `coroutineRunner.submit/cancel` | `TaskAction::{Started,CancelWork,SeedingStarted,SeedingStopped,ChecksumStarted,ChecksumStopped}` | 效果队列，宿主按序消费 |
+| `taskPaused` / `taskRemoved` / `fileDeleteDenied` / `queueChanged` | `TaskAction::{Paused,Removed,DeleteDenied,QueueChanged}` | 同上 |
+| `Task.deleteFiles()` | `TaskAction::DeleteFiles` | 排在 `CancelWork` 之后（宿主先取消再删） |
+| `_unwatchFile(task)` | `TaskAction::UnwatchFile` | 引擎层摘 `QFileSystemWatcher` |
+| `_schedule(task)` | `TaskService::schedule(id, max) -> Vec<String>` | `queue.wait` + `pump` |
+| `_dispatch(task)` | `TaskService::dispatch(id, workId) -> bool` | 置 `RUNNING` + `queue.run`，不置脏 |
+| `startAll` / `pauseAll` | `TaskActions::start_all` / `pause_all` | 后者按 `isRunning or isWaiting` 过滤 |
+| `_pump()` | `TaskActions::pump` | 派发时发号并登记 `Started` |
+| `_rebalance` / `_onRunDone` | `TaskActions::rebalance` / `on_run_finished` | 同序聚合效果 |
+
+### 关键决策
+
+- **适配层单独一个模块，不塞进 `task_service.rs`**：`task_service.rs` 保持「引擎无关记账
+  半边」的定位（3180 行已经很大），`task_actions.rs` 只做「报告 → 效果」的翻译。
+- **用 `TaskStore` 端口 trait 抽象「怎么拿到 `&mut TaskService`」**
+  （`with_tasks<R>(&self, f: impl FnOnce(&mut TaskService) -> R) -> R`），三个 `impl`：
+  `RefCell<TaskService>` / `RefCell<&mut TaskService>` / `Rc<RefCell<TaskService>>`。
+  `Engine.tasks` 仍是值类型（不做 `Rc` 大改），`Engine::task_actions()` 用第二种临时借出。
+- **副作用摊成 `TaskAction` 效果队列（12 变体）**：宿主（引擎 / 外壳）按序消费；
+  `take_effects()` 取走、`effects()` 只读拷贝。
+- **workId 由 `TaskActions` 自己发号**（`run-1` / `seed-2` / `checksum-3`，一个全局
+  计数器 + 前缀）：宿主把它当不透明句柄原样交回 `CancelWork`，不解析。
+- **`TaskAction::CancelWork` 必须排在 `DeleteFiles` 之前**：Python 把 `onStopped` 放在
+  `_cancelWork(finished=onStopped)` 的回调里，Rust 没有回调，只能用**顺序**表达依赖，
+  与第 99 步 `DeleteReport::delete_files` 的约定一致（写进模块 doc 的「顺序」一节）。
+- **`max_task_num` 用 `MaxTaskNum = Rc<dyn Fn() -> usize>`**：Python 每次 `_pump` 现读
+  `cfg.maxTaskNum.value`；引擎临时借出时用 `with_max(store, n)`（一次动作内配置不变，
+  等价）。
+- **`pause_all` 走 `is_running || is_waiting` 过滤，不用 `TaskService::pause_all`**：
+  后者只返回聚合的 `started`，拿不到每个任务的 `CancelWork` / `taskPaused`；
+  为此给 `TaskService` 补了 `is_running` / `is_waiting` 两个只读访问器。
+- **`set_status` 口径统一**（`pause` / `stop` / `resume_saved` / `rebalance` / `dispatch`）：
+  `Task.setStatus` 会连带改未完成 step 的状态、再由 `updateStatus()` 反推任务状态；直接赋
+  `record.status` 会漏掉 step 半边，`canPause`（读第一个 `RUNNING` 步骤）永远看到旧值。
+- **`dispatch` 不置 `pending_flush`**：Python 的 `_dispatch` 不 `_flushSoon`。
+- **`actions::UiHooks` 不在本模块**：剪贴板 / 抽屉 / 编辑对话框 / 打开文件落在
+  `app.platform.desktop`，要等 Slint 窗口 + `gd3-core::desktop` 的 GUI 调用方。
+
+### 单测（15 个）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `pause_emits_cancel_then_paused_then_dispatches_the_freed_slot` | 效果序 `CancelWork → Paused → Started(b)`；`a` 暂停、`b` 被派发、等待队列空 |
+| `start_short_circuits_for_running_and_queued_tasks` | 在跑 → 无效果（连 `_pump` 都不走）；暂停后 → 入队 + 派发 |
+| `start_seeding_marks_the_record_and_emits_one_effect` | `shouldSeed=true`、`is_seeding`、`SeedingStarted{seed-1,is_manual:true}`；未知 id → 无效果 |
+| `stop_seeding_emits_seeding_stopped_before_the_cancel` | `SeedingStopped` 在 `CancelWork` 之前；`shouldSeed` 置假、登记项摘除 |
+| `delete_emits_unwatch_cancel_removed_then_dispatches` | `UnwatchFile → CancelWork → Removed → Started(b)`；无 `DeleteFiles` |
+| `delete_puts_delete_files_after_the_cancel_and_checksum_stopped_first` | `ChecksumStopped` 最先、`DeleteFiles` 在 `CancelWork` 之后、`Removed` 之前 |
+| `redownload_deletes_files_after_the_cancel_and_requeues` | `UnwatchFile → CancelWork → DeleteFiles → Started`；`completedAt=0` / `shouldSeed` / `checksums` 清空 |
+| `move_to_front_emits_queue_changed_only_when_the_queue_takes_it` | 命中即发（哪怕已在队首）；不在等待队列 → 无效果 |
+| `set_category_writes_the_field_without_any_effect` | 无效果、`Some("video")`、置脏 |
+| `checksum_start_and_cancel_round_trip` | `ChecksumStarted{checksum-1}` → `ChecksumStopped{checksum-1}` → 再取消无效果 |
+| `start_all_then_pause_all_walks_the_queue_in_order` | `startAll` 只排 `PAUSED`/`WAITING`；`pauseAll` 的中间态（`w` 先被 pump 派发又被暂停） |
+| `work_ids_are_unique_across_kinds` | 三类 workId 互不相同（做种 / 校验 / 下载） |
+| `refcell_ref_mut_variant_borrows_the_engine_copy` | `RefCell<&mut TaskService>` 变体：句柄释放后引擎那份能看到改动 |
+| `on_run_finished_dispatches_the_next_waiting_task` | `queue.done` 后立刻派发下一个；`all_completed` 在派发之后算 |
+| `rebalance_cancels_the_overflow_and_keeps_the_head` | 上限 2→1：`runningIds()[1:]` 的 `b` 被取消并放回等待队列，`a` 不动 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib task_actions`：**16 passed**（15 个新单测 + 1 个名字撞上的
+  旧 smoke `install_task_actions_registers_handlers_headless`）；
+- `cargo test --workspace`：**1226 passed / 0 failed**（28 段，第 99 步 1211 + 15）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（7m34s）；
+- Python 侧没改一行，不跑 Python 全量。
+
+**已知缺口**：`Engine::task_actions()` 只有编译期验证（借用形态
+`RefCell<&mut TaskService>` 能通过类型检查），没有运行期冒烟测试——它的函数体是
+「读一次 `max_task_num()` + `RefCell::new(&mut self.tasks)`」，首次 `with_tasks`
+必然是单次独占借用，没有可踩的 `RefCell` 双借；下次动 `engine.rs` 时顺手补。
+
+### 下一步（第 101 步候选）
+
+1. `edit`（`_cancelWork(finished=onStopped)` + `replaceWith` + `setOptions` +
+   `updatePlaceholders`）与 `update_selection` 的记账半边；
+2. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：纯函数，造
+   `Script`/`Territory` 枚举后可搬；
+3. `app/services/runtime_status.py`（195 行）：需先给 `pack::BinaryRuntime` 补
+   `install` / `fetch_latest_version` 的同步签名；
+4. `actions::UiHooks` 实现：等 Slint 主窗口；
+5. D-Bus / keepalive：仍排最后。
