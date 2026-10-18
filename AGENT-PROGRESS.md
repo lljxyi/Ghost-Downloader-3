@@ -3598,3 +3598,43 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 - 卡点：无（`arch_keywords` 最初用 `Option<[&str;3]>` 装不下 2 元素组，
   编译期就报错，改成 `Option<&[&str]>`；`sizeHintForColumn` 的实测列宽
   由 Slint 侧测量后作为 `needed` 入参）
+
+## 第 70 步：标签族 + 自适应编辑器（2026-10-18 03:14）
+- 做了什么：`labels.rs`（约 490 行，11 测试）+ `editors.rs`（约 300 行，
+  9 测试），`lib.rs` 两行注册（`editors` 于 `edit_task` 前、`labels` 于
+  `menu_view` 前）：
+  - `labels.rs`：`elide_right(text, width, advance)` 复刻 Qt
+    `QFontMetrics::elidedText(ElideRight)`——空串/`width<=0`/放得下三短路、
+    否则在 `width - advance("…")` 预算内二分最长前缀；`icon_minimum_height`
+    = `max(size, fmHeight)`、`icon_indent` = `iconSize+4`（**无图标才 0**）、
+    `icon_y_offset` 用 `div_euclid`（Python `//` 负数向下取整）；
+    `IconCache`（`_iconCache` 的 `id(icon)` 键，同键只渲染一次）；
+    `IconStrongBodyLabel`（`contentsWidth - indent` 省略 + 全文 tooltip）、
+    `ElidedLabel`、`EditableLabel`（150ms `OutCubic`、`enter/leave/hide`、
+    左键双击、下划线 y/长度/笔色）。
+  - `editors.rs`：`py_round` 半值取偶（`round(2.5)==2`）；`EditMetrics::new`
+    五段拼 `padding`（contents 上下 + viewport 上下 + `frame*2` +
+    `round(documentMargin*2)`）；`AutoSizingEdit` 的
+    `minimum_size_hint`（`min(minVisible, blockCount)`）与 `size_hint`
+    （先按 `maxVisible` 截断再逐维 `expandedTo` 最小）；`combo_size_hint`
+    = `advance + 60`；`FolderPicker` 的 `folder_path`（strip）、
+    `folder_commit`（空不发信号）、`save_history`（删首个命中 + 插首 +
+    截 20）、`refresh_history`（只跳空串，纯空白保留）、`browse_selected`。
+- 实证结论（写进两个模块头）：
+  - Qt 的 `elidedText` 在 `width <= 0` 时返回**原文**，不是空串；预算连
+    省略号都放不下时只留 `…`；
+  - `IconStrongBodyLabel._elide` 的宽度是 `contentsRect().width() - indent()`，
+    而 `EditableLabel._elide` **不减 indent**（无图标）；
+  - `EditableLabel` 下划线长度用 `super().text()`（已省略的显示文本），
+    且 `_underlineProgress <= 0` 直接 return；
+  - `AutoSizingEdit.sizeHint` 的 `expandedTo` 逐维取大 → `maxVisible` 小于
+    `minVisible` 时高度会被抬回最小；
+  - `refreshHistory` 的 `if folder:` 只过滤**空串**，`" "` 是真值。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy -p gd3-ui --all-targets --
+    -D warnings` 0 error（11m49s）。
+  - `cargo test -p gd3-ui --lib`：**297 → 317 passed**（labels 11 + editors 9）。
+- 下一步：`track_bar.rs` + `band_selector.rs` + `progress_toast.rs` +
+  `category_settings.rs`（P4 第二批），随后 `option_cards` / `token_line_edit`
+  / `markdown_viewer` / `bootstrap_list` / `range_slider`。
+- 卡点：无（clippy 单轮 11~12 分钟，故按「多模块攒一批再跑」推进）
