@@ -7013,3 +7013,91 @@ workId、没有 `should_wait`），而 `Engine::stop()` 调的正是它，效果
 
 倾向 1：小、且与这一步是同一类债务，趁热清掉；否则后面接 `boot::run` 时会同时踩两个重复
 实现。
+
+## 第 107 步：`RuntimeStatusService` 收敛 + `matchIdentityPreset`
+
+> 时间：2026-10-18 23:21（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 做了什么
+
+两件同一类的事：清掉第 106 步记下的重复定义；补上 `FeatureService.parse()` 的前置函数。
+
+1. **`engine.rs` 删掉 `RuntimeStatusService` 空壳桩**（`pub struct RuntimeStatusService;`，
+   第 83 步的产物），改成 `pub use crate::runtime_status::RuntimeStatusService;`。第 102 步
+   已经把整类搬进 `runtime_status.rs`（932 行 / 22 单测），但 `Engine` 一直在用自己那份
+   空壳——`runtime_status()` 返回的是零大小结构体，`stored_status()` / `install()` /
+   `refresh_status()` 一个都调不到。补 `runtime_status_mut()` 作写入口
+   （`setting_cards.py:804` 的 `RuntimeCard` 与 OOBE 向导是它的真消费者）。
+2. **`identity.rs` 补 `match_identity_preset`**（`app/client.py:83-94`）：
+   `FeatureService.parse()` 在 `options.clientProfile` 为空时按 host 找预设，把
+   `clientProfile` / `userAgent` 补进 options。这是 `parse` 端口的前半段，纯函数、无依赖。
+
+### 逐条对照
+
+| Python | Rust |
+|---|---|
+| `matchIdentityPreset(host)`（`client.py:83`） | `identity::match_identity_preset(host, presets)` |
+| `preset.get("isEnabled", True)` | `IdentityPreset.is_enabled`（第 43 步已按读盘口径建模） |
+| `pattern.startswith("*.")` → `host == suffix or host.endswith("." + suffix)` | `host_matches` 的 `Some(suffix)` 分支 |
+| `elif host == pattern` | `None` 分支 |
+| `return None` | `Option<&IdentityPreset>` |
+
+### 关键决策
+
+- **返回 `&IdentityPreset` 而不是克隆**：Python 返回的是 `cfg.identityPresets` 里那个 dict，
+  调用方只读两个字段（`clientProfile` / `userAgent`）；生命周期绑在 `presets` 上，要留就
+  clone。
+- **`presets` 作参数**：`cfg` 是模块级全局，Rust 侧没有响应式配置层，由调用方每轮现读再
+  传入（同 `speed_meter::should_wait`、`settings::read_*`）。
+- **不做 URL 解析**：`urlparse(options.url).hostname` 的取 host 留给调用方
+  （`FeatureService.parse` 的移植里做）。`gd3-core` 里已有几处私有的「从 URL 抠 host」
+  （`http_pack.rs` / `github.rs`），等搬 `parse` 时统一抽，不先造半吊子。
+- **空模式串照抄**：`pattern == ""` 时 Python 走 `elif host == pattern`，于是只有空 host
+  命中。不特判、不修正。
+
+### 5 条新单测（`identity.rs`）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `match_identity_preset_skips_disabled_entries` | `isEnabled=false` 整条跳过，命中后面那条 |
+| `wildcard_matches_bare_suffix_and_subdomains_only` | `*.pcs.baidu.com` 命中裸后缀与多级子域，不命中 `xpcs.baidu.com` |
+| `plain_patterns_are_exact_matches` | 非通配是精确匹配，不做后缀 |
+| `first_hit_wins_not_the_most_specific` | 顺序优先，不是「最具体」 |
+| `default_presets_match_baidu_pcs_hosts` | 缺省预设（第 43 步）与命中函数串起来 |
+
+### 把「桩的边界」写清了
+
+`featureService` / `browserService` / `aria2RpcService` 仍是桩，但这次把**为什么**写进
+README 与模块头：三者共用一条 `parse` 端口（`featureService.parse` 被
+`browser_service.py:496` 与 `aria2_rpc.py:218` 各调一次），默认实现是 **Python 插件**
+（`features/` 下 `FeaturePack` 子类的 `pack.parsers` / `pack.pages()` / `pack.config` /
+`taskCardClass`），Rust 无法加载；`gd3-core::loader`（第 87 步）只搬了「按依赖排序
+manifest 列表」。这不是「还没做」，是**结构性不可移植**——除非将来定义一套 Rust 侧插件
+ABI。这条边界值得写下来，否则后续每轮都会有人（包括我）重新怀疑这里漏了活。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**824 passed / 0 failed**（第 106 步 819 + 5；首跑即绿）；
+- `cargo test --workspace`：**1327 passed / 0 failed**（28 段）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**本步单独跑的那次没跑完**。
+  第一次跑到 `Checking gd3-ui`（`--test` target）时已耗时 9 分钟、CPU 只有 8%
+  （机器 939 MB 内存 + 1.1 GB swap，编译在抖动），随后被停掉。**第 108 步的 clippy
+  是整 workspace 一起跑的，覆盖了本步的改动**（本步只删了一个空壳桩 + 加了一个纯函数），
+  结果记在第 108 步的笔记里。这是为省掉一次 10 分钟的重复编译而做的合并，不是漏检；
+- Python 侧没改一行。
+
+### 下一步（第 108 步）
+
+`feature_service` 的**可移植内核**：
+
+- `TaskParser` trait：`priority`（默认 100，`pack.py:42`）/ `matches` /
+  `matches_passive`（默认转 `matches`，`pack.py:49-50`）/ `parse`；
+- `ParserChain`：`register` 后按 `priority` **稳定**排序（Python 的 `list.sort` 稳定）、
+  `parse` 先跑 `match_identity_preset` 前置再逐条 `matches`、无匹配 →
+  `TaskError`（`raise ValueError(f"No parser matched: {options.url}")`）；
+- pack / UI 部分（`pack.pages()`、`taskCardClass`、`pack.config.createRuntimeCard`）
+  明确标 N/A，理由同上面那条边界。
+
+它是 `browser_service.py:496` 与 `aria2_rpc.py:218` 的共同依赖，也是 Phase 8 剩下最大
+两块（浏览器扩展服务 / aria2 RPC）的前置。
