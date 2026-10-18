@@ -3703,3 +3703,73 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   然后 P1 设置页收尾（`setting_cards.rs` 949、`setting_card_group.rs` 290、
   `card_groups.rs` 191）。
 - 卡点：无（clippy 单轮 12 分钟，仍按「多模块攒一批再跑」推进）
+
+## 第 72 步：P4 收官五模块（range_slider / token_line_edit / option_cards / bootstrap_list / markdown_viewer）（2026-10-18 04:52）
+- 做了什么：
+  - `range_slider.rs`（1074 行，19 测试）：`HANDLE_SIZE 22` / `HANDLE_RADIUS 11` /
+    `INNER_RADIUS 5` / `GROOVE_HEIGHT 4` / `LABEL_HEIGHT 24` / `LABEL_GAP 4` /
+    `LABEL_PADDING_H 8` / `LABEL_PADDING_V 6` / `PREVIEW_W 160` / `PREVIEW_H 90` /
+    `PREVIEW_BORDER 2` / `PREVIEW_MARGIN 6`；`RangeSliderState` 的 `set_range` /
+    `set_values` / `to_pixel_x` / `to_value`（`editors::py_round` 半值取偶）/
+    `label_rects`（重叠以 mid 轴对称分开、分开后**仍夹**到 `[0, width-w]`）/
+    `mouse_press`（仅左键；`y < LABEL_HEIGHT` 只命中气泡且 end 优先）/
+    `update_drag`（值变才发信号）/ `start_inline_edit`（56×24，`max(0, min(w-56, hx-28))`）/
+    `finish_inline_edit`（**无条件**发信号）/ `update_preview`（`PreviewAction::Fetch`）。
+  - `token_line_edit.rs`（604 行，12 测试）：15 个几何/尺寸常量 + `token_background` /
+    `token_elide_width`（`width - 34`，可为负）/ `token_label_text` /
+    `TokenWidgetState::{elide, label_text}` / `TokenKey::submits` /
+    `TokenLineEdit::{key_press, focus_in, focus_out, underline, set_tokens, add_token,
+    remove_index, remove_last, input_visible}`；`underline` 的可见带 = Python
+    `barPath(0,h-10,w,10, r=5)` 减 `rectPath(0,h-10,w,8)` → `y = h-2`、`height = 2`、
+    `radius = min(5, height/2) = 1`。
+  - `option_cards.rs`（909 行，11 测试）：四张卡 `OutputFolderCard` /
+    `SubworkerCountCard` / `ClientProfileCard` / `UrlEditCard` / `HeadersEditCard`；
+    `build_profile_menu(include_auto)` 条目数**恒为 12**（1 首项 + raw + 分隔 + 9 家族），
+    `include_auto=false` 只把首项的 value 换成空串；每家族 = 「最新」+ 分隔 + 版本。
+  - `bootstrap_list.rs`（737 行，12 测试）：`to_ago_text`（60/3600/86400 三门槛，
+    `(s/60).floor()`）/ `to_status_text`（有缓存不看 7 天门槛）/ `card_content`
+    （`newest` 只取有缓存的、`hasError` 看全部）/ `is_subscription_url`（CPython
+    `urlsplit`：只 lstrip C0+空格、删 `\t\r\n`、scheme 需 `i>0` 且首字符 ASCII 字母、
+    netloc 到最早 `/?#`）/ `BootstrapListDialogState`（`validate()` 全通过才 `Commit`）。
+  - `markdown_viewer.rs`（568 行，12 测试）：`AlertKind` 五值 + light/dark 色 +
+    octicons path；`match_alert`（**大写 only**，输入是 Qt 已去 `>` 的块文本）；
+    `insert_alert_separators`（`(?m)^[ \t]*>[ \t]*\[!KIND\].*(?:\n[ \t]*>.*)*`，
+    每块后插 `"\n\n<!-- -->"`）；`alert_icon_svg` / `alert_heading_html` /
+    `alert_body_html`；`size_for_lines` / `content_height` / `resolve_height`
+    （**先 max 后 min**）/ `MarkdownViewerState`。
+  - `profile.rs` 追加 `FAMILY_VERSIONS`（9 家族 131 项，wreq `Emulation` 成员快照）+
+    `versions_of`；`identity.rs` 的 `IdentityPreset` 补 `Debug`（`ClientProfileCard`
+    要 derive）；`lib.rs` 按字母序注册五模块（`pub mod` 47 + `mod format` = 48）。
+- 实证结论（写进模块头）：
+  - `ALERT_MARKER` 的 `^` **没有** `MULTILINE`，而 `_refreshAlertStyle` 传给
+    `ALERT_MARKER.sub("", body, 1)` 的 body 是 Qt `toHtml()` 片段（以 `<p style=...>`
+    开头）→ **实际运行时 marker 根本不会被去掉**；Rust 侧忠实保留这个锚定语义，
+    并用 `body_html_only_strips_marker_at_body_start` 把两条分支都钉住。
+  - `token_line_edit.paintEvent` 的下划线不是「y=h-10 高 10」，而是
+    `barPath - rectPath` 剩下的 2px 带（`y = h-2`），`radius` 被高度夹成 1。
+  - `_updateDrag` 在值没变时**不**发 `rangeChanged`，`_onInlineEditFinished` 却
+    **无条件**发——两者口径不同，分别用 `update_drag -> Option<Range>` 与
+    `finish_inline_edit -> Range` 表达。
+  - `buildProfileMenu` 的 `includeAuto` 只影响首项，不影响条目数。
+- 修掉的**测试算错**（实现均与 Python 一致，是断言写错）：
+  - `markdown_viewer::viewer_state_clamps_size_hint`：`size_hint(95.0)` 内容本就高于
+    最小 10，结果是 95 不是 100；
+  - `option_cards::profile_menu_mirrors_build_profile_menu`：`include_auto=false`
+    的条目数仍是 12；
+  - `range_slider::label_rects_clamp_to_widget_bounds`：`endW` 是 `advance("100")+16
+    = 40`（不是 24），夹取后 `end.x = 300 - 40 = 260`；
+  - `range_slider::update_drag_clamps_and_only_reports_changes`：start 已被拖到 80
+    后，End 分支再夹回 80 是**无变化**（`None`）；另起一个 slider 才测得到 End 发信号；
+  - `token_line_edit::underline_only_when_focused`：`y` 是 `h-2 = 31`（不是 25）。
+- 修掉的两处 clippy（`-D warnings`）：`markdown_viewer.rs` 的
+  `doc_lazy_continuation`（bullet 里以 `+` 开头的续行被当成新列表项）、
+  `token_line_edit.rs` 的 `collapsible_if`（改 let-chain）。
+- 验证：
+  - `cargo fmt --all --check` 通过；
+  - `cargo test -p gd3-ui --lib`：**363 → 439 passed**；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings` 0 error（2m07s，增量）；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` 全绿；
+  - commit `8d67541`。
+- 下一步：P1 设置页收尾——`setting_cards.rs`(949)、`setting_card_group.rs`(290)、
+  `card_groups.rs`(191)；然后 P5 OOBE（`oobe_window.py` 971 行）→ P6 平台外壳。
+- 卡点：无
