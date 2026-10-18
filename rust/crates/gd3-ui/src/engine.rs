@@ -38,8 +38,9 @@
 //! - [`SpeedMeter`]：整类都搬了（`addSpeed`/`_tick`/`start`/`stop`）；
 //! - [`NameConflictQueue`]：复用 [`crate::name_conflict::NameConflictQueue`]
 //!   （第 65 步 b 已逐条对齐 `name_conflict_queue.py`）；
-//! - [`CategoryService`]：只搬「从配置装载规则」（`_load`）；匹配与输出目录解析仍是
-//!   [`crate::category`] / [`crate::file_select`] 里的纯函数；
+//! - [`CategoryService`]：规则装载 + 匹配 + 输出目录推导（第 95 步起整类都在
+//!   [`crate::category`]，这里 `pub use` 转出口）；`TaskService` 持有的是一份
+//!   **克隆**，改规则后要 [`Engine::push_categories`] 推过去（见「已知差异」）；
 //! - 监听器：`PortListener` / `RustBrowserListener` / `RustAria2Listener` 三个实现
 //!   都还没迁（套接字层在 `gd3-servers`），这里只保留**后端开关点**与配置快照。
 //!
@@ -59,6 +60,10 @@
 //!   `loadCrx`、`deleteRecoverably`、`fileWatcher` 全是桩：装配点保留，行为没有；
 //! - `probeConflict` 恒 `None`（`TaskStore.probeConflict` 依赖占位文件路径，尚未迁移），
 //!   所以冲突队列不会真的弹窗，见 [`Engine::on_name_conflicted`]；
+//! - **分类服务是克隆**：Python 的 `Engine` / `TaskService` / `FeatureService` 拿的是
+//!   同一个 `CategoryService` 实例，改规则立刻全处可见；Rust 侧
+//!   [`Engine::new`] 把 `category.clone()` 交给 `TaskService`，所以改完规则必须
+//!   调 [`Engine::push_categories`]（或 `TaskService::set_categories`）重新同步；
 //! - Python 的 `_pump()` 在 `_schedule` 里被顺带调用；这里由调用方显式
 //!   [`Engine::pump`]（`resume_saved` 只入队，第 82 步的结论）。
 
@@ -68,7 +73,7 @@ use std::path::{Path, PathBuf};
 use gd3_core::config::UserConfig;
 use gd3_core::settings;
 
-use crate::category::{self, CategoryRule};
+pub use crate::category::CategoryService;
 use crate::name_conflict::{
     ConflictActions, ConflictEvent, ConflictTask, DialogOutcome, NameConflictChoice,
     NameConflictQueue, ProbeTarget,
@@ -208,34 +213,6 @@ impl SpeedMeter {
 // ---------------------------------------------------------------------------
 // 桩服务
 // ---------------------------------------------------------------------------
-
-/// `app/services/category_service.py`（约 240 行）的桩：只搬 `_load`。
-///
-/// 分类规则的增删改在 [`crate::category`]（第 39 步），按名匹配在
-/// [`crate::file_select::match_by_name`]；`outputFolderOf`（决定任务落到哪个目录）
-/// 还没迁，等 `TaskStore` 一起。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CategoryService {
-    rules: Vec<CategoryRule>,
-}
-
-impl CategoryService {
-    /// `CategoryService.__init__` → `_load(cfg.categoryRules.value)`。
-    pub fn from_config(config: &UserConfig) -> Self {
-        let raw = config
-            .get("Category", "CategoryRules")
-            .and_then(|value| value.as_str())
-            .map(str::to_string);
-        CategoryService {
-            rules: category::parse_rules(raw.as_deref()),
-        }
-    }
-
-    /// `categories()`。
-    pub fn rules(&self) -> &[CategoryRule] {
-        &self.rules
-    }
-}
 
 /// `app/services/runtime_status.py`（195 行）的桩：运行时（aria2/ffmpeg…）的
 /// 探测、安装进度与 `statusChanged` 都未迁移。
@@ -443,7 +420,10 @@ impl Engine {
                 .to_string(),
         );
         trace.push("construct:TaskService".to_string());
-        let tasks = TaskService::new();
+        let mut tasks = TaskService::new();
+        // `TaskService.add` 的第一步就是 `categoryService.outputFolderOf(task)`；
+        // Python 传的是同一个实例，Rust 侧传克隆（见「已知差异」）。
+        tasks.set_categories(category.clone());
 
         trace.push(
             "connect:nameConflictQueue <- taskService.probeConflict, taskService.add, post"
@@ -534,6 +514,13 @@ impl Engine {
 
     pub fn category(&self) -> &CategoryService {
         &self.category
+    }
+
+    /// 改完规则/输出设置后把分类服务推给 [`TaskService`]。
+    ///
+    /// Python 没有这一步（同一个对象），Rust 侧是克隆；见「已知差异」。
+    pub fn push_categories(&mut self) {
+        self.tasks.set_categories(self.category.clone());
     }
 
     pub fn speed_meter(&self) -> &SpeedMeter {

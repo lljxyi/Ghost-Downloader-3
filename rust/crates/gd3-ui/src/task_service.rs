@@ -36,9 +36,12 @@
 //! - **不自己算磁盘剩余空间**：`disk_usage(task.outputFolder)` 是文件系统事实，
 //!   由调用方算好后走 `add_with_free_space(..., free_space)`；`free_space == None`
 //!   等价于 Python 的 `except OSError: pass`（跳过检查），`add()` 是它的简写；
-//! - `add_with_conflict()` 不调 `CategoryService.outputFolderOf()`（Python 在
-//!   `TaskService.add` 里先用它改写 `task.category` / `task.outputFolder`），
-//!   输出目录由调用方在 `TaskRecord` 上设好；
+//! - **分类服务是克隆**（第 95 步）：`add_with_conflict()` 的第一步就是
+//!   `self.categories.output_folder_of(&record)` 并写回 `category` /
+//!   `output_folder`（与 `task_service.py:361` 同序），但 Python 的
+//!   `TaskService` 拿的是 `Engine` 里**同一个** `CategoryService` 实例，Rust 侧
+//!   是克隆——改规则/设置后要 [`TaskService::set_categories`] 重新推
+//!   （引擎侧 [`crate::engine::Engine::push_categories`]）；
 //! - `pump()` 派发时用**空 workId** 占位（Python 在 `_dispatch` 里拿到协程 id 才
 //!   `queue.run(taskId, workId)`）：这里先 `run(id, "")` 把 `runningCount` 顶上去，
 //!   否则 `pump` 的循环条件与 `tasksAllCompleted` 的判定都不成立；引擎起来后由
@@ -63,6 +66,7 @@ use gd3_core::task::{TaskRecord, TaskStatus};
 
 use crate::AppWindow;
 use crate::card::CardRuntime;
+use crate::category::CategoryService;
 
 /// `TaskService.add()` 的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,12 +138,29 @@ pub struct TaskService {
     delete_denied_notified: bool,
     /// `TaskStore._placeholders` + `_taskByPlaceholder`。
     placeholders: PlaceholderRegistry,
+    /// `TaskService._categoryService`：`add` 的第一步就是
+    /// `task.category, task.outputFolder = outputFolderOf(task)`。
+    ///
+    /// `Default` = 空规则 + 分类功能关闭 → 不改 `category` / `outputFolder`
+    /// （与 Python 里 `isCategoryEnabled` 缺省 `False` 的行为一致）。
+    categories: CategoryService,
 }
 
 impl TaskService {
     /// 空服务、未 load（`flush()` 不会写盘）。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 分类服务（`TaskService._categoryService`）。
+    pub fn categories(&self) -> &CategoryService {
+        &self.categories
+    }
+
+    /// 换上分类服务。Python 是构造时传同一个实例；Rust 侧由
+    /// [`crate::engine::Engine::push_categories`] 在改完规则/设置后重新推。
+    pub fn set_categories(&mut self, categories: CategoryService) {
+        self.categories = categories;
     }
 
     /// 从 `tasks.jsonl` 读出的记录建服务（相当于 `loadSaved()` 之后）。
@@ -304,6 +325,12 @@ impl TaskService {
                 outcome: Some(AddOutcome::Duplicate),
             });
         }
+        // `task_service.py:361`：`task.category, task.outputFolder =
+        // categoryService.outputFolderOf(task)`——分类功能开启时，落在默认下载
+        // 目录的任务会被改道到分类目录（`record.category` 为 `None` 才按名字猜）。
+        let resolved = self.categories.output_folder_of(&record);
+        record.output_folder = resolved.folder_string();
+        record.category = resolved.category;
         // `Task.__post_init__` 的口径：`toSafeFilename(name, fallback="download")`。
         // 这里补一次，避免调用方塞进来的名字带分隔符把占位符建到输出目录之外。
         record.name = to_safe_filename(&record.name, "download", DEFAULT_MAX_FILENAME_LENGTH);
@@ -1618,5 +1645,132 @@ mod tests {
         assert_eq!(std::fs::read(&occupied).expect("读回"), b"occupied");
         assert_eq!(service.task("a").expect("任务在").name, "b(1).bin");
         assert_eq!(service.placeholders().owner(&renamed), Some("a"));
+    }
+    // -----------------------------------------------------------------------
+    // 第 95 步：`add` 第一步的 `outputFolderOf` 接线
+    // -----------------------------------------------------------------------
+
+    /// 预设规则 + 开启分类，下载目录 = `folder`。
+    fn categories(folder: &Path) -> CategoryService {
+        CategoryService::new(
+            crate::category::parse_rules(None),
+            crate::category::CategoryOutputSettings {
+                is_category_enabled: true,
+                download_folder: folder.to_string_lossy().into_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn add_with_conflict_moves_the_task_into_the_category_folder() {
+        let dir = TempDir::new("category-default");
+        let mut service = TaskService::new();
+        service.set_categories(categories(dir.path()));
+
+        let mut record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        record.name = "movie.mkv".to_string();
+        let report = service
+            .add_with_conflict(
+                record,
+                NameConflictChoice::KeepBoth,
+                true,
+                Some(1024),
+                never_trash,
+            )
+            .expect("不是错误");
+        assert_eq!(report.outcome, Some(AddOutcome::Added { queued: true }));
+
+        let task = service.task("a").expect("任务在");
+        assert_eq!(task.category.as_deref(), Some("cat_video"));
+        assert_eq!(
+            PathBuf::from(&task.output_folder),
+            dir.path().join("Video"),
+            "默认下载目录 → 分类目录"
+        );
+        // 占位符也建在分类目录里。
+        assert_eq!(
+            service
+                .placeholders()
+                .get("a")
+                .map(|entry| entry.paths.clone()),
+            Some(vec![dir.path().join("Video/movie.mkv")])
+        );
+        assert!(dir.path().join("Video/movie.mkv").exists());
+    }
+
+    #[test]
+    fn add_with_conflict_keeps_a_custom_folder_but_sets_the_category() {
+        let dir = TempDir::new("category-custom");
+        let custom = dir.path().join("custom");
+        let mut service = TaskService::new();
+        service.set_categories(categories(dir.path()));
+
+        let mut record = record_in(&custom, "a", TaskStatus::Waiting);
+        record.name = "movie.mkv".to_string();
+        service
+            .add_with_conflict(
+                record,
+                NameConflictChoice::KeepBoth,
+                true,
+                Some(1024),
+                never_trash,
+            )
+            .expect("不是错误");
+
+        let task = service.task("a").expect("任务在");
+        assert_eq!(task.category.as_deref(), Some("cat_video"));
+        assert_eq!(
+            PathBuf::from(&task.output_folder),
+            custom,
+            "非默认目录不动，但分类照样定"
+        );
+        assert!(custom.join("movie.mkv").exists());
+    }
+
+    #[test]
+    fn add_with_conflict_respects_an_explicit_category() {
+        let dir = TempDir::new("category-explicit");
+        let mut service = TaskService::new();
+        service.set_categories(categories(dir.path()));
+
+        let mut record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        record.name = "movie.mkv".to_string();
+        record.category = Some("cat_audio".to_string());
+        service
+            .add_with_conflict(
+                record,
+                NameConflictChoice::KeepBoth,
+                true,
+                Some(1024),
+                never_trash,
+            )
+            .expect("不是错误");
+
+        let task = service.task("a").expect("任务在");
+        assert_eq!(task.category.as_deref(), Some("cat_audio"));
+        assert_eq!(PathBuf::from(&task.output_folder), dir.path().join("Audio"));
+    }
+
+    #[test]
+    fn add_with_conflict_leaves_the_folder_alone_when_categories_are_disabled() {
+        let dir = TempDir::new("category-disabled");
+        // `TaskService::default()` 的分类服务 = 空规则 + 关闭。
+        let mut service = TaskService::new();
+        let mut record = record_in(dir.path(), "a", TaskStatus::Waiting);
+        record.name = "movie.mkv".to_string();
+        service
+            .add_with_conflict(
+                record,
+                NameConflictChoice::KeepBoth,
+                true,
+                Some(1024),
+                never_trash,
+            )
+            .expect("不是错误");
+
+        let task = service.task("a").expect("任务在");
+        assert_eq!(task.category, None, "关闭时连分类都不猜");
+        assert_eq!(PathBuf::from(&task.output_folder), dir.path());
+        assert!(dir.path().join("movie.mkv").exists());
     }
 }

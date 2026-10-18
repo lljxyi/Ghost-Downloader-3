@@ -220,6 +220,43 @@ cargo run -p gd3-ui --bin gd3-ui -- --headless --frames 3 --data-dir /tmp/gd3-da
 cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.py）
 ```
 
+### 分类匹配与输出目录（`category.rs`）
+
+`app/services/category_service.py` 的匹配半边（第 95 步）。规则表与写路径在第 39/49 步
+就已落地，这一步补的是「任务落到哪个目录」：
+
+| Python | Rust | 口径 |
+|---|---|---|
+| `Path(name).suffixes` | `path_suffixes` / `normalized_suffixes` | 先去掉尾部分隔符再取 `name`；名字以 `.` 结尾 → 空；开头连续点全剥（`.bashrc` 无后缀、`.tar.gz` 只有 `gz`）；中间空段保留（`a..b` → `["", "b"]`） |
+| `CategoryService.matchByName` | `match_by_name`（`file_select` 的同名函数是 `CategoryInfo` 投影版薄包装，内核同为 `match_by_name_in`） | 候选顺序「末两段拼接」→「末段」，逐个候选扫**全部分类**；`a.tar.gz` 先试 `tar.gz` 再试 `gz`，`a.mp3.mp4` 先试 `mp3.mp4` 再试 `mp4` |
+| `categoryOf` | `category_of` | `files` 长度 > 1 → 空串（多文件任务不分类），否则按 `name` 猜 |
+| `folderOf` | `folder_of` | 未知分类 / `folder` 为 `None` 或空串 → `None`；否则 `{default}` **全替换**成下载目录，返回裸字符串（不归一化） |
+| `outputFolderOf` | `output_folder_of` | 关闭分类 → 原样；`category == None` 才按名猜；分类非空**且**输出目录 == 默认下载目录 → 换分类目录（`folderOf` 为 `None` 时保持原目录） |
+
+`OutputFolder { category: Option<String>, folder: PathBuf }` 保留 Python 的 `None` / `""`
+之别：`None` = 没指定（这时才会去猜），`Some("")` = 显式「不分类」（不再猜、也不换目录）。
+「是不是默认下载目录」用 `Path` 相等判断，`/d/`、`/d/.`、`/d//` 都等价于 `/d`；
+替换出来的目录过 `posix_normpath`（对应 Python `Path(str)` 的归一化），没替换时
+逐字节保留入参。
+
+`CategoryService`（第 95 步从 `engine.rs` 搬来，`engine` 仍 `pub use` 同一类型）
+= 规则表 + `CategoryOutputSettings { is_category_enabled, download_folder }`
+（`from_config` 读 `Category/EnableCategory` 与 `GeneralDownload/DownloadFolder`，
+缺键按 `SPECS` 缺省）。`TaskService::add_with_conflict` 的**第一步**就是
+`self.categories.output_folder_of(&record)` 并把 `category` / `output_folder` 写回，
+与 `task_service.py:361` 同序。
+
+已知差异：
+
+- Python 的 `Engine` / `TaskService` 拿的是同一个 `CategoryService` 实例，改规则立刻
+  全处可见；Rust 侧 `Engine::new` 传的是克隆，改完规则要 `Engine::push_categories()`
+  （或 `TaskService::set_categories`）重新同步。`TaskService::default()` 的分类服务是
+  「空规则 + 关闭」，所以没接线的调用方行为与之前完全一致；
+- 前导 `//` 的路径：Rust 的 `Path` 压成单个根，Python `PurePosixPath("//d")` 保留双斜杠，
+  这条差异没镜像（也不影响「同一目录」判定之外的行为）。
+
+规模：`category.rs` **1180 行 / 14 单测**（第 95 步 +7）。
+
 ### 任务记账（`task_service.rs`）
 
 `app/services/task_service.py` 的 `TaskService`（705 行）把「存储/队列记账 + 引擎交互 +
@@ -257,8 +294,10 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   `UpdateReport { name, paths, created, moved, removed }` 把「实际动了什么」交给调用方
   （`name` 是最终名字，撞名时与传入的不同）；任务没有登记项时返回 `Ok(None)`
   （Python 是 `KeyError`）。
-- 已知差异：`add_with_conflict()` **不调** `CategoryService.outputFolderOf()`（分类目录
-  规则还没搬），输出目录由调用方填好；`delete_recoverably` 由调用方注入（生产传
+- **第一步是 `outputFolderOf`**（第 95 步）：`add_with_conflict()` 先算
+  `self.categories.output_folder_of(&record)` 并把 `category` / `output_folder` 写回
+  （分类功能开启且输出目录是默认下载目录时改道到分类目录），再做 `mkdir -p` /
+  占位符 / 重名决策；`delete_recoverably` 由调用方注入（生产传
   `gd3_core::trash::delete_recoverably`，`Err` 按 `false` 处理）。
 
 ### 引擎装配（`engine.rs`）
@@ -785,8 +824,8 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1622 行 / 38 单测**
-（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个）。
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1773 行 / 42 单测**
+（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个）。
 
 ## 剩余工作（Phase 8）
 

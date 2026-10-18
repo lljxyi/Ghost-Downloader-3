@@ -469,54 +469,27 @@ pub struct TypeMenuItem {
     pub count: usize,
 }
 
-/// 镜像 `Path(name).suffixes`（CPython 3.13 口径，见模块头）。
-pub fn path_suffixes(name: &str) -> Vec<String> {
-    // `Path.name`：去掉尾部分隔符后取最后一段。
-    let trimmed = name.trim_end_matches('/');
-    let file_name = match trimmed.rsplit_once('/') {
-        Some((_, tail)) => tail,
-        None => trimmed,
-    };
-    if file_name.ends_with('.') {
-        return Vec::new();
-    }
-    let stripped = file_name.trim_start_matches('.');
-    let mut segments = stripped.split('.');
-    segments.next();
-    segments.map(|segment| format!(".{segment}")).collect()
-}
-
-/// `matchByName` 的中间量：`[s.lstrip(".").lower() for s in Path(filename).suffixes]`。
-pub fn normalized_suffixes(name: &str) -> Vec<String> {
-    path_suffixes(name)
-        .iter()
-        .map(|suffix| suffix.trim_start_matches('.').to_lowercase())
-        .collect()
-}
+// 后缀解析与「按名匹配」的内核在第 95 步搬进 [`crate::category`]（
+// `CategoryService.matchByName` 与本模块的「按类型选择」共用同一套候选顺序），
+// 这里只留 `CategoryInfo` 投影版本的薄包装，后缀函数直接转出口。
+pub use crate::category::{normalized_suffixes, path_suffixes};
 
 /// 镜像 `CategoryService.matchByName`（`services/category_service.py:157-171`）：
 /// 候选顺序「末两段拼接」→「末段」，逐个候选遍历**全部分类**（分类内按
 /// `extensions` 顺序），命中即返回 categoryId；无后缀或无命中返回空串。
+///
+/// 内核是 [`crate::category::match_by_name_in`]，规则表版本是
+/// [`crate::category::match_by_name`]。
 pub fn match_by_name(filename: &str, categories: &[CategoryInfo]) -> String {
-    let suffixes = normalized_suffixes(filename);
-    if suffixes.is_empty() {
-        return String::new();
-    }
-    let mut candidates: Vec<String> = Vec::new();
-    if suffixes.len() >= 2 {
-        candidates.push(suffixes[suffixes.len() - 2..].join("."));
-    }
-    if let Some(last) = suffixes.last() {
-        candidates.push(last.clone());
-    }
-    for candidate in candidates {
-        for category in categories {
-            if category.extensions.contains(&candidate) {
-                return category.category_id.clone();
-            }
-        }
-    }
-    String::new()
+    crate::category::match_by_name_in(
+        filename,
+        categories.iter().map(|category| {
+            (
+                category.category_id.as_str(),
+                category.extensions.as_slice(),
+            )
+        }),
+    )
 }
 
 /// 镜像 `_buildTypeMenu`：按首次出现顺序出项，末尾补「其他」。
@@ -594,28 +567,6 @@ mod tests {
                 extensions: vec!["mp3".into()],
             },
         ]
-    }
-
-    /// venv 实跑（CPython 3.13.5）的 `Path.suffixes` 逐条锁定。
-    #[test]
-    fn path_suffixes_matches_cpython_313() {
-        let cases: [(&str, Vec<&str>); 12] = [
-            ("a.tar.gz", vec![".tar", ".gz"]),
-            ("a.MP4", vec![".MP4"]),
-            ("noext", vec![]),
-            (".bashrc", vec![]),
-            ("a.", vec![]),
-            ("x.y.z.", vec![]),
-            ("a..b", vec![".", ".b"]),
-            (".tar.gz", vec![".gz"]),
-            ("文件夹/视频.MKV", vec![".MKV"]),
-            ("dir/a.b/c.MKV", vec![".MKV"]),
-            ("A.B.C", vec![".B", ".C"]),
-            ("a.b-c.d", vec![".b-c", ".d"]),
-        ];
-        for (name, expected) in cases {
-            assert_eq!(path_suffixes(name), expected, "suffixes({name})");
-        }
     }
 
     /// `matchByName` 与 venv 实跑逐条一致（含空串分支）。

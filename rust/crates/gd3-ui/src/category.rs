@@ -24,11 +24,22 @@
 //! 镜像 `CategoryService` 的五个写方法；`draft_to_rule` 由真
 //! `CategoryEditDialog.category()` 生成的金文件逐条对比。
 //!
-//! 匹配与输出目录解析（matchByName/categoryOf/outputFolderOf）随
-//! Phase 8 任务造/引擎桥接并轨；cfg 写与 categoriesChanged 重推归调用方。
+//! 匹配与输出目录解析（第 95 步）：`path_suffixes` / `normalized_suffixes`
+//! 镜像 `Path(name).suffixes`（CPython 3.13 口径，原在 `file_select`），
+//! `match_by_name` 镜像 `CategoryService.matchByName`，`category_of` /
+//! `folder_of` / `output_folder_of` 镜像 `categoryOf` / `folderOf` /
+//! `outputFolderOf`；[`CategoryService`] 把「规则表 + 输出设置」打包成
+//! `TaskService` 能直接持有的服务（第 95 步从 `engine` 搬来，`engine`
+//! 仍 `pub use` 同一类型）。cfg 写与 `categoriesChanged` 重推归调用方。
+
+use std::path::{Path, PathBuf};
+
+use gd3_core::config::{UserConfig, py_json_string};
+use gd3_core::path::posix_normpath;
+use gd3_core::settings;
+use gd3_core::task::TaskRecord;
 
 use crate::pystr::py_strip;
-use gd3_core::config::py_json_string;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CategoryRule {
@@ -422,6 +433,279 @@ pub fn reorder_categories(rules: &mut Vec<CategoryRule>, category_ids: &[String]
     true
 }
 
+// ---------------------------------------------------------------------------
+// 按名匹配（matchByName）
+// ---------------------------------------------------------------------------
+
+/// 镜像 `Path(name).suffixes`（CPython 3.13 口径，逐条实跑钉在单测里）。
+///
+/// 与 `Pathlib` 的三处非显然口径：
+/// - 只看 `Path(name).name`（尾部分隔符先去掉，再取最后一段），所以
+///   `dir/a.b/c.MKV` 只取 `c.MKV`；
+/// - 名字以 `.` 结尾（`a.` / `x.y.z.`）→ **空列表**（`Path("a.").suffixes == []`）；
+/// - 开头的连续点全部剥掉（`.bashrc` → 无后缀；`.tar.gz` → `[".gz"]`），
+///   中间的空段保留（`a..b` → `[".", ".b"]`）。
+pub fn path_suffixes(name: &str) -> Vec<String> {
+    // `Path.name`：去掉尾部分隔符后取最后一段。
+    let trimmed = name.trim_end_matches('/');
+    let file_name = match trimmed.rsplit_once('/') {
+        Some((_, tail)) => tail,
+        None => trimmed,
+    };
+    if file_name.ends_with('.') {
+        return Vec::new();
+    }
+    let stripped = file_name.trim_start_matches('.');
+    let mut segments = stripped.split('.');
+    segments.next();
+    segments.map(|segment| format!(".{segment}")).collect()
+}
+
+/// `matchByName` 的中间量：`[s.lstrip(".").lower() for s in Path(filename).suffixes]`。
+pub fn normalized_suffixes(name: &str) -> Vec<String> {
+    path_suffixes(name)
+        .iter()
+        .map(|suffix| suffix.trim_start_matches('.').to_lowercase())
+        .collect()
+}
+
+/// [`match_by_name`] 与 [`crate::file_select::match_by_name`] 共用的内核。
+///
+/// 候选顺序（`category_service.py:157-171`）：「末两段拼接」→「末段」，逐个
+/// 候选遍历**全部分类**（分类内按 `extensions` 顺序），命中即返回 categoryId。
+/// 这样 `a.tar.gz` 先试 `tar.gz` 再试 `gz`，而 `a.mp3.mp4` 先试 `mp3.mp4`
+/// 再试 `mp4`——长候选优先是 Python 的既有行为，不是笔误。
+pub fn match_by_name_in<'a, I>(filename: &str, categories: I) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a [String])>,
+{
+    let suffixes = normalized_suffixes(filename);
+    if suffixes.is_empty() {
+        return String::new();
+    }
+
+    let mut candidates: Vec<String> = Vec::new();
+    if suffixes.len() >= 2 {
+        candidates.push(suffixes[suffixes.len() - 2..].join("."));
+    }
+    if let Some(last) = suffixes.last() {
+        candidates.push(last.clone());
+    }
+
+    // 分类表要按候选重扫一遍（Python 是两层 for），先收成 Vec。
+    let categories: Vec<(&str, &[String])> = categories.into_iter().collect();
+    for candidate in candidates {
+        for (category_id, extensions) in &categories {
+            if extensions.contains(&candidate) {
+                return (*category_id).to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// 镜像 `CategoryService.matchByName`：无后缀或无命中返回空串。
+pub fn match_by_name(rules: &[CategoryRule], filename: &str) -> String {
+    match_by_name_in(
+        filename,
+        rules
+            .iter()
+            .map(|rule| (rule.category_id.as_str(), rule.extensions.as_slice())),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// 输出目录推导（categoryOf / folderOf / outputFolderOf）
+// ---------------------------------------------------------------------------
+
+/// `cfg.isCategoryEnabled` + `cfg.downloadFolder` 的快照（Python 是活对象，
+/// Rust 侧由调用方在改配置后重建，见 [`CategoryService::set_settings`]）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CategoryOutputSettings {
+    pub is_category_enabled: bool,
+    pub download_folder: String,
+}
+
+impl CategoryOutputSettings {
+    /// `cfg.isCategoryEnabled.value` / `cfg.downloadFolder.value`。
+    ///
+    /// 走 `settings::read_*`（按 `SPECS` 的缺省值兜底），与 Python
+    /// `ConfigItem.value` 的「缺键即缺省」一致；`read_*` 返回 `None` 只可能
+    /// 出现在属性名不存在时，此时退回 `Default`。
+    pub fn from_config(config: &UserConfig) -> Self {
+        CategoryOutputSettings {
+            is_category_enabled: settings::read_bool(config, "isCategoryEnabled").unwrap_or(false),
+            download_folder: settings::read_text(config, "downloadFolder").unwrap_or_default(),
+        }
+    }
+}
+
+/// `outputFolderOf` 的返回值。
+///
+/// `category` 保留 Python 的 `None` / `""` 之别：`None` = 任务没指定分类（这时
+/// 才按名字猜），`Some("")` = 显式「不分类」（不再猜、也不换目录）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputFolder {
+    pub category: Option<String>,
+    pub folder: PathBuf,
+}
+
+impl OutputFolder {
+    /// 写回 `TaskRecord.output_folder` 的字符串口径。
+    ///
+    /// 目录没被替换时逐字节等于入参（Python 的 `task.outputFolder` 本来就是个
+    /// 已归一化的 `Path`，不会有差别）；被替换时来自 [`posix_normpath`]，
+    /// 与 Python `Path(str)` 的归一化同口径。
+    pub fn folder_string(&self) -> String {
+        self.folder.to_string_lossy().into_owned()
+    }
+}
+
+/// 镜像 `CategoryService.categoryById`。
+pub fn category_by_id<'a>(
+    rules: &'a [CategoryRule],
+    category_id: &str,
+) -> Option<&'a CategoryRule> {
+    rules.iter().find(|rule| rule.category_id == category_id)
+}
+
+/// 镜像 `CategoryService.categoryOf`：多文件任务（`files` 长度 > 1）不分目录，
+/// 直接返回空串；否则按任务名猜。
+pub fn category_of(rules: &[CategoryRule], record: &TaskRecord) -> String {
+    if record.is_output_folder() {
+        return String::new();
+    }
+    match_by_name(rules, &record.name)
+}
+
+/// 镜像 `CategoryService.folderOf`：未知分类 / `folder` 缺失或空串 → `None`；
+/// 否则把**全部** `{default}` 换成下载目录（Python `str.replace` 是全替换）。
+///
+/// 返回值**不做**路径归一化（Python 这里返回的也是裸字符串），归一化由
+/// [`output_folder_of`] 转 `Path` 时完成。
+pub fn folder_of(
+    rules: &[CategoryRule],
+    category_id: &str,
+    download_folder: &str,
+) -> Option<String> {
+    let rule = category_by_id(rules, category_id)?;
+    let folder = rule.folder.as_deref().filter(|folder| !folder.is_empty())?;
+    Some(folder.replace("{default}", download_folder))
+}
+
+/// 镜像 `CategoryService.outputFolderOf`（`category_service.py:184-192`）。
+///
+/// 三条分支：
+/// 1. 分类功能关闭 → 原样返回（`category` 也不猜）；
+/// 2. `record.category` 为 `None` → 按名字猜（可能是空串）；
+/// 3. 分类非空**且**当前输出目录就是默认下载目录 → 换成分类目录
+///    （`folderOf` 为 `None` 时保持原目录）。
+///
+/// 「是不是默认下载目录」用 `Path` 相等判断，所以 `a/`、`a//b`、`a/.` 这类
+/// 写法与 Python `Path(...) == Path(...)` 一样被视为同一个目录。
+pub fn output_folder_of(
+    rules: &[CategoryRule],
+    record: &TaskRecord,
+    settings: &CategoryOutputSettings,
+) -> OutputFolder {
+    if !settings.is_category_enabled {
+        return OutputFolder {
+            category: record.category.clone(),
+            folder: PathBuf::from(&record.output_folder),
+        };
+    }
+
+    let mut category = record.category.clone();
+    if category.is_none() {
+        category = Some(category_of(rules, record));
+    }
+
+    let mut folder = PathBuf::from(&record.output_folder);
+    if let Some(category_id) = category.as_deref().filter(|id| !id.is_empty())
+        && folder == Path::new(&settings.download_folder)
+        && let Some(mapped) = folder_of(rules, category_id, &settings.download_folder)
+    {
+        folder = PathBuf::from(posix_normpath(&mapped));
+    }
+
+    OutputFolder { category, folder }
+}
+
+/// `app/services/category_service.py` 的服务面：规则表 + 输出设置。
+///
+/// 第 95 步从 `engine` 搬来（`engine` 仍 `pub use` 同一类型），为的是让
+/// [`crate::task_service::TaskService`] 能直接持有它——`TaskService.add` 的
+/// 第一步就是 `outputFolderOf`。
+///
+/// 与 Python 的差异：Python 的 `TaskService` 和 `Engine` 拿的是**同一个**
+/// `CategoryService` 实例（改规则立刻可见）；Rust 侧是克隆，改完规则要由
+/// 调用方 [`CategoryService`] 重新推给 `TaskService`
+/// （[`crate::task_service::TaskService::set_categories`]）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CategoryService {
+    rules: Vec<CategoryRule>,
+    settings: CategoryOutputSettings,
+}
+
+impl CategoryService {
+    /// `CategoryService.__init__` → `_load(cfg.categoryRules.value)`。
+    pub fn from_config(config: &UserConfig) -> Self {
+        let raw = config
+            .get("Category", "CategoryRules")
+            .and_then(|value| value.as_str())
+            .map(str::to_string);
+        CategoryService {
+            rules: parse_rules(raw.as_deref()),
+            settings: CategoryOutputSettings::from_config(config),
+        }
+    }
+
+    /// 显式构造（单测与「配置已解析好」的调用方用）。
+    pub fn new(rules: Vec<CategoryRule>, settings: CategoryOutputSettings) -> Self {
+        CategoryService { rules, settings }
+    }
+
+    /// `categories()`。
+    pub fn rules(&self) -> &[CategoryRule] {
+        &self.rules
+    }
+
+    /// 改规则表（`add/update/remove/reorder/reset` 之后调用方写回 cfg 并调这里）。
+    pub fn set_rules(&mut self, rules: Vec<CategoryRule>) {
+        self.rules = rules;
+    }
+
+    /// `cfg.isCategoryEnabled` / `cfg.downloadFolder` 的快照。
+    pub fn settings(&self) -> &CategoryOutputSettings {
+        &self.settings
+    }
+
+    /// 配置变更后重建快照（Python 每次用时现读 `cfg.*.value`）。
+    pub fn set_settings(&mut self, settings: CategoryOutputSettings) {
+        self.settings = settings;
+    }
+
+    /// `matchByName`。
+    pub fn match_by_name(&self, filename: &str) -> String {
+        match_by_name(&self.rules, filename)
+    }
+
+    /// `categoryOf`。
+    pub fn category_of(&self, record: &TaskRecord) -> String {
+        category_of(&self.rules, record)
+    }
+
+    /// `folderOf`（用当前快照里的下载目录）。
+    pub fn folder_of(&self, category_id: &str) -> Option<String> {
+        folder_of(&self.rules, category_id, &self.settings.download_folder)
+    }
+
+    /// `outputFolderOf`。
+    pub fn output_folder_of(&self, record: &TaskRecord) -> OutputFolder {
+        output_folder_of(&self.rules, record, &self.settings)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -646,5 +930,251 @@ mod tests {
         assert_eq!(reset.len(), 8);
         assert_eq!(reset[0].category_id, "cat_video");
         assert_eq!(reset, default_rules());
+    }
+    // -----------------------------------------------------------------------
+    // 第 95 步：后缀解析 / 按名匹配 / 输出目录推导
+    // -----------------------------------------------------------------------
+
+    /// venv 实跑（CPython 3.13.5）的 `Path.suffixes` 逐条锁定（第 95 步从
+    /// `file_select` 搬来，实现也搬来了）。
+    #[test]
+    fn path_suffixes_matches_cpython_313() {
+        let cases: [(&str, Vec<&str>); 12] = [
+            ("a.tar.gz", vec![".tar", ".gz"]),
+            ("a.MP4", vec![".MP4"]),
+            ("noext", vec![]),
+            (".bashrc", vec![]),
+            ("a.", vec![]),
+            ("x.y.z.", vec![]),
+            ("a..b", vec![".", ".b"]),
+            (".tar.gz", vec![".gz"]),
+            ("文件夹/视频.MKV", vec![".MKV"]),
+            ("dir/a.b/c.MKV", vec![".MKV"]),
+            ("A.B.C", vec![".B", ".C"]),
+            ("a.b-c.d", vec![".b-c", ".d"]),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(path_suffixes(name), expected, "suffixes({name})");
+        }
+    }
+
+    fn record(name: &str, output_folder: &str) -> TaskRecord {
+        TaskRecord {
+            name: name.to_string(),
+            url: String::new(),
+            pack_id: String::new(),
+            task_id: "t".into(),
+            status: gd3_core::task::TaskStatus::Waiting,
+            steps: Vec::new(),
+            created_at: 0,
+            completed_at: 0,
+            output_folder: output_folder.to_string(),
+            file_size: 0,
+            files: None,
+            category: None,
+            should_seed: false,
+            checksums: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
+            type_name: None,
+        }
+    }
+
+    fn task_file(index: i64, relative_path: &str) -> gd3_core::task::TaskFile {
+        gd3_core::task::TaskFile {
+            index,
+            relative_path: relative_path.to_string(),
+            size: 0,
+            selected: true,
+            downloaded_bytes: 0,
+            completed: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn enabled(download_folder: &str) -> CategoryOutputSettings {
+        CategoryOutputSettings {
+            is_category_enabled: true,
+            download_folder: download_folder.to_string(),
+        }
+    }
+
+    fn custom_rule(category_id: &str, folder: Option<&str>) -> CategoryRule {
+        CategoryRule {
+            category_id: category_id.to_string(),
+            name: category_id.to_string(),
+            icon: "DOCUMENT".into(),
+            extensions: vec!["x".into()],
+            folder: folder.map(str::to_string),
+        }
+    }
+
+    /// `matchByName`：长候选优先、大小写无关、无后缀/无命中空串。
+    #[test]
+    fn match_by_name_prefers_the_longer_suffix_chain() {
+        let rules = default_rules();
+        assert_eq!(match_by_name(&rules, "a.mp4"), "cat_video");
+        assert_eq!(match_by_name(&rules, "a.MKV"), "cat_video");
+        assert_eq!(match_by_name(&rules, "a.tar.gz"), "cat_archive");
+        // 「末两段拼接」优先于「末段」：mp3.mp4 命中 video(mp4)。
+        assert_eq!(match_by_name(&rules, "a.mp3.mp4"), "cat_video");
+        // 拼接候选不命中时回落末段：mp3.gz → gz → cat_archive（venv 实跑同）。
+        assert_eq!(match_by_name(&rules, "a.mp3.gz"), "cat_archive");
+        assert_eq!(match_by_name(&rules, "a.mp3"), "cat_audio");
+        // 两段都不命中 → 空串。
+        assert_eq!(match_by_name(&rules, "a.mp3.zzz"), "");
+        assert_eq!(match_by_name(&rules, "noext"), "");
+        assert_eq!(match_by_name(&rules, ".bashrc"), "");
+        assert_eq!(match_by_name(&[], "a.mp4"), "");
+    }
+
+    /// `categoryOf`：`files` 长度 > 1 → 空串；`None` / 单文件 → 按名字猜。
+    #[test]
+    fn category_of_skips_multi_file_tasks() {
+        let rules = default_rules();
+        assert_eq!(category_of(&rules, &record("a.mkv", "/d")), "cat_video");
+
+        let mut single = record("a.mkv", "/d");
+        single.files = Some(vec![task_file(0, "a.mkv")]);
+        assert_eq!(category_of(&rules, &single), "cat_video");
+
+        let mut multi = record("a.mkv", "/d");
+        multi.files = Some(vec![task_file(0, "a.mkv"), task_file(1, "b.mkv")]);
+        assert_eq!(category_of(&rules, &multi), "");
+    }
+
+    /// `folderOf`：`{default}` 全替换；未知分类 / 空 `folder` → `None`。
+    #[test]
+    fn folder_of_replaces_every_default_placeholder() {
+        let rules = vec![
+            custom_rule("cat_a", Some("{default}/x/{default}")),
+            custom_rule("cat_b", Some("")),
+            custom_rule("cat_c", None),
+        ];
+        assert_eq!(
+            folder_of(&rules, "cat_a", "/root/dl"),
+            Some("/root/dl/x//root/dl".into())
+        );
+        assert_eq!(folder_of(&rules, "cat_b", "/root/dl"), None);
+        assert_eq!(folder_of(&rules, "cat_c", "/root/dl"), None);
+        assert_eq!(folder_of(&rules, "nope", "/root/dl"), None);
+        // 预设：`cat_other` 的 folder 为 None → 不换目录。
+        assert_eq!(folder_of(&default_rules(), "cat_other", "/d"), None);
+        assert_eq!(
+            folder_of(&default_rules(), "cat_video", "/d"),
+            Some("/d/Video".into())
+        );
+    }
+
+    /// `outputFolderOf`：关闭时原样；开启时只在「默认下载目录」上换目录。
+    #[test]
+    fn output_folder_of_only_rewrites_the_default_folder() {
+        let rules = default_rules();
+        let off = CategoryOutputSettings::default();
+
+        // 1. 关闭 → 不猜分类、不动目录（Python 直接 return）。
+        let resolved = output_folder_of(&rules, &record("a.mkv", "/d"), &off);
+        assert_eq!(resolved.category, None);
+        assert_eq!(resolved.folder, PathBuf::from("/d"));
+
+        // 2. 开启 + 默认目录 + 命中 → 分类目录。
+        let resolved = output_folder_of(&rules, &record("a.mkv", "/d"), &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some("cat_video"));
+        assert_eq!(resolved.folder, PathBuf::from("/d/Video"));
+
+        // 3. 开启 + 自定义目录 → 只定分类，目录不动。
+        let resolved = output_folder_of(&rules, &record("a.mkv", "/custom"), &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some("cat_video"));
+        assert_eq!(resolved.folder, PathBuf::from("/custom"));
+
+        // 4. 显式分类优先于按名猜。
+        let mut explicit = record("a.mkv", "/d");
+        explicit.category = Some("cat_audio".into());
+        let resolved = output_folder_of(&rules, &explicit, &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some("cat_audio"));
+        assert_eq!(resolved.folder, PathBuf::from("/d/Audio"));
+
+        // 5. 显式空串 = 「不分类」，既不猜也不换目录。
+        let mut blank = record("a.mkv", "/d");
+        blank.category = Some(String::new());
+        let resolved = output_folder_of(&rules, &blank, &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some(""));
+        assert_eq!(resolved.folder, PathBuf::from("/d"));
+
+        // 6. 未知分类 → 保留 id、目录不动。
+        let mut unknown = record("a.mkv", "/d");
+        unknown.category = Some("nope".into());
+        let resolved = output_folder_of(&rules, &unknown, &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some("nope"));
+        assert_eq!(resolved.folder, PathBuf::from("/d"));
+
+        // 7. 未命中 → `Some("")`，目录不动。
+        let resolved = output_folder_of(&rules, &record("a.unknown", "/d"), &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some(""));
+        assert_eq!(resolved.folder, PathBuf::from("/d"));
+
+        // 8. 多文件任务不分类（categoryOf 返回空串）。
+        let mut multi = record("a.mkv", "/d");
+        multi.files = Some(vec![task_file(0, "a.mkv"), task_file(1, "b.mkv")]);
+        let resolved = output_folder_of(&rules, &multi, &enabled("/d"));
+        assert_eq!(resolved.category.as_deref(), Some(""));
+        assert_eq!(resolved.folder, PathBuf::from("/d"));
+    }
+
+    /// 目录等价判定与写回口径：尾斜杠/重复斜杠/`.` 都算同一个目录，
+    /// 替换出来的目录按 `Path(str)` 归一化。
+    #[test]
+    fn output_folder_of_normalizes_like_pathlib() {
+        let rules = default_rules();
+        // 注：`//d` 不算——Rust 的 `Path` 把前导 `//` 压成根，而 Python
+        // `PurePosixPath("//d") != PurePosixPath("/d")`；这条差异不在此钉。
+        for folder in ["/d/", "/d/.", "/d//"] {
+            let resolved = output_folder_of(&rules, &record("a.mkv", folder), &enabled("/d"));
+            assert_eq!(
+                resolved.folder,
+                PathBuf::from("/d/Video"),
+                "目录写法 {folder} 应视作默认下载目录"
+            );
+        }
+
+        // 下载目录自带尾斜杠 → `{default}/Video` 拼出 `/d//Video`，归一化后与
+        // Python `Path(...)` 的 `str()` 一致。
+        let resolved = output_folder_of(&rules, &record("a.mkv", "/d/"), &enabled("/d/"));
+        assert_eq!(resolved.folder_string(), "/d/Video");
+
+        // 未替换时逐字节保留入参。
+        let resolved = output_folder_of(&rules, &record("a.mkv", "/custom/"), &enabled("/d"));
+        assert_eq!(resolved.folder_string(), "/custom/");
+    }
+
+    /// 服务面：`from_config` 读两个键、`Default` 是「空规则 + 关闭」。
+    #[test]
+    fn service_reads_both_config_keys() {
+        let config = gd3_core::settings::default_config_with_download_folder("/dl");
+        let service = CategoryService::from_config(&config);
+        // `categoryRules` 缺省 `"[]"` → 八预设。
+        assert_eq!(service.rules().len(), 8);
+        assert_eq!(service.settings().download_folder, "/dl");
+        assert!(!service.settings().is_category_enabled);
+        // 关闭 → `output_folder_of` 不换目录。
+        assert_eq!(
+            service.output_folder_of(&record("a.mkv", "/dl")).folder,
+            PathBuf::from("/dl")
+        );
+
+        let mut service = service;
+        service.set_settings(enabled("/dl"));
+        assert_eq!(
+            service.output_folder_of(&record("a.mkv", "/dl")).folder,
+            PathBuf::from("/dl/Video")
+        );
+        assert_eq!(service.match_by_name("a.mkv"), "cat_video");
+        assert_eq!(service.category_of(&record("a.mkv", "/dl")), "cat_video");
+        assert_eq!(service.folder_of("cat_video"), Some("/dl/Video".into()));
+
+        // `Default` = 空规则 + 关闭（`TaskService::default()` 依赖这一点）。
+        let empty = CategoryService::default();
+        assert!(empty.rules().is_empty());
+        assert!(!empty.settings().is_category_enabled);
+        assert_eq!(empty.match_by_name("a.mkv"), "");
     }
 }
