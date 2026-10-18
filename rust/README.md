@@ -1121,6 +1121,51 @@ URL 先去重（保序，留第一次出现），再跑 `SequenceMatcher(旧, �
 规模：`task_draft.rs` **1075 行 / 32 单测**；`sequence_matcher.rs` **387 行 / 11 单测**；
 `gd3-core/src/task.rs` 加 `TaskOptions::from_options`（**513 行**）。
 
+## 速度表（`gd3-ui::speed_meter`）
+
+`app/services/speed_meter.py`（56 行）的移植。「全局下载速度」这一条数字：任务每收一块
+数据就 `addSpeed(n)`，速度表每秒把累加到的字节数当成瞬时速度发布一次再清零——不做滑动
+平均。它同时是**限速闸门**，任务在每个分片前问一次「现在超限了吗」。
+
+| Python | Rust | 备注 |
+|---|---|---|
+| `start()` | `start() -> Vec<SpeedEffect>` | 已在跑 → 空；否则 `StartTicking{work_id}` |
+| `stop()` | `stop() -> Vec<SpeedEffect>` | `[Cancel, Emit(0)]`，**无条件**发 0 |
+| `addSpeed(n)` | `add_speed(n)` | 不看「在不在跑」 |
+| `waitForSpeedLimit()` | `should_wait(enabled, limit)` | 谓词化 |
+| `_tick()` | `tick() -> Vec<SpeedEffect>` | 先发布再清零；循环已停 → 空 |
+| `_onTickFailed` | `on_tick_failed()` | 只置空 workId，不清 `bytes` / `current_speed` |
+
+三条口径：
+
+- **`_tickLoop` 摊成 `StartTicking{work_id}`**：宿主起 1 秒周期、每周期调 `tick()`，
+  失败时调 `on_tick_failed()`。模块内不留计时器，单测不必等真实时间。
+- **`waitForSpeedLimit` 退化成谓词**：`enabled` / `limit` 每轮由调用方从
+  `settings::read_bool(cfg, "isSpeedLimitEnabled")` / `read_i64(cfg, "speedLimitation")`
+  现读再传入，等价于 Python 的每轮重读 `cfg`，且模块不持有配置快照。
+  判断是 `bytes > limit`（严格大于，等于上限不算超）。
+- **字段全用 `Cell<T>`**：读侧（`current_speed` / `pending_bytes` / `is_running` /
+  `should_wait`）只要 `&self`，写侧（`start` / `stop` / `add_speed` / `tick` /
+  `on_tick_failed`）才要 `&mut self`。workId 由服务发号（`speed-1` / `speed-2` …）。
+
+`on_tick_failed` **不清** `bytes` / `current_speed`（照抄 Python）：下一轮 `start()` 的第一次
+`tick` 会把残留量发出去，这是既有行为，不修。
+
+### 为什么不搬 `name_conflict_queue.py`
+
+`app/services/name_conflict_queue.py`（73 行）的队列**第 65 步 b 就搬过了**，落在
+`gd3-ui::name_conflict` 里：`NameConflictQueue::{add, set_choice, cancel, refresh}` +
+`ConflictEvent::{RefreshPosted, ConflictChanged}` + `trait ConflictActions`（注入
+`probeConflict` / `add`）。第 96 步把 `probeConflict` 接上之后，`engine.rs` 的
+`on_name_conflicted` / `refresh_conflicts` / `apply_dialog_outcome` 三个入口全在跑；
+`TaskConflictActions::add` 按 `task_id` 反查 `TaskRecord` 再 `tasks.add(record, true)`，
+把「队列只拿得到 `ConflictTask`（两列）」这个缺口补掉了。
+
+搬新模块前先 `grep -n 'pub struct <名字>' crates/*/src/*.rs`：进度笔记的标题按**Python
+文件用途**起名（「重名冲突提示」），从标题看不出它把服务层队列一起搬了。
+
+规模：`speed_meter.rs` **330 行 / 13 单测**。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

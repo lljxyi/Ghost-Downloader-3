@@ -69,6 +69,7 @@ pub mod shell;
 pub mod single_instance;
 pub mod sort;
 pub mod speed;
+pub mod speed_meter;
 pub mod subtitle_select;
 pub mod task_actions;
 pub mod task_draft;
