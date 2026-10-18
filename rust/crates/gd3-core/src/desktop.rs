@@ -14,7 +14,7 @@
 //! | `openChromiumUrl`（:178-234） | [`open_chromium_url_on`] / [`open_chromium_url`] |
 //! | `Popen` / `QProcess.startDetached` | [`spawn_detached`] |
 //! | `buildFontFamilies`（:15-45） | **未迁移**：入参是 `QLocale` 的 `script()` / `territory()` |
-//! | `deleteRecoverably`（:112-114） | **未迁移**：`QFile.moveToTrash` 要 freedesktop 回收站实现 |
+//! | `deleteRecoverably`（:112-114） | 见 `crate::trash`（第 91 步） |
 //! | `_sendForegroundInput` / `_revealInFolderShell` / `requestForeground` / `raiseWindow` / `startFileDrag` | **N/A**：纯 Win32 `ctypes` + Qt 窗口 |
 //!
 //! # 设计

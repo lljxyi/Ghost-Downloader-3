@@ -26,6 +26,7 @@ pub mod settings;
 pub mod store;
 pub mod task;
 pub mod task_error;
+pub mod trash;
 pub mod version;
 
 pub use checksum::{
@@ -68,4 +69,10 @@ pub use run_at_login::{
 pub use store::{LoadOutcome, load_records, save_records, to_line};
 pub use task::{Progress, TaskFile, TaskRecord, TaskStatus, TaskStep};
 pub use task_error::{CANCELLED_MESSAGE, TaskError};
+pub use trash::{
+    MAX_ATTEMPTS, TrashLocation, choose_trash_dir, current_uid, delete_recoverably,
+    deletion_date_at, deletion_date_now, encode_path, generic_data_dir, home_trash_dir,
+    mount_point_of, move_to_trash, resolve_trash_dir, shared_trash_ok, topdir_trash_dir,
+    trash_entry_name, trash_info_text,
+};
 pub use version::{is_newer, parse_version};

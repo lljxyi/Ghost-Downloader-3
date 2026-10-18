@@ -547,7 +547,7 @@ SHA-2 增量一致性）。
 | `openChromiumUrl`（:178-234） | `desktop::open_chromium_url` | 按表序命中第一个，`chrome://` 换成该浏览器的 scheme |
 | `Popen` / `QProcess.startDetached` | `desktop::spawn_detached` | `setsid(2)`（`pre_exec`）+ 三路 `Stdio::null()`，**不等**子进程 |
 | `buildFontFamilies`（:15-45） | **未迁移** | 入参是 `QLocale` 的 `script()` / `territory()`，Slint 侧没有对应概念 |
-| `deleteRecoverably`（:112-114） | **未迁移** | `QFile.moveToTrash` 要 freedesktop 回收站实现 |
+| `deleteRecoverably`（:112-114） | `trash::delete_recoverably` | 见下一节「可恢复删除」 |
 | `_sendForegroundInput` / `_revealInFolderShell` / `requestForeground` / `raiseWindow` / `startFileDrag` | **N/A** | 纯 Win32 `ctypes` + Qt 窗口 |
 
 三个决策：
@@ -590,6 +590,85 @@ SHA-2 增量一致性）。
    （未做 `SIGCHLD` 处理）。
 
 规模：`desktop.rs` **604 行 / 14 单测**；`filesystem.rs` 新增 `which`（1 单测）。
+
+## 可恢复删除（`gd3-core::trash`）
+
+`app/platform/desktop.py:112-114` 只有两行，但它把整件事委托给了 Qt：
+
+```python
+def deleteRecoverably(path: str) -> bool:
+    return QFile.moveToTrash(path)
+```
+
+所以要复刻的不是 Python，而是 **`QFile::moveToTrash`**。第 91 步用 PySide6 +
+`QT_QPA_PLATFORM=offscreen` 真跑出全部口径（探针目录 `/root/gd3probe*`），
+**没有一条是照 freedesktop 规范推测的**：
+
+| 实测项 | 口径 |
+|---|---|
+| 回收站根 | `QStandardPaths::GenericDataLocation` + `/Trash`，即 `$XDG_DATA_HOME/Trash`（未设 → `$HOME/.local/share/Trash`） |
+| `$XDG_DATA_HOME` 不存在 | 返回 `False`，**什么都不建**（不自动补父目录） |
+| 目录结构 | `Trash/{files,info}`，三个目录都是 `0700` |
+| `.trashinfo` | `0644`（umask 口径）；正文 `[Trash Info]\nPath=<编码>\nDeletionDate=<YYYY-MM-DDTHH:MM:SS>\n`，**本地时间、无时区** |
+| `Path=`（home 回收站） | **原样**：传 `rel.txt` 就写 `rel.txt`，传 `sub/../rel2.txt` 就写原样 |
+| `Path=`（顶层回收站） | **相对 `$topdir`**：`/tmp/a/b.txt` → `a/b.txt`（不带前导 `/`） |
+| 百分号编码 | **保留** `A-Za-z0-9` `-` `.` `_` `~` 和 `/`，其余按 UTF-8 逐字节大写 `%XX`（`中` → `%E4%B8%AD`） |
+| 冲突命名 | 第 0 次 `<name>`；第 i 次（i≥1）`<name>-<inode + i - 1>` |
+| 源文件不存在 | 返回 `False`，但**回收站目录已被建好**（先建目录再 stat 源） |
+| 符号链接 / 目录 | 链接按链接本身移入（不跟随）；目录整棵 `rename` |
+
+顶层回收站（文件与 home 回收站不同设备）三分支，`/tmp` 上实测：
+
+1. `$topdir/.Trash` 存在、是目录、**带 sticky 位**、**不是符号链接** →
+   `$topdir/.Trash/<uid>/{files,info}`；
+2. `.Trash` 存在但无 sticky → Qt 打 `Warning: '<dir>' doesn't have sticky bit set!`
+   后退化成 `$topdir/.Trash-<uid>`；
+3. `.Trash` 不存在 → 建 `$topdir/.Trash-<uid>`。
+
+| Python | Rust |
+|---|---|
+| `deleteRecoverably`（:112-114） | `trash::delete_recoverably`（`bool` 口径） |
+| `QFile.moveToTrash` | `trash::move_to_trash`（`io::Result<PathBuf>`，`Err` = `False`） |
+
+辅助函数：`home_trash_dir` / `generic_data_dir` / `topdir_trash_dir` / `choose_trash_dir`
+（纯路径选择）/ `resolve_trash_dir` → `TrashLocation` / `mount_point_of` / `shared_trash_ok` /
+`encode_path` / `trash_info_text` / `trash_entry_name` / `current_uid` /
+`deletion_date_at` / `deletion_date_now`。
+
+三个决策：
+
+1. **`TrashLocation { dir, topdir }` 而不是裸 `PathBuf`。** 因为 `Path=` 的口径两种回收站
+   不一样（见上表），而「选哪个回收站」和「`Path=` 怎么写」必须由同一个判定结果驱动；
+   拆开就会重算一遍设备/sticky，出现两处不一致。
+2. **时间戳作参数传入**（`deletion_date: &str`），`deletion_date_now()` 只在
+   `delete_recoverably` 里取一次。`localtime_r` 走 `libc`（`chrono` 不在离线缓存里），
+   格式 `%Y-%m-%dT%H:%M:%S`。
+3. **不做跨设备 `copy` 兜底。** 回收站目录本来就按「文件所在设备」选，`rename` 不会
+   跨设备；Qt 在这里也只是失败回滚（`rename` 失败会把刚写的 `.trashinfo` 删掉）。
+
+实测交叉验证（第 91 步，`/tmp` 是 tmpfs、`/root` 在 `/` 上，正好跨设备）：
+
+```text
+# Qt:      XDG_DATA_HOME=/root/gd3probe-py-xdg2, /tmp/gd3probe-py2/sub/deep/x y 中.txt
+Path=gd3probe-py2/sub/deep/x%20y%20%E4%B8%AD.txt
+# Rust:    /tmp/gd3probe-rust/f.txt
+Path=gd3probe-rust/f.txt
+# Qt（home 回收站，/root 上）:
+Path=/root/gd3probe-py2/sub/y.txt
+```
+
+与 Python 的已知差异：
+
+1. **Qt 在跨设备分支里会顺手建一个空的 `$XDG_DATA_HOME/Trash`**（内部流程先试 home
+   回收站），这里不建——空目录对用户不可见，也没被规范要求；
+2. `Path=` 里的非 UTF-8 字节：Python 走 `surrogateescape` 原样保留，Rust 走
+   `to_string_lossy()`（替换成 U+FFFD）；
+3. Qt 在无 sticky 的 `.Trash` 上打 `qWarning`，库侧没有 logger，分支选择由
+   `shared_trash_ok` 的返回值暴露给调用方；
+4. 冲突重试上限都是 100 次，但 Qt 之后**静默**返回 `False`，这里返回
+   `AlreadyExists`（带候选名被占用的说明）。
+
+规模：`trash.rs` **899 行 / 23 单测**。
 
 ## 剩余工作（Phase 8）
 
