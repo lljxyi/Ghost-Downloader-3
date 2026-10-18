@@ -6928,3 +6928,88 @@ Slint 主窗口 / `boot::run`）得自己记得取。下一步二选一：
    sources 端口，是 Phase 8 里剩下最大的一块。
 
 倾向 1：小、且能让第 104/105 步的成果在引擎层可见；`browser_service` 留到网络端口就位后。
+## 第 106 步：`Engine` 侧收敛 + 速度表效果接线
+
+> 时间：2026-10-18 22:56（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 做了什么
+
+第 105 步让 `TaskService` 持有速度表并攒效果，但 `Engine` 里还躺着第 83 步的一份**弱化版
+`SpeedMeter`**（原 `engine.rs:151-214`：`start() -> ()`、`stop() -> Option<i64>`、没有
+workId、没有 `should_wait`），而 `Engine::stop()` 调的正是它，效果直接丢弃。结果是**两份
+状态机各说各话**：`Engine` 停了自己那份，`TaskService` 那份照跑。
+
+这一步做四件事：
+
+1. 删掉 `engine.rs` 里那份旧 `SpeedMeter`（-64 行），改
+   `use crate::speed_meter::{SpeedEffect, SpeedMeter}`；
+2. 删掉 `Engine.speed_meter` 字段 / 构造 / 初始化项；`Engine::speed_meter()` 改成委托
+   `self.tasks.speed_meter()`；`Engine::speed_meter_mut()` **整个删掉**；
+3. `TaskService` 补 `stop_speed_meter()`（`engine.py:44` 的 `self.speedMeter.stop()`）；
+4. 新增 `Engine::drain_speed_effects()`，`Engine::pump()` / `Engine::stop()` 各调一次。
+
+### 逐条对照
+
+| Python | Rust |
+|---|---|
+| `self.speedMeter = SpeedMeter(coroutineRunner)`（`engine.py:20`） | 速度表归 `TaskService` 持有（第 105 步）；`construct:SpeedMeter` 轨迹标签保留 |
+| `TaskService(…, self.speedMeter, …)`（:21-22） | `TaskService` 自己 `SpeedMeter::default()`；装配顺序不变 |
+| `engine.speedMeter` | `Engine::speed_meter()` → `TaskService::speed_meter()` |
+| `self.speedMeter.stop()`（:44） | `TaskService::stop_speed_meter()`（效果进缓冲） |
+| `speedChanged` 的订阅者（`BrowserService` 等） | `Engine::drain_speed_effects()` |
+| `_pump()` 末尾的 `_refreshSpeedMeter()` | `TaskService::pump` 里已有（第 105 步）；`Engine::pump` 末尾 drain |
+| `speedChanged.emit(0)` 在停机时的落点 | `drain_speed_effects()` 记 `speed:cancel:<id>` + `speed:emit:0` |
+
+### 关键决策
+
+- **速度表只留一份，归 `TaskService` 所有**。Python 是 `Engine` 构造后注入、两个对象拿同一
+  引用；Rust 侧只有 `TaskService` 会改它，所以「谁用谁持有」，`Engine` 只转出口。
+- **删 `speed_meter_mut()` 是刻意的**：绕过 `add_speed` / `tick_speed_meter` /
+  `stop_speed_meter` 直接改状态机，等于把 `speedChanged` 丢了。唯一使用者是
+  `stop_order_mirrors_python_and_flushes_twice`，改成用 `pump()` 让表**真的**跑起来——
+  比手工 `start()` 更接近真实路径。
+- **drain 只挂在 `Engine::pump` / `Engine::stop`**。另外三个调用点（`stopSeeding` /
+  `_seed` / `_onSeedingEnded`）走 `TaskActions`，宿主在那里 `take_speed_effects()`
+  （第 100 步的效果队列口径）。没人取就攒着，下次 pump / stop 一并吐出，顺序不变。
+- **`construct:SpeedMeter` 轨迹标签保留**：它钉的是「装配顺序」而不是「谁持有」；删掉会让
+  `construction_order_mirrors_python_engine` 的期望与 `engine.py` 的构造顺序脱节。
+- **删掉两条旧单测**（`speed_meter_tick_and_stop` /
+  `speed_meter_stop_without_start_emits_nothing`）：它们测的是已删掉的弱化实现，同样的行为
+  在 `speed_meter.rs` 的 13 条里都有，且更严（含 workId 与效果队列）。
+
+### 2 条新单测
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `pump_records_the_speed_meter_start_in_the_trace` | `pump` 派发 → 轨迹 `speed:start:speed-1`；表在跑；缓冲随即为空 |
+| `draining_an_idle_speed_meter_yields_nothing` | 空闲 drain 返回空且不记标签 |
+
+`stop_order_mirrors_python_and_flushes_twice` 的期望轨迹插进
+`speed:cancel:speed-1` / `speed:emit:0`，位置紧跟 `stop:speedMeter.stop`（与
+`engine.py:44` 的调用位置一致，在 `browserListener.stop()` 之前）。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**819 passed / 0 failed**（第 105 步 819 − 2 + 2；首跑即绿）；
+- `cargo test --workspace`：**1322 passed / 0 failed**（28 段）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**；
+- Python 侧没改一行。
+
+### 遗留：`engine.rs` 还有一处同类重复
+
+`engine.rs:161` 还留着 `pub struct RuntimeStatusService;` 的空壳桩，而第 102 步已经把整类
+搬进 `gd3-ui::runtime_status`（`runtime_status.rs:145`，932 行 / 22 单测）。与速度表是同一个
+坑：**只看进度笔记标题发现不了**，必须
+`grep -n 'pub struct <名字>' crates/*/src/*.rs` 才能看到两份定义。
+
+### 下一步（第 107 步）
+
+二选一：
+
+1. **`Engine.runtime_status` 换成 `crate::runtime_status::RuntimeStatusService`**——同这一步的
+   收敛手法，但要改 `FeatureService` 桩里对它的调用（桩的方法签名与真实现不同）；
+2. 回到 Phase 7 的 P0 主线（主窗口 + 任务卡片 + 抽屉）。
+
+倾向 1：小、且与这一步是同一类债务，趁热清掉；否则后面接 `boot::run` 时会同时踩两个重复
+实现。
