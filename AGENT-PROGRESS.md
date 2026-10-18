@@ -4727,3 +4727,75 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
   3. `app/models/serialization.py`（94 行）：`TaskRecord` ↔ JSON 的字段映射；
   4. D-Bus / keepalive 仍排在最后（`zbus` 缓存可用但编译代价大）。
 - 卡点：无
+
+## 第 87 步：gd3-core::loader + gd3-core::version（2026-10-18 10:30）
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/version.rs`（110 行 / 4 单测）：
+    `parse_version` / `is_newer` **从 `gd3-ui::setting_cards` 搬进 core**，
+    `setting_cards.rs` 那 34 行实现换成
+    `pub use gd3_core::version::{is_newer, parse_version};`
+    （`setting_cards` 里 `is_newer` 还有 `runtime_card` 的调用点，`pub use` 后照常可用；
+    它自己那两个测试也留着，等于跨 crate 复验一遍）。
+    搬家的原因：`gd3-core::loader` 的 `gdMinVersion` 门禁要用 `parse_version`，
+    而 `gd3-core` 不能反向依赖 `gd3-ui`。
+  - 新增 `rust/crates/gd3-core/src/loader.rs`（1029 行 / 37 单测）：
+    `VersionRejection` / `ScanReport` / `DependencyError` / `DependencySkip` /
+    `OrderReport` / `LoadReport` / `SeededPack` / `SeedReport` +
+    `scan_packs` / `load_packs` / `ordered_by_dependency` / `seed_packs` +
+    私有 `VisitState` / `visit` / `sorted_subdirs` / `copy_tree` / `resolve_path` /
+    `lexical_normalize`。
+  - `lib.rs` 加 `pub mod loader;` / `pub mod version;` + 12 个类型/函数 re-export。
+  - `rust/README.md` 新增「插件加载与版本门禁」一节（对照表 + 精确口径 + 四条已知差异 + 规模）。
+- 关键决策：
+  - `ordered_by_dependency` 返回 `OrderReport { ordered, skipped }` 而**不是** `Result`：
+    Python 的失败只影响顶层那个 manifest（`skipped.add(m.name)` + `visiting.clear()`
+    然后继续下一个），整体排序不中断，`Result` 表达不了这个语义。
+  - `load_packs` 只搬到「排序好的 manifest 列表」：`loadManifest`（`importlib` +
+    `getattr(module, className)` + `PackClass(services)`）的产物是 Python 类实例
+    （返回 Qt 控件与信号），Rust 侧没有对应概念，实例化留在 Python。
+  - `app_version` 作为参数传进 `scan_packs` / `load_packs`，不在 core 里硬编码
+    `VERSION = "4.4.0"`（`app/config/constants.py` 的常量归 `gd3-ui` 入口）。
+  - `seed_packs` 返回 `io::Result<SeedReport>`：Python 那边 `rmtree` / `copytree`
+    没有 `try/except`，文件系统错误原样冒出去；返回的只有「同步了哪些」，日志由调用方打。
+- 实证结论（源码级 + CPython 3.13 实测，全部有单测钉住）：
+  - `orderedByDependency` 是 DFS 三色：命中 `visited` 直接返回、命中 `skipped` 报
+    `{name} 依赖的 FeaturePack 已被跳过`、命中 `visiting` 报
+    `循环依赖: a -> b -> a`（环从 `visiting` 里该名字**首次**出现处开始、末尾补一次自己）、
+    依赖不在 `byName` 里报 `{name} 依赖未找到的 FeaturePack: {dep}`（`{name}` 是
+    **当前正在访问的节点**，不是顶层那个）；
+  - 两节点环 `a -> b -> a` 的**两条** skip 记录原因不同：第一轮顶层 `a` 报 `Cycle`，
+    第二轮顶层 `b` 命中 `skipped` 报 `SkippedDependency`（`visiting` 已在上一轮被
+    `clear()`）——这条有专门单测；
+  - `byName = {m.name: m}` 是**同名后者胜**，`ordered` 里存的是 `byName[name]`
+    而不是循环变量，所以同名 manifest 只入列一次、入列的是最后一个；
+  - `seedPacks` 在 `mkdir` **之前**就 `return`（`seedDir` 不存在或 `resolve()` 相等），
+    所以目标目录不会被创建；用户侧版本判定是 `parseVersion(user) >= parseVersion(seed)`
+    → **`1.0` 与 `1.0.0` 去尾零后相等，不覆盖**（有单测）；
+  - `copytree` 默认 `symlinks=False`：符号链接按目标内容拷，所以 `copy_tree` 用
+    `Path::is_dir()`（跟随链接）+ `fs::copy`，且 `dst` 必须不存在（先 `os.mkdir`）。
+- 已知差异（写进模块头 + README）：
+  - `Path.resolve()` 解析符号链接；`resolve_path` 先 `fs::canonicalize`（目标存在时等价），
+    失败退回 `std::path::absolute` + 词法归一。只有「目标目录尚不存在**且**路径带链接」
+    才有区别；
+  - `copytree` 会 `copystat` 目录 mtime/权限，`copy_tree` 只保留文件权限位；
+  - 目录项排序：Python 按 `PurePath._parts_normcase`（POSIX 上等价按码点），
+    Rust 按 `to_string_lossy()` 的 `String`（等价按 UTF-8 字节），非 UTF-8 名字会退化；
+  - Python 的 `isdigit()` / `int()` 接受 Unicode 十进制数字（`parseVersion("１.２")`
+    得 `(1, 2)`），Rust 的 `char::to_digit(10)` 只认 ASCII → `()`。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**195 passed**（第 86 步 154 + 37 loader + 4 version）；
+  - `cargo test --workspace`：**1044 passed, 0 failed**（第 86 步 1003 + 41）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（1m18s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧没改一行，不需要跑 Python 全量；
+  - commit `f860401`。
+- 下一步：
+  1. `gd3-core::checksum`（`app/checksum.py` 33 行）：`parse_checksum`
+     （`text.split()[0].lower()`）/ `match_checksum` 是纯逻辑，`to_checksum` 要
+     md5/sha1/sha256/sha512/shake（`md-5` / `digest` 已缓存，`sha1` / `sha2` 未验证
+     离线可用 → 先试 `cargo add --offline`，不可用就只搬前两个 + `CHUNK_SIZE = 4MiB`）；
+  2. `app/models/serialization.py`（94 行）：`TaskRecord` ↔ JSON 的字段映射；
+  3. `app/services/runtime_status.py`（195 行）接线：现在有 `pack::BinaryRuntime` 可依赖；
+  4. D-Bus / keepalive 仍排在最后（`zbus` 缓存可用但编译代价大）。
+- 卡点：无
