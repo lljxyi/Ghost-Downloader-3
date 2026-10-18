@@ -4941,3 +4941,66 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
      `name_conflict_queue.py`（73 行）都太小，并进相邻步骤；
   5. D-Bus / keepalive 仍排最后（`zbus` 缓存可用但编译代价大）。
 - 卡点：无
+
+## 第 90 步：gd3-core::desktop + filesystem::which（2026-10-18 11:31）
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/desktop.rs`（**604 行 / 14 单测**）：
+    `LINUX_BROWSERS`（7 项）/ `MACOS_BROWSERS`（4 项）/ `browser_url` /
+    `shutdown_command_on` / `restart_command_on` / `sleep_command_on` /
+    `open_file_command_on` / `open_folder_command_on`（共用私有 `open_target_command_on`）/
+    `reveal_in_folder_on`（+ 私有 `parent_display`）/ `open_chromium_url_on` /
+    `open_chromium_url` / 六个当前平台包装 / `spawn_detached`（`setsid(2)` + 三路 `Stdio::null()`）。
+  - `filesystem.rs` 新增 `pub fn which(name)`（`shutil.which` 的纯 `PATH` 版，1 单测）；
+    `lib.rs` 加 `pub mod desktop;` + 18 个 re-export，`filesystem` 的 re-export 补 `which`；
+  - `rust/README.md` 新增「桌面动作（`gd3-core::desktop`）」一节。
+- 关键决策：
+  - **`*_on(os, ...)` 纯函数 + 不带 `_on` 的包装**（包装只做 `std::env::consts::OS` 分发），
+    这样三条平台的命令表都能在本机（Linux）被单测钉住，而不是靠 `cfg!` 分支。
+  - **`os` 判定照抄 `match sys.platform`：只认 `win32` / `darwin`，其余全部落进 `case _`**。
+    上一轮凭印象写的版本对未知平台返回 `None`，这是错的——Python 里
+    `"freebsd13"` / `"openbsd7"` / 空串拿到的都是 POSIX 分支的
+    `shutdown -h now` / `systemctl suspend` / `xdg-open` / Linux 浏览器表。
+    已改成 `shutdown_command_on` 等直接返回 `Vec<String>`，`Option` 只用于表示
+    「Windows 未迁移」；单测 `unknown_platform_falls_into_posix_branch` 钉住。
+  - **`openChromiumUrl` 的 `which` 用闭包注入**：单测传假 `which`，不依赖本机装了什么浏览器。
+    `open_chromium_url` 改用新加的 `filesystem::which` 而不是
+    `find_executable(Path::new(""), name)`——后者的第一条分支是 `""/<name>` 的
+    `is_file()`，也就是**相对当前目录**，`shutil.which` 没有这一步。
+  - **`buildFontFamilies` / `deleteRecoverably` 仍标「未迁移」**：前者入参是 `QLocale` 的
+    `script()` / `territory()`（要自己造 `Script`/`Territory` 枚举才能搬，且 Slint 侧没有
+    对应概念）；后者要 freedesktop 回收站实现（下一步候选）。
+- 实证结论（回读 `app/platform/desktop.py:120-234` 逐条核对，全部有单测钉住）：
+  - `shutdown`：win32 `["shutdown","/s","/t","0"]`、darwin `["osascript","-e","tell app \"System Events\" to shut down"]`、`case _` `["shutdown","-h","now"]`；
+  - `restart`：`/r` / `... to restart` / `["shutdown","-r","now"]`；
+  - `sleep`：`["rundll32.exe","powrprof.dll,SetSuspendState","0","1","0"]` / `["pmset","sleepnow"]` / `["systemctl","suspend"]`；
+  - `revealInFolder` 的三分支：`isExisting(path)` → win32 `SHOpenFolderAndSelectItems`（N/A）/ darwin `open -R <path>` / `case _` `xdg-open <str(path.parent)>`；
+    `elif isExisting(path.parent)` → `openFolder(path.parent)`；否则什么都不做；
+  - Linux 浏览器候选表字面顺序：`google-chrome`、`google-chrome-stable`、
+    `microsoft-edge-stable`、`microsoft-edge`、`brave-browser`、`chromium-browser`、`chromium`；
+    macOS：`Google Chrome`、`Microsoft Edge`、`Brave Browser`、`Chromium`；
+  - `toBrowserUrl`：`url.startswith("chrome://")` → `f"{scheme}://{url[9:]}"`，
+    只剥一次、大小写敏感、`"chrome://"` 本身换成 `"{scheme}://"`；
+  - `str(Path("foo").parent)` == `"."`，而 Rust 的 `Path::new("foo").parent()` 是空路径
+    （`display()` 是空串）；`Path::new("/").parent()` 是 `None`，Python 的
+    `Path("/").parent` 还是 `Path("/")` → 私有 `parent_display` 把两种边界都对齐。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**248 passed**（第 89 步 233 + 15）；
+  - `cargo test --workspace`：**1097 passed, 0 failed**（第 89 步 1082 + 15，约 10 分钟编译）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（1m24s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧没改一行，不需要跑 Python 全量；
+  - commit `93be2db`。
+- 下一步（按价值/风险排序）：
+  1. **`gd3-core::trash`**：`desktop.py:112-114` 的 `deleteRecoverably`
+     （`QFile.moveToTrash`）→ freedesktop 回收站规范：`$XDG_DATA_HOME/Trash`、
+     每个挂载点的 `.Trash/$uid` 或 `.Trash-$uid`、`files/` + `info/*.trashinfo`
+     （`[Trash Info]` 的 `Path=` 百分号编码 + `DeletionDate=`）；
+     `deleteRecoverably` 被 `engine.py:17,22` / `startup.py:36,50` 注入，是真实缺口；
+  2. `app/platform/hidden_subprocess.py`（99 行）：Linux 分支 `subprocess` +
+     `start_new_session`，可复用本步的 `spawn_detached`；
+  3. `buildFontFamilies`：造 `Script` / `Territory` 枚举后搬（纯函数）；
+  4. `app/services/runtime_status.py`（195 行）仍需先给 `pack::BinaryRuntime` 补
+     `install` / `fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
+  5. D-Bus / keepalive 仍排最后（`zbus` 缓存可用但编译代价大）。
+- 卡点：无
