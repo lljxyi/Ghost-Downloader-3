@@ -198,11 +198,6 @@ fn now_seconds() -> i64 {
         .unwrap_or_default()
 }
 
-/// 状态归一：镜像 `Task.updateStatus` 及其前置步骤。
-///
-/// Python 侧在 `__post_init__`（含 `fromDict`）里就会调用它，所以加载旧记录会改写 Task 状态。
-/// Rust 把「读盘」与「归一」分成两步：`load_records` 只忠实回写，需要 Python 语义的调用方
-/// 在加载后显式调用 `update_status`。
 /// `task.setOptions(options)` 的入参（`app/view/dialogs/edit_task.py` 组装）。
 ///
 /// `category: Option<Option<String>>` 区分「键不存在」与「键存在、值为 `None`」——
@@ -213,6 +208,27 @@ pub struct TaskOptions {
     pub output_folder: Option<String>,
     /// `options["category"]`（`None` = 键不存在）。
     pub category: Option<Option<String>>,
+}
+
+impl TaskOptions {
+    /// 从 options 字典里取出本结构建模的两个键。
+    ///
+    /// 镜像 `Task.setOptions(options: dict)`（`task.py:287-294`）的读法：`outputFolder`
+    /// 只认字符串（Python 收 `str` / `Path`，本仓 `TaskRecord.output_folder` 就是
+    /// `String`）；`category` 只看键在不在，值不是字符串时按 `None` 落。
+    pub fn from_options(options: &Map<String, Value>) -> Self {
+        let output_folder = options
+            .get("outputFolder")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let category = options
+            .get("category")
+            .map(|value| value.as_str().map(str::to_string));
+        Self {
+            output_folder,
+            category,
+        }
+    }
 }
 
 impl TaskRecord {
@@ -339,6 +355,10 @@ impl TaskRecord {
     }
 
     /// 从 Step 状态推出 Task 状态。
+    ///
+    /// 镜像 `Task.updateStatus` 及其前置步骤：Python 侧在 `__post_init__`（含 `fromDict`）
+    /// 里就会调用它，所以加载旧记录会改写 Task 状态。Rust 把「读盘」与「归一」分成两步：
+    /// `load_records` 只忠实回写，需要 Python 语义的调用方在加载后显式调用它。
     pub fn update_status(&mut self) -> TaskStatus {
         self.update_files_from_steps();
 

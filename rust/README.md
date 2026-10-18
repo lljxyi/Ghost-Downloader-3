@@ -1039,6 +1039,88 @@ Rust 没有协程运行时，沿用第 100/101 步的做法：**服务只算状�
 `gd3-core/src/pack.rs` 加两个默认方法 + `runtime_id` 进 vtable（**1180 行 / 38 单测**）；
 `task_error.rs` 加 `install_not_found`。
 
+## 任务草稿（`gd3-ui::task_draft` / `gd3-ui::sequence_matcher`）
+
+`app/services/task_draft.py`（241 行）的移植：批量 URL 面板的状态机核心。每个 URL 对应
+一个 `DraftItem`（正在解析 / 解析成功 / 解析失败 / 已确认），`setUrls` 对「旧 URL 列表
+→ 新 URL 列表」做增量 diff，只对**变化的那几段**取消旧解析、提交新解析。
+
+沿用第 100–102 步的形态：**服务只算状态与意图，副作用摊成 `DraftEffect` 队列**。
+
+| 效果 | Python 信号 | 宿主该做什么 |
+|---|---|---|
+| `Parse { work_id, options }` | `coroutineRunner.submit(...)` | 跑 `featureService.parse(options)`，完成回调 `on_parsed` / `on_parse_failed` |
+| `Cancel { work_id }` | `coroutineRunner.cancel(parseId)` | 取消对应解析（句柄由服务发号） |
+| `Busy { busy }` | `parsingBusyChanged` | 批量面板的「解析中」指示 |
+| `Succeeded { url, task }` | `parseSucceeded` | 更新该 URL 的草稿卡片 |
+| `Failed { url, error }` | `parseFailed` | 显示错误 + 重试按钮 |
+| `Changed` | `itemsChanged` | 重刷整个列表 |
+| `Cleared` | `itemsCleared` | 清空列表 |
+| `Confirmed { task, auto_start }` | `taskConfirmed` | 交给 `TaskService::add` |
+
+### `setUrls` 的 diff（逐段对齐）
+
+URL 先去重（保序，留第一次出现），再跑 `SequenceMatcher(旧, 新)`：
+
+| opcode | 旧段 `previous[i1..i2]` | 新段 `urls[j1..j2]` |
+|---|---|---|
+| `equal` | 原样搬进新列表（**不重新解析**，已解析的 Task 也留着） | — |
+| `replace` | 取消还在解析的 `parseId`，其余丢弃 | 每个 url 新建 item + 提交解析 |
+| `delete` | 取消还在解析的 `parseId`，其余丢弃 | — |
+| `insert` | — | 每个 url 新建 item + 提交解析 |
+
+末尾固定发 `Busy` + `Changed`。
+
+### `confirm` 的两遍循环
+
+1. 有 `task` 的：`setOptions(buildOptions)` → `Confirmed`；
+2. 还在解析的：把 `buildOptions` 与 `autoStart` 冻进 `confirmed_options` /
+   `confirmed_auto_start`；
+3. 第二遍把「在解析但没被确认」的取消掉（Python 的防御分支，正常流程走不到——
+   `addParsedTasks` / `onParsed` 都会先把 `parseId` 清空）；
+4. 清空 `items`：已确认但还在解析的 item 移进 `detached`，等回调；然后 `Busy` +
+   `Cleared`。
+
+### 关键决策
+
+- **回调按 `parseId` 反查，而不是闭包捕获 item**：Python 把 item 塞进闭包，所以能改
+  「已经从 `_items` 里摘掉」的那个对象；Rust 只能反查。而取消时 `parseId` 被清空，
+  于是「取消后迟到的回调」自然查不到——与 Python 的 `if not item.parseId: return` 等价。
+- **`detached` 显式保存游离项**：`confirm()` 之后还在解析的 item 无处安放（Python 靠
+  闭包持有）。它们必然已 `confirmed_options.is_some()`，所以 `on_parsed` 命中时直接
+  `Confirmed`，`on_parse_failed` 命中时直接丢弃（Python 只记一条 warning）。
+- **`Parse` 携带原始 options 字典（含 `"url"`），不在这里转 `TaskOptions`**：本仓的
+  `TaskOptions` 只建模 `outputFolder` / `category` 两键，提前转换会把 `headers` /
+  `subworkerCount` 这些尚未建模的键丢掉，由端口自己按需取字段。
+- **`submitErrors` 判 N/A**：`Parse` 只是入队，不会失败。`setUrls` 的「busy → 各
+  submitError → changed」退化成「busy → changed」。
+- **`work_id` 由服务发号**（`draft-1` / `draft-2` …，一个全局计数器），宿主当不透明句柄
+  原样交回 `Cancel`。
+- **`clear()` 不动 `detached`**：那里是**已确认**的任务，清草稿不该把它们的解析掐掉
+  （Python 没有这个概念）。
+- **`is_parsing()` 只看 `items`**：照抄 Python——`confirm()` 之后哪怕还有游离的解析在跑，
+  `parsingBusyChanged` 也发 `false`。
+- **`categoryOverride: Option<String>`**：`set_url_category(url, None)` 只是清掉覆盖，
+  无法表达「把分类置成 None」——Python 同口径。
+- **`addParsedTasks` 的 `tasks` 非空但全被跳过时仍发 `Busy` + `Changed`**：照抄 Python
+  的两个 emit 在循环之后，不是「有变化才发」。
+
+### `sequence_matcher`（`difflib` 的最小移植）
+
+只覆盖 `TaskDraft.setUrls` 用到的那一种配置：`isjunk=None` + `autojunk=False`。这个前提
+下 `__chain_b` 退化成「元素 → 下标列表」的普通 map，`find_longest_match` 里两条 junk
+扩展循环是死代码，所以只保留三步：最长公共块、队列切分、相邻块合并，逐行对应 CPython
+3.13 的 `/usr/lib/python3.13/difflib.py`。
+
+- `matching_blocks` 末尾的哨兵 `Match { a: len, b: len, size: 0 }` 必须保留——opcodes
+  靠它把「最后一个公共块之后的部分」也吐出来；
+- `Match` 的 `Ord` 派生顺序即 Python 元组 `(a, b, size)` 的排序口径（`blocks.sort()` 与
+  「相邻块合并」都依赖它）；
+- `get_opcodes()` 不缓存（Python 的 `self.opcodes` 缓存没有复用场景）。
+
+规模：`task_draft.rs` **1075 行 / 32 单测**；`sequence_matcher.rs` **387 行 / 11 单测**；
+`gd3-core/src/task.rs` 加 `TaskOptions::from_options`（**513 行**）。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
