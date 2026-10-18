@@ -6241,3 +6241,124 @@ Rust 侧的对应：
    `install` / `fetch_latest_version` 的同步签名；
 4. `actions::UiHooks` 实现：等 Slint 主窗口；
 5. D-Bus / keepalive：仍排最后。
+## 第 101 步：`edit` / `updateSelection` 接线（第 100 步的续）（2026-10-18 19:05）
+
+**目标**：第 100 步把 `actions::TaskService` 的 10 个方法接到了真 `TaskService` 上；
+剩下两个**不走卡片分派**的服务方法——`edit(task, options, newTask)`（编辑对话框）与
+`updateSelection(task, selectedIndexes)`（抽屉文件列表）——还停在「只算意图」。
+判定标准同前：`app/services/task_service.py` 的**调用序列**与**信号发射顺序**。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-core/src/task.rs` | 420 → **493 行**：新增 `TaskOptions`（`output_folder` / `category`）+ `TaskRecord::{can_reuse_progress, set_options, replace_with, set_selection}` |
+| `gd3-ui/src/task_service.rs` | 3180 → **3611 行 / 77 单测**：新增 `EditReport` / `SelectionReport` + `TaskService::{edit, update_selection}` + 5 单测 |
+| `gd3-ui/src/task_actions.rs` | 916 → **1116 行 / 18 单测**：`TaskAction::DeleteFilesAt` 变体 + `TaskActions::{edit, update_selection}` + 3 单测 |
+| `rust/README.md` | 969 → **987 行**：调用序列表补两行、变体数 12 → 13、新增 `edit` / `updateSelection` 三段 |
+
+### 逐条对齐 Python
+
+```python
+edit(task, options, newTask)                       # task_service.py:464-476
+    cancelChecksum(task)
+    needsDelete = newTask is not None and not task.canReuseProgress(newTask)
+    def onStopped():
+        if needsDelete: task.deleteFiles()
+        if newTask is not None: task.replaceWith(newTask)
+        task.setOptions(options)
+        self._store.updatePlaceholders(task)
+        self._flushSoon()
+        self._schedule(task)
+    self._cancelWork(task, finished=onStopped)
+
+updateSelection(task, selectedIndexes)             # task_service.py:482-528
+    wasCompleted = task.status == COMPLETED        # 早于 setSelection
+    def apply():
+        task.setSelection(selectedSet)
+        self._store.updatePlaceholders(task)
+        if wasCompleted and task.files and any(f.selected and not f.completed for f in task.files):
+            task.completedAt = 0
+            self._unwatchFile(task)
+            self._cancelWork(task, finished=lambda: self._schedule(task))
+        self._flushSoon()
+    isRunningDeselected = 队列在跑 and 第一个 RUNNING step 的 fileIndex 不在选中里
+    if isRunningDeselected: _cancelWork(task, finished=onStopped{apply(); _schedule()})
+    else: apply()
+```
+
+Rust 侧的对应：
+
+| Python | Rust | 差异 |
+|---|---|---|
+| `task.setOptions(options)` | `TaskRecord::set_options(&TaskOptions)` | `TaskStep.setOptions` 是 `pass`（全仓无覆盖），不搬 |
+| `task.replaceWith(newTask)` | `TaskRecord::replace_with(&TaskRecord)` | `_bindTask` 只写回指 → Rust 侧空操作，随后同 `updateStatus()` |
+| `task.setSelection(set)` | `TaskRecord::set_selection(&BTreeSet<i64>)` | `set(selectedIndexes)` 用 `BTreeSet` 表达 |
+| `task.canReuseProgress(newTask)` | `TaskRecord::can_reuse_progress` | 基类恒 `False`，**全仓无子类覆盖** |
+| `task.deleteFiles()`（`edit` 里） | `TaskAction::DeleteFilesAt { paths }` | 路径是**改名前的快照**（见下） |
+| `_store.updatePlaceholders(task)` | `TaskService::update_placeholders`（第 94 步） | 返回 `Result<_, CreateError>`，`edit` 透传 |
+| `_unwatchFile` | `TaskAction::UnwatchFile` | 已有变体 |
+
+### 关键决策
+
+- **`edit` 的 `deleteFiles` 必须用**快照**路径，新增 `TaskAction::DeleteFilesAt`**：
+  Python 的 `onStopped` 先 `deleteFiles()` 再 `replaceWith(newTask)`；`replaceWith` 换掉
+  `name` 之后 `placeholderPaths` 就跟着变。Rust 侧记录**就地**改过，宿主事后按
+  `taskId` 现算会删到新路径（`delete` / `redownload` 的路径不变，仍用
+  `DeleteFiles { task_id }`）。快照由 `TaskService::edit` 在 `replaceWith` 之前取，
+  放在 `EditReport::delete_paths`。
+- **`edit` / `update_selection` 是 `TaskActions` 的固有方法，不进 `actions::TaskService`
+  trait**：trait 是「卡片动作触达的服务面」，编辑对话框走
+  `featureService.createEditDialog`、选择走抽屉文件列表，都不经过 `card::` 分派。
+- **`edit` 不 `_unwatchFile`**（`delete` / `redownload` 会）——照抄 Python；文件监听由
+  引擎在协程收尾时摘。
+- **`TaskOptions.category` 用 `Option<Option<String>>`**：Python 用
+  `if "category" in options` 判断键存在，`{"category": None}` 会把分类清成 `None`；
+  单层 `Option` 表达不了「键不存在」与「键存在、值 None」之别。
+- **`TaskOptions.output_folder` 只收 `String`**：Python 的
+  `isinstance(newFolder, (str, Path))` 允许 `Path`，Rust 侧调用方自己转字符串
+  （记录里存的就是 `String`）。
+- **`update_selection` 的 `wasCompleted` 在 `set_selection` 之前快照**：`setSelection`
+  末尾 `updateStatus()`，已完成任务可能被重算成别的状态。
+- **「有选中未完成文件」看新选中集**：`apply()` 里 `setSelection` 已经改过
+  `files[].selected`，判断必须用它之后的值。
+- **`isRunningDeselected` 只看第一个 `RUNNING` step**（Python `break`）：
+  `file_index is None` 判 `False`。
+- **`restarted` 与 `interrupted` 互斥**（在跑的任务不会是 `COMPLETED`），所以
+  「尾部 `_schedule`」两种分支各一次、不会叠加；实现里用
+  `if restarted || interrupted` 一次表达。
+- **`edit` 出错时记录已被改过**：`replaceWith` / `setOptions` 先跑、
+  `update_placeholders` 才可能 `Err`，与 Python 抛异常时的中间态一致；本层此时
+  **不登记任何效果**（`?` 在 emit 之前）。
+- **`SelectionReport` 用 `Option<CancelWork>` 而不是「空 `CancelWork`」**：外层取消
+  「没发生」与「发生了但没工作可取消」是两件事，前者不该发任何效果。
+
+### 单测（8 个）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `edit_without_new_task_writes_options_and_requeues`（service） | 没 `newTask` → `needs_delete=false`；`delete_paths` 仍是旧路径；`outputFolder` / `category` 落上；占位符跟着搬；`started=[a]`；**`report.status` 仍是 `Paused`**（`pump` 只排队） |
+| `edit_with_new_task_snapshots_the_old_delete_paths`（service） | `needs_delete=true`；`delete_paths` 是**改名前的**路径；`replaceWith` 换了 name / url、不换 outputFolder |
+| `update_selection_marks_files_and_recomputes_the_size`（service） | `files[].selected` 按选中集置位；`fileSize` = 选中项之和；`restarted=false`、无效果 |
+| `update_selection_restarts_a_completed_task_with_selected_incomplete_files`（service） | `restarted=true`；`completedAt=0`；`restart_cancel` 一定 `Some`（哪怕没工作可取消）；`started=[a]` |
+| `update_selection_cancels_a_running_task_when_the_running_file_is_deselected`（service） | 第一个 `RUNNING` step 的 `fileIndex` 被取消勾选 → 外层 `cancel.work_id = work-1`，随后重新派发 |
+| `edit_emits_delete_files_at_the_snapshot_paths_then_dispatches`（actions） | 效果序 `DeleteFilesAt(旧路径) → Started(run-1)`；`status` 由动作层的 `_dispatch` 置 `Running` |
+| `update_selection_restart_emits_unwatch_then_dispatches`（actions） | `UnwatchFile → Started`（没有工作可取消 → 不发 `CancelWork`） |
+| `update_selection_of_a_running_task_cancels_before_it_requeues`（actions） | `CancelWork(run-1) → Started(run-2)`：外层取消在 `apply()` 之前 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**739 passed / 0 failed**；
+- `cargo test --workspace`：**1234 passed / 0 failed**（28 段，第 100 步 1226 + 8）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（9m49s）；
+- Python 侧没改一行，不跑 Python 全量。
+
+### 下一步（第 102 步候选）
+
+1. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：纯函数，造
+   `Script`/`Territory` 枚举后可搬；
+2. `app/services/runtime_status.py`（195 行）：需先给 `pack::BinaryRuntime` 补
+   `install` / `fetch_latest_version` 的同步签名；
+3. `actions::UiHooks` 实现：等 Slint 主窗口；
+4. D-Bus / keepalive：仍排最后。
