@@ -5797,3 +5797,165 @@ Python 的 `add` 会强制 `shouldSeed = True`，那样就测不出 `startSeedin
 ### 卡点
 
 无。
+
+## 第 98 步：TaskService 校验记账半边 + _rebalance（2026-10-18 16:13）
+
+**目标**：补上 `TaskService` 的校验（checksum）记账半边与 `_rebalance`——
+`startChecksum` / `cancelChecksum` / `checksumProgress` / `_onChecksumDone` /
+`_onChecksumFailed`（`app/services/task_service.py:408-427`、`:617-626`），以及
+`cfg.maxTaskNum.valueChanged` 直连的 `_rebalance`（`:639-647`）。`toChecksum` 本体
+（手写 SHA-256/512）已在 `gd3-core::checksum`（第 88 步），协程提交归引擎侧——本步只做
+**记账**：谁在算、workId 是谁、进度多少、算完了往哪写、超限时该摘谁。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-ui/src/task_service.rs` | 2356 → **2717 行 / 56 → 65 单测**；新增 `ChecksumWork` / `ChecksumEvent` / `RebalanceReport` 三个类型、`checksums: BTreeMap<String, ChecksumWork>` 字段、9 个方法（`checksum_progress` / `checksum_work` / `checksum_count` / `start_checksum` / `set_checksum_progress` / `cancel_checksum` / `on_checksum_done` / `on_checksum_failed` / `rebalance`）；模块 doc 新增「校验也只做记账」一条；imports 加 `TaskError` / `serde_json::Value`；9 个新单测 |
+| `rust/README.md` | 865 → **888 行**；「任务记账」补「校验记账 + `_rebalance`（第 98 步）」一节（含 `del` → `None`、孤儿进度两条差异）；规模行改 **2717 行 / 65 单测** |
+
+### 逐条对齐 Python
+
+```python
+# checksumProgress (task_service.py:408-410)
+work = self._checksums.get(task.taskId); return work.progress if work else None
+
+# startChecksum (:412-420)
+work = ChecksumWork()                      # workId="" progress=0
+self._checksums[task.taskId] = work
+work.workId = self._coroutineRunner.submit(
+    toChecksum(Path(task.outputPath), algorithm, lambda p: setattr(work, "progress", p)),
+    done=lambda c: self._onChecksumDone(task, algorithm, c),
+    failed=lambda e: self._onChecksumFailed(task, e))
+self.checksumStarted.emit(task)
+
+# cancelChecksum (:422-427)
+work = self._checksums.pop(task.taskId, None)
+if work is None: return
+self._coroutineRunner.cancel(work.workId)
+self.checksumStopped.emit(task, None)
+
+# _onChecksumDone (:617-621)
+del self._checksums[task.taskId]           # 缺项 -> KeyError
+task.checksums[algorithm] = checksum
+self._flushSoon()
+self.checksumCompleted.emit(task, algorithm)
+
+# _onChecksumFailed (:623-626)
+del self._checksums[task.taskId]
+self.checksumStopped.emit(task, TaskError("无法读取文件：{detail}", detail=str(error)))
+
+# _rebalance (:639-647)
+for taskId in self._queue.runningIds()[cfg.maxTaskNum.value:]:
+    task = self._store.taskById(taskId)
+    if task is not None and task.canPause:
+        self._cancelWork(task)
+        task.setStatus(TaskStatus.WAITING)
+        self._queue.wait(taskId)
+self._pump()
+```
+
+Rust 侧的对应：
+
+| Python | Rust | 差异 |
+|---|---|---|
+| `_checksums[taskId] = work` + `checksumStarted.emit` | `start_checksum(id, work_id) -> Option<ChecksumEvent>` | 任务不在列表 → `None`（Python 拿的一定是活对象） |
+| `setattr(work, "progress", p)` | `set_checksum_progress(id, p) -> bool` | 只写登记表里的那条；Python 写的是闭包捕获的孤儿对象 |
+| `_checksums.pop(..., None)` + `cancel` + `emit` | `cancel_checksum(id) -> Option<String>` | `Some(workId)` = 调用方还要发 `checksumStopped(task, None)` |
+| `del _checksums[taskId]` + 写 `checksums` + `_flushSoon` + `emit` | `on_checksum_done(id, algorithm, checksum) -> Option<ChecksumEvent::Completed>` | 缺项退化成 `None` 而非 `KeyError` |
+| `del` + `emit(TaskError(...))` | `on_checksum_failed(id, detail) -> ChecksumEvent::Stopped { error }` | 返回值不是 `Option`（Python 无条件 `emit`） |
+| `runningIds()[max:]` 循环 | `rebalance(max_task_num) -> RebalanceReport` | 无 |
+
+`TaskError::new("无法读取文件：{detail}", [("detail", detail)])` 与
+`app/i18n.py:18` 的 `TaskErrors` 文案逐字一致（占位符留给渲染层）。
+
+### 关键决策
+
+- **`start_checksum` 不接收 `algorithm`**：`ChecksumWork` 只有 `workId` / `progress`
+  两个字段（Python 同），算法只用于引擎构造 `toChecksum` 与 `_onChecksumDone` 的写回，
+  落账无意义。workId 由引擎提交协程后回填——Rust 侧改成入参，因为「提交协程」在引擎。
+- **`on_checksum_done` 用 `self.checksums.remove(task_id)?` 作守卫**：Python 的 `del`
+  在缺项时抛 `KeyError`，Rust 退化成 `None`（不写 `checksums`、不置脏、不发信号）。
+  首跑 `on_checksum_done_is_idempotent_and_needs_the_task` 红灯正是漏了这一步——
+  当时只判任务存在、没判登记项存在，第二次调用会把摘要覆盖掉。
+- **`on_checksum_failed` 返回 `ChecksumEvent` 而不是 `Option`**：Python 的 `del` 之后
+  无条件 `emit`，任务已从 store 消失也照发（它拿的是活对象，`del` 只碰 `_checksums`）。
+- **`set_checksum_progress` 返回 `bool`**：Python 的 `onProgress` 闭包持有 `work`
+  对象，`cancelChecksum` 之后迟到的进度会写进孤儿对象（界面上看不见，也不报错）；
+  Rust 只写登记表里的那条，返回是否真写了——语义等价（都对界面不可见），但不会
+  制造无主对象。记入模块 doc「已知差异」。
+- **`cancel_checksum` 返回 `Option<String>`（workId）而不是 `CancelWork`**：这里没有
+  「做种」那半边，只有协程要取消；`Some` 同时编码了「要发 `checksumStopped(task, None)`」。
+- **`rebalance` 不置 `pending_flush`**：Python 的 `task.setStatus(WAITING)` 不落盘，
+  要等下一次真实改动才写。`resume_saved` 同样处理（第 82 步的既有约定）。
+- **`canPause` 走 `facts::can_pause`**：不可暂停的任务原样留在运行中（Python 同样
+  `continue`），`running_count()` 可能仍大于上限——这是照抄，不是缺陷。
+- **`RebalanceReport.cancelled` 用 `Vec<(String, CancelWork)>`**：取消与「放回等待」
+  是一对，拆成并列两个 vec 会丢失对应关系；`requeued` 保留一份纯 id 列表给调用方
+  批量发信号，`started` 单独放 `_pump()` 的结果（对应 `runStarted`）。
+- **`rebalance` 的溢出切片先 `collect()`**：`self.queue.running_ids()` 借 `self.queue`，
+  循环体里要 `&mut self` 调 `cancel_work` / `task_mut` / `queue.wait`。
+
+### Python 实测（`TaskService.__new__` + 假 runner/store，脚本在 scratch `probe98.py`）
+
+```text
+1 startChecksum: workId=w1 progress=0 events=[('started', 't1')] path=/tmp/gd3-probe/out.bin alg=sha256
+  checksumProgress=0  absent=None
+2 progress    : progress=42 checksumProgress=42
+3 onDone      : checksums={'sha256': 'abc123'} work={} events=[('started','t1'),('completed','t1','sha256')] flush=w2
+4 onDone twice: KeyError('t1')
+5 cancel      : work={} events=[('started','t1'),('stopped','t1',None,None)] cancelled=['w1']
+5b cancel twice: events=[('started','t1'),('stopped','t1',None,None)] cancelled=['w1']
+6 onFailed    : work={} events=[('started','t1'),('stopped','t1','无法读取文件：boom',{'detail':'boom'})]
+7 rebalance   : status=[COMPLETED, COMPLETED, WAITING] waiting=['c'] running=['a','b'] cancelled=['wc'] events=[]
+8 rebalance   : status=[COMPLETED, COMPLETED] waiting=[] running=['a','b'] cancelled=[] events=[]
+9 rebalance   : waiting=[] running=['a','b'] events=[('runStarted','b')]
+```
+
+要点：第 3 条证明 `startChecksum` 自己**不置脏**（`flush` 仍是 `startChecksum` 之前
+留下的 `w2`），脏标记来自 `_onChecksumDone` 里的 `_flushSoon()`；第 4 条是 `del` 的
+`KeyError` 现场；第 5b 条证明第二次 `cancelChecksum` 直接 `return`（不再取消协程、
+不再发信号）；第 7/8 条证明 `canPause` 为假时原样跳过、上限够时不摘；第 9 条证明
+`_rebalance` 末尾的 `_pump()` 会把等待队列里的任务派发出去。
+
+### 单测（9 个，全部 hermetic）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `start_checksum_registers_the_work` | `workId` + `progress=0` 登记 + `Started`；任务不在 → `None` 且不登记 |
+| `set_checksum_progress_updates_the_registered_work` | 进度写进登记项；`cancel_checksum` 之后迟到的进度返回 `false` |
+| `cancel_checksum_returns_the_work_id_once` | 首次返回 `Some(workId)` + 摘项；第二次 `None`（不取消协程、不发信号） |
+| `on_checksum_done_records_the_digest_and_flushes` | `startChecksum` 不置脏 → `onDone` 写 `checksums` + 置脏 + 摘项 |
+| `on_checksum_done_is_idempotent_and_needs_the_task` | 第二次 `None`（Python `KeyError`）；任务不在 → `None` |
+| `on_checksum_failed_reports_the_task_error` | `TaskError` 文案 + 不置脏 + 不写 `checksums`；任务不在也发信号 |
+| `rebalance_cancels_tasks_beyond_the_limit` | 超限的运行中任务被摘（`CancelWork` 带 workId）+ 状态回 `WAITING` + 进等待队列；到上限不派发 |
+| `rebalance_skips_tasks_that_cannot_pause` | 塞一个 `FFmpegStep` + `Running` 的步骤 → `canPause` 假 → 不动 |
+| `rebalance_pumps_after_the_limit_grows` | 上限从 1 涨到 2 → 等待队列里的任务被派发 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**702 passed / 0 failed**（693 + 9）；
+- `cargo test --workspace`：**1204 passed / 0 failed**（28 段，第 97 步 1195 + 9）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**；
+- Python 侧没改一行，不跑 Python 全量（探针脚本在 scratch，未入库）。
+
+### 下一步（第 99 步候选，按价值/风险）
+
+1. **`actions::TaskService` 的接线**：`engine.rs` 还没 `impl actions::TaskService`
+   （`pause` / `start` / `start_seeding` / `stop_seeding` / `delete` / `redownload` /
+   `move_to_front` / `set_category` / `start_checksum` / `cancel_checksum`）——
+   整条卡片动作链都还没落到 `TaskService` 上，是「引擎装配」的下一块硬骨头。
+   trait 收 `&self`、`TaskService` 要 `&mut self`，需要
+   `impl actions::TaskService for RefCell<TaskService>` 之类的适配器；
+2. `delete` / `redownload` / `edit` / `set_category` / `update_selection` /
+   `start_all` / `pause_all` 的记账半边；
+3. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：造 `Script`/`Territory`
+   枚举后可搬，纯函数；
+4. `app/services/runtime_status.py`（195 行）：需先给 `pack::BinaryRuntime` 补
+   `install`/`fetch_latest_version` 的同步签名；
+5. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
