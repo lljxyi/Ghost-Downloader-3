@@ -33,7 +33,7 @@ pub const BASE_HEADERS: [(&str, &str); 8] = [
 
 pub const DEFAULT_PRESET_NAME: &str = "默认";
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HeaderPreset {
     pub name: String,
     pub headers: Vec<(String, String)>,

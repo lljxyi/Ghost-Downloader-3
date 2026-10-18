@@ -20,7 +20,7 @@
 
 use crate::pystr::py_strip;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityPreset {
     pub name: String,
     pub client_profile: String,
@@ -110,7 +110,7 @@ pub fn row_desc(preset: &IdentityPreset) -> String {
     parts.join(" · ")
 }
 
-fn clip_user_agent(ua: &str) -> String {
+pub fn clip_user_agent(ua: &str) -> String {
     if ua.chars().count() <= 24 {
         ua.to_string()
     } else {
