@@ -18,6 +18,7 @@ pub mod actions;
 pub mod band_selector;
 pub mod banners;
 pub mod batch_url;
+pub mod boot;
 pub mod bootstrap_list;
 pub mod card;
 pub mod card_groups;

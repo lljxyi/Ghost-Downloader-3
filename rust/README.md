@@ -150,8 +150,8 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
 | P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**55 个模块**（54 个 `pub` + 私有 `format`）/ **33 411 行 `src/`**（含 `lib.rs` 3 482 行）、
-**6 个 Slint 文件 2 858 行**、**584 个单测**。
+规模：**56 个模块**（55 个 `pub` + 私有 `format`）/ **34 113 行 `src/`**（含 `lib.rs` 3 488 行）、
+**6 个 Slint 文件 2 858 行**、**599 个单测**（`cargo test -p gd3-ui --lib`）。
 
 `app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
 无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
@@ -164,7 +164,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（584）
+cargo test -p gd3-ui --lib                 # 只跑单测（599）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 
@@ -178,9 +178,37 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
   非法 IPv6 括号、Markdown 缺片段标记——都在注释里写明与 Python 的差异；
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
-**尚未做**：把 Slint 侧真正跑起来——没有 `main` / 事件循环，没有接 `gd3-core` 的
-`TaskService` 与 `UserConfig.json`，`Ghost-Downloader-3.py` 的入口仍走 Qt。
-这是 Phase 8 的内容。
+**尚未做**：接 `gd3-core` 的 `TaskService`（引擎、托盘、单实例锁在 Phase 8 里逐项补），
+`Ghost-Downloader-3.py` 的入口仍走 Qt。二进制入口见下一节。
+
+## Phase 8：启动入口（`gd3-ui` 二进制）
+
+`crates/gd3-ui/src/main.rs` 只有一行（转 `boot::main_entry`），启动序列在
+`crates/gd3-ui/src/boot.rs`，对应仓库根的 `Ghost-Downloader-3.py`（268 行）：
+
+```text
+Paths（paths.py）→ load_config（qconfig.load）→ 窗口 + push_settings → 事件循环
+```
+
+- **路径语义**照抄 Qt 的「字符串拼接」而不是 `Path::join`：本机 `HOME` 为空时
+  `QStandardPaths` 给 `HomeLocation='/'`、`GenericDataLocation='//.local/share'`、
+  `DownloadLocation='//Downloads'`，双斜杠必须保留（`home_path_join` 有单测钉住）；
+- **配置**：文件不存在 → 用 `settings::default_config_with_download_folder(DOWNLOAD_DIR)`，
+  且**不写盘**（Python 的 `qconfig.load` 同样不写）；文件损坏 → 退回缺省并标记 `broken`；
+- **事件循环**：有 `DISPLAY`/`WAYLAND_DISPLAY` 走 winit 后端（`window.run()`），
+  否则走 `MinimalSoftwareWindow`，跑 `--frames` 帧后退出；
+- **CLI**：`--silence`（对应 Python 的 `--silence`）、`--version`、`--help` 之外，
+  另有三个 Rust 侧可测性开关 `--headless` / `--frames` / `--data-dir`（Python 没有）。
+
+```bash
+cargo run -p gd3-ui --bin gd3-ui -- --headless --frames 3 --data-dir /tmp/gd3-data
+# Ghost Downloader v4.4.0 launched (headless, 3 frame(s), config=default, data=/tmp/gd3-data)
+cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.py）
+```
+
+未迁移（后续小步）：单实例锁（QSharedMemory）、D-Bus / URL scheme 接收、
+`app/engine.py` 的全部服务、托盘 / keepalive / 通知、功能包加载、更新检查、
+OOBE 分支、翻译器。
 
 ## 剩余工作（Phase 8）
 
