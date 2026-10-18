@@ -4871,3 +4871,73 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
   4. `app/services/speed_meter.py`（56 行）/ `plan.py`（53 行）都太小，
      可以顺手并进相邻步骤。
 - 卡点：无
+
+## 第 89 步：gd3-core::file_association + gd3-core::run_at_login（2026-10-18 11:19）
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/file_association.rs`（**548 行 / 14 单测**）：
+    `MIME_PREFIX` / `desktop_file_path` / `service_file_path` / `load_mime_types` /
+    `desktop_entry_text` / `service_entry_text` / `save_mime_types` /
+    `register_file_types` / `register_url_scheme` / `unregister_url_scheme` +
+    私有（现 `pub(crate)`）`remove_if_exists`。
+  - 新增 `rust/crates/gd3-core/src/run_at_login.rs`（**415 行 / 14 单测**）：
+    `LAUNCH_AGENT_LABEL` / `WINDOWS_RUN_KEY` / `WINDOWS_VALUE_NAME` /
+    `autostart_file_path` / `autostart_entry_text` / `set_autostart` /
+    `launch_agent_path` / `launch_agent_text` / `set_launch_agent` /
+    `windows_run_value` / `set_run_at_login`。
+  - `lib.rs`：加 `pub mod file_association;` / `pub mod run_at_login;` + 21 个 re-export；
+    `pack.rs` 的 `split_lines` 从 `fn` 改成 `pub(crate) fn`（`file_association` 复用，
+    不再复制第 4 份）；
+  - `rust/README.md` 新增「Linux 桌面集成」一节。
+- 关键决策：
+  - **`home` / `desktop_id` / `executable_path` / `version` 全部作参数传入**（照第 87 步
+    `app_version`）：core 不硬编码 `gd3-ui` 的 `DESKTOP_ID` / `VERSION`，更不猜
+    `EXECUTABLE_PATH`（Python 侧是 `$APPIMAGE` → `sys.argv[0]`（frozen）→
+    `sys.executable` 的运行时探测结果）。macOS 的 plist 路径在 Python 里写死成
+    `/Users/{getpwuid(...).pw_name}/...`，这里换成 `home`（macOS 上等价，且可测）。
+  - **`save_mime_types` 把 `subprocess.run` 拆成返回值 `Vec<Vec<String>>`**：
+    `update-desktop-database <applications>` 总排第一（即使 mimes 为空、文件已被删），
+    之后每个 mime 一条 `xdg-mime default <desktop_id>.desktop <mime>`；Python 在
+    `FileNotFoundError` 时 `break`，调用方按「`NotFound` 就停」复刻。
+  - **mime 集合用 `BTreeSet` 而不是 `set`**：`xdg-mime` 的调用顺序变确定，落盘内容不受影响
+    （`';'.join(sorted(mimes))` 本来就排序）。
+  - **`register_file_types` 保留「丢掉非 `x-scheme-handler/*` 的已有 MIME」**：
+    `saveMimeTypes(schemes | {ft.mimeType for ft in fileTypes})` 原样如此，写进 doc + 单测钉住。
+  - **`remove_if_exists` 只吞 `NotFound`**（镜像 `unlink(missing_ok=True)`），
+    改成 `pub(crate)` 供 `run_at_login` 的禁用分支复用。
+  - **Windows 注册表判 N/A，但 `set_run_at_login` 在 Windows 上返回 `Unsupported` 而非
+    静默成功**：Python 用 `winreg` 写 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，
+    本机离线拿不到 `windows-sys` / `winreg` crate。静默 `Ok(())` 会让用户以为设置生效；
+    `windows_run_value` 保留数据格式（`"<EXE>" --silence`）+ 单测，等 API 可用时接上。
+- 实证结论（CPython 3.13 实测 + 源码级，全部有单测钉住）：
+  - Linux `.desktop` 正文 **217 字节**、macOS plist **398 字节**（`executable =
+    /opt/ghost/GhostDownloader`、`VERSION = 4.4.0`）：用
+    `QT_QPA_PLATFORM=offscreen HOME=<tmp> setRunAtLogin(True)` 真跑一遍生成文件后
+    `repr()` 取值，两条断言逐字比较（含 `Exec="..." --silence` 的引号）；
+  - `loadMimeTypes` 在循环里**直接 `return`**：只有第一个 `MimeType=` 行有效
+    （第二行 `MimeType=z;` 被忽略，有单测）；空段 `a;b;;c;` 被丢掉；
+  - 空集合时只 `unlink` 两份文件、**不 `mkdir`、不删目录**，但
+    `update-desktop-database` 照样跑（单测断言命令数 = 1、`.local/share` 不存在）；
+  - `run_at_login` 禁用时同样只 `unlink`，`~/.config/autostart` / `LaunchAgents` 留着；
+  - 两个 Python 文件里 `file_association.py` / `run_at_login.py` **都没有 `try/except`**
+    （外层 `try/except Exception` + log 在 `register` / `registerUrlScheme` 那三个入口），
+    所以 Rust 侧一律返回 `io::Result`，日志由调用方打；
+  - Python 的 `sys.platform` 三分支没有 `else`（未知平台静默不做）→ Rust 侧同样 `Ok(())`。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**233 passed**（第 88 步 205 + 28）；
+  - `cargo test --workspace`：**1082 passed, 0 failed**（第 88 步 1054 + 28，10m47s 编译）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（3m08s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧没改一行，不需要跑 Python 全量；
+  - commit `85c0e6e`。
+- 下一步（按价值/风险排序）：
+  1. `app/services/runtime_status.py`（195 行）需要先给 `pack::BinaryRuntime` 补
+     `install` / `fetch_latest_version` 的**同步签名**（Python 是 `async` 且要网络）；
+  2. `app/platform/hidden_subprocess.py`（99 行）：Linux 分支是 `subprocess` +
+     `start_new_session`，Rust 侧 `CommandExt::pre_exec`；
+  3. `app/platform/desktop.py`（405 行）：shutdown / restart / sleep / openFile，
+     Linux 走 `systemctl` / `xdg-open`；
+  4. `app/services/speed_meter.py`（56 行）/ `plan.py`（53 行）/
+     `name_conflict_queue.py`（73 行）都太小，并进相邻步骤；
+  5. D-Bus / keepalive 仍排最后（`zbus` 缓存可用但编译代价大）。
+- 卡点：无
