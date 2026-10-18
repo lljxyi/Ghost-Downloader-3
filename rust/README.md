@@ -150,8 +150,8 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
 | P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**56 个模块**（55 个 `pub` + 私有 `format`）/ **34 113 行 `src/`**（含 `lib.rs` 3 488 行）、
-**6 个 Slint 文件 2 858 行**、**599 个单测**（`cargo test -p gd3-ui --lib`）。
+规模：**57 个模块**（56 个 `pub` + 私有 `format`）/ **34 790 行 `src/`**（含 `lib.rs` 3 489 行）、
+**6 个 Slint 文件 2 858 行**、**620 个单测**（`cargo test -p gd3-ui --lib`）。
 
 `app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
 无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
@@ -164,7 +164,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（599）
+cargo test -p gd3-ui --lib                 # 只跑单测（620）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 
@@ -178,7 +178,7 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
   非法 IPv6 括号、Markdown 缺片段标记——都在注释里写明与 Python 的差异；
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
-**尚未做**：接 `gd3-core` 的 `TaskService`（引擎、托盘、单实例锁在 Phase 8 里逐项补），
+**尚未做**：`TaskService` 的引擎半边（托盘、单实例锁、引擎在 Phase 8 里逐项补），
 `Ghost-Downloader-3.py` 的入口仍走 Qt。二进制入口见下一节。
 
 ## Phase 8：启动入口（`gd3-ui` 二进制）
@@ -205,6 +205,23 @@ cargo run -p gd3-ui --bin gd3-ui -- --headless --frames 3 --data-dir /tmp/gd3-da
 # Ghost Downloader v4.4.0 launched (headless, 3 frame(s), config=default, data=/tmp/gd3-data)
 cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.py）
 ```
+
+### 任务记账（`task_service.rs`）
+
+`app/services/task_service.py` 的 `TaskService`（705 行）把「存储/队列记账 + 引擎交互 +
+19 个信号」揉在一个类里。`task_service.rs` 只做**引擎无关**的那一半：
+
+- 任务列表是 `Vec<TaskRecord>`（插入序 = Python `dict` 的迭代序），队列记账转调
+  `gd3_core::queue::TaskQueue`；
+- 信号退化成返回值：`pump(maxTaskNum)` 返回「该派发哪些 id」，
+  `on_run_finished(id, maxTaskNum)` 返回 `RunOutcome { started, all_completed }`
+  ——**`all_completed` 必须在派发之后算**，否则「刚做完一个、正好接上下一个等待任务」
+  会被误判成全完成；
+- `_flushSoon()` 的 200ms 防抖退化成 `pending_flush` 标记，由调用方 tick 后 `flush()`；
+- `add()` 的磁盘检查走 `add_with_free_space(record, autoStart, free_space)`：`free_space`
+  由调用方用 `disk_usage` 算，`None` 等价于 Python 的 `except OSError: pass`；
+- **`autoStart` 即入队，与 `fileSize` 无关**——Python 的 `if task.fileSize > 0:` 只包住
+  磁盘检查，`_schedule()` 在块外无条件调用（首版按「`fileSize > 0` 才入队」写错了）。
 
 未迁移（后续小步）：单实例锁（QSharedMemory）、D-Bus / URL scheme 接收、
 `app/engine.py` 的全部服务、托盘 / keepalive / 通知、功能包加载、更新检查、
