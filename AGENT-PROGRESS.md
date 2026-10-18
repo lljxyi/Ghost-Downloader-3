@@ -3981,3 +3981,68 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 - 下一步：P6 平台外壳（`shell/tray.py` 205 / `dock.py` 141 /
   `mac_status_item.py` 112）→ 更新 `rust/README.md` + `AGENT-DONE`。
 - 卡点：无
+
+## 第 75 步：P6 平台外壳语义层（`shell.rs`，tray/dock/mac_status_item）（2026-10-18 05:29）
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/shell.rs`（**848 行 / 21 测试**），镜像
+    `app/view/shell/tray.py`(205) + `dock.py`(141) + `mac_status_item.py`(112)；
+    `lib.rs` 在 `setting_cards` 与 `settings_group` 之间注册 `pub mod shell;`（line 62）。
+  - 托盘：`TRAY_NAME "Ghost Downloader"`、四个动作文案、`TrayActionKind` 五值
+    （含 `Separator`）、`TrayMenuEntry{kind,icon,text}`、`tray_menu()`（5 项，
+    图标 `GHOST/PLAY/PAUSE/None/CLOSE`）、`TraySignal{ActivationRequested,StartAll,
+    PauseAll,Quit}`、`tray_action`、`ActivationReason` 五值 + `from_qt`/`qt_value`、
+    `tray_activated`（**只认 Trigger**）、`tray_tooltip(speed)`（`speed > 0` 才带
+    `"↓ {toReadableSize}/s"`）。
+  - Windows 菜单三态：`TrayMenuFlavor{RoundMenu,TrayRoundMenu,AcrylicMenu}` +
+    `tray_menu_flavor(platform, win11)`；常量 `TRAY_MENU_WIDTH_PAD 5`、
+    `ACRYLIC_MENU_Y_OFFSET 45`、`ACRYLIC_MENU_ITEM_HEIGHT 28`、
+    `ACRYLIC_MENU_ICON_SIZE 14`、`ACRYLIC_MENU_HIDE_DELAY_MS 400`、
+    `ACRYLIC_MENU_PAINT_COLOR (0,0,0,1)`、`ACRYLIC_TINT_DARK "00000030"` /
+    `ACRYLIC_TINT_LIGHT "FFFFFF30"`；`acrylic_position`、`round_menu_position`、
+    `acrylic_tint`、`acrylic_is_dark`。
+  - Dock：`DOCK_ICON_SIZE 256`、`DOCK_FONT_RATIO 0.14`、`DOCK_FONT_MIN_PIXEL 6`、
+    `DOCK_TEXT_MAX_WIDTH_RATIO 0.85`、`DOCK_TEXT_Y_RATIO 0.82`、
+    `DOCK_TEXT_STROKE_WIDTH 12` / `COLOR (0,0,0,180)` / `FILL (255,255,255)`、
+    `DOCK_BAR_HEIGHT_RATIO 0.08` / `STYLE 0` / `MIN 0.0` / `MAX 100.0` /
+    `INDETERMINATE false`；`to_dock_speed`（**一位小数** + `B/s,K/s,M/s,G/s`，
+    `<1024` 输出整数）、`DockTextLayout{pixel_size,text_x,text_y,advance}` +
+    `dock_text_layout(size,text,&advance)`（字体测宽作闭包入参）、`dock_bar_height`、
+    `dock_bar_visible`、`DockEffect{SetActivationPolicy,UpdateTile,ClearTile}`、
+    `DockState` + `on_speed_changed` / `on_show_speed_changed` /
+    `on_show_icon_changed` / `clear`。
+  - 状态项：`STATUS_ICON_SIZE 16.0`、`STATUS_START_ALL_INDEX 1`、
+    `STATUS_PAUSE_ALL_INDEX 2`、`StatusMenuItem{title,selector,key,symbol}`、
+    `status_menu()`（`showDashboard:/startAll:/pauseAll:/quitApp:`，**仅退出**
+    有快捷键 `"q"`）、`status_speed_title(show,bps)`（带**前导空格**）、
+    `status_menu_enabled(&[TaskStatus]) -> (bool,bool)`、`status_icon_size(w,h)`。
+- 实证结论（写进模块头，本轮实读源码）：
+  - 托盘菜单顺序固定五项，分隔线在「全部暂停」与「退出程序」之间；
+  - `_onActivated` 只认 `Trigger`（单击），双击/中键/上下文菜单一律忽略；
+    `messageClicked` 直连 `activationRequested`；
+  - `toReadableSize`（两位小数 + `B/KB/MB/GB/TB`）与 `toDockSpeed`（一位小数 +
+    `B/s,K/s,M/s,G/s`）是**两套口径**，不能互相复用；
+  - 平台分支只看 `win32` + `isGreaterEqualWin11()`：Win11 → `AcrylicMenu`，
+    Win10 → `TrayRoundMenu`，其它 → `RoundMenu`；
+  - `AcrylicMenu.adjustPosition` 的宽度是 `sizeHint.width + 5`，`x` 用
+    `min(self.x() - m.left(), rect.right() - w)` 钳右边界，`y` 硬减 45；
+  - `TrayRoundMenu.showEvent` 只钳右下（`min(x, right-width)` / `min(y, bottom-height)`）；
+  - Dock 字号 `int(size * 0.14)`，超宽时**逐像素**降到 `> 6` 为止，`textY` 固定
+    `size * 0.82`，进度条高 `tileHeight * 0.08`、`progress >= 0` 才显示；
+  - `dock.clear` 在未建 container 时**无副作用**（用 `has_container: bool`
+    忠实 Python 闭包的 `nonlocal container`）；
+  - 状态项「全部开始」在存在 `PAUSED/FAILED/WAITING` 时启用、「全部暂停」在存在
+    `RUNNING` 时启用；`setSpeed` 标题带前导空格（与托盘无空格相反）。
+- 修掉的问题：
+  - clippy `manual_contains`：`statuses.iter().any(|s| *s == TaskStatus::Running)`
+    → `statuses.contains(&TaskStatus::Running)`；
+  - 上一轮已删 `status_speed_title_after_toggle`（两分支同返回空串，
+    clippy `if_same_then_else`），注释里写明「把开关新值传给 `status_speed_title` 即可」。
+- 验证：
+  - `cargo test -p gd3-ui --lib`：**533 → 554 passed, 0 failed**（shell 21 项）；
+  - `cargo test -p gd3-ui --lib shell::`：21 passed；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings` 0 error（增量 2m27s）；
+  - `cargo fmt --all --check` 通过；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers` 全绿；
+  - commit `f6ca6d7`。
+- 下一步：更新 `rust/README.md` 完成状态 → 创建 `AGENT-DONE` → 停止推进等验收。
+- 卡点：无
