@@ -42,6 +42,7 @@ pub mod labels;
 pub mod markdown_viewer;
 pub mod menu_view;
 pub mod name_conflict;
+pub mod oobe;
 pub mod option_cards;
 pub mod pack_info;
 pub mod plan;
