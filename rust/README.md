@@ -473,6 +473,64 @@ Rust 侧没有对应概念，所以只搬到 manifest 排序为止，实例化�
 规模：`checksum.rs` **914 行 / 10 单测**（其中 4 条是 `hashlib` 向量，2 条是
 SHA-2 增量一致性）。
 
+## Linux 桌面集成（`gd3-core::file_association` / `gd3-core::run_at_login`）
+
+`app/platform/file_association.py`（148 行）与 `app/platform/run_at_login.py`（79 行）
+都是「按平台分三支」的文件。可搬的只有 Linux 两支 + macOS 的 plist 文本：
+
+| Python | Rust | 要点 |
+|---|---|---|
+| `loadMimeTypes`（:19-30） | `file_association::load_mime_types` | 只看**第一行** `MimeType=`，按 `;` 切、丢空段 |
+| `saveMimeTypes`（:33-66） | `file_association::save_mime_types` | 写 / 删两份文件，**返回待执行命令** |
+| `_registerLinux`（:69-79） | `file_association::register_file_types` | 只保留 `x-scheme-handler/*` + 各 `FileType.mime_type` |
+| `registerUrlScheme`（:91-104） | `file_association::register_url_scheme` | 并上 `x-scheme-handler/<scheme>` |
+| `unregisterUrlScheme`（:106-119） | `file_association::unregister_url_scheme` | 去掉它，其它保留 |
+| `_setLinux`（:59-79） | `run_at_login::set_autostart` | `~/.config/autostart/<desktop_id>.desktop` |
+| `_setMacOS`（:37-56） | `run_at_login::set_launch_agent` | `<home>/Library/LaunchAgents/<label>.plist` |
+| `setRunAtLogin`（:10-16） | `run_at_login::set_run_at_login` | 按 `std::env::consts::OS` 分发 |
+| `_setWindows`（:19-34，`winreg`） | `run_at_login::windows_run_value` | 只算注册表数据，**写注册表判 N/A** |
+
+三个决策：
+
+1. **`home` / `desktop_id` / `executable_path` / `version` 全部作参数传入。**
+   `gd3-core` 不硬编码 `gd3-ui` 里的 `DESKTOP_ID` / `VERSION`，更不猜 `EXECUTABLE_PATH`
+   （Python 那份是 `app/config/paths.py` 的运行时探测结果：`$APPIMAGE` → `sys.argv[0]`
+   （frozen）→ `sys.executable`）。照第 87 步 `app_version` 的做法。
+   macOS 的 plist 路径在 Python 里写死成 `/Users/{getpwuid(...).pw_name}/...`，
+   Rust 侧换成 `home`（macOS 上两者相同，且可测）。
+2. **`save_mime_types` 把 `subprocess.run` 拆成返回值 `Vec<Vec<String>>`。**
+   `update-desktop-database <applications 目录>` 总排第一（即使 mimes 为空、文件已被删），
+   之后每个 mime 一条 `xdg-mime default <desktop_id>.desktop <mime>`。Python 在
+   `FileNotFoundError` 时 `break`，调用方按「`NotFound` 就停」复刻即可。
+3. **`for mime in mimes` 用 `BTreeSet`（有序）而不是 Python 的 `set`（哈希序）。**
+   `xdg-mime` 的调用顺序变了，落盘内容不变（`';'.join(sorted(mimes))` 本来就排序）。
+
+四个易错点：
+
+- `loadMimeTypes` 在循环里**直接 `return`**：只有第一个 `MimeType=` 行有效；
+- `_registerLinux` 会**丢掉**已有 MIME 里所有非 `x-scheme-handler/*` 的项
+  （`saveMimeTypes(schemes | {ft.mimeType for ft in fileTypes})`），这是 Python 原样行为，
+  有单测钉住；
+- 空集合时只 `unlink(missing_ok=True)` 两份文件、**不 `mkdir`、不删目录**，
+  但 `update-desktop-database` 照样跑；
+- `run_at_login` 禁用时同样只 `unlink`，`~/.config/autostart` / `LaunchAgents` 留着。
+
+与 Python 的已知差异：
+
+1. **Windows 注册表未迁移**（需要 `windows-sys` / `winreg` crate，本机离线不可用）。
+   `set_run_at_login` 在 Windows 上返回 `io::ErrorKind::Unsupported` 而**不是静默成功**——
+   让用户看得见失败，而不是以为设置生效了；`windows_run_value` 保留数据格式
+   （`"<EXECUTABLE_PATH>" --silence`）+ 单测，等注册表 API 可用时接上；
+2. Python 的 `sys.platform` 三分支没有 `else`，未知平台静默不做；Rust 侧同样返回 `Ok(())`；
+3. 两个 Python 文件都**没有 `try/except`**（`file_association.py` 的
+   `register` / `registerUrlScheme` 外层那层 `try/except Exception` + log 在调用方），
+   所以这里一律返回 `io::Result`，日志由调用方打；
+4. 落盘文本的字节数由 CPython 3.13 实测核对：Linux `.desktop` **217 字节**、
+   macOS plist **398 字节**（`ExecutablePath = "/opt/ghost/GhostDownloader"`），
+   两条断言逐字比较。
+
+规模：`file_association.rs` **548 行 / 14 单测**、`run_at_login.rs` **415 行 / 14 单测**。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

@@ -266,7 +266,7 @@ fn py_strip(text: &str) -> &str {
 }
 
 /// 镜像 CPython `str.splitlines()` 的行界集合（`\r\n` 算一个）。
-fn split_lines(text: &str) -> Vec<String> {
+pub(crate) fn split_lines(text: &str) -> Vec<String> {
     fn is_boundary(c: char) -> bool {
         matches!(
             c,
