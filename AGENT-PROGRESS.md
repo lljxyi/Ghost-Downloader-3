@@ -3554,3 +3554,47 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   - `cargo test -p gd3-ui --lib`：**237 → 255 passed**（pack_info 9 + subtitle_select 9）。
 - 下一步：P3 剩余两个对话框 `extension_install.py`(133) / `release_info.py`(123)。
 - 卡点：无
+
+## 第 68 步：扩展安装 + 发行说明对话框语义层，P3 收官（2026-10-18 01:45）
+- 做了什么：收口上一轮已写盘未提交的 `extension_install.rs`（331 行，7 测试），
+  新写 `release_info.rs`（约 790 行，17 测试），`lib.rs` 两行注册
+  （`extension_install` 于 `edit_task`/`facts` 之间，`release_info` 于
+  `pystr`/`row` 之间）：
+  - `extension_install.rs`：`MIN_WIDTH=768`、`MAX_HEIGHT=790`、
+    `chip()` 的 `&nbsp;` 与 `font-family: 'Cascadia Code', Consolas, monospace;`
+    逐字节；`ExtensionInstallState::new(path, dark, gif_available)` 把
+    `QMovie.isValid()` 摊成入参，`install_action(opened)` 返回
+    `InstallOutcome{reveal_path, chromium_url, opened, fallback}`。
+  - `release_info.rs`：`Release`/`ReleaseAsset` + `from_response`
+    （`tag_name`→`name` 取首个 strip 非空、`published_at` 空退 `created_at`、
+    `version` 空兜 `Unknown`）；`published_date()` 用 `chars().take(10)`
+    （**码点切片**，不是字节）；`description_markdown()` 走 `body or "暂无更新说明"`；
+    `Platform{Windows{legacy},MacOs,Android,Linux}` + `arch_keywords` +
+    `asset_score`（平台关键词 `40 - i*10` 取最大、架构子串硬门槛、按平台扩展名
+    加分）+ `best_asset_index`（`score > bestScore` 初值 -1 → **同分取先出现者**，
+    最终 `<0` 返回 None）；`ReleaseInfoState` 建行（`toReadableSize(size)` +
+    `str(download_count)`）、按 `bestAsset` 预选、`validate()` = 有选中、
+    `min_width(available, needed)` 复刻两段式
+    `min(580, w-48)` → 有资产再 `max(旧, needed+68)`。
+- 实证结论（写进两个模块头）：
+  - `cancelButton` 在 `release_info.py` 里**没有** `setVisible(False)`，
+    保持 `MessageBoxBase` 默认「取消」（与第 62 步实测一致）；
+  - `dateLabel` 空串就空串，不补占位符；
+  - `assetScore` 的 `windows7` 关键词只在 `isLessThanWin10()` 时参与加权，
+    且 `setup` 是 `.exe` 加 100 的硬条件（裸 `.exe` 只有基础分）；
+  - macOS 的 `mac` 是**第三**关键词 → 只给 20 分（`App-mac-x64.zip` 实测 70，
+    不是 90）；
+  - 初始选中靠 Qt 的**对象同一性**（`item.data(UserRole) is best`），
+    行序与 `assets` 序一致，故等价于 `best_asset_index`。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy -p gd3-ui --all-targets -- -D warnings`
+    0 error（11m04s）。
+  - `cargo test -p gd3-ui --lib`：**255 → 279 passed**（extension_install 7 +
+    release_info 17）。
+- 下一步：P4 组件库（`app/view/components/` 12 文件 ~1900 行：`range_slider`、
+  `band_selector`、`bootstrap_list`、`markdown_viewer`、`token_line_edit`、
+  `track_bar`、`tree_view`、`scroll_area`、`banners`、`labels`、`option_cards`、
+  `install_button`、`progress_toast`、`category_settings`、`editors`）。
+- 卡点：无（`arch_keywords` 最初用 `Option<[&str;3]>` 装不下 2 元素组，
+  编译期就报错，改成 `Option<&[&str]>`；`sizeHintForColumn` 的实测列宽
+  由 Slint 侧测量后作为 `needed` 入参）
