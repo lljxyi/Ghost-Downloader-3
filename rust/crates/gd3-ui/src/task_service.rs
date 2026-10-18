@@ -1313,6 +1313,16 @@ impl TaskService {
         std::mem::take(&mut self.speed_effects)
     }
 
+    /// `Engine.stop()` 里的 `self.speedMeter.stop()`（`engine.py:44`）。
+    ///
+    /// Python 的 `Engine` 与 `TaskService` 拿的是**同一个实例**，所以这里只是把那次
+    /// 调用转给服务自己持有的速度表；`speedChanged.emit(0)` 的效果同样进缓冲，
+    /// 由宿主用 [`TaskService::take_speed_effects`] 取走。
+    pub fn stop_speed_meter(&mut self) {
+        let effects = self.speed_meter.stop();
+        self.speed_effects.extend(effects);
+    }
+
     /// `_tick()`（`speed_meter.py:48-53`）的落点：宿主每秒调一次，效果同样进缓冲。
     pub fn tick_speed_meter(&mut self) {
         let effects = self.speed_meter.tick();

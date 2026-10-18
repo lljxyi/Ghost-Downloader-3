@@ -459,7 +459,8 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
 → construct:browserListener → construct:Aria2RpcService → construct:aria2Listener
 ```
 
-- **真的搬了**：`TaskService`（第 81/82 步）、`SpeedMeter`（整类）、
+- **真的搬了**：`TaskService`（第 81/82 步）、`SpeedMeter`（整类在
+  `speed_meter.rs`，第 104 步；由 `TaskService` 持有，第 105 步）、
   `NameConflictQueue`（复用 `name_conflict.rs`）、`CategoryService` 的 `_load`；
 - **桩**：`RuntimeStatusService` / `FeatureService` / `BrowserService` / `Aria2RpcService`
   只保留装配点；监听器只保留后端开关（`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` == `"1"`
@@ -1172,6 +1173,33 @@ Rust 侧 `TaskService` 自己持有 `SpeedMeter`（Python 里是 `Engine` 构造
 
 `stop()` 在没跑时不吐效果，所以「队列本来就空」的 `pump` 不会产生噪声。
 
+### 接线（`Engine`）
+
+Python 的 `Engine.stop()` 里也有一发 `self.speedMeter.stop()`（`engine.py:44`，在
+`taskService.flush()` 之后、`browserListener.stop()` 之前）——它和 `TaskService` 拿的是
+**同一个实例**，所以 Rust 侧速度表归 `TaskService` 所有，`Engine` 只转出口：
+
+| Python | Rust |
+|---|---|
+| `engine.speedMeter` | `Engine::speed_meter()` → `TaskService::speed_meter()` |
+| `engine.speedMeter.stop()` | `TaskService::stop_speed_meter()`（效果进缓冲） |
+| `speedChanged` 的消费者 | `Engine::drain_speed_effects()` |
+| 四个调用点里的 `_refreshSpeedMeter()` | 同上，效果由宿主取走 |
+
+`Engine::drain_speed_effects()` 把 `TaskService::take_speed_effects()` 取到的效果逐条记进
+装配轨迹（`speed:start:<workId>` / `speed:cancel:<workId>` / `speed:emit:<值>`），再把
+`Vec<SpeedEffect>` 交回宿主——宿主据此起 1 秒周期、取消周期、刷数字；引擎测试据此钉住
+「谁在什么时候起表」。
+
+**只有 `Engine::pump()` 与 `Engine::stop()` 自动 drain**。另外三个调用点
+（`stopSeeding` / `_seed` / `_onSeedingEnded`）走 `TaskActions`，宿主在那里
+`take_speed_effects()`（第 100 步的效果队列口径）；没人取就一直攒，下次 `pump` / `stop`
+一并吐出——顺序不变，只是延迟。
+
+第 83 步曾在 `engine.rs` 里写过一份弱化的 `SpeedMeter`（`start() -> ()`、
+`stop() -> Option<i64>`，没有 workId），第 106 步删掉，改用 `crate::speed_meter`：
+同一份状态机不能有两份，否则「`Engine` 停表」与「`TaskService` 记账」会各说各话。
+
 ### 为什么不搬 `name_conflict_queue.py`
 
 `app/services/name_conflict_queue.py`（73 行）的队列**第 65 步 b 就搬过了**，落在
@@ -1185,8 +1213,10 @@ Rust 侧 `TaskService` 自己持有 `SpeedMeter`（Python 里是 `Engine` 构造
 搬新模块前先 `grep -n 'pub struct <名字>' crates/*/src/*.rs`：进度笔记的标题按**Python
 文件用途**起名（「重名冲突提示」），从标题看不出它把服务层队列一起搬了。
 
-规模：`speed_meter.rs` **330 行 / 13 单测**；`task_service.rs` 3611 → **3850 行 / 86 单测**
-（接线 + 9 条单测）。
+规模：`speed_meter.rs` **332 行 / 13 单测**；`task_service.rs` 3611 → **3864 行 / 86 单测**
+（接线 + 9 条单测 + `stop_speed_meter`）；`engine.rs` 1195 → **1161 行 / 17 单测**
+（删掉第 83 步那份弱化 `SpeedMeter` 与 2 条重复单测，补 `drain_speed_effects` 与 2 条
+引擎级测试）。
 
 ## 剩余工作（Phase 8）
 

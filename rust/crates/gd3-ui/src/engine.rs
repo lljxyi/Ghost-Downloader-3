@@ -35,7 +35,9 @@
 //! # 哪些是真的
 //!
 //! - [`TaskService`]：第 81/82 步的记账半边（含 `tasks.jsonl` 装载与落盘）；
-//! - [`SpeedMeter`]：整类都搬了（`addSpeed`/`_tick`/`start`/`stop`）；
+//! - [`SpeedMeter`]：整类都在 [`crate::speed_meter`]（第 104 步），由
+//!   [`TaskService`] 持有（第 105 步）；本模块只负责把效果记进轨迹
+//!   （[`Engine::drain_speed_effects`]）；
 //! - [`NameConflictQueue`]：复用 [`crate::name_conflict::NameConflictQueue`]
 //!   （第 65 步 b 已逐条对齐 `name_conflict_queue.py`）；
 //! - [`CategoryService`]：规则装载 + 匹配 + 输出目录推导（第 95 步起整类都在
@@ -81,6 +83,7 @@ use crate::name_conflict::{
     ConflictActions, ConflictEvent, ConflictTask, DialogOutcome, NameConflictChoice,
     NameConflictQueue, ProbeTarget,
 };
+use crate::speed_meter::{SpeedEffect, SpeedMeter};
 use crate::task_service::{AddOutcome, TaskService};
 
 // ---------------------------------------------------------------------------
@@ -146,71 +149,6 @@ fn port_attr(config: &UserConfig, attr: &str) -> u16 {
 /// `cfg.maxTaskNum`（`RangeValidator(1, 10)`）。
 fn max_task_num(config: &UserConfig) -> usize {
     int_attr(config, "maxTaskNum").max(1) as usize
-}
-
-// ---------------------------------------------------------------------------
-// 速度表（整类迁移）
-// ---------------------------------------------------------------------------
-
-/// `app/services/speed_meter.py`（56 行）：每秒把累计字节数转成「当前速度」。
-///
-/// Python 的 `_tickLoop` 是 `await asyncio.sleep(1)` + `post(self._tick)`，
-/// 这里把「一秒」留给调用方（无头事件循环 / 引擎的定时器），只搬状态机：
-/// `start` → 每秒 `tick` → `stop`。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SpeedMeter {
-    bytes: i64,
-    current_speed: i64,
-    running: bool,
-}
-
-impl SpeedMeter {
-    pub fn new() -> Self {
-        SpeedMeter::default()
-    }
-
-    /// `currentSpeed`（`speedChanged` 最近一次发射的值）。
-    pub fn current_speed(&self) -> i64 {
-        self.current_speed
-    }
-
-    /// `_tickWorkId is not None`。
-    pub fn is_running(&self) -> bool {
-        self.running
-    }
-
-    /// `start()`：已在跑则不动（Python `if self._tickWorkId is not None: return`）。
-    pub fn start(&mut self) {
-        self.running = true;
-    }
-
-    /// `stop()`：没在跑 → `None`（Python 直接 `return`，**不发** `speedChanged`）；
-    /// 否则清零并返回该发的值（`speedChanged.emit(0)`）。
-    pub fn stop(&mut self) -> Option<i64> {
-        if !self.running {
-            return None;
-        }
-        self.running = false;
-        self.bytes = 0;
-        self.current_speed = 0;
-        Some(0)
-    }
-
-    /// `addSpeed(byteCount)`。
-    pub fn add_speed(&mut self, byte_count: i64) {
-        self.bytes += byte_count;
-    }
-
-    /// `_tick()`：没在跑 → `None`（Python 的 `if self._tickWorkId is None: return`）；
-    /// 否则把累计字节数抬成当前速度、清零累加器，返回 `speedChanged` 该发的值。
-    pub fn tick(&mut self) -> Option<i64> {
-        if !self.running {
-            return None;
-        }
-        self.current_speed = self.bytes;
-        self.bytes = 0;
-        Some(self.current_speed)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +317,6 @@ pub struct Engine {
     config: UserConfig,
     tasks_path: PathBuf,
     category: CategoryService,
-    speed_meter: SpeedMeter,
     tasks: TaskService,
     name_conflicts: NameConflictQueue,
     runtime_status: RuntimeStatusService,
@@ -414,8 +351,9 @@ impl Engine {
         trace.push("construct:CategoryService".to_string());
         let category = CategoryService::from_config(&config);
 
+        // Python 在这里构造 `SpeedMeter` 并注入 `TaskService`；Rust 侧速度表归
+        // `TaskService` 自己持有（第 105 步），这里只留构造轨迹以保住装配顺序。
         trace.push("construct:SpeedMeter".to_string());
-        let speed_meter = SpeedMeter::new();
 
         trace.push(
             "connect:taskService <- categoryService, speedMeter, fileWatcher, \
@@ -482,7 +420,6 @@ impl Engine {
             config,
             tasks_path,
             category,
-            speed_meter,
             tasks,
             name_conflicts,
             runtime_status,
@@ -526,13 +463,14 @@ impl Engine {
         self.tasks.set_categories(self.category.clone());
     }
 
+    /// `engine.speedMeter`：Python 里 `TaskService` / `BrowserService` 拿的是
+    /// **同一个实例**，Rust 侧归 [`TaskService`] 所有，这里只转出口。
+    ///
+    /// 写入口（`addSpeed` / `tick` / `stop`）都在 [`TaskService`] 上
+    /// （`add_speed` / `tick_speed_meter` / `stop_speed_meter`），因为它们要顺带把
+    /// 效果攒进缓冲——绕过去就等于把 `speedChanged` 丢了。
     pub fn speed_meter(&self) -> &SpeedMeter {
-        &self.speed_meter
-    }
-
-    /// 速度表的写入口（`addSpeed` / `tick` / `start` / `stop`）。
-    pub fn speed_meter_mut(&mut self) -> &mut SpeedMeter {
-        &mut self.speed_meter
+        self.tasks.speed_meter()
     }
 
     pub fn tasks(&self) -> &TaskService {
@@ -642,7 +580,8 @@ impl Engine {
         self.tasks.flush(&self.tasks_path)?;
 
         self.trace.push("stop:speedMeter.stop".to_string());
-        self.speed_meter.stop();
+        self.tasks.stop_speed_meter();
+        self.drain_speed_effects();
 
         self.trace.push("stop:browserListener.stop".to_string());
         self.browser_listener.stop();
@@ -663,7 +602,26 @@ impl Engine {
     /// Python 在 `_schedule` 里顺带调用；这里由调用方显式触发（没有引擎时
     /// 「派发」只是记账，见 `task_service.rs` 的模块头）。
     pub fn pump(&mut self) -> Vec<String> {
-        self.tasks.pump(self.max_task_num())
+        let dispatched = self.tasks.pump(self.max_task_num());
+        self.drain_speed_effects();
+        dispatched
+    }
+
+    /// 取走 [`TaskService::take_speed_effects`] 攒下的速度表效果，并把它们记进轨迹。
+    ///
+    /// 标签：`speed:start:<workId>` / `speed:cancel:<workId>` / `speed:emit:<值>`。
+    /// 宿主（`boot::run` / 主窗口）拿返回值去真的起 1 秒周期、取消周期、刷数字；
+    /// 引擎测试靠轨迹钉住「谁在什么时候起表」。
+    pub fn drain_speed_effects(&mut self) -> Vec<SpeedEffect> {
+        let effects = self.tasks.take_speed_effects();
+        for effect in &effects {
+            self.trace.push(match effect {
+                SpeedEffect::StartTicking { work_id } => format!("speed:start:{work_id}"),
+                SpeedEffect::Cancel { work_id } => format!("speed:cancel:{work_id}"),
+                SpeedEffect::Emit { speed } => format!("speed:emit:{speed}"),
+            });
+        }
+        effects
     }
 
     /// `taskService.nameConflicted.connect(nameConflictQueue.add)` 的落点。
@@ -914,7 +872,9 @@ mod tests {
         std::fs::write(&path, line(&record("a", TaskStatus::Running, 10)) + "\n").expect("写盘");
         let mut engine = Engine::new(&settings::default_config(), &path);
         engine.start().expect("start");
-        engine.speed_meter_mut().start();
+        // 让速度表真的跑起来（`pump` 派发后运行队列非空），这样 `stop()` 的
+        // cancel / emit 两个效果才有东西可发。
+        assert_eq!(engine.pump(), vec!["a".to_string()]);
         let before = engine.trace().len();
 
         engine.stop().expect("stop");
@@ -923,6 +883,8 @@ mod tests {
             "stop:taskService.stop",
             "stop:flush#1",
             "stop:speedMeter.stop",
+            "speed:cancel:speed-1",
+            "speed:emit:0",
             "stop:browserListener.stop",
             "stop:aria2Listener.stop",
             "stop:featureService.deactivate",
@@ -936,6 +898,39 @@ mod tests {
         assert!(!engine.tasks().pending_flush());
         let text = std::fs::read_to_string(&path).expect("读回");
         assert!(text.contains("\"PAUSED\""), "{text}");
+    }
+
+    #[test]
+    fn pump_records_the_speed_meter_start_in_the_trace() {
+        let dir = temp_dir("pump-speed");
+        let path = dir.join("tasks.jsonl");
+        std::fs::write(&path, line(&record("a", TaskStatus::Waiting, 10)) + "\n").expect("写盘");
+        let mut engine = Engine::new(&settings::default_config(), &path);
+        engine.start().expect("start");
+        let before = engine.trace().len();
+
+        let dispatched = engine.pump();
+
+        assert_eq!(dispatched, vec!["a".to_string()]);
+        assert_eq!(
+            &engine.trace()[before..],
+            strings(&["speed:start:speed-1"]).as_slice()
+        );
+        assert!(engine.speed_meter().is_running());
+        // 效果已经被 drain 取走了，缓冲是空的。
+        assert!(engine.drain_speed_effects().is_empty());
+    }
+
+    #[test]
+    fn draining_an_idle_speed_meter_yields_nothing() {
+        let dir = temp_dir("drain-idle");
+        let mut engine = Engine::new(&settings::default_config(), dir.join("tasks.jsonl"));
+        engine.start().expect("start");
+        let before = engine.trace().len();
+
+        assert!(engine.drain_speed_effects().is_empty());
+
+        assert_eq!(engine.trace().len(), before, "空闲时不记标签");
     }
 
     #[test]
@@ -1097,35 +1092,6 @@ mod tests {
         ] {
             assert!(!flag_is_on(value), "{value:?} 不该算开启");
         }
-    }
-
-    #[test]
-    fn speed_meter_tick_and_stop() {
-        let mut meter = SpeedMeter::new();
-        assert!(!meter.is_running());
-        meter.add_speed(100);
-        // 没 start 时 `_tick` 直接 return，累计值留着。
-        assert_eq!(meter.tick(), None);
-        assert_eq!(meter.current_speed(), 0);
-
-        meter.start();
-        assert!(meter.is_running());
-        assert_eq!(meter.tick(), Some(100));
-        assert_eq!(meter.current_speed(), 100);
-        // 累加器已清零。
-        assert_eq!(meter.tick(), Some(0));
-
-        meter.add_speed(7);
-        assert_eq!(meter.stop(), Some(0));
-        assert!(!meter.is_running());
-        assert_eq!(meter.current_speed(), 0);
-    }
-
-    #[test]
-    fn speed_meter_stop_without_start_emits_nothing() {
-        let mut meter = SpeedMeter::new();
-        assert_eq!(meter.stop(), None);
-        assert!(!meter.is_running());
     }
 
     #[test]
