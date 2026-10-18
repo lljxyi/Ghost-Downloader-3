@@ -3888,3 +3888,96 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   （`shell/tray.py` 205 / `dock.py` 141 / `mac_status_item.py` 112）→ 更新
   `rust/README.md` + `AGENT-DONE`。
 - 卡点：无
+
+## 第 74 步：P5 OOBE 向导语义层（2026-10-18 05:20）
+- 做了什么：
+  - 新增 `gd3-ui/src/oobe.rs`（**1895 行 / 38 测试**），镜像
+    `app/view/windows/oobe_window.py`(971)；`lib.rs` 在 `name_conflict` 与
+    `option_cards` 之间注册 `pub mod oobe;`。
+  - 覆盖面：
+    - 窗口几何：`WINDOW_WIDTH 960` / `WINDOW_HEIGHT 600` / `PREVIEW_WIDTH 592`
+      / `PREVIEW_HEIGHT 333` / `STORE_COLUMN_WIDTH 280` / `PAGE_COUNT 6` /
+      `LATEST_EXTENSION_VERSION "2.2.0"` / `CHROMIUM_EXTENSIONS_URL`；
+      `LAYOUT_MARGIN_H 36` / `LAYOUT_MARGIN_BOTTOM 16` / `LAYOUT_TITLE_BAR_GAP 8`
+      / `NAV_MARGIN_TOP 14` / `PRIMARY_BUTTON_WIDTH 200` /
+      `SYSTEM_TITLE_BAR_X/Y/WIDTH = 0/10/75`；
+    - `IconChip`：`ICON_CHIP_RADIUS 8.0`、`icon_chip_margin(w) = py_round(w*0.25)`、
+      `NEUTRAL_CHIP_COLORS` / `SUCCESS_CHIP_COLORS`、三档尺寸 30/34/80；
+    - 主题卡：`ThemeMode{Light,Dark,Auto}`（`value()` = `Light/Dark/Auto`、
+      `preview_mode()` = `light/dark/auto`、`label()` = 浅色/深色/跟随系统）、
+      `selected_theme_index`、`selection_ring(w,h) = (1,1,w-2,h-2)`、
+      `CARD_BORDER_RADIUS 5.0` / `SELECTION_PEN_WIDTH 2.0`；
+      `ThemePreview` 的 `mini_layout`（标题条 14、padding 8、三条
+      `y+22 h9` / `y+37 h9*0.55` / `y+h-20 h11*0.34`、圆角 3）与
+      `preview_panes`（Auto 左浅右深各半）、三组预览色；
+    - 卡片规格：`ActionCardSpec{title,hint,icon,recommended,url}` +
+      `has_hint()` / `fixed_height()` / `minimum_height()`（有 hint →
+      `minimum_height=Some(80)` 且 `fixed_height=None`，无 hint → `Some(48)`/`None`）、
+      `manual_install_card()`、`store_cards()`（三张 `GLOBE` 卡，URL 复用
+      `settings_spec` 的三个商店常量）；`OptionCardSpec` + 七个 `OPTION_*`；
+    - 文案常量：欢迎/基本设置/扩展页/推荐组件/更多选项/完成页/底部导航全部逐字，
+      含 `LANGUAGE_FALLBACK_LABEL "使用系统设置"`；
+    - 语言下拉：`language_items()` 直接复用 `settings_spec::LANGUAGE_LABELS`
+      （末项就是兜底文案）、`language_index(value)` = `combo_index`、
+      `language_pick(index, current)`（越界/同值 → `None`）；
+    - 扩展页：`ListenStatus{Off,Failed,Listening}`、`BannerIcon{WARNING,INFO,SUCCESS}`、
+      `Banner`、`BANNER_WIDTH/CLOSABLE/DURATION_MS/SHOWS_CONTENT = 592/false/-1/false`、
+      `ListenInfo`、`listen_banner`、`connected_banner`、
+      `ExtensionPageState{is_paired,banner:Option<Banner>}` +
+      `refresh_listen_state` / `set_connected_banner` / `on_connection_changed` /
+      `on_pair_requested` / `on_listen_state_changed(visible,...)` /
+      `on_protocol_mismatched`；`ManualInstallToast` / `TOAST_DURATION_MS 5000` /
+      `extension_extracted(open_ok)`；
+    - 推荐组件：`RuntimeEntry`（`installed` 镜像 `bool(runtime.path())`）、
+      `RuntimeRow{entry,has_checkbox,checked}`、`mount_rows`（过滤
+      `canInstall && title`，`sort_by_key(|e| !e.is_recommended)` 稳定排序，
+      已安装 → 无复选框）、`selected_runtimes`、`install_targets`、
+      `RuntimeInstallState{mounted,rows}` + `mount/is_mounted/rows/set_checked/
+      selected/install_targets`；
+    - 更多选项：`AssocKind{FileTypes,UriSchemes}`（`key()` = `associateFileTypes` /
+      `associateUriSchemes`）、`PackAssoc{file_types:Option<bool>,
+      uri_schemes:Option<bool>}`、`AdvancedOptions` + `cards()` / `card_titles()` /
+      `save(current_run_at_login, packs) -> SavePlan`、`PackAssocWrite`、
+      `UrlSchemePlan{register,registered}`、
+      `SavePlan{set_run_at_login:Option<bool>,clipboard_listener,category_enabled,
+      pack_assoc,url_scheme:Option,aria2_rpc}`；
+    - 窗口状态机：`Page` 六值 + `ALL` / `index()` / `from_index()`、
+      `OobeEffect` 八值、`Navigation` + `navigation(index)`、
+      `OobeState` + `go_next()` / `back()` / `finish()` / `close()` /
+      `on_language_changed()`。
+- 实证结论（写进模块头，本轮再次核对）：
+  - `_onNextClicked` 在 `i == 3` 时**先** `_installSelectedRuntimes()` **再**自增，
+    自增后才判断 `i == 2` 刷新监听、`i == 3` 挂载组件 —— 所以 2→3 走挂载、
+    3→4 走安装，两者不会同时触发；
+  - `_onBackClicked` **不**刷新监听也**不**挂载（只 `setCurrentIndex(..., isBack=True)`）；
+  - `_finish` 与 `closeEvent` 共用 `_isFinished` 闸门，区别是前者额外
+    `advancedOptionsPage.save()` 且显式 `close()`；
+  - `refreshListenState` 在 `_isPaired` 时直接 return（横幅不再被监听状态覆盖），
+    `_onListenStateChanged` 只在 `isVisible()` 时刷新；
+  - `_onConnectionChanged` 用 `installType or version` 判配对，断开时回落
+    `refreshListenState()`；
+  - `save()` 的 `runAtLogin` 分支是**值变才写**（`!=` 才 `setRunAtLogin` + `cfg.set`），
+    其余六个开关**无条件写**；`urlSchemeCard` 先注册/反注册再写配置；
+    macOS（`fileAssocCard is None`）整段跳过关联与协议；
+  - `mount()` 过滤条件是 `rt.canInstall and rt.title`（**title 空**才丢，不是 name）；
+    排序键是 `not rt.isRecommended`（推荐在前，稳定排序）；
+  - `_onExtensionExtracted` 只在 `openChromiumUrl` 失败时才复制剪贴板 + 弹 5s 提示；
+  - `LanguageChanged` 整块重建 content 后恢复**原页码**，语言切换不跳页。
+- 修掉的问题：
+  - 测试数据写错：`RuntimeEntry::new("", "无标题", ...)` 把空串给了 **name**，
+    而 Python 过滤的是 **title** → 改成 `("no-title", "", ...)`（实现未动）；
+  - `const { assert!(OPTION_CARD_MARGINS == (18,8,18,8)) }` 编译失败
+    （元组 `PartialEq` 还不是 const trait）→ 拆成四个字段比较；
+  - clippy：`doc_lazy_continuation` ×2（模块头续行以 `（` 开头 → 并成一行）、
+    `should_implement_trait`（`OobeState::next` 撞 `Iterator::next` → 改名
+    `go_next`，语义仍对应 `_onNextClicked`）、`bool_comparison` ×2
+    （`BANNER_CLOSABLE == false` → `!BANNER_CLOSABLE`）。
+- 验证：
+  - `cargo fmt --all --check` 通过；
+  - `cargo test -p gd3-ui --lib`：**495 → 533 passed**（oobe 38 项）；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings` 0 error（增量 2m21s）；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers` 全绿；
+  - commit `55f2345`。
+- 下一步：P6 平台外壳（`shell/tray.py` 205 / `dock.py` 141 /
+  `mac_status_item.py` 112）→ 更新 `rust/README.md` + `AGENT-DONE`。
+- 卡点：无
