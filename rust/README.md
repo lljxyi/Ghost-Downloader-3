@@ -427,6 +427,52 @@ Rust 侧没有对应概念，所以只搬到 manifest 排序为止，实例化�
 
 规模：`loader.rs` **1029 行 / 37 单测**、`version.rs` **110 行 / 4 单测**。
 
+## 文件校验（`gd3-core::checksum`）
+
+`app/checksum.py` 只有 33 行，但它是「任务卡上的算法菜单」与「`matchChecksum` 挑算法」
+的唯一实现，**必须真能算**，不能只搬纯逻辑：
+
+| Python | Rust | 要点 |
+|---|---|---|
+| `parseChecksum`（:27-28） | `checksum::parse_checksum` | `(text.split() or [""])[0].lower()` |
+| `matchChecksum`（:31-33） | `checksum::match_checksum` | 按**插入顺序**返回第一个命中的算法名 |
+| `toChecksum`（:14-24） | `checksum::to_checksum` | 同步阻塞，`on_progress` 收 `done * 100 / size` |
+| `COMMON_ALGORITHMS` / `CHUNK_SIZE` | 同名常量 | `("md5","sha1","sha256","sha512")` / `4 * 1024 * 1024` |
+| `SHAKE_LENGTHS` | `SHAKE_LENGTHS` | 常量保留，但 `to_checksum` 对它们返回 `Unsupported` |
+| `ALGORITHMS`（`sorted(hashlib.algorithms_available)`） | **未迁移** | 环境相关（本机 40 项），改用 `SUPPORTED_ALGORITHMS` |
+
+四个易错点：
+
+1. `str.split()` 的空白口径是 `str.isspace()`，**包含** `\x1c`-`\x1f`，而 Rust 的
+   `char::is_whitespace` 不包含 → 用私有的 `py_isspace`；
+2. `f.read(CHUNK_SIZE)` 走 `BufferedReader`，**除非 EOF 否则返回满块**；直接用
+   `File::read` 的短读会让进度回调的次数与取值和 Python 不一致 → `read_chunk` 循环填满；
+3. `size = path.stat().st_size` 在**开文件之前**取；空文件一块都读不到，所以
+   `done * 100 // size` 根本不会执行（Python 侧也就不存在 `ZeroDivisionError`）；
+4. `toChecksum` 在 Python 是 `async`（每块 `asyncio.to_thread`）；Rust 侧同步阻塞，
+   取消靠调用方丢弃任务。
+
+### 为什么手写 SHA-256 / SHA-512
+
+本机离线（`static.crates.io` 403），`~/.cargo/registry/cache` 里有 `md-5` 与 `sha1`
+（且已在 `Cargo.lock` 里），**没有 `sha2`**。`sha256` 是下载校验最常用的算法，缺位等于
+功能回归，所以按 FIPS 180-4 实现了这两个摘要：全部常量（K 表 / 初始状态）由 Python
+按定义现算生成，避免手抄；向量对着 `hashlib` 钉住（空串、`abc`、`hello world\n`、
+55/56/63/64/111/112/127/128 字节填充边界、4MiB+7 跨块大文件）。
+
+**`sha2` crate 可用后应整体替换掉 `checksum.rs` 里的 `mod sha256` / `mod sha512`。**
+
+`shake_128` / `shake_256` 是 Keccak，代码量与风险都远高于 SHA-2，本轮不实现：
+`to_checksum` 对它们返回 `ChecksumError::Unsupported`（`Display` 照抄 CPython 的
+`unsupported hash type xxx`）。Python 侧能算，这是已知差异。
+
+其它已知差异：`hashlib.new` 的算法名大小写不敏感，Rust 侧只认小写四个（Python 调用点
+传进来的本来也都是 `ALGORITHMS` 里的小写名）；算法菜单在 Rust 侧将只有
+`COMMON_ALGORITHMS` 那四项，没有「更多」子菜单。
+
+规模：`checksum.rs` **914 行 / 10 单测**（其中 4 条是 `hashlib` 向量，2 条是
+SHA-2 增量一致性）。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

@@ -2,6 +2,7 @@
 //!
 //! 迁移期与 Python 实现共用同一份磁盘格式：两侧都能读写 `tasks.jsonl` 与 `.ghd`。
 
+pub mod checksum;
 pub mod config;
 pub mod container;
 pub mod ed2k;
@@ -24,6 +25,10 @@ pub mod task;
 pub mod task_error;
 pub mod version;
 
+pub use checksum::{
+    CHUNK_SIZE, COMMON_ALGORITHMS, ChecksumError, SHAKE_LENGTHS, SUPPORTED_ALGORITHMS,
+    match_checksum, parse_checksum, to_checksum,
+};
 pub use container::{
     ContainerError, SegmentRange, build_mp4_segment_range, build_webm_segment_range,
     parse_mp4_boxes, parse_sidx,

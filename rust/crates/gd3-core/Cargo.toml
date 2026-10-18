@@ -13,6 +13,8 @@ serde_json.workspace = true
 uuid.workspace = true
 base64 = "0.22"
 toml = "1.1.8"
+md-5 = "0.11"
+sha1 = "0.11"
 [target.'cfg(unix)'.dependencies]
 # `shutil._access_check` 走的是 `os.access(..., X_OK)`，std 没有对应物。
 # 只为一个函数引入 libc（本来就在依赖图里，编译代价为零）。
