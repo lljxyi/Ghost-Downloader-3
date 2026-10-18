@@ -4560,3 +4560,67 @@ Python 是**两套机制叠加**——锁用 `QSharedMemory(DESKTOP_ID)`（`atta
   `single_instance::Handoff` 的过滤规则）、更新检查、keepalive（`desktop_keepalive.py`
   睡眠抑制）。
 - 卡点：无
+
+## 第 85 步：`gd3-core::filesystem`（2026-10-18 08:41）
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/filesystem.rs`（**636 行 / 18 单测**），镜像
+    `app/platform/filesystem.py` 里除 `toSafeFilename` / `splitStemExt`（已在
+    `gd3-core::filename`）之外的**六个**函数：
+    `is_existing`、`is_folder`、`to_posix_path`、`local_file_path`、`find_executable`、
+    `delete_path`；
+  - `path.rs` 加 `posix_normpath`（镜像 `str(PurePosixPath(p))`，**135 → 210 行**）+ 1 单测；
+  - `gd3-core` 在 `[target.'cfg(unix)'.dependencies]` 下引入 `libc`，只为
+    `shutil._access_check` 用的 `access(2)`；
+  - `lib.rs`：`pub mod filesystem;` + 导出六个函数与 `posix_normpath`；
+  - `rust/README.md`：新增「平台辅助（`gd3-core::filesystem`）」一节（对照表 + 5 条
+    CPython 细节 + 为什么不加影子开关）。`gd3-ui` 的规模数字（59 模块 / 36 838 行 /
+    653 单测）不受影响，没动。
+- 实证结论（源码级 + CPython 3.13.5 实跑）：
+  - `urlsplit` **只 `lstrip`**（`"  file:///tmp/x  "` 的 `path` 是 `"/tmp/x  "`，尾部
+    空格保留），并删掉 URL 里的 `\t\r\n`；scheme 必须首字符是 ASCII 字母、其余属于
+    `[A-Za-z0-9+-.]`，`":file:..."`（`i == 0`）与 `"fi le:..."` 都**不**认；
+    `file` 不在 `uses_params` 里，所以 path 不按 `;` 拆；
+  - `url2pathname` 在 POSIX 上就是 `unquote`：按 `%` 切段，**每段只解前两个十六进制
+    字符、剩下的原样拼回去** —— 所以 `unquote("%4142") == "A42"`（不是 `"AB"`），
+    `unquote("%%41") == "%A"`、`unquote("%2") == "%2"`；`+` **不**解成空格；最后按
+    UTF-8 `errors="replace"` 解（`%FF` → `�`、`%C3%28` → `�(`）；
+  - `str(PurePosixPath(p))`：`""`→`"."`、`"//"`→`"//"`、`"///a"`→`"/a"`、
+    `"//a//b/./c"`→`"//a/b/c"`、`"a/.."`→`"a/.."`（**不**消解 `..`）、
+    `"a\\b"`→`"a\\b"`（POSIX 上反斜杠是普通字符）；
+  - `toPosixPath` 的顺序是「先 `Path()` 归一，再 `.replace("\\", "/")`」——反过来的话
+    `a\b/c` 会变成 `a/b/c`，正确结果是 `a/b/c`… 两种写法在这条上碰巧同结果，但
+    `Path("a\\b//c")` 归一成 `a\b/c` 才替换，所以顺序必须照抄（有单测钉住）；
+  - `shutil.which` 的 POSIX 分支（`/usr/lib/python3.13/shutil.py:1340-1410`）：
+    `os.path.split(cmd)` 有 `dirname` 时 `path = [dirname]`、只查这一条；否则
+    `path = PATH.split(':')`（`PATH=""` 直接 `return None`，空段 = 当前目录），
+    `files = [cmd]`（**POSIX 上不看 `PATHEXT`**，那是 win32 分支），判据
+    `_access_check = exists && os.access(F_OK|X_OK) && not isdir`；按
+    `os.path.normcase(dir)` 去重（POSIX 恒等）；
+  - `os.access(..., X_OK)` 在 root 下是「任一个 x 位为真」、非 root 下按 euid/egid 判，
+    **std 没有对应物**（自己看 `mode & 0o111` 在非 root 下会把「只有 group-x 且我不在
+    那个组」判成真），所以加了 `libc`。这是 `gd3-core` 唯一的平台相关依赖；
+  - `deletePath` 用 `path.is_dir() and not path.is_symlink()` 分流：`is_dir()` 跟随
+    链接、`is_symlink()` 不跟，所以**指向目录的符号链接走 `unlink` 分支**（只删链接，
+    目标还在）——Rust 侧照抄（有单测）；
+  - `localFilePath` 的 `path.is_file()` 对含 NUL 的路径抛 `ValueError` 而 Python 只捕
+    了构造 `Path` 时的 `OSError` → **Python 会崩、Rust 返回 `None`**（写进模块头差异表）；
+  - `Path.suffix.lower()` 里 `0 < i < len-1` 才算有后缀（`".bashrc"`/`"a."` 都无后缀），
+    集合里的项按原样比（只把路径后缀转小写）。
+- 验证：
+  - `cargo test -p gd3-core`：**105 passed**（原 87 + 18 filesystem + 1 normpath）；
+  - `cargo test --workspace`：**954 passed, 0 failed**（第 84 步 935 + 19）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（10m52s）；
+  - `cargo fmt --all --check` 通过；
+  - Python 侧**没改一行**，不需要跑 Python 全量；
+  - commit `e01309c`（代码）。
+- 勘误：commit message 写「636 行 / 19 单测」，`filesystem.rs` 实际是 **18 单测**，
+  第 19 个在 `path.rs`（`posix_normpath`）。
+- 下一步（Phase 8，按 `VPS-MIGRATION.md` 第 12 节的优先级）：
+  1. D-Bus 名字注册（`org.freedesktop.Application` 的 `Open`/`Activate`，过滤规则直接
+     复用 `single_instance::Handoff`；本机没有 session bus 时要有降级路径，别让启动挂住）；
+  2. 更新检查（`app/services/update_service.py` 335 行）；
+  3. keepalive（`app/platform/desktop_keepalive.py` 113 行，睡眠抑制）。
+  另外 `app/models/pack.py`（310 行，`BinaryRuntime` / `FeaturePack`）现在只差
+  `find_executable` 这一个依赖了，可以考虑排进 Phase 8。
+- 卡点：无
