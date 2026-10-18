@@ -324,6 +324,28 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   单测 `cancel_work_prefers_the_queue_work_id` 钉住。
   `refresh()` 现在也把 `isSeeding` / `canSeed` / `hasOutputFile` 填成真实值
   （之前一律 `CardRuntime::default()`）。
+- **校验记账 + `_rebalance`**（第 98 步）：`startChecksum` / `cancelChecksum` /
+  `_onChecksum*` 与 `_rebalance` 的状态机搬过来；`toChecksum` 本体（手写 SHA-256/512）
+  已在 `gd3-core::checksum`，由引擎调用。`_checksums`（taskId →
+  `ChecksumWork { work_id, progress }`）是纯运行时表，`algorithm` 不落账
+  （Python 的 `ChecksumWork` 也只有这两个字段，算法只用于引擎构造 `toChecksum`
+  与 `_onChecksumDone` 的写回）。信号退化成返回值：`start_checksum` →
+  `Option<ChecksumEvent>`（`None` = 任务不在），`cancel_checksum` → `Option<String>`
+  （workId；`Some` 同时意味着调用方要发 `checksumStopped(task, None)`，没有登记项时
+  Python 直接 `return`，既不取消协程也不发信号），`on_checksum_done` →
+  `Option<ChecksumEvent::Completed>`，`on_checksum_failed` → `ChecksumEvent::Stopped
+  { error }`（**不是 `Option`**：Python 无条件 `emit`）。
+  `_rebalance` 抽成 `rebalance(max_task_num) -> RebalanceReport { cancelled, requeued,
+  started }`：超出上限的**运行中**任务按 `running_ids()` 顺序 `cancel_work` + 放回等待
+  队列，再 `_pump()` 一次。`cancelled` 用 `Vec<(String, CancelWork)>` 而不是并列两个
+  vec，取消与放回等待是一对，拆开会丢失对应关系。`canPause` 走 `facts::can_pause`，
+  不可暂停的任务原样留在运行中（Python 同样跳过）；**不置 `pending_flush`**——Python 的
+  `setStatus(WAITING)` 不落盘，靠下一次真实改动写。
+  差异：①`_onChecksumDone` / `_onChecksumFailed` 里的 `del self._checksums[taskId]`
+  在 Python 缺项时抛 `KeyError`，Rust 退化成 `None`（不写 `checksums`、不置脏、
+  不发信号）；②`onProgress` 闭包在 Python 里持有 `work` 对象，`cancelChecksum` 之后
+  迟到的进度会写进孤儿对象（界面看不见），Rust 的 `set_checksum_progress` 只写登记表里
+  的那条、返回 `bool` 说明是否真写了。
 
 ### 引擎装配（`engine.rs`）
 
@@ -852,8 +874,9 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **2356 行 / 56 单测**
-（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个、做种 9 个）。
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **2717 行 / 65 单测**
+（其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个、
+做种 9 个、校验与 `_rebalance` 9 个）。
 
 ## 剩余工作（Phase 8）
 

@@ -52,7 +52,10 @@
 //! - **做种只做记账**（第 97 步）：`_seed`/`_onSeeding*`/`startSeeding`/
 //!   `stopSeeding` 的状态机（`_seeding` 字典 + `isSeeding` + `shouldSeed`）已对齐，
 //!   但 `task.runSeeding()` 本体（libtorrent）与 `_watchFile` / 速度表计数仍归引擎层；
-//!   校验（`startChecksum`）与 `_rebalance`（依赖 `Task.canPause`）也还没做。
+//! - **校验也只做记账**（第 98 步）：`_checksums` + `checksumProgress` + 三个信号的
+//!   判定已对齐（`startChecksum` / `cancelChecksum` / `_onChecksumDone` /
+//!   `_onChecksumFailed`），`toChecksum` 本体在 `gd3_core::checksum`、协程提交归引擎；
+//!   `_rebalance`（依赖 `Task.canPause`）同样只做记账。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -69,6 +72,8 @@ use gd3_core::placeholder::{
 use gd3_core::queue::TaskQueue;
 use gd3_core::store;
 use gd3_core::task::{TaskRecord, TaskStatus};
+use gd3_core::task_error::TaskError;
+use serde_json::Value;
 
 use crate::AppWindow;
 use crate::card::CardRuntime;
@@ -161,6 +166,39 @@ pub struct CancelWork {
     pub stopped_seeding: bool,
 }
 
+/// `ChecksumWork`（`task_service.py:27-30`）：一次校验的协程 id 与进度。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChecksumWork {
+    /// `coroutineRunner.submit(toChecksum(...))` 的返回值。
+    pub work_id: String,
+    /// `onProgress` 回写的百分比（`done * 100 // size`），初值 `0`。
+    pub progress: i64,
+}
+
+/// `checksumStarted` / `checksumCompleted` / `checksumStopped` 的返回值替身。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumEvent {
+    /// `checksumStarted.emit(task)`（`Signal(object)`）。
+    Started,
+    /// `checksumCompleted.emit(task, algorithm)`（`Signal(object, str)`）。
+    Completed { algorithm: String },
+    /// `checksumStopped.emit(task, error)`（`Signal(object, object)`）：
+    /// 取消时 `error is None`，失败时是
+    /// `TaskError("无法读取文件：{detail}", detail=str(error))`。
+    Stopped { error: Option<TaskError> },
+}
+
+/// `_rebalance(*_args)` 的产物。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RebalanceReport {
+    /// 被取消的任务（按 `runningIds()` 顺序）：`(taskId, _cancelWork 的结果)`。
+    pub cancelled: Vec<(String, CancelWork)>,
+    /// 放回等待队列的 id（`canPause` 为真的那些，与 `cancelled` 同序）。
+    pub requeued: Vec<String>,
+    /// 尾部 `_pump()` 派发的 id。
+    pub started: Vec<String>,
+}
+
 /// 任务列表 + 队列记账（不含引擎）。
 #[derive(Debug, Clone, Default)]
 pub struct TaskService {
@@ -185,6 +223,11 @@ pub struct TaskService {
     ///
     /// 同时充当 `Task.isSeeding`（Python 的非持久化字段，`init=False, repr=False`）。
     seeding: BTreeMap<String, String>,
+    /// `TaskService._checksums`：taskId → 校验协程的 workId + 进度。
+    ///
+    /// `ChecksumWork` 整体入库（不是只存 workId）：`checksumProgress(task)` 要读
+    /// `progress`，而 `onProgress` 回调只拿得到 taskId。
+    checksums: BTreeMap<String, ChecksumWork>,
 }
 
 impl TaskService {
@@ -826,6 +869,48 @@ impl TaskService {
         started
     }
 
+    /// `_rebalance(*_args)`（`task_service.py:639-647`）：`maxTaskNum` 变小时把超出
+    /// 限额的运行中任务取消并放回等待队列，然后 `_pump()`。
+    ///
+    /// ```python
+    /// for taskId in self._queue.runningIds()[cfg.maxTaskNum.value:]:
+    ///     task = self._store.taskById(taskId)
+    ///     if task is not None and task.canPause:
+    ///         self._cancelWork(task)
+    ///         task.setStatus(TaskStatus.WAITING)
+    ///         self._queue.wait(taskId)
+    /// self._pump()
+    /// ```
+    ///
+    /// 三处口径：
+    /// - `runningIds()[max:]` 是**切片**：`max` 大于运行数时一个都不动；
+    /// - `canPause` 走 `facts::can_pause`（要读第一个 `RUNNING` 步骤的规则），
+    ///   不可暂停的任务**原样留在运行中**（Python 同样跳过）；
+    /// - **不置 `pending_flush`**：Python 的 `setStatus` 不落盘，靠下一次真实改动写。
+    pub fn rebalance(&mut self, max_task_num: usize) -> RebalanceReport {
+        let mut report = RebalanceReport::default();
+        let overflow: Vec<String> = self
+            .queue
+            .running_ids()
+            .into_iter()
+            .skip(max_task_num)
+            .collect();
+        for task_id in overflow {
+            if !self.task(&task_id).is_some_and(facts::can_pause) {
+                continue;
+            }
+            let work = self.cancel_work(&task_id);
+            if let Some(record) = self.task_mut(&task_id) {
+                record.status = TaskStatus::Waiting;
+            }
+            self.queue.wait(&task_id);
+            report.cancelled.push((task_id.clone(), work));
+            report.requeued.push(task_id);
+        }
+        report.started = self.pump(max_task_num);
+        report
+    }
+
     /// `resumeSaved()`：启动时把持久化里的 `WAITING`/`RUNNING` 重新排进队列。
     ///
     /// Python 的 `resumeSaved()` 还做两件引擎侧的事：已完成任务的
@@ -890,6 +975,108 @@ impl TaskService {
             })
             .map(|record| record.task_id.clone())
             .collect()
+    }
+
+    /// `checksumProgress(task)`（`task_service.py:408-410`）：没有登记项 → `None`。
+    pub fn checksum_progress(&self, task_id: &str) -> Option<i64> {
+        self.checksums.get(task_id).map(|work| work.progress)
+    }
+
+    /// `self._checksums[taskId]`（`workId` + `progress`）。
+    pub fn checksum_work(&self, task_id: &str) -> Option<&ChecksumWork> {
+        self.checksums.get(task_id)
+    }
+
+    /// `len(self._checksums)`。
+    pub fn checksum_count(&self) -> usize {
+        self.checksums.len()
+    }
+
+    /// `startChecksum(task, algorithm)` 的记账部分（`task_service.py:412-420`）。
+    ///
+    /// ```python
+    /// work = ChecksumWork()
+    /// self._checksums[task.taskId] = work
+    /// work.workId = self._coroutineRunner.submit(toChecksum(...), done=..., failed=...)
+    /// self.checksumStarted.emit(task)
+    /// ```
+    ///
+    /// `algorithm` 只用于引擎构造 `toChecksum(path, algorithm, onProgress)`，**不落账**
+    /// （`ChecksumWork` 只有 `workId` / `progress` 两个字段）；workId 由引擎提交协程后
+    /// 回填。任务不在列表里 → `None`（Python 不校验，因为调用点拿的一定是真任务）。
+    pub fn start_checksum(&mut self, task_id: &str, work_id: &str) -> Option<ChecksumEvent> {
+        self.task(task_id)?;
+        self.checksums.insert(
+            task_id.to_string(),
+            ChecksumWork {
+                work_id: work_id.to_string(),
+                progress: 0,
+            },
+        );
+        Some(ChecksumEvent::Started)
+    }
+
+    /// `toChecksum` 的 `onProgress` 回调（`lambda p: setattr(work, "progress", p)`）。
+    ///
+    /// Python 的闭包持有 `work` 对象：即使 `cancelChecksum` 已经把它从 `_checksums`
+    /// 里摘掉，迟到的进度仍会写进那个孤儿对象（界面上看不见）。这里只写登记表里的
+    /// 那条，返回是否真的写了。
+    pub fn set_checksum_progress(&mut self, task_id: &str, progress: i64) -> bool {
+        match self.checksums.get_mut(task_id) {
+            Some(work) => {
+                work.progress = progress;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `cancelChecksum(task)`（`task_service.py:422-427`）：摘掉登记项 + 取消协程 +
+    /// `checksumStopped.emit(task, None)`。
+    ///
+    /// 返回要取消的 workId：`Some` 意味着调用方还要发 `checksumStopped(task, None)`；
+    /// 没有登记项时 Python 直接 `return`（不发信号、不取消协程）。
+    pub fn cancel_checksum(&mut self, task_id: &str) -> Option<String> {
+        self.checksums.remove(task_id).map(|work| work.work_id)
+    }
+
+    /// `_onChecksumDone`（`task_service.py:617-621`）：`del _checksums[taskId]` →
+    /// `task.checksums[algorithm] = checksum` → `_flushSoon()` →
+    /// `checksumCompleted.emit(task, algorithm)`。
+    ///
+    /// Python 的 `del` 在登记项不存在时抛 `KeyError`：这里退化成 `None`（不写、不发）。
+    /// 任务不在列表里也 `None`（Python 会 `AttributeError`）——但登记项仍被摘掉。
+    pub fn on_checksum_done(
+        &mut self,
+        task_id: &str,
+        algorithm: &str,
+        checksum: &str,
+    ) -> Option<ChecksumEvent> {
+        self.checksums.remove(task_id)?;
+        let record = self.task_mut(task_id)?;
+        record
+            .checksums
+            .insert(algorithm.to_string(), Value::String(checksum.to_string()));
+        // `_flushSoon()`：`checksums` 是持久化字段。
+        self.pending_flush = true;
+        Some(ChecksumEvent::Completed {
+            algorithm: algorithm.to_string(),
+        })
+    }
+
+    /// `_onChecksumFailed`（`task_service.py:623-626`）：`del` +
+    /// `checksumStopped.emit(task, TaskError("无法读取文件：{detail}", detail=str(error)))`。
+    ///
+    /// 与 Python 一致：**不置脏、不写 `task.checksums`**（失败没有结果可写）。
+    /// 任务不在列表里也照样发信号——Python 拿的是活对象，`del` 只碰 `_checksums`。
+    pub fn on_checksum_failed(&mut self, task_id: &str, detail: &str) -> ChecksumEvent {
+        self.checksums.remove(task_id);
+        ChecksumEvent::Stopped {
+            error: Some(TaskError::new(
+                "无法读取文件：{detail}",
+                vec![("detail", detail.to_string())],
+            )),
+        }
     }
 
     /// `stop()`：把在跑/等待的任务标成 `PAUSED`。
@@ -2350,5 +2537,181 @@ mod tests {
         service.refresh(&window);
         let row = window.get_tasks().row_data(0).expect("首行缺失");
         assert_eq!(row.toggleIcon, "PAUSE", "做种中 → PAUSE");
+    }
+
+    #[test]
+    fn start_checksum_registers_the_work() {
+        let mut service = TaskService::from_records(vec![record("t", TaskStatus::Completed, 10)]);
+        assert_eq!(
+            service.start_checksum("t", "w1"),
+            Some(ChecksumEvent::Started)
+        );
+        assert_eq!(service.checksum_progress("t"), Some(0));
+        assert_eq!(
+            service.checksum_work("t").map(|work| work.work_id.as_str()),
+            Some("w1")
+        );
+        assert_eq!(service.checksum_count(), 1);
+        assert_eq!(service.checksum_progress("nope"), None);
+
+        // 任务不在列表里 → 不登记（Python 走不到这条）。
+        assert_eq!(service.start_checksum("nope", "w2"), None);
+        assert_eq!(service.checksum_count(), 1);
+    }
+
+    #[test]
+    fn set_checksum_progress_updates_the_registered_work() {
+        let mut service = TaskService::from_records(vec![record("t", TaskStatus::Completed, 10)]);
+        service.start_checksum("t", "w1");
+        assert!(service.set_checksum_progress("t", 42));
+        assert_eq!(service.checksum_progress("t"), Some(42));
+
+        // 取消之后迟到的进度写不进去（Python 会写进孤儿对象，看不见）。
+        service.cancel_checksum("t");
+        assert!(!service.set_checksum_progress("t", 99));
+        assert_eq!(service.checksum_progress("t"), None);
+    }
+
+    #[test]
+    fn cancel_checksum_returns_the_work_id_once() {
+        let mut service = TaskService::from_records(vec![record("t", TaskStatus::Completed, 10)]);
+        service.start_checksum("t", "w1");
+        assert_eq!(service.cancel_checksum("t"), Some("w1".to_string()));
+        assert_eq!(service.checksum_count(), 0);
+        // 第二次：Python `pop(..., None)` → `return`，不发信号也不取消协程。
+        assert_eq!(service.cancel_checksum("t"), None);
+        assert_eq!(service.cancel_checksum("nope"), None);
+    }
+
+    #[test]
+    fn on_checksum_done_records_the_digest_and_flushes() {
+        let mut service = TaskService::from_records(vec![record("t", TaskStatus::Completed, 10)]);
+        service.start_checksum("t", "w1");
+        assert!(!service.pending_flush(), "startChecksum 本身不落盘");
+        assert_eq!(
+            service.on_checksum_done("t", "sha256", "abc123"),
+            Some(ChecksumEvent::Completed {
+                algorithm: "sha256".to_string()
+            })
+        );
+        assert_eq!(service.checksum_count(), 0);
+        assert!(service.pending_flush(), "`checksums` 是持久化字段");
+        let record = service.task("t").expect("任务在");
+        assert_eq!(
+            record.checksums.get("sha256"),
+            Some(&Value::String("abc123".to_string()))
+        );
+    }
+
+    #[test]
+    fn on_checksum_done_is_idempotent_and_needs_the_task() {
+        let mut service = TaskService::from_records(vec![record("t", TaskStatus::Completed, 10)]);
+        service.start_checksum("t", "w1");
+        assert!(service.on_checksum_done("t", "md5", "aaa").is_some());
+        // Python 的 `del` 在这里抛 KeyError；Rust 幂等。
+        assert_eq!(service.on_checksum_done("t", "md5", "bbb"), None);
+        // 任务不在列表里 → 不写（Python 会 AttributeError）。
+        assert_eq!(service.on_checksum_done("nope", "md5", "ccc"), None);
+    }
+
+    #[test]
+    fn on_checksum_failed_reports_the_task_error() {
+        let mut service = TaskService::from_records(vec![record("t", TaskStatus::Completed, 10)]);
+        service.start_checksum("t", "w1");
+        assert_eq!(
+            service.on_checksum_failed("t", "boom"),
+            ChecksumEvent::Stopped {
+                error: Some(TaskError::new(
+                    "无法读取文件：{detail}",
+                    vec![("detail", "boom".to_string())]
+                ))
+            }
+        );
+        assert_eq!(service.checksum_count(), 0);
+        // 失败不落盘、不写 `checksums`。
+        assert!(!service.pending_flush());
+        assert!(service.task("t").expect("任务在").checksums.is_empty());
+        // 任务不在列表里也照样发信号（Python 拿的是活对象）。
+        assert!(matches!(
+            service.on_checksum_failed("nope", "gone"),
+            ChecksumEvent::Stopped { error: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn rebalance_cancels_tasks_beyond_the_limit() {
+        let mut service = TaskService::from_records(vec![
+            record("a", TaskStatus::Running, 10),
+            record("b", TaskStatus::Running, 10),
+            record("c", TaskStatus::Running, 10),
+        ]);
+        service.on_run_started("a", "wa");
+        service.on_run_started("b", "wb");
+        service.on_run_started("c", "wc");
+
+        let report = service.rebalance(2);
+        assert_eq!(
+            report.cancelled,
+            vec![(
+                "c".to_string(),
+                CancelWork {
+                    work_id: Some("wc".to_string()),
+                    stopped_seeding: false,
+                }
+            )]
+        );
+        assert_eq!(report.requeued, vec!["c".to_string()]);
+        assert!(report.started.is_empty(), "运行数已到上限，不派发");
+        assert_eq!(
+            service.task("c").expect("任务在").status,
+            TaskStatus::Waiting
+        );
+        assert_eq!(service.waiting_order(), vec!["c".to_string()]);
+        assert_eq!(service.running_count(), 2);
+    }
+
+    #[test]
+    fn rebalance_skips_tasks_that_cannot_pause() {
+        let mut blocked = record("b", TaskStatus::Running, 10);
+        blocked.steps.push(TaskStep {
+            step_index: 0,
+            file_index: None,
+            step_id: "step".to_string(),
+            status: TaskStatus::Running,
+            progress: Progress::Int(0),
+            received_bytes: 0,
+            speed: 0,
+            extra: Map::new(),
+            type_name: Some("FFmpegStep".to_string()),
+        });
+        let mut service =
+            TaskService::from_records(vec![record("a", TaskStatus::Running, 10), blocked]);
+        service.on_run_started("a", "wa");
+        service.on_run_started("b", "wb");
+
+        let report = service.rebalance(1);
+        assert!(report.cancelled.is_empty(), "canPause 为假 → 不动");
+        assert!(report.requeued.is_empty());
+        assert_eq!(service.running_count(), 2);
+        assert_eq!(
+            service.task("b").expect("任务在").status,
+            TaskStatus::Running
+        );
+    }
+
+    #[test]
+    fn rebalance_pumps_after_the_limit_grows() {
+        let mut service = TaskService::from_records(vec![
+            record("a", TaskStatus::Running, 10),
+            record("b", TaskStatus::Waiting, 10),
+        ]);
+        service.on_run_started("a", "wa");
+        assert!(service.start("b"), "b 进等待队列");
+
+        let report = service.rebalance(2);
+        assert!(report.cancelled.is_empty(), "运行数没超限");
+        assert_eq!(report.started, vec!["b".to_string()]);
+        assert_eq!(service.running_count(), 2);
+        assert!(service.waiting_order().is_empty());
     }
 }
