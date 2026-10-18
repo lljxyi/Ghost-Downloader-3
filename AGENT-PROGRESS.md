@@ -4489,3 +4489,74 @@ Phase 7 收口时 `gd3-ui` 只有 lib（58 个 `.rs`、无 `main`、无事件循
   更新检查。这几项都是「Rust 侧可以独立立起来、且不碰 `UserConfig.json` 写权」的，
   顺序上单实例锁最靠前（它决定「第二个实例该把 URL 交给谁」）。
 - 卡点：无
+
+## 第 84 步：`gd3-ui::single_instance`（单实例锁 + URI 交接）（2026-10-18 08:18）
+
+Phase 8 第一项：`app/platform/application.py::SingletonApplication` 的 Rust 对应物。
+Python 是**两套机制叠加**——锁用 `QSharedMemory(DESKTOP_ID)`（`attach()` 成功 = 已有实例
+→ `sys.exit(-1)`），通道用 Windows `WM_COPYDATA` / Linux `org.freedesktop.Application`
+的 `Open`/`Activate`。Rust 侧换成一个 **Unix domain socket**（`APP_DATA_DIR/instance.sock`）：
+`bind()` 成功即抢到锁、`connect()` 成功即「已有实例」，同一条连接顺带把参数送过去。
+一个机制同时给出锁与通道，不依赖 D-Bus、不依赖显示器。
+
+- 做了什么：
+  - `single_instance.rs`（521 行，9 单测）：`Handoff{Activate, OpenUris}` + `to_payload`/
+    `parse_payload`、`plan_from_argv`（要不要发 / 发什么）、`Acquire{Primary(Instance),
+    Secondary(Secondary)}`、`acquire`/`acquire_with_handoff`、`Instance`（后台线程收消息 →
+    `take_handoffs`，`release`/`Drop` 停线程 + 删 socket）、陈旧 socket 回收、常量
+    `LOCK_FILE`/`PROTOCOL`/`SECOND_INSTANCE_EXIT = 255`；
+  - `boot.rs`：`Paths::lock_path()`、`Cli::positional`（原始位置参数，wake 判定要用）、
+    `RunSummary::handoffs`、新枚举 `RunOutcome{Ran(RunSummary), AlreadyRunning(Secondary)}`；
+    `run()` 在 `load_config` 之后上锁（Python 的顺序：`setupEnvironment` → `SingletonApplication`），
+    事件循环结束后 `take_handoffs()` + `release()`，再走 `Engine::stop()`；
+    `main_entry` 对 `AlreadyRunning` 返回 255；
+  - 测试：`ran(&cli)` helper 替掉 4 处 `run(&cli).expect(...)`；新增
+    `lock_path_lives_in_app_data_dir`、`second_instance_in_the_same_data_dir_hands_off`
+    （同数据目录第二个 `run()` → `AlreadyRunning` + 主实例收到 `OpenUris`）；
+  - `rust/README.md`：规模 59 模块 / 36 838 行 / 653 单测；启动流程图加锁与放锁两步；
+    新增「单实例锁（`single_instance.rs`）」一节。
+- 实证结论（源码级）：
+  - 第二个实例的分支（`application.py:114-124`）：`attach()` 成功后**先**判断
+    `any(isWakeUri(arg) for arg in sys.argv[1:])`，命中就**一个字节都不发**直接退出；
+    否则有 URI 发 `Open(uris)`、没 URI 发 `Activate`。两种都 `sys.exit(-1)`；
+  - `urisFromArgv` 会跳过 `ghostdownloader://...`，所以「带启动 URI 但没别的 URL」= 空 uris
+    = `Activate`；这与 D-Bus `Open` slot 里「含 `isLaunchUri` → `activationRequested`」
+    是同一条语义，所以 `parse_payload` 直接镜像了 `_DesktopBusReceiver.Open` 的过滤：
+    空行/ wake URI 丢掉 → 空则丢弃 → 含启动 URI 则升级成 `Activate`；
+  - `desktop_keepalive.py`（113 行）是**睡眠抑制**（`SetThreadExecutionState` /
+    `IOPauseAssertion`），与单实例锁无关，别混；
+  - `_unlockSingleInstance` 在 `exec()` 的 `finally` 里，即**停机序列之前**——Rust 侧
+    `release()` 也放在 `Engine::stop()` 之前（有注释钉住顺序）；
+  - 陈旧 socket：Python 的 `QSharedMemory` 用「先 `attach`/`detach` 清一遍」处理残留；
+    socket 版本靠 `bind` 失败后 `connect` 探活，`ConnectionRefused`/`NotFound` → 删文件重试一次。
+- 线协议（Rust 侧自定，Python 的两套通道都被替换掉了）：
+  ```text
+  gd3-ipc/1 activate\n              ← Activate / WM_USER_WAKE
+  gd3-ipc/1 open\n<uri>\n<uri>\n    ← Open / COPYDATA_OPEN_FILES
+  ```
+  首行是协议名、第二行是动作名；空载荷（`release()` 的唤醒连接、半截连接）不算消息。
+- 已知差异（写进模块头）：锁在 `APP_DATA_DIR` 下（换 `--data-dir` 就换锁，Python 的
+  `QSharedMemory` key 是全局的）、Windows 后端没实现、**不注册 D-Bus 服务名**
+  （桌面双击链接仍走「第二个实例 → socket 交接」，结果等价）、`SIGINT` 处理没搬、
+  交接消息要等事件循环结束才取（消费方还没迁过来）。
+- 验证：
+  - `cargo test -p gd3-ui --lib single_instance::`：**9 passed**；`boot::`：**21 passed**；
+  - `cargo test --workspace`：**935 passed, 0 failed**（第 83 步 924 + 11）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m24s）；
+  - `cargo fmt --all --check` 通过；
+  - 二进制双进程实测（同一个 `--data-dir`）：
+    ```text
+    $ ./target/debug/gd3-ui --headless --frames 6000 --data-dir /tmp/tmp.1ZIIJgzjZ4 &
+    $ ls -a /tmp/tmp.1ZIIJgzjZ4      → instance.sock
+    $ ./target/debug/gd3-ui --headless --data-dir /tmp/tmp.1ZIIJgzjZ4 https://example.com/x
+    → exit 255
+    $ ./target/debug/gd3-ui --headless --data-dir /tmp/tmp.1ZIIJgzjZ4 ghostdownloader://wake
+    → exit 255（wake 分支同样退出，但一个字节都不发）
+    A: launched (headless, 6000 frame(s), …), exit 0；退出后 instance.sock 已删
+    ```
+  - commit `69dafe2`。
+- 下一步：Phase 8 继续按优先级 —— 托盘（`shell/tray.py`，205 行，纯 Slint 语义层 + 单测）、
+  D-Bus 服务名注册（`org.freedesktop.Application` 的 `Open`/`Activate`，可复用
+  `single_instance::Handoff` 的过滤规则）、更新检查、keepalive（`desktop_keepalive.py`
+  睡眠抑制）。
+- 卡点：无
