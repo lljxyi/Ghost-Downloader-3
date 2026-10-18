@@ -603,40 +603,9 @@ pub fn file_content(path: &str, hint: &str) -> String {
     }
 }
 
-/// 镜像 `app/update.py::parseVersion`（:11-27）。
-///
-/// `lstrip("vV")` → 累积 ASCII 数字 → `.` 分隔 → 去尾部 0。
-/// Python 的 `isdigit()` 对 Unicode 数字为真但 `int(ch)` 会抛错，
-/// 版本串实际只用 ASCII 数字，这里按 ASCII 处理（已注明差异）。
-pub fn parse_version(text: &str) -> Vec<u64> {
-    let mut segments: Vec<u64> = Vec::new();
-    let mut acc: u64 = 0;
-    let mut has_digit = false;
-    for ch in text.trim_start_matches(['v', 'V']).chars() {
-        if let Some(digit) = ch.to_digit(10) {
-            acc = acc * 10 + u64::from(digit);
-            has_digit = true;
-        } else if ch == '.' && has_digit {
-            segments.push(acc);
-            acc = 0;
-            has_digit = false;
-        } else {
-            break;
-        }
-    }
-    if has_digit {
-        segments.push(acc);
-    }
-    while segments.last() == Some(&0) {
-        segments.pop();
-    }
-    segments
-}
-
-/// `isNewer(current, latest) = parseVersion(latest) > parseVersion(current)`。
-pub fn is_newer(current: &str, latest: &str) -> bool {
-    parse_version(latest) > parse_version(current)
-}
+/// 版本解析与比较：实现已搬到 [`gd3_core::version`]（`gd3-core::loader` 的
+/// `gdMinVersion` 门禁也要用，而 `gd3-core` 不能反向依赖 `gd3-ui`）。
+pub use gd3_core::version::{is_newer, parse_version};
 
 /// `RuntimeCard` 的输入（`runtimeStatusService.status(runtime)` 的快照）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

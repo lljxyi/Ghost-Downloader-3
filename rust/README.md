@@ -366,6 +366,67 @@ Python 侧**没有**加影子开关：这几个函数都是一次 syscall 的包
 `pack.rs` 里另有一份私有的 `py_isspace` / `py_strip` / `split_lines` / `decode_ignore`
 ——`gd3-core::hls` 与 `gd3-ui::pystr` 已各有一份，抽公共模块会牵动既有调用点，留作后续。
 
+## 插件加载与版本门禁（`gd3-core::loader` / `gd3-core::version`）
+
+`app/loader.py` 里**不依赖 `importlib`** 的部分，加上 `app/update.py` 的版本比较：
+
+| Python | Rust | 要点 |
+|---|---|---|
+| `parseVersion`（`update.py:11-27`） | `version::parse_version` | 第 62 步写在 `gd3-ui::setting_cards`，这里搬进 core 后改 `pub use` |
+| `isNewer`（`update.py:30-31`） | `version::is_newer` | `parseVersion(latest) > parseVersion(current)` |
+| `seedPacks`（`loader.py:17-41`） | `loader::seed_packs` | 返回 `SeedReport { synced }`，日志由调用方打 |
+| `loadPacks`（`loader.py:44-68`） | `loader::scan_packs` + `loader::load_packs` | 只到「排序好的 manifest 列表」 |
+| `orderedByDependency`（`loader.py:71-104`） | `loader::ordered_by_dependency` | 返回 `OrderReport { ordered, skipped }`，**不是** `Result` |
+| `loadManifest`（`loader.py:107-140`） | **未迁移** | `importlib` + 动态子类，插件实例化留在 Python |
+
+`loadPacks` 的最后一步是 `[pack for m in ordered if (pack := loadManifest(m, services))]`，
+而 `loadManifest` 是「按文件路径加载 Python 模块 → `getattr(module, className)` →
+`PackClass(services)`」。`FeaturePack` 本身就是 Python 类（返回 Qt 控件与信号），
+Rust 侧没有对应概念，所以只搬到 manifest 排序为止，实例化留给 Python。
+
+精确口径（都有单测钉住）：
+
+- 目录扫描 = `sorted(iterdir())` 后跳过**非目录** / `.` 开头 / `_pending` 结尾；
+- `gdMinVersion` 非空且 `parseVersion(app) < parseVersion(gdMinVersion)` → 进 `rejected`，
+  不算错误（Python 只 log 一条 `跳过 FeaturePack {}：需要 GD ≥ {}，当前 {}`）；
+- `featuresDir` 不存在 → `dir_missing = true`（Python 只 log 一条 warning，返回空列表）；
+- 排序是 DFS 三色，**失败只影响顶层那个 manifest**：环 / 缺依赖 / 依赖已被跳过都只把
+  **顶层名**记进 `skipped`，然后 `visiting.clear()` 继续下一个顶层项，`visited` 与
+  `ordered` 里已完成的保持不动；
+- `byName` 是 `{m.name: m}`（**同名后者胜**），`ordered` 里存的是 `byName[name]`
+  而不是循环变量 —— 所以同名 manifest 只入列一次、且入列的是最后一个；
+- 环的起点是 `visiting` 里该名字**首次**出现处，末尾再补一次自己
+  （`a -> b -> c -> b` 报的是 `循环依赖: b -> c -> b`）；缺依赖报的 `{name}` 是
+  **当前正在访问的节点**，不是顶层那个。
+
+`seedPacks` 的四个易错点：
+
+1. `seedDir` 不存在或 `seedDir.resolve() == targetDir.resolve()` → 在 `mkdir` **之前**
+   返回，所以目标目录不会被创建；
+2. 种子侧 manifest 解析失败或 `version` 为空 → 跳过（`_pending` 结尾的目录也在这里被滤掉）；
+3. 用户侧已有同目录、manifest 合法、`version` 非空、且
+   `parseVersion(user) >= parseVersion(seed)` → 保留用户版本（`1.0` 与 `1.0.0` 因为去尾零
+   而**相等**，所以不会覆盖）；
+4. 否则 `rmtree` + `copytree`，`copytree` 默认 `symlinks=False`：符号链接按目标内容拷。
+   `copy_tree` 因此用 `Path::is_dir()`（跟随链接）+ `fs::copy`，并且 `dst` 必须不存在
+   （`copytree` 先 `os.mkdir`，目标已存在报 `FileExistsError`）。
+
+与 Python 的已知差异：
+
+1. `Path.resolve()` 会解析符号链接。`resolve_path` 先用 `fs::canonicalize`（目标存在时
+   等价），失败退回 `std::path::absolute` + 词法归一（只压 `.` / `..`）。只有「目标目录
+   尚不存在**且**路径里带符号链接」这种组合才与 Python 不同；
+2. `copytree` 会 `copystat` 保留目录 mtime / 权限，`copy_tree` 只保留文件权限位
+   （`fs::copy` 自带），目录权限按 umask 新建；
+3. 目录项排序：Python 按 `PurePath` 的 `_parts_normcase` 元组比较（POSIX 上等价于按名字
+   比较码点），Rust 用 `to_string_lossy()` 后按 `String` 比较（等价于按 UTF-8 字节比较）；
+   合法 UTF-8 下一致，非 UTF-8 名字会退化；
+4. Python 的 `str.isdigit()` 对 Unicode 十进制数字为真，`int(ch)` 也接受它们 ——
+   CPython 3.13 实测 `parseVersion("１.２")` 得 `(1, 2)`；Rust 的 `char::to_digit(10)`
+   只认 ASCII，`parse_version("１.２")` 得 `()`。版本串实际只用 ASCII 数字。
+
+规模：`loader.rs` **1029 行 / 37 单测**、`version.rs` **110 行 / 4 单测**。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
