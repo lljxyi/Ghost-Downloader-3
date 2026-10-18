@@ -288,6 +288,35 @@ gd3-ipc/1 open\n<uri>\n<uri>\n    ← 把 URI 交给已有实例（Open / COPYDA
 未迁移（后续小步）：D-Bus 服务名注册（`org.freedesktop.Application`）、
 托盘 / keepalive / 通知、功能包加载、更新检查、OOBE 分支、翻译器。
 
+## 平台辅助（`gd3-core::filesystem`）
+
+`app/platform/filesystem.py` 的六个纯探测/换算函数已经搬完（`toSafeFilename` /
+`splitStemExt` 早就在 `gd3-core::filename`）：
+
+| Python | Rust | 要点 |
+|---|---|---|
+| `isExisting` | `is_existing` | `stat` 成功即真（跟随符号链接） |
+| `isFolder` | `is_folder` | `S_ISDIR` |
+| `toPosixPath` | `to_posix_path` | 先按 `PurePosixPath` 归一，再把 `\` 换成 `/` |
+| `localFilePath` | `local_file_path` | 自带 `urlsplit` + `url2pathname`（`unquote`） |
+| `findExecutable` | `find_executable` | 先看 `installFolder/`，再走 `shutil.which` 的 POSIX 分支 |
+| `deletePath` | `delete_path` | 目录 `rmtree`、其余 `unlink`；指向目录的符号链接只删链接 |
+
+搬过来的几个 CPython 细节（都有单测钉住）：
+
+- `urlsplit` 只 `lstrip`，尾部空格留在 `path` 里；query / fragment 不进 `path`；
+- `unquote` 按 `%` 切段、每段**只解前两个十六进制字符**（`%4142` → `A42`），解不出的
+  `%` 原样保留；`+` **不**解成空格（那是 `unquote_plus`）；
+- `shutil.which` 有目录部分时只查那一条，否则遍历 `PATH`（空段 = 当前目录），判据是
+  `exists && access(X_OK) && !isdir` —— 所以 `gd3-core` 在 unix 上多了一个 `libc`
+  依赖，只为 `access(2)`（std 没有对应物，自己看 mode 位在非 root 下会判错）；
+- `str(Path(p))` 的归一（`posix_normpath`，加在 `gd3-core::path`）只去空组件与 `.`、
+  压缩斜杠，**不消解 `..`**，恰好两个前导斜杠保留。
+
+Python 侧**没有**加影子开关：这几个函数都是一次 syscall 的包装，两侧行为一致，也没有
+性能动机；`localFilePath` 目前在 Python 里还没有调用方，等 `pack.py` 的
+`BinaryRuntime` 搬过来再一起接。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

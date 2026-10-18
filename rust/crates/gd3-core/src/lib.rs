@@ -6,6 +6,7 @@ pub mod config;
 pub mod container;
 pub mod ed2k;
 pub mod filename;
+pub mod filesystem;
 pub mod ghd;
 pub mod github;
 pub mod hls;
@@ -24,8 +25,11 @@ pub use container::{
     parse_mp4_boxes, parse_sidx,
 };
 pub use filename::{DEFAULT_MAX_FILENAME_LENGTH, split_stem_ext, to_safe_filename};
+pub use filesystem::{
+    delete_path, find_executable, is_existing, is_folder, local_file_path, to_posix_path,
+};
 pub use ghd::PartRecord;
-pub use path::posix_join;
+pub use path::{posix_join, posix_normpath};
 pub use queue::TaskQueue;
 pub use store::{LoadOutcome, load_records, save_records, to_line};
 pub use task::{Progress, TaskFile, TaskRecord, TaskStatus, TaskStep};

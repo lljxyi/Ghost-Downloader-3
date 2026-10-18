@@ -67,6 +67,49 @@ pub fn posix_stem(name: &str) -> &str {
     }
 }
 
+/// 镜像 `str(PurePosixPath(p))`：去空组件与 `.`、压缩重复斜杠，**不消解 `..`**，
+/// 恰好两个前导斜杠保留。
+///
+/// 期望值来自 CPython 3.13：
+///
+/// ```text
+/// ""      -> "."        "a//b"  -> "a/b"      "///a" -> "/a"
+/// "."     -> "."        "/"     -> "/"        "//a"  -> "//a"
+/// "a/"    -> "a"        "//"    -> "//"       "a/.." -> "a/.."
+/// ```
+///
+/// 注意它跟 [`posix_join`] 不是一回事：`posix_join("")` 得到 `/name`，而
+/// `Path("")` 在 Python 里是 `.`。两者只在「拼接后归一」这一步口径相同。
+pub fn posix_normpath(path: &str) -> String {
+    // 前导斜杠：0 个 = 相对路径；1 个 = 绝对路径；恰好 2 个 = 保留双斜杠；
+    // 3 个以上 = 压成 1 个（与 `posix_join` 同一套规则）。
+    let leading = path.bytes().take_while(|byte| *byte == b'/').count();
+    let (prefix, rest) = match leading {
+        0 => ("", path),
+        1 => ("/", &path[1..]),
+        2 => ("//", &path[2..]),
+        _ => ("/", path.trim_start_matches('/')),
+    };
+
+    let parts: Vec<&str> = rest
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+
+    if parts.is_empty() {
+        // `Path("")` / `Path(".")` → "."，但 `Path("/")` → "/"、`Path("//")` → "//"
+        return if prefix.is_empty() {
+            String::from(".")
+        } else {
+            String::from(prefix)
+        };
+    }
+
+    let mut normalised = String::from(prefix);
+    normalised.push_str(&parts.join("/"));
+    normalised
+}
+
 #[cfg(test)]
 mod tests {
     use super::{posix_join, posix_stem};
@@ -131,5 +174,37 @@ mod tests {
     fn drops_dot_and_empty_components() {
         assert_eq!(posix_join("./a/./b/.", "n"), "a/b/n");
         assert_eq!(posix_join("..", "n"), "../n");
+    }
+}
+
+#[cfg(test)]
+mod normpath_tests {
+    use super::posix_normpath;
+
+    #[test]
+    fn matches_str_of_pure_posix_path() {
+        // 期望值全部来自 CPython 3.13：`str(PurePosixPath(p))`
+        let cases = [
+            ("", "."),
+            (".", "."),
+            ("./", "."),
+            ("a/", "a"),
+            ("a//", "a"),
+            ("a//b", "a/b"),
+            ("/a//b/", "/a/b"),
+            ("//", "//"),
+            ("///a", "/a"),
+            ("/", "/"),
+            ("//a", "//a"),
+            ("a/.", "a"),
+            ("a/..", "a/.."),
+            ("../a", "../a"),
+            ("a\\b", "a\\b"),
+            ("./a/./b", "a/b"),
+            ("//a//b/./c", "//a/b/c"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(posix_normpath(raw), expected, "raw={raw:?}");
+        }
     }
 }

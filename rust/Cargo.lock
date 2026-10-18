@@ -1615,6 +1615,7 @@ name = "gd3-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "libc",
  "regex",
  "serde",
  "serde_json",
