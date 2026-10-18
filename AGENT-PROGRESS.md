@@ -5004,3 +5004,73 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
      `install` / `fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
   5. D-Bus / keepalive 仍排最后（`zbus` 缓存可用但编译代价大）。
 - 卡点：无
+
+## 第 91 步：gd3-core::trash（2026-10-18 11:56）
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-core/src/trash.rs`（**899 行 / 23 单测**），镜像 Qt 的
+    `QFile::moveToTrash`（= `app/platform/desktop.py:112-114` 的 `deleteRecoverably`）：
+    `home_trash_dir` / `generic_data_dir` / `topdir_trash_dir` / `choose_trash_dir`（纯路径选择）/
+    `TrashLocation{dir, topdir}` / `resolve_trash_dir` / `mount_point_of` / `shared_trash_ok` /
+    `encode_path` / `trash_info_text` / `trash_entry_name` / `current_uid` /
+    `deletion_date_at` / `deletion_date_now` / `move_to_trash` / `delete_recoverably`。
+  - `lib.rs`：`pub mod trash;`（:29）+ 16 个 re-export。
+  - `rust/README.md` 新增「可恢复删除（`gd3-core::trash`）」一节（插在「剩余工作（Phase 8）」之前）；
+    `desktop.rs` 文档表里 `deleteRecoverably` 那行从「未迁移」改成「见 `crate::trash`」。
+- 关键决策：
+  - **复刻的是 Qt，不是 freedesktop 规范**：Python 两行代码把整件事委托给 `QFile.moveToTrash`，
+    所以全部口径都用 PySide6 + `QT_QPA_PLATFORM=offscreen` 真跑实测（第 91 步调研的探针目录
+    `/root/gd3probe2..10`，本轮又补了 `gd3probe-py*` / `gd3probe-rust*` 两组交叉验证）。
+  - **`TrashLocation { dir, topdir }` 而不是裸 `PathBuf`**：`Path=` 的口径两种回收站不一样，
+    必须由同一个判定结果驱动，否则会重算一遍设备/sticky 出现两处不一致。
+  - **时间戳作参数传入**（`deletion_date: &str`），只有 `delete_recoverably` 去取
+    `deletion_date_now()`。`localtime_r` 走 `libc`（`chrono` 不在离线缓存里），
+    格式 `%Y-%m-%dT%H:%M:%S`。
+  - **`move_to_trash` 返回 `io::Result<PathBuf>`，`delete_recoverably` 返回 `bool`**：
+    前者给调用方日志用（`Err` = Python 的 `False`），后者保留 `deleteRecoverably` 的原始口径。
+  - **不做跨设备 `copy` 兜底**：回收站目录本来就按「文件所在设备」选，`rename` 不会跨设备；
+    Qt 在这里也只是失败回滚（`rename` 失败把刚写的 `.trashinfo` 删掉），Rust 同样。
+- 实证结论（**本轮抓到并修掉一个真实偏差**）：
+  - **`Path=` 在顶层回收站里是相对 `$topdir` 的**，不是绝对路径：
+    Qt 把 `/tmp/gd3probe-py2/sub/deep/x y 中.txt` 写成
+    `Path=gd3probe-py2/sub/deep/x%20y%20%E4%B8%AD.txt`（不带前导 `/`）。
+    初稿写的是绝对路径，交叉验证时发现不一致，改成 `TrashLocation::original_path`
+    （home → 原样；顶层 → `strip_prefix(topdir)`）。
+  - home 回收站写**调用方传进来的原样**：`/root/gd3probe-py2/sub/y.txt` 原样、
+    相对路径 `rel.txt` 也原样（`Path=rel.txt`）；
+  - 顶层回收站目录选择与 Qt 完全一致：`/tmp` 上实测两侧都落到 `/tmp/.Trash-0`
+    （`/tmp` 是 tmpfs、`/root` 在 `/` 上，正好跨设备）；
+  - `$XDG_DATA_HOME` 不存在 → `False` 且什么都不建；源文件不存在 → `False` 但
+    `Trash/{files,info}` 已建好；`Trash` / `files` / `info` 三个目录都是 `0700`；
+  - 冲突命名 `dup.txt`、`dup.txt-271242`、`dup.txt-271243`……（第 i 次用 `inode + i - 1`）；
+  - 百分号编码保留 `A-Za-z0-9-._~/`（**斜杠不编码**），其余按 UTF-8 逐字节大写 `%XX`。
+- 已知差异（都写进模块文档与 README）：
+  1. **Qt 在跨设备分支里会顺手建一个空的 `$XDG_DATA_HOME/Trash`**（内部流程先试 home
+     回收站），Rust 侧不建——空目录对用户不可见，规范也没要求；
+  2. `Path=` 里的非 UTF-8 字节：Python 走 `surrogateescape` 原样保留，Rust 走
+     `to_string_lossy()`；
+  3. Qt 在无 sticky 的 `.Trash` 上打 `qWarning`，库侧没有 logger，分支选择改由
+     `shared_trash_ok` 的返回值暴露；
+  4. 冲突重试上限都是 100 次，但 Qt 之后**静默**返回 `False`，这里返回 `AlreadyExists`。
+- 验证：
+  - `cargo test -p gd3-core --lib`：**271 passed**（第 90 步 248 + 23）；
+  - `cargo test --workspace`：**1120 passed, 0 failed**（第 90 步 1097 + 23，约 9 分钟编译）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（5m10s，
+    中途抓到一处 `needless_as_bytes`：`text.as_bytes().len()` → `text.len()`）；
+  - `cargo fmt --all --check` 通过；
+  - 交叉验证：临时集成测试 `tests/trash_probe_tmp.rs` 跑完即删（工作树里没有残留），
+    Rust 与 Qt 对同一文件写出的 `Path=` 逐字节一致；
+  - Python 侧没改一行，不需要跑 Python 全量；
+  - commit `da4a890`。
+- 下一步（按价值/风险排序）：
+  1. **`gd3-ui::task_service` 的 `OVERWRITE` 分支**：`TaskStore.add` 遇到
+     `NameConflictChoice::OVERWRITE` 时先 `move_to_trash` 再重建占位符，失败则
+     `isOverwriteFailed = True` + 退化成 `KEEP_BOTH`（`app/services/task_service.py:69-90`）
+     ——`trash` 落地后的自然下游，也是唯一真实调用点；
+  2. `app/platform/hidden_subprocess.py`（99 行）判 N/A（非 win32 直接 return），
+     若要搬可复用 `desktop::spawn_detached`；
+  3. `buildFontFamilies`（`desktop.py:15-45`）：造 `Script` / `Territory` 枚举后可搬（纯函数）；
+  4. `app/services/runtime_status.py`（195 行）仍需先给 `pack::BinaryRuntime` 补
+     `install` / `fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
+  5. D-Bus / keepalive 仍排最后（`zbus` 缓存可用但编译代价大）。
+- 卡点：无
