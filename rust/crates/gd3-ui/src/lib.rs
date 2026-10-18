@@ -32,6 +32,7 @@ pub mod headers;
 pub mod identity;
 pub mod menu_view;
 pub mod name_conflict;
+pub mod pack_info;
 pub mod plan;
 pub mod profile;
 pub mod proxy;
@@ -42,6 +43,7 @@ pub mod settings_group;
 pub mod settings_spec;
 pub mod sort;
 pub mod speed;
+pub mod subtitle_select;
 pub mod window;
 
 slint::include_modules!();
