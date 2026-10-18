@@ -670,6 +670,85 @@ Path=/root/gd3probe-py2/sub/y.txt
 
 规模：`trash.rs` **899 行 / 23 单测**。
 
+## 占位符与重名冲突（`gd3-core::placeholder`）
+
+`TaskStore.add`（`app/services/task_service.py:62`）在真正落盘前先「占坑」：给
+`outputFolder/name` 建一个 0 字节文件（输出是目录时建目录），建不成就进冲突决策循环。
+
+```python
+task.outputFolder.mkdir(parents=True, exist_ok=True)
+stem, ext = splitStemExt(task.name)
+index = 0
+while True:
+    try:
+        self._createPlaceholders(task)
+        break
+    except FileExistsError as error:
+        takenPath = Path(error.filename)
+    isUnfinished = self._isUnfinishedPlaceholder(takenPath)
+    if not isUnfinished and choice == ASK:
+        return None
+    if not isUnfinished and choice == OVERWRITE:
+        if self._deleteRecoverably(takenPath):
+            continue
+        isOverwriteFailed = True
+        choice = KEEP_BOTH
+    index += 1
+    task.setName(f"{stem}({index}){ext}")
+```
+
+| Python | Rust |
+|---|---|
+| `NameConflictChoice`（`StrEnum`） | `NameConflictChoice` + `as_str` / `parse` |
+| `Task.placeholderPaths` | `placeholder_paths`（只返回 `[folder/name]`，见差异 1） |
+| `Path(f"{path}.ghd")` | `sidecar_path` |
+| `deletePlaceholder`（`task.py:20`） | `delete_placeholder`（`io::Result`） |
+| `_createPlaceholders` | `create_placeholders`（`Result<Vec<PathBuf>, CreateError>`） |
+| `add` 的 `while True` 循环 | `resolve_conflict`（`Result<Option<ConflictOutcome>, CreateError>`） |
+| `_placeholders` + `_taskByPlaceholder` | `PlaceholderRegistry` |
+| `_isUnfinishedPlaceholder` | `PlaceholderRegistry::is_unfinished` |
+| `add` 里的 `replacedTasks` 去重 | `PlaceholderRegistry::replaced_tasks` |
+
+冲突决策的五个分支，`resolve_conflict` 全部覆盖（都有单测钉住）：
+
+| 情形 | 结果 |
+|---|---|
+| 占位符建成 | `Ok(Some{ name, overwrite_failed: false })` |
+| `Ask` + 占位符属于已完成任务 | `Ok(None)` —— 调用方放弃本次添加 |
+| `Overwrite` + 回收站移入成功 | `continue`：**同名**重试，`name` 不变 |
+| `Overwrite` + 移入失败 | `overwrite_failed = true`，退化成 `KeepBoth` 改名 |
+| 占位符属于未完成任务 | 不许覆盖、也不许 `Ask` 放弃，一律改名 |
+
+三个决策：
+
+1. **冲突决策做成「纯循环 + 闭包注入」。** `resolve_conflict` 不知道 `Task` 是什么，
+   只通过 `create` / `is_unfinished` / `delete_recoverably` 三个闭包与外界交互。
+   于是全部分支都能在 `gd3-core` 里被单测钉住，而 `TaskService` 的接线（含
+   `tasks.jsonl` 落盘、`replacedTasks` 移除）留在 `gd3-ui`。
+2. **`CreateError` 区分 `Taken` 与 `Io`。** Python 只有 `FileExistsError` 会被
+   `except` 抓住继续决策，其余 `OSError`（父目录没了、ENOSPC、EACCES）直接冒泡把
+   `add` 打断。用同一个 `TakenPath` 表达两者会让「权限不足」被误当成「重名」，
+   在 `Overwrite` 分支里反复重试。
+3. **`PlaceholderRegistry` 存 `taskId` 而不是任务对象。** Python 的
+   `_taskByPlaceholder` 存 `Task`，`_isUnfinishedPlaceholder` 直接读 `task.status`；
+   core 层不认识 `TaskRecord` 的生命周期，所以 `is_unfinished` 收一个
+   `status_of: impl Fn(&str) -> Option<TaskStatus>`。
+
+与 Python 的已知差异：
+
+1. **`placeholder_paths` 只返回 `[outputFolder/name]`。** Python 的
+   `Task.placeholderPaths` 还会遍历 `self.steps`，把落在 `outputFolder` 下的
+   `step.outputPath` 追加进去；但 `TaskStep.outputPath` 基类返回 `""` 且全仓没有
+   任何子类覆盖它（`grep` 只有 `app/models/task.py:105 class TaskStep`），所以那个
+   循环永不追加。插件若自定义 step 覆盖 `outputPath`，这里要跟着扩。
+2. **改名重试有上限**（`MAX_RENAME_ATTEMPTS = 10_000`）。Python 没有上限：文件名长到
+   触发 `toSafeFilename` 的 200 字符截断时，`name(1).ext` 与 `name(2).ext` 截断后
+   可能完全相同 → 死循环。到达上限后返回最后一次的 `Taken`。
+3. `delete_placeholder` 返回 `io::Result` 而不是静默：Python 的 `deletePlaceholder`
+   遇到 `OSError` 会抛，`_createPlaceholders` 的回滚循环里也会跟着中断。
+
+规模：`placeholder.rs` **915 行 / 31 单测**。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

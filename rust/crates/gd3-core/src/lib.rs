@@ -20,6 +20,7 @@ pub mod m3u8;
 pub mod pack;
 pub mod pair_token;
 pub mod path;
+pub mod placeholder;
 pub mod queue;
 pub mod run_at_login;
 pub mod settings;
@@ -60,6 +61,11 @@ pub use loader::{
 };
 pub use pack::{BinaryRuntime, FileType, ManifestError, PackManifest, UriScheme, VersionInfo};
 pub use path::{posix_join, posix_normpath};
+pub use placeholder::{
+    ConflictOutcome, CreateError, MAX_RENAME_ATTEMPTS, NameConflictChoice, PlaceholderRegistry,
+    Placeholders, TakenPath, create_placeholders, delete_placeholder, placeholder_paths,
+    resolve_conflict, sidecar_path,
+};
 pub use queue::TaskQueue;
 pub use run_at_login::{
     LAUNCH_AGENT_LABEL, WINDOWS_RUN_KEY, WINDOWS_VALUE_NAME, autostart_entry_text,
