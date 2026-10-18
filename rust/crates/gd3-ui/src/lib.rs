@@ -30,6 +30,7 @@ mod format;
 pub mod headers;
 pub mod identity;
 pub mod menu_view;
+pub mod name_conflict;
 pub mod plan;
 pub mod profile;
 pub mod proxy;

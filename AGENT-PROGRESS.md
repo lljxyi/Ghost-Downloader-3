@@ -3456,3 +3456,48 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   语义层（文件选择对话框 / 重名提示队列）。
 - 卡点：无（`PySide6` 未装在 venv 里，`app/view/dialogs/*` 无法直接 import，
   纯函数段靠「抠源码 exec」交叉验证）
+
+## 第 65 步：文件选择 + 重名提示语义层（P2 收尾）（2026-10-18 00:32）
+- 做了什么：两个新模块（`lib.rs` 加 `pub mod file_select;` / `pub mod name_conflict;`）：
+  - `file_select.rs`（856 行，9 测试）：arena 勾选树（`nodes` + `parent/children`
+    + `roots`）替代 `QStandardItemModel`；`rows()` 先序摊平成
+    `TreeRow{path,name,depth,is_folder,size_text,check,file_index}` 给 Slint
+    `ListView`；`set_check`/`set_selected_indexes`/`set_all`/`invert_selection`/
+    `select_category`/`summary_text`/`validate` 逐条镜像
+    `_onItemChanged`/`_setSelectedIndexes`/`_updateBranchCheckState`/
+    `_updateAncestorCheckStates`；`type_menu` + `match_by_name` +
+    `path_suffixes`（CPython 3.13 `Path.suffixes` 口径）。
+  - `name_conflict.rs`（约 880 行，12 测试）：`NameConflictChoice`（StrEnum
+    keepBoth/overwrite/ask）、`NameConflict`、`ProbeTarget`、`title_text`/
+    `content_text`/`rest_checkbox_text`/`rest_checkbox_visible`、
+    `NameConflictDialogState`（缺省 KeepBoth + 未勾选 + 隐藏标题栏）、
+    `DialogOutcome`（`_onFinished` 两条路径）、`NameConflictQueue` +
+    `ConflictActions` trait + `ConflictEvent`、`NameConflictPrompt` +
+    `DialogRequest`。
+- 实证结论：
+  - **两个测试自身写错**（实现是对的，已改测试）：
+    1. `video/a.mp4(selected=True)` + `video/b.mp4(selected=True)` 建树后
+       `video` 是 **Checked** 不是 PartiallyChecked（`_updateBranchCheckState`
+       全 Checked → Checked）；
+    2. `select_category("cat_video")` 同时命中 `a.mp4` 与 `b.mkv`
+       （分类 extensions 里两者都在）→ `[0,1]`，且 `v` 文件夹变 Checked。
+  - `_updateAncestorCheckStates` **只看直接子节点**、不递归；空子列表按
+    `all([])==True` 落 Checked（不可达但照抄）。
+  - `selectedIndexes()` 只统计叶子（`_fileItems`），文件夹行不计入
+    `已选择 {n}/{total}` 的 n。
+  - `modifiedAt = int(st_mtime)` 是**向零截断**：`ProbeTarget.modified_at`
+    保留 `f64`，截断放在队列里（`as i64` 与 `int()` 同口径），测试锁定
+    `1.9 → 1`。
+  - `setChoice`/`cancel` 的 taskId 校验失败时**连 refresh 都不做**；
+    `add` 只在「无 conflict 且未 post」时 post 一次；`_refresh` 末尾
+    **无条件** emit（可能为 None）；`isAppliedToRest` 切的是
+    `tasks[:restCount]`（restCount 是探测那一刻的剩余长度）。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error（全工作区）。
+  - `cargo test -p gd3-ui --lib`：**204 → 226 passed**（file_select 9 +
+    name_conflict 12，另 1 个是原有）。
+  - 正文四组字面量与 venv 实跑逐字节一致（TZ=UTC、`utc_offset_seconds=0`）。
+- 下一步：P3 其它对话框（`edit_task.py` 127 / `pack_info.py` 106 /
+  `subtitle_select.py` 88 / `extension_install.py` 133 / `release_info.py` 123）。
+- 卡点：无
