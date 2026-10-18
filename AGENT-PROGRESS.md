@@ -3501,3 +3501,29 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
 - 下一步：P3 其它对话框（`edit_task.py` 127 / `pack_info.py` 106 /
   `subtitle_select.py` 88 / `extension_install.py` 133 / `release_info.py` 123）。
 - 卡点：无
+
+## 第 66 步：编辑任务对话框语义层（P3 起）（2026-10-18 01:05）
+- 做了什么：新模块 `edit_task.rs`（457 行，12 测试，`lib.rs` 插
+  `pub mod edit_task;` 于 `drawer` 与 `facts` 之间）：
+  - 公共骨架常量：`TITLE=编辑任务参数`、`BUTTON_APPLY=应用`、
+    `BUTTON_CANCEL=取消`、`MIN_WIDTH=680`、`CONFIRM_TITLE=确认更换链接`、
+    `CONFIRM_TEMPLATE`（`新链接与原链接的内容不一致，将清除已下载的 {0} 数据，
+    是否继续？`）、`PARSE_FAILED_TITLE=链接解析失败`、`INFO_BAR_DURATION_MS=4000`。
+  - `take_url(&mut Options) -> String`：`options.remove("url")` + `trim()`
+    —— **会删键**，这是 `pop` 的语义，也是「url 没变时 edit 收到的 options
+    里没有 url」的根源。
+  - `DraftEditState` + `DraftAccept{set_options, accepted}`。
+  - `LiveEditState{task_url,pending_parse_id,interactive,pending_options}` +
+    `set_interactive`/`progress_visible`/`yes_enabled`/`accept(options,&mut submit)`
+    /`cancel_pending_parse`/`on_reparsed(can_reuse,received_bytes)`
+    /`confirm_replacement(bool)`/`on_parse_failed(localized)`；
+    `LiveAccept{Edit,Parsing}`、`ReparseOutcome{EditAndClose,Confirm,Restored,
+    ParseFailed{..}}`。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy --all-targets -- -D warnings`
+    0 error（全工作区）。
+  - `cargo test -p gd3-ui --lib`：**226 → 237 passed**。
+- 下一步：P3 剩余四个对话框 `pack_info.rs` / `subtitle_select.rs` /
+  `extension_install.rs` / `release_info.rs`（写前需重读源码，上次输出被截断）。
+- 卡点：无（`LiveEditState.pending_options` 显式承担 Python 闭包捕获
+  `options` 的角色；`_onReparseFailed` 只收已本地化文本，UI 层不引 i18n 表）

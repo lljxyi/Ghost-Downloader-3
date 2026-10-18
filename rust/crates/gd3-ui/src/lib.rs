@@ -23,6 +23,7 @@ pub mod close_mode;
 pub mod conflict;
 pub mod draft;
 pub mod drawer;
+pub mod edit_task;
 pub mod facts;
 pub mod file_select;
 pub mod filter;
