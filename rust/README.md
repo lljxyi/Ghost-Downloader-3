@@ -346,6 +346,27 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   不发信号）；②`onProgress` 闭包在 Python 里持有 `work` 对象，`cancelChecksum` 之后
   迟到的进度会写进孤儿对象（界面看不见），Rust 的 `set_checksum_progress` 只写登记表里
   的那条、返回 `bool` 说明是否真写了。
+- **删除 / 重下 / 分类 / 批量**（第 99 步）：`delete` / `redownload` / `setCategory` /
+  `startAll` / `pauseAll`，以及 `pause` 尾部的 `_pump()`。三个新报告类型
+  `PauseReport { cancel, started }`、`DeleteReport { cancel, removed, checksum_work,
+  delete_files, delete_denied, started }`、`RedownloadReport { checksum_work, cancel,
+  status, started }`——信号照例退化成返回值，`started` 是尾部 `_pump()` 的派发结果
+  （`taskStarted` 由调用方发）。`delete` 就地删占位符文件（`deletePlaceholder` +
+  `<path>.ghd`，只删「空目录 / 零字节文件」，正在下载的内容不动），**已下载内容**
+  留给调用方（`delete_files` 为真时执行 `Task.deleteFiles` 的语义，要等协程真停下——
+  Python 放在 `finished` 回调里）；`_canDeleteIn` 只在 macOS 上可能为假（`read_dir`
+  撞 `PermissionDenied`），非 macOS 恒真，所以 Linux 上 `delete_denied` 永远是 `false`。
+  `redownload` 同步做完 `reset()` + `queue.wait` + `pump`（Python 在 `finished` 回调里，
+  但 `_pump()` 只**返回**该派发的 id，顺序等价）。`setCategory` 只改 `category` + 置脏，
+  **不重算 `outputFolder`、不动占位符**；卡片菜单的「未分类」传 `""`，落成 `Some("")`
+  而不是 `None`（`outputFolderOf` 用 `is None` 判断要不要按名字猜分类）。
+  `startAll` 只排 `PAUSED` / `WAITING` / `FAILED` 且**不改状态**（`_dispatch` 才
+  `setStatus(RUNNING)`）；`pauseAll` 先快照 id 再遍历（`pause` 里的 `_pump` 会改队列），
+  返回的 `started` 含「被 pump 派发又立刻被 pause」的中间任务（Python 同）。
+  差异：`Task.deletePlaceholders` 里「未完成步骤的 `step.outputPath`」那一段仍没法镜像
+  （`TaskStep` 基类在 Rust 侧没有 `outputPath`，那是 `HttpStep`/`yt_dlp` 等子类的属性），
+  只做占位符文件那半边——与第 93 步 `placeholder_paths()` 只返回 `[outputPath]` 是
+  同一个缺口。
 
 ### 引擎装配（`engine.rs`）
 
@@ -874,9 +895,9 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **2717 行 / 65 单测**
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **3122 行 / 72 单测**
 （其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个、
-做种 9 个、校验与 `_rebalance` 9 个）。
+做种 9 个、校验与 `_rebalance` 9 个、删除/重下/分类/批量 7 个）。
 
 ## 剩余工作（Phase 8）
 

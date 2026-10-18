@@ -23,10 +23,11 @@
 //! - `_flushSoon()` 的 200ms 防抖退化成 `pending_flush` 标记 + 调用方 tick
 //!   （Python 用 `asyncio.sleep(0.2)` + `coroutineRunner.post(self.flush)`）。
 //!
-//! 为什么不做成 `actions::TaskService` 的 `impl`：那个 trait 的方法（`pause`/
-//! `start`/`delete`/`redownload`/`startChecksum`）每一个都要先「取消协程 / 停做种 /
-//! 删文件」，没有引擎就只能假装。等 `app/engine.py` 迁过来再实现那个 trait，
-//! 这里先把不依赖引擎的记账与判定做扎实。
+//! 为什么还没做 `actions::TaskService` 的 `impl`：那个 trait 收 `&self`，而这里的
+//! 方法全要 `&mut self`；且每个动作的第一步都是「取消协程 / 停做种 / 删文件」，
+//! 没有引擎就只能假装。第 97–99 步已经把 `pause` / `start` / `delete` /
+//! `redownload` / `startChecksum` 的**记账半边**补齐，接引擎时只需一层
+//! `RefCell` 适配器。
 //!
 //! # 已知差异
 //!
@@ -55,7 +56,14 @@
 //! - **校验也只做记账**（第 98 步）：`_checksums` + `checksumProgress` + 三个信号的
 //!   判定已对齐（`startChecksum` / `cancelChecksum` / `_onChecksumDone` /
 //!   `_onChecksumFailed`），`toChecksum` 本体在 `gd3_core::checksum`、协程提交归引擎；
-//!   `_rebalance`（依赖 `Task.canPause`）同样只做记账。
+//!   `_rebalance`（依赖 `Task.canPause`）同样只做记账；
+//! - **删除/重下也只做记账**（第 99 步）：`delete` / `redownload` / `setCategory` /
+//!   `startAll` / `pauseAll` 的记账与顺序已对齐，`_unwatchFile`（文件监听器）、
+//!   `Task.deleteFiles`（截断已下载内容）与协程取消仍归引擎层；
+//!   `Task.deletePlaceholders` 里「未完成步骤的 `step.outputPath`」那一段没法镜像
+//!   ——`TaskStep` 基类的 `outputPath` 恒为 `""`，真实路径来自 `HttpStep` /
+//!   `yt_dlp` / `bittorrent` 等步骤子类，Rust 侧的 `TaskStep` 只是数据行；所以只做
+//!   占位符文件那半边（与 `placeholder_paths()` 只返回 `[outputPath]` 是同一个缺口）。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -199,6 +207,50 @@ pub struct RebalanceReport {
     pub started: Vec<String>,
 }
 
+/// `pause(task)` 的产物。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PauseReport {
+    /// `_cancelWork(task)` 的结果（协程取消归引擎）。
+    pub cancel: CancelWork,
+    /// 尾部 `_pump()` 派发的 id（`taskPaused` 之后让出的空位）。
+    pub started: Vec<String>,
+}
+
+/// `delete(task, shouldDeleteFiles)` 的产物。
+///
+/// 不 `derive(PartialEq)`：`removed` 是 `TaskRecord`，`gd3-core` 侧没给它
+/// `PartialEq`（含 `Value`，只可能到 `PartialEq` 不到 `Eq`）。
+#[derive(Debug, Clone)]
+pub struct DeleteReport {
+    /// `_cancelWork(task)` 的结果。
+    pub cancel: CancelWork,
+    /// 被移除的记录（`taskRemoved` 的载荷；占位符文件已经删过了）。
+    pub removed: TaskRecord,
+    /// `cancelChecksum(task)` 摘掉的 workId：`Some` 时调用方还要发
+    /// `checksumStopped(task, None)`。
+    pub checksum_work: Option<String>,
+    /// `canDelete = shouldDeleteFiles and _canDeleteIn(outputFolder)`：为真时
+    /// 调用方还要执行 `Task.deleteFiles`（截断/清空已下载内容）。
+    pub delete_files: bool,
+    /// 本次首次触发 `fileDeleteDenied`（Python 只提示一次）。
+    pub delete_denied: bool,
+    /// 尾部 `_pump()` 派发的 id。
+    pub started: Vec<String>,
+}
+
+/// `redownload(task)` 的产物。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedownloadReport {
+    /// `cancelChecksum(task)` 摘掉的 workId（同 [`DeleteReport::checksum_work`]）。
+    pub checksum_work: Option<String>,
+    /// `_cancelWork(task)` 的结果。
+    pub cancel: CancelWork,
+    /// `Task.reset()` 之后的状态（= Python `reset()` 里 `updateStatus()` 的返回）。
+    pub status: TaskStatus,
+    /// `_schedule` 尾部 `_pump()` 派发的 id。
+    pub started: Vec<String>,
+}
+
 /// 任务列表 + 队列记账（不含引擎）。
 #[derive(Debug, Clone, Default)]
 pub struct TaskService {
@@ -228,6 +280,25 @@ pub struct TaskService {
     /// `ChecksumWork` 整体入库（不是只存 workId）：`checksumProgress(task)` 要读
     /// `progress`，而 `onProgress` 回调只拿得到 taskId。
     checksums: BTreeMap<String, ChecksumWork>,
+}
+
+/// `_canDeleteIn(folder)`（`task_service.py:606-615`）：macOS 上「删不掉已下载内容」
+/// 的情形是「目录里一个条目都读不出来（`PermissionError`）」——那是沙箱/权限问题，
+/// 其余平台恒真。
+///
+/// Python 用 `next(folder.iterdir(), None)` 只取一个条目；`read_dir` 打开目录时才
+/// 可能 `PermissionDenied`，等价。
+#[cfg(target_os = "macos")]
+fn can_delete_in(folder: &Path) -> bool {
+    match fs::read_dir(folder) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::PermissionDenied,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn can_delete_in(_folder: &Path) -> bool {
+    true
 }
 
 impl TaskService {
@@ -715,19 +786,183 @@ impl TaskService {
         self.cancel_work(task_id)
     }
 
-    /// `pause(task)` 的记账部分：`_cancelWork` + `setStatus(PAUSED)` + 待落盘。
+    /// `pause(task)`（`task_service.py:429-436`）的记账部分。
     ///
-    /// 返回任务是否存在（Python 对不存在的任务会 `AttributeError`，这里退化）。
-    pub fn pause(&mut self, task_id: &str) -> bool {
-        if self.task(task_id).is_none() {
-            return false;
-        }
-        let _ = self.cancel_work(task_id);
+    /// ```python
+    /// self._cancelWork(task)
+    /// task.setStatus(TaskStatus.PAUSED)
+    /// self._flushSoon()
+    /// self.taskPaused.emit(task)
+    /// self._pump()
+    /// ```
+    ///
+    /// 尾部 `_pump()` 不能省：让出空位后要立刻派发下一个等待任务（`started`）。
+    /// 任务不在列表里 → `None`（Python 会 `AttributeError`）。
+    pub fn pause(&mut self, task_id: &str, max_task_num: usize) -> Option<PauseReport> {
+        self.task(task_id)?;
+        let cancel = self.cancel_work(task_id);
         if let Some(record) = self.task_mut(task_id) {
             record.status = TaskStatus::Paused;
         }
         self.pending_flush = true;
+        let started = self.pump(max_task_num);
+        Some(PauseReport { cancel, started })
+    }
+
+    /// `delete(task, shouldDeleteFiles)`（`task_service.py:438-452`）的记账部分。
+    ///
+    /// ```python
+    /// self.cancelChecksum(task)
+    /// self._unwatchFile(task)
+    /// canDelete = shouldDeleteFiles and self._canDeleteIn(task.outputFolder)
+    /// if shouldDeleteFiles and not canDelete and not self._hasNotifiedDeleteDenied:
+    ///     self._hasNotifiedDeleteDenied = True
+    ///     self.fileDeleteDenied.emit()
+    /// def onStopped():
+    ///     if canDelete: task.deleteFiles()
+    ///     task.deletePlaceholders()
+    /// self._cancelWork(task, finished=onStopped)
+    /// self._store.remove(task.taskId)
+    /// self._flushSoon()
+    /// self.taskRemoved.emit(task.taskId)
+    /// self._pump()
+    /// ```
+    ///
+    /// 顺序照抄：**先摘校验、再判能不能删、再取消协程、再移除记录、最后 pump**。
+    /// 占位符文件在这里就地删（`deletePlaceholder` + `<path>.ghd`，只删「空目录 /
+    /// 零字节文件」，正在下载的内容不动）；**已下载内容**留给调用方
+    /// （[`DeleteReport::delete_files`] 为真时执行 `Task.deleteFiles` 的语义），
+    /// 因为它要等协程真的停下（Python 放在 `finished` 回调里）。
+    /// `_unwatchFile` 同样归引擎。
+    ///
+    /// 任务不在列表里 → `None`（Python 在 `task.outputFolder` 就 `AttributeError`）。
+    pub fn delete(
+        &mut self,
+        task_id: &str,
+        should_delete_files: bool,
+        max_task_num: usize,
+    ) -> Option<DeleteReport> {
+        let folder = PathBuf::from(self.task(task_id)?.output_folder.clone());
+        let checksum_work = self.cancel_checksum(task_id);
+        let delete_files = should_delete_files && can_delete_in(&folder);
+        let delete_denied = should_delete_files && !delete_files && self.note_delete_denied();
+        let cancel = self.cancel_work(task_id);
+        let removed = self.remove(task_id)?;
+        for path in removed.placeholder_paths() {
+            let _ = delete_placeholder(&path);
+            // `delete_path` 返回 `()`，不能再套 `let _ =`（clippy::let_unit_value）。
+            delete_path(&sidecar_path(&path));
+        }
+        let started = self.pump(max_task_num);
+        Some(DeleteReport {
+            cancel,
+            removed,
+            checksum_work,
+            delete_files,
+            delete_denied,
+            started,
+        })
+    }
+
+    /// `redownload(task)`（`task_service.py:454-463`）的记账部分。
+    ///
+    /// ```python
+    /// self.cancelChecksum(task)
+    /// self._unwatchFile(task)
+    /// def onStopped():
+    ///     task.deleteFiles()
+    ///     task.reset()
+    ///     self._flushSoon()
+    ///     self._schedule(task)
+    ///     self._cancelWork(task, finished=onStopped)
+    /// ```
+    ///
+    /// Python 把 `reset()` + `_schedule()` 放在 `finished` 回调里；这里直接做完，
+    /// 因为 `_pump()` 只**返回**该派发的 id，真正的派发归调用方——调用方拿到
+    /// `started` 之后、提交协程之前删掉旧文件即可（顺序与 Python 一致）。
+    /// `_unwatchFile` 归引擎。
+    ///
+    /// 任务不在列表里 → `None`。
+    pub fn redownload(&mut self, task_id: &str, max_task_num: usize) -> Option<RedownloadReport> {
+        self.task(task_id)?;
+        let checksum_work = self.cancel_checksum(task_id);
+        let cancel = self.cancel_work(task_id);
+        let status = self.task_mut(task_id)?.reset();
+        // `_flushSoon()`：`reset()` 动了持久化字段（`completedAt` / `shouldSeed` /
+        // `checksums` / 每个 step 的进度）。
+        self.pending_flush = true;
+        // `_schedule(task)`：`queue.wait(taskId)` + `_pump()`。
+        self.queue.wait(task_id);
+        let started = self.pump(max_task_num);
+        Some(RedownloadReport {
+            checksum_work,
+            cancel,
+            status,
+            started,
+        })
+    }
+
+    /// `setCategory(task, categoryId)`（`task_service.py:478-480`）：只改
+    /// `task.category` + 落盘，**不重算 `outputFolder`**、也不动占位符。
+    ///
+    /// Python 的 `categoryId` 恒为 `str`（卡片菜单的「未分类」传 `""`），所以
+    /// 空串落成 `Some("")` 而不是 `None`——`outputFolderOf` 用 `categoryId is None`
+    /// 判断「要不要按名字猜分类」，两种空值语义不同。
+    pub fn set_category(&mut self, task_id: &str, category_id: &str) -> bool {
+        match self.task_mut(task_id) {
+            Some(record) => record.category = Some(category_id.to_string()),
+            None => return false,
+        }
+        self.pending_flush = true;
         true
+    }
+
+    /// `startAll()`（`task_service.py:530-534`）：对 `PAUSED` / `WAITING` / `FAILED`
+    /// 的任务逐个 `_schedule`（= `queue.wait` + `_pump()`）。
+    ///
+    /// 返回所有被派发的 id（Python 是逐任务 pump，这里同序聚合）。
+    /// **不改状态**：`_dispatch` 才 `setStatus(RUNNING)`，排队期间还是原状态。
+    pub fn start_all(&mut self, max_task_num: usize) -> Vec<String> {
+        let ids: Vec<String> = self
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.status,
+                    TaskStatus::Paused | TaskStatus::Waiting | TaskStatus::Failed
+                )
+            })
+            .map(|record| record.task_id.clone())
+            .collect();
+        let mut started = Vec::new();
+        for task_id in ids {
+            self.queue.wait(&task_id);
+            started.extend(self.pump(max_task_num));
+        }
+        started
+    }
+
+    /// `pauseAll()`（`task_service.py:536-539`）：对**运行中或等待中**的任务逐个
+    /// `pause`（`_cancelWork` + `PAUSED` + `_pump`）。
+    ///
+    /// 先快照 id 列表再遍历——Python 用 `list(self._store.tasks.values())` 同理，
+    /// 否则 `pause` 里的 `_pump` 会改动正在迭代的队列。
+    pub fn pause_all(&mut self, max_task_num: usize) -> Vec<String> {
+        let ids: Vec<String> = self
+            .records
+            .iter()
+            .filter(|record| {
+                self.queue.is_running(&record.task_id) || self.queue.is_waiting(&record.task_id)
+            })
+            .map(|record| record.task_id.clone())
+            .collect();
+        let mut started = Vec::new();
+        for task_id in ids {
+            if let Some(report) = self.pause(&task_id, max_task_num) {
+                started.extend(report.started);
+            }
+        }
+        started
     }
 
     /// `_cancelWork(task)`（`task_service.py:629-639`）的记账部分。
@@ -1357,14 +1592,16 @@ mod tests {
         let mut service = TaskService::new();
         service.add(record("a", TaskStatus::Running, 10), true);
         service.on_run_started("a", "work-1");
-        assert!(service.pause("a"));
+        let report = service.pause("a", 1).expect("任务在");
+        assert_eq!(report.cancel.work_id.as_deref(), Some("work-1"));
+        assert!(report.started.is_empty(), "等待队列为空");
         assert_eq!(service.running_count(), 0);
         assert_eq!(
             service.task("a").expect("任务在").status,
             TaskStatus::Paused
         );
         assert!(service.pending_flush());
-        assert!(!service.pause("missing"));
+        assert!(service.pause("missing", 1).is_none());
     }
 
     #[test]
@@ -2712,6 +2949,179 @@ mod tests {
         assert!(report.cancelled.is_empty(), "运行数没超限");
         assert_eq!(report.started, vec!["b".to_string()]);
         assert_eq!(service.running_count(), 2);
+        assert!(service.waiting_order().is_empty());
+    }
+    #[test]
+    fn pause_pumps_the_freed_slot() {
+        let mut service = TaskService::new();
+        service.add(record("a", TaskStatus::Running, 10), true);
+        service.add(record("b", TaskStatus::Waiting, 10), false);
+        service.on_run_started("a", "work-1");
+        service.queue.wait("b");
+
+        let report = service.pause("a", 1).expect("任务在");
+        assert_eq!(report.cancel.work_id.as_deref(), Some("work-1"));
+        assert_eq!(report.started, vec!["b".to_string()], "让出空位立刻补位");
+        assert_eq!(service.running_count(), 1);
+        assert!(service.waiting_order().is_empty());
+    }
+
+    #[test]
+    fn delete_reports_checksum_cancel_and_pumps() {
+        let mut service = TaskService::new();
+        service.add(record("a", TaskStatus::Running, 10), true);
+        service.add(record("b", TaskStatus::Waiting, 10), false);
+        service.on_run_started("a", "work-1");
+        service.start_checksum("a", "check-1").expect("任务在");
+        service.queue.wait("b");
+
+        let report = service.delete("a", false, 1).expect("任务在");
+        assert_eq!(report.checksum_work.as_deref(), Some("check-1"));
+        assert_eq!(report.cancel.work_id.as_deref(), Some("work-1"));
+        assert_eq!(report.removed.task_id, "a");
+        assert!(!report.delete_files, "shouldDeleteFiles=False");
+        assert!(!report.delete_denied, "非 macOS 恒可删");
+        assert_eq!(report.started, vec!["b".to_string()]);
+        assert_eq!(service.len(), 1);
+        assert_eq!(service.checksum_count(), 0, "校验登记项要摘掉");
+        assert_eq!(service.running_count(), 1);
+        assert!(service.pending_flush());
+        assert!(service.delete("missing", false, 1).is_none());
+    }
+
+    #[test]
+    fn delete_removes_placeholders_but_keeps_content() {
+        let dir = TempDir::new("delete");
+        let mut service = TaskService::new();
+        service.add(record_in(dir.path(), "a", TaskStatus::Completed), false);
+        service.add(record_in(dir.path(), "b", TaskStatus::Completed), false);
+        let empty = placeholder(dir.path(), "a.bin");
+        std::fs::write(&empty, b"").expect("写占位符");
+        std::fs::write(sidecar_path(&empty), b"{}").expect("写 sidecar");
+        let content = placeholder(dir.path(), "b.bin");
+        std::fs::write(&content, b"payload").expect("写内容");
+
+        let report = service.delete("a", true, 1).expect("任务在");
+        assert!(report.delete_files, "非 macOS 恒可删");
+        assert!(!report.delete_denied);
+        assert!(!empty.exists(), "零字节占位符要删");
+        assert!(!sidecar_path(&empty).exists(), "sidecar 也要删");
+
+        service.delete("b", true, 1).expect("任务在");
+        assert!(content.exists(), "有内容的文件是真实数据，不能删");
+    }
+
+    #[test]
+    fn redownload_resets_and_requeues() {
+        let mut service = TaskService::new();
+        let mut done = record("a", TaskStatus::Completed, 10);
+        done.completed_at = 1234;
+        done.should_seed = false;
+        done.checksums
+            .insert("sha256".to_string(), serde_json::json!("abc"));
+        done.steps.push(step(10));
+        service.add(done, false);
+        service.start_checksum("a", "check-1").expect("任务在");
+
+        let report = service.redownload("a", 1).expect("任务在");
+        assert_eq!(report.checksum_work.as_deref(), Some("check-1"));
+        assert!(report.cancel.work_id.is_none(), "不在队列里");
+        assert_eq!(report.status, TaskStatus::Waiting);
+        assert_eq!(report.started, vec!["a".to_string()]);
+        assert_eq!(service.checksum_count(), 0);
+        assert!(service.pending_flush());
+        assert_eq!(service.running_count(), 1);
+        let record = service.task("a").expect("任务在");
+        assert_eq!(record.completed_at, 0);
+        assert!(record.should_seed);
+        assert!(record.checksums.is_empty());
+        assert_eq!(record.steps[0].status, TaskStatus::Waiting);
+        assert_eq!(record.steps[0].received_bytes, 0);
+        assert!(service.redownload("missing", 1).is_none());
+    }
+
+    #[test]
+    fn set_category_writes_the_raw_string_and_flushes() {
+        let dir = TempDir::new("category");
+        let path = dir.path().join("tasks.jsonl");
+        let (mut service, failures) = TaskService::load(&path).expect("缺失文件不算错误");
+        assert!(failures.is_empty());
+        service.add(record("a", TaskStatus::Completed, 10), false);
+        assert!(service.flush(&path).expect("写盘"));
+        assert!(!service.pending_flush());
+
+        assert!(service.set_category("a", ""));
+        assert_eq!(
+            service.task("a").expect("任务在").category.as_deref(),
+            Some(""),
+            "「未分类」传空串，落成 Some(\"\") 而非 None"
+        );
+        assert!(service.pending_flush());
+
+        assert!(service.set_category("a", "video"));
+        assert_eq!(
+            service.task("a").expect("任务在").category.as_deref(),
+            Some("video")
+        );
+        assert!(!service.set_category("missing", "video"));
+    }
+
+    #[test]
+    fn start_all_queues_paused_waiting_and_failed() {
+        let mut service = TaskService::from_records(vec![
+            record("p", TaskStatus::Paused, 10),
+            record("w", TaskStatus::Waiting, 10),
+            record("f", TaskStatus::Failed, 10),
+            record("d", TaskStatus::Completed, 10),
+        ]);
+
+        assert_eq!(service.start_all(1), vec!["p".to_string()]);
+        assert_eq!(
+            service.waiting_order(),
+            vec!["w".to_string(), "f".to_string()],
+            "只排 PAUSED/WAITING/FAILED，保持记录顺序"
+        );
+        assert_eq!(
+            service.task("w").expect("任务在").status,
+            TaskStatus::Waiting,
+            "排队期间不改状态（_dispatch 才 setStatus(RUNNING)）"
+        );
+        assert_eq!(
+            service.task("d").expect("任务在").status,
+            TaskStatus::Completed
+        );
+        assert_eq!(service.running_count(), 1);
+    }
+
+    #[test]
+    fn pause_all_pauses_running_and_waiting() {
+        let mut service = TaskService::new();
+        service.add(record("a", TaskStatus::Running, 10), true);
+        service.add(record("b", TaskStatus::Waiting, 10), false);
+        service.add(record("c", TaskStatus::Completed, 10), false);
+        service.on_run_started("a", "wa");
+        service.queue.wait("b");
+
+        let started = service.pause_all(1);
+        assert_eq!(
+            started,
+            vec!["b".to_string()],
+            "pause(a) 的 pump 先把 b 派发出去，随后 b 自己也被暂停"
+        );
+        assert_eq!(
+            service.task("a").expect("任务在").status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            service.task("b").expect("任务在").status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            service.task("c").expect("任务在").status,
+            TaskStatus::Completed,
+            "已完成的不动"
+        );
+        assert_eq!(service.running_count(), 0);
         assert!(service.waiting_order().is_empty());
     }
 }
