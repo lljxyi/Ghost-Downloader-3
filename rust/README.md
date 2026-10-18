@@ -388,6 +388,12 @@ setCategory(t, c)  task.category = c → _flushSoon
 moveToFront(ids)   if queue.moveToFront(ids): queueChanged
 startChecksum(t,a) _checksums[t]=work → submit(toChecksum(...)) → checksumStarted
 cancelChecksum(t)  if work: cancel(workId) → checksumStopped(t, None)
+edit(t, opts, nt)  cancelChecksum → needsDelete = nt and not canReuseProgress(nt)
+                   → _cancelWork → onStopped{deleteFiles?, replaceWith?, setOptions,
+                   updatePlaceholders, _flushSoon, _schedule}
+updateSelection(t, idx)  [isRunningDeselected: _cancelWork] → apply{setSelection,
+                   updatePlaceholders, [completedAt=0, _unwatchFile, _cancelWork],
+                   _flushSoon} → [_schedule]
 ```
 
 两个缺口与补法：
@@ -398,10 +404,11 @@ cancelChecksum(t)  if work: cancel(workId) → checksumStopped(t, None)
   `impl`：`RefCell<TaskService>`（UI 自持）、`RefCell<&mut TaskService>`（临时借引擎那份，
   `Engine::task_actions()` 走这条）、`Rc<RefCell<TaskService>>`（长期共享）；
 - **没有协程运行时**：Python 每个动作都会 `coroutineRunner.submit/cancel`。Rust 侧退化成
-  `TaskAction` 效果队列——`TaskActions` 只**登记**要做什么，宿主按序消费。12 个变体：
+  `TaskAction` 效果队列——`TaskActions` 只**登记**要做什么，宿主按序消费。13 个变体：
   `Started` / `CancelWork` / `Paused` / `Removed` / `DeleteDenied` / `DeleteFiles` /
-  `UnwatchFile` / `SeedingStarted` / `SeedingStopped` / `ChecksumStarted` /
-  `ChecksumStopped` / `QueueChanged`，每个都对应 Python 里的一行具体调用或一次信号。
+  `DeleteFilesAt` / `UnwatchFile` / `SeedingStarted` / `SeedingStopped` /
+  `ChecksumStarted` / `ChecksumStopped` / `QueueChanged`，每个都对应 Python 里的一行
+  具体调用或一次信号。
   workId 由 `TaskActions` 自己发号（`run-1` / `seed-2` / `checksum-3`，一个全局计数器 +
   前缀区分类别），宿主只需把它当**不透明句柄**原样交回 `CancelWork`。
 
@@ -423,6 +430,17 @@ cancelChecksum(t)  if work: cancel(workId) → checksumStopped(t, None)
 再由 `updateStatus()` 反推任务状态（步骤混着 `COMPLETED` 时甚至可能反推出 `WAITING`）。
 直接赋 `record.status` 会漏掉这半边，`canPause`（读第一个 `RUNNING` 步骤）也就永远看到
 旧值。
+
+`edit` 与 `updateSelection` 是 `TaskActions` 的**固有方法**（不进 `actions::TaskService`
+trait）：前者走 `featureService.createEditDialog`、后者走抽屉的文件列表，都不是卡片
+动作分派。两者的 `finished=` 回调各带一句 `deleteFiles()`，而 `edit` 的那句在
+`replaceWith(newTask)` **之前**——名字一换 `placeholderPaths` 就跟着换，宿主事后按
+taskId 现算会删到新路径。所以 `edit` 的效果是 `DeleteFilesAt { task_id, paths }`
+（`paths` 是改名前的快照），其余动作仍用 `DeleteFiles { task_id }`。
+
+`updateSelection` 的三处口径（全部照抄 Python）：`wasCompleted` 在 `setSelection`
+**之前**快照；「有选中未完成文件」看的是**新**选中集；`isRunningDeselected` 只看
+**第一个** `RUNNING` step（`fileIndex is None` 判 `False`）。
 
 还没接的：`actions::UiHooks`（剪贴板 / 抽屉 / 编辑对话框 / 打开文件）落到
 `app.platform.desktop`，要等 Slint 窗口就位。

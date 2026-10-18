@@ -72,7 +72,7 @@
 //!   `record.status` 会漏掉这半边，`canPause`（读第一个 `RUNNING` 步骤）也就永远
 //!   看到旧值。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ use gd3_core::placeholder::{
 };
 use gd3_core::queue::TaskQueue;
 use gd3_core::store;
-use gd3_core::task::{TaskRecord, TaskStatus};
+use gd3_core::task::{TaskOptions, TaskRecord, TaskStatus};
 use gd3_core::task_error::TaskError;
 use serde_json::Value;
 
@@ -256,6 +256,53 @@ pub struct RedownloadReport {
     pub status: TaskStatus,
     /// `_schedule` 尾部 `_pump()` 派发的 id。
     pub started: Vec<String>,
+}
+
+/// `edit(task, options, newTask)` 的产物。
+///
+/// 不 `derive(PartialEq)`：`placeholders` 里是 `UpdateReport`（含 `PathBuf`，
+/// 可以比）但没必要为此扩大约束，测试逐字段断言。
+#[derive(Debug, Clone, Default)]
+pub struct EditReport {
+    /// `cancelChecksum(task)` 摘掉的 workId（`Some` 时调用方发
+    /// `checksumStopped(task, None)`）。
+    pub checksum_work: Option<String>,
+    /// `_cancelWork(task, finished=onStopped)` 的结果。
+    pub cancel: CancelWork,
+    /// `needsDelete = newTask is not None and not task.canReuseProgress(newTask)`：
+    /// 为真时调用方要执行 `Task.deleteFiles()`。
+    pub needs_delete: bool,
+    /// `replaceWith` **之前**的占位符路径：宿主按这些路径执行 `deleteFiles`。
+    ///
+    /// 顺序有语义——Python 的 `onStopped` 先 `deleteFiles()` 再 `replaceWith`，
+    /// 而 `replaceWith` 会换掉 `name`（进而换掉 `placeholderPaths`）；Rust 侧
+    /// 记录已经就地改过，事后按 taskId 现算会删到新路径。
+    pub delete_paths: Vec<PathBuf>,
+    /// `_store.updatePlaceholders(task)` 的产物。
+    pub placeholders: Option<UpdateReport>,
+    /// `setOptions` / `replaceWith` 之后的 `updateStatus()`。
+    pub status: TaskStatus,
+    /// 尾部 `_schedule(task)` 的 `_pump()` 派发的 id。
+    pub started: Vec<String>,
+}
+
+/// `updateSelection(task, selectedIndexes)` 的产物。
+#[derive(Debug, Clone, Default)]
+pub struct SelectionReport {
+    /// 外层 `_cancelWork(task, finished=onStopped)`（`isRunningDeselected` 分支
+    /// 才有；此时它在 `apply()` **之前**，与 Python 同序）。
+    pub cancel: Option<CancelWork>,
+    /// `apply()` 里 `wasCompleted` 命中：`completedAt = 0` + `_unwatchFile(task)`
+    /// + 嵌套 `_cancelWork(finished=lambda: _schedule(task))`。
+    pub restarted: bool,
+    /// 嵌套 `_cancelWork` 的结果（与 `restarted` 同真同假）。
+    pub restart_cancel: Option<CancelWork>,
+    /// `_store.updatePlaceholders(task)` 的产物。
+    pub placeholders: Option<UpdateReport>,
+    /// 尾部 `_schedule(task)` 的 `_pump()` 派发的 id。
+    pub started: Vec<String>,
+    /// 最终状态（`setSelection` 里的 `updateStatus()` 之后）。
+    pub status: TaskStatus,
 }
 
 /// 任务列表 + 队列记账（不含引擎）。
@@ -934,6 +981,176 @@ impl TaskService {
         }
         self.pending_flush = true;
         true
+    }
+
+    /// `edit(task, options, newTask)`（`task_service.py:464-476`）。
+    ///
+    /// ```python
+    /// cancelChecksum(task)
+    /// needsDelete = newTask is not None and not task.canReuseProgress(newTask)
+    /// def onStopped():
+    ///     if needsDelete: task.deleteFiles()
+    ///     if newTask is not None: task.replaceWith(newTask)
+    ///     task.setOptions(options)
+    ///     self._store.updatePlaceholders(task)
+    ///     self._flushSoon()
+    ///     self._schedule(task)
+    ///     self._cancelWork(task, finished=onStopped)
+    /// ```
+    ///
+    /// **`edit` 不 `_unwatchFile`**（`delete` / `redownload` 会）——旧文件若被
+    /// `deleteFiles` 清空，监听器由引擎在协程收尾时摘。
+    ///
+    /// `onStopped` 的四步在 Rust 侧同步做完（`_cancelWork` 的 `finished` 回调
+    /// 没有对应物，见模块 doc 的「顺序」）；`deleteFiles` 退化成
+    /// [`EditReport::delete_paths`] 快照 + 宿主按序应用。
+    ///
+    /// 任务不在列表里 → `Ok(None)`。
+    pub fn edit(
+        &mut self,
+        task_id: &str,
+        options: &TaskOptions,
+        new_task: Option<&TaskRecord>,
+        max_task_num: usize,
+    ) -> Result<Option<EditReport>, CreateError> {
+        let Some(before) = self.task(task_id).cloned() else {
+            return Ok(None);
+        };
+        // `Task.deleteFiles()` 读的是**当前**占位符；`replaceWith` 换掉 name 之后
+        // 就算不出旧路径了，所以先快照。
+        let delete_paths = before.placeholder_paths();
+        let needs_delete = match new_task {
+            Some(new_task) => !before.can_reuse_progress(new_task),
+            None => false,
+        };
+        let checksum_work = self.cancel_checksum(task_id);
+        let cancel = self.cancel_work(task_id);
+        // `if newTask is not None: task.replaceWith(newTask)`
+        if let Some(new_task) = new_task
+            && let Some(record) = self.task_mut(task_id)
+        {
+            record.replace_with(new_task);
+        }
+        // `task.setOptions(options)`
+        if let Some(record) = self.task_mut(task_id) {
+            record.set_options(options);
+        }
+        // `self._store.updatePlaceholders(task)`
+        let placeholders = self.update_placeholders(task_id)?;
+        // `_flushSoon()`
+        self.pending_flush = true;
+        // `_schedule(task)`：`queue.wait(taskId)` + `_pump()`。
+        self.queue.wait(task_id);
+        let started = self.pump(max_task_num);
+        let status = self
+            .task(task_id)
+            .map_or(TaskStatus::Waiting, |record| record.status);
+        Ok(Some(EditReport {
+            checksum_work,
+            cancel,
+            needs_delete,
+            delete_paths,
+            placeholders,
+            status,
+            started,
+        }))
+    }
+
+    /// `updateSelection(task, selectedIndexes)`（`task_service.py:482-528`）。
+    ///
+    /// ```python
+    /// wasCompleted = task.status == COMPLETED          # 快照，早于 setSelection
+    /// def apply():
+    ///     task.setSelection(selectedSet)                # 改 files[].selected + fileSize
+    ///     self._store.updatePlaceholders(task)
+    ///     if wasCompleted and task.files and any(f.selected and not f.completed):
+    ///         task.completedAt = 0
+    ///         self._unwatchFile(task)
+    ///         self._cancelWork(task, finished=lambda: self._schedule(task))
+    ///     self._flushSoon()
+    /// isRunningDeselected = 队列在跑 and 第一个 RUNNING step 的 fileIndex 不在选中里
+    /// if isRunningDeselected: _cancelWork(task, finished=onStopped{apply(); _schedule()})
+    /// else: apply()
+    /// ```
+    ///
+    /// 三处口径：
+    /// - `wasCompleted` 在 `setSelection` **之前**取：`setSelection` 会
+    ///   `updateStatus()`，已完成任务可能被重算成 `WAITING`；
+    /// - 「有选中未完成文件」看的是**新**选中集（`setSelection` 已经改过
+    ///   `files[].selected`）；
+    /// - `isRunningDeselected` 只看**第一个** `RUNNING` step（`break`），
+    ///   `fileIndex is None` 时判 `False`。
+    ///
+    /// 任务不在列表里 → `Ok(None)`。
+    pub fn update_selection(
+        &mut self,
+        task_id: &str,
+        selected: &BTreeSet<i64>,
+        max_task_num: usize,
+    ) -> Result<Option<SelectionReport>, CreateError> {
+        let Some(before) = self.task(task_id).cloned() else {
+            return Ok(None);
+        };
+        let was_completed = before.status == TaskStatus::Completed;
+        // `isRunningDeselected`：队列在跑 → 看第一个 RUNNING step 的 fileIndex。
+        let mut interrupted = false;
+        if self.queue.is_running(task_id) {
+            for step in &before.steps {
+                if step.status == TaskStatus::Running {
+                    interrupted = step
+                        .file_index
+                        .is_some_and(|index| !selected.contains(&index));
+                    break;
+                }
+            }
+        }
+        // `if isRunningDeselected: _cancelWork(task, finished=onStopped)`
+        let cancel = if interrupted {
+            Some(self.cancel_work(task_id))
+        } else {
+            None
+        };
+        // apply()
+        if let Some(record) = self.task_mut(task_id) {
+            record.set_selection(selected);
+        }
+        let placeholders = self.update_placeholders(task_id)?;
+        let restarted = was_completed
+            && self.task(task_id).is_some_and(|record| {
+                record
+                    .files
+                    .as_ref()
+                    .is_some_and(|files| files.iter().any(|file| file.selected && !file.completed))
+            });
+        let restart_cancel = if restarted {
+            if let Some(record) = self.task_mut(task_id) {
+                record.completed_at = 0;
+            }
+            Some(self.cancel_work(task_id))
+        } else {
+            None
+        };
+        // `_flushSoon()`
+        self.pending_flush = true;
+        // `_schedule(task)`：两条分支各一次（`restarted` 在嵌套 `finished` 里，
+        // `interrupted` 在 `onStopped` 里；二者互斥——在跑的任务不会是 COMPLETED）。
+        let started = if restarted || interrupted {
+            self.queue.wait(task_id);
+            self.pump(max_task_num)
+        } else {
+            Vec::new()
+        };
+        let status = self
+            .task(task_id)
+            .map_or(TaskStatus::Waiting, |record| record.status);
+        Ok(Some(SelectionReport {
+            cancel,
+            restarted,
+            restart_cancel,
+            placeholders,
+            started,
+            status,
+        }))
     }
 
     /// `startAll()`（`task_service.py:530-534`）：对 `PAUSED` / `WAITING` / `FAILED`
@@ -3176,5 +3393,219 @@ mod tests {
         );
         assert_eq!(service.running_count(), 0);
         assert!(service.waiting_order().is_empty());
+    }
+
+    #[test]
+    fn edit_without_new_task_writes_options_and_requeues() {
+        let dir = TempDir::new("edit-plain");
+        let target = dir.path().join("moved");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Paused);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+
+        let options = TaskOptions {
+            output_folder: Some(target.to_string_lossy().into_owned()),
+            category: Some(Some("video".to_string())),
+        };
+        let report = service
+            .edit("a", &options, None, 4)
+            .expect("edit 不应报错")
+            .expect("任务在");
+
+        assert!(!report.needs_delete, "没给 newTask → 不删文件");
+        assert_eq!(
+            report.delete_paths,
+            vec![placeholder(dir.path(), "a.bin")],
+            "deleteFiles 的路径是改名前那一份"
+        );
+        assert_eq!(report.checksum_work, None);
+        assert_eq!(report.cancel, CancelWork::default(), "没有在跑的工作");
+        assert!(report.placeholders.is_some(), "登记项还在 → 有产物");
+        let record = service.task("a").expect("任务在");
+        assert_eq!(record.output_folder, target.to_string_lossy());
+        assert_eq!(record.category.as_deref(), Some("video"));
+        assert!(
+            placeholder(&target, "a.bin").is_file(),
+            "占位符跟着 outputFolder 搬走了"
+        );
+        assert!(
+            !placeholder(dir.path(), "a.bin").exists(),
+            "旧位置不该留下占位符"
+        );
+        assert_eq!(report.started, vec!["a".to_string()], "尾部 _schedule 派发");
+        assert_eq!(
+            report.status,
+            TaskStatus::Paused,
+            "`pump` 只排队（空 workId 占位），置 RUNNING 的是动作层的 `_dispatch`"
+        );
+    }
+
+    #[test]
+    fn edit_with_new_task_snapshots_the_old_delete_paths() {
+        let dir = TempDir::new("edit-new");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Paused);
+        input.name = "a.bin".to_string();
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+
+        let mut new_task = record_in(dir.path(), "a", TaskStatus::Waiting);
+        new_task.name = "renamed.bin".to_string();
+        new_task.url = "https://example.com/v2".to_string();
+        let options = TaskOptions::default();
+        let report = service
+            .edit("a", &options, Some(&new_task), 4)
+            .expect("edit 不应报错")
+            .expect("任务在");
+
+        assert!(report.needs_delete, "canReuseProgress 恒 False → 必删");
+        assert_eq!(
+            report.delete_paths,
+            vec![placeholder(dir.path(), "a.bin")],
+            "快照在 replaceWith 之前：必须是旧名字的路径"
+        );
+        let record = service.task("a").expect("任务在");
+        assert_eq!(record.name, "renamed.bin");
+        assert_eq!(record.url, "https://example.com/v2");
+        assert_eq!(
+            record.output_folder,
+            dir.path().to_string_lossy(),
+            "replaceWith 不换 outputFolder"
+        );
+    }
+
+    #[test]
+    fn update_selection_marks_files_and_recomputes_the_size() {
+        let dir = TempDir::new("select-plain");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Completed);
+        input.name = "a.bin".to_string();
+        let mut first = file(0, "0.bin");
+        first.size = 30;
+        first.completed = true;
+        let mut second = file(1, "1.bin");
+        second.size = 70;
+        second.completed = true;
+        input.files = Some(vec![first, second]);
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+
+        let selected: BTreeSet<i64> = [0].into_iter().collect();
+        let report = service
+            .update_selection("a", &selected, 4)
+            .expect("update_selection 不应报错")
+            .expect("任务在");
+
+        let record = service.task("a").expect("任务在");
+        let files = record.files.as_ref().expect("有文件");
+        assert!(files[0].selected);
+        assert!(!files[1].selected);
+        assert_eq!(record.file_size, 30, "fileSize = 选中项之和");
+        assert!(!report.restarted, "没有「选中未完成文件」");
+        assert_eq!(report.cancel, None);
+        assert!(report.started.is_empty(), "不重下就不 schedule");
+    }
+
+    #[test]
+    fn update_selection_restarts_a_completed_task_with_selected_incomplete_files() {
+        let dir = TempDir::new("select-restart");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Completed);
+        input.name = "a.bin".to_string();
+        let mut first = file(0, "0.bin");
+        first.completed = true;
+        let mut second = file(1, "1.bin");
+        second.completed = false;
+        input.files = Some(vec![first, second]);
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+
+        let selected: BTreeSet<i64> = [0, 1].into_iter().collect();
+        let report = service
+            .update_selection("a", &selected, 4)
+            .expect("update_selection 不应报错")
+            .expect("任务在");
+
+        assert!(report.restarted, "已完成 + 选中里有未完成文件 → 重下");
+        assert!(
+            report.restart_cancel.is_some(),
+            "嵌套 _cancelWork 一定被调用（哪怕没工作可取消）"
+        );
+        let record = service.task("a").expect("任务在");
+        assert_eq!(record.completed_at, 0, "completedAt 清零");
+        assert_eq!(report.started, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn update_selection_cancels_a_running_task_when_the_running_file_is_deselected() {
+        let dir = TempDir::new("select-running");
+        let mut service = TaskService::new();
+        let mut input = record_in(dir.path(), "a", TaskStatus::Waiting);
+        input.name = "a.bin".to_string();
+        let mut first = file(0, "0.bin");
+        first.completed = true;
+        let second = file(1, "1.bin");
+        input.files = Some(vec![first, second]);
+        let mut running_step = step(5);
+        running_step.file_index = Some(1);
+        input.steps = vec![running_step];
+        service
+            .add_with_conflict(
+                input,
+                NameConflictChoice::KeepBoth,
+                false,
+                None,
+                never_trash,
+            )
+            .expect("建占位符");
+        service.start("a");
+        assert!(service.dispatch("a", "work-1"));
+
+        let selected: BTreeSet<i64> = [0].into_iter().collect();
+        let report = service
+            .update_selection("a", &selected, 4)
+            .expect("update_selection 不应报错")
+            .expect("任务在");
+
+        let cancel = report
+            .cancel
+            .expect("运行中的文件被取消勾选 → 外层 _cancelWork");
+        assert_eq!(cancel.work_id.as_deref(), Some("work-1"));
+        assert_eq!(
+            report.started,
+            vec!["a".to_string()],
+            "onStopped 末尾的 _schedule 把任务重新排上"
+        );
+        assert_eq!(service.running_count(), 1);
     }
 }

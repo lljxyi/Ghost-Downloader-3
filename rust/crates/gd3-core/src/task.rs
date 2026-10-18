@@ -7,7 +7,7 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -203,6 +203,18 @@ fn now_seconds() -> i64 {
 /// Python 侧在 `__post_init__`（含 `fromDict`）里就会调用它，所以加载旧记录会改写 Task 状态。
 /// Rust 把「读盘」与「归一」分成两步：`load_records` 只忠实回写，需要 Python 语义的调用方
 /// 在加载后显式调用 `update_status`。
+/// `task.setOptions(options)` 的入参（`app/view/dialogs/edit_task.py` 组装）。
+///
+/// `category: Option<Option<String>>` 区分「键不存在」与「键存在、值为 `None`」——
+/// Python 用 `if "category" in options` 判断，后者会把分类清成 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskOptions {
+    /// `options.get("outputFolder")`：只接受 `str` / `Path`（其余类型忽略）。
+    pub output_folder: Option<String>,
+    /// `options["category"]`（`None` = 键不存在）。
+    pub category: Option<Option<String>>,
+}
+
 impl TaskRecord {
     /// 未被选中的 Selectable File 对应的 Step 不参与状态推导。
     pub fn is_step_selected(&self, step: &TaskStep) -> bool {
@@ -416,5 +428,66 @@ impl TaskRecord {
             step.speed = 0;
         }
         self.update_status()
+    }
+
+    /// `Task.canReuseProgress(newTask)`：**基类恒 `False`**，全仓没有子类覆盖
+    /// （`grep canReuseProgress app/` 只命中 `task.py:439` 的定义与两处调用），
+    /// 所以 `edit` 的 `needsDelete` 等价于「给了 newTask」。
+    pub fn can_reuse_progress(&self, _new_task: &TaskRecord) -> bool {
+        false
+    }
+
+    /// `Task.setOptions(options)`（`task.py:287-294`）。
+    ///
+    /// ```python
+    /// newFolder = options.get("outputFolder")
+    /// if isinstance(newFolder, (str, Path)): self.outputFolder = Path(newFolder)
+    /// if "category" in options: self.category = options["category"]
+    /// for step in self.steps: step.setOptions(options)   # TaskStep 里是 pass
+    /// ```
+    ///
+    /// **不调 `updateStatus()`**（Python 也没有）：`outputFolder` / `category`
+    /// 都不参与状态推导。
+    pub fn set_options(&mut self, options: &TaskOptions) {
+        if let Some(folder) = &options.output_folder {
+            self.output_folder = folder.clone();
+        }
+        if let Some(category) = &options.category {
+            self.category = category.clone();
+        }
+    }
+
+    /// `Task.replaceWith(newTask)`（`task.py:442-450`）：只换 url / name /
+    /// fileSize / steps，**不换** outputFolder / category / taskId / 已完成时间。
+    ///
+    /// 换完 `steps` 后 Python 逐个 `_bindTask(self)`（只写回指，不碰状态），
+    /// Rust 的 `TaskStep` 没有回指字段，这一步是空操作；随后两侧都
+    /// `updateStatus()`。
+    pub fn replace_with(&mut self, new_task: &TaskRecord) {
+        self.url = new_task.url.clone();
+        self.name = new_task.name.clone();
+        self.file_size = new_task.file_size;
+        self.steps = new_task.steps.clone();
+        self.update_status();
+    }
+
+    /// `Task.setSelection(selectedIndexes)`（`task.py:411-418`）。
+    ///
+    /// `files is None` → 直接返回（Python 判的是 `None`，空列表会继续走：
+    /// `fileSize` 归零 + `updateStatus()`）；其余逐个置 `selected`、
+    /// `fileSize` 取选中项之和、再 `updateStatus()`。
+    pub fn set_selection(&mut self, selected: &BTreeSet<i64>) {
+        let Some(files) = self.files.as_mut() else {
+            return;
+        };
+        for file in files.iter_mut() {
+            file.selected = selected.contains(&file.index);
+        }
+        self.file_size = files
+            .iter()
+            .filter(|file| file.selected)
+            .map(|file| file.size)
+            .sum();
+        self.update_status();
     }
 }

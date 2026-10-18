@@ -19,6 +19,12 @@
 //! moveToFront(ids)   if queue.moveToFront(ids): queueChanged
 //! startChecksum(t,a) _checksums[t]=work → submit(toChecksum(...)) → checksumStarted
 //! cancelChecksum(t)  if work: cancel(workId) → checksumStopped(t, None)
+//! edit(t, opts, nt)  cancelChecksum → needsDelete = nt and not canReuseProgress(nt)
+//!                    → _cancelWork → onStopped{deleteFiles?, replaceWith?, setOptions,
+//!                    updatePlaceholders, _flushSoon, _schedule}
+//! updateSelection(t, idx)  [isRunningDeselected: _cancelWork] → apply{setSelection,
+//!                    updatePlaceholders, [completedAt=0, _unwatchFile, _cancelWork],
+//!                    _flushSoon} → [_schedule]
 //! ```
 //!
 //! # 两个缺口与它们的补法
@@ -52,11 +58,14 @@
 //! （Slint 窗口）就位。
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::actions;
-use crate::task_service::{CancelWork, TaskService};
-use gd3_core::task::TaskStatus;
+use crate::task_service::{CancelWork, EditReport, SelectionReport, TaskService};
+use gd3_core::placeholder::CreateError;
+use gd3_core::task::{TaskOptions, TaskRecord, TaskStatus};
 
 /// `cfg.maxTaskNum.value` 的现读形态（Python 每次 `_pump` 都重新取）。
 pub type MaxTaskNum = Rc<dyn Fn() -> usize>;
@@ -82,6 +91,14 @@ pub enum TaskAction {
     ///
     /// 排在 [`TaskAction::CancelWork`] 之后——Python 在 `finished` 回调里做。
     DeleteFiles { task_id: String },
+    /// 同上，但作用在**快照路径**上（只有 `edit` 用）。
+    ///
+    /// `edit` 的 `onStopped` 先 `deleteFiles()` 再 `replaceWith(newTask)`：名字一变
+    /// `placeholderPaths` 就跟着变，宿主事后按 taskId 现算会删到新路径。
+    DeleteFilesAt {
+        task_id: String,
+        paths: Vec<PathBuf>,
+    },
     /// `_unwatchFile(task)`：摘掉文件监听（`QFileSystemWatcher`）。
     UnwatchFile { task_id: String },
     /// `_seed(task, isManual)`：提交 `task.runSeeding(isManual)` + `_refreshSpeedMeter()`。
@@ -301,6 +318,88 @@ impl<S: TaskStore> TaskActions<S> {
         }
         self.dispatch(&report.started);
         report.started
+    }
+
+    /// `edit(task, options, newTask)`（`task_service.py:464-476`）。
+    ///
+    /// 不进 [`actions::TaskService`] trait：编辑对话框走
+    /// `featureService.createEditDialog`，不是卡片动作分派。
+    ///
+    /// 效果序（= Python 的发射序）：
+    /// `ChecksumStopped? → CancelWork? → SeedingStopped? → DeleteFilesAt? → Started…`。
+    /// `deleteFiles` 用 [`TaskAction::DeleteFilesAt`] 带上**改名前**的路径。
+    ///
+    /// 出错时（`updatePlaceholders` 的 `CreateError`）记录**已经**改过（`replaceWith`
+    /// / `setOptions` 先跑），与 Python 抛异常时的中间态一致；本层不登记任何效果。
+    pub fn edit(
+        &self,
+        task_id: &str,
+        options: &TaskOptions,
+        new_task: Option<&TaskRecord>,
+    ) -> Result<Option<EditReport>, CreateError> {
+        let max = self.max_task_num();
+        let report = self
+            .store
+            .with_tasks(|tasks| tasks.edit(task_id, options, new_task, max))?;
+        let Some(report) = report else {
+            return Ok(None);
+        };
+        // `cancelChecksum(task)`
+        if let Some(work_id) = &report.checksum_work {
+            self.emit(TaskAction::ChecksumStopped {
+                task_id: task_id.to_string(),
+                work_id: work_id.clone(),
+            });
+        }
+        // `_cancelWork(task, finished=onStopped)`
+        self.emit_cancel(task_id, &report.cancel);
+        // `onStopped` 第一句：`if needsDelete: task.deleteFiles()`
+        if report.needs_delete {
+            self.emit(TaskAction::DeleteFilesAt {
+                task_id: task_id.to_string(),
+                paths: report.delete_paths.clone(),
+            });
+        }
+        // 尾部 `_schedule(task)` 的派发
+        self.dispatch(&report.started);
+        Ok(Some(report))
+    }
+
+    /// `updateSelection(task, selectedIndexes)`（`task_service.py:482-528`）。
+    ///
+    /// 效果序：
+    /// - `isRunningDeselected` 分支：`CancelWork → Started…`（`apply()` 在
+    ///   `finished` 回调里，`_schedule` 在 `onStopped` 末尾）；
+    /// - 已完成任务重新勾选未完成项：`UnwatchFile → CancelWork → Started…`；
+    /// - 其余：无效果（只改记录 + 占位符）。
+    pub fn update_selection(
+        &self,
+        task_id: &str,
+        selected: &BTreeSet<i64>,
+    ) -> Result<Option<SelectionReport>, CreateError> {
+        let max = self.max_task_num();
+        let report = self
+            .store
+            .with_tasks(|tasks| tasks.update_selection(task_id, selected, max))?;
+        let Some(report) = report else {
+            return Ok(None);
+        };
+        // `if isRunningDeselected: _cancelWork(task, finished=onStopped)`
+        if let Some(cancel) = &report.cancel {
+            self.emit_cancel(task_id, cancel);
+        }
+        // `apply()` 里 `wasCompleted` 那一段：`_unwatchFile` 先、嵌套 `_cancelWork` 后。
+        if report.restarted {
+            self.emit(TaskAction::UnwatchFile {
+                task_id: task_id.to_string(),
+            });
+            if let Some(cancel) = &report.restart_cancel {
+                self.emit_cancel(task_id, cancel);
+            }
+        }
+        // 尾部 `_schedule(task)` 的派发
+        self.dispatch(&report.started);
+        Ok(Some(report))
     }
 
     /// `TaskStatus` 的只读快照（测试与状态行用）。
@@ -911,5 +1010,107 @@ mod tests {
         assert_eq!(narrow.take_effects(), vec![cancel("b", "run-2")]);
         assert_eq!(status(&store, "b"), TaskStatus::Waiting);
         assert_eq!(status(&store, "a"), TaskStatus::Running);
+    }
+
+    fn task_file(index: i64, completed: bool) -> gd3_core::task::TaskFile {
+        gd3_core::task::TaskFile {
+            index,
+            relative_path: format!("{index}.bin"),
+            size: 10,
+            selected: true,
+            downloaded_bytes: 0,
+            completed,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn edit_emits_delete_files_at_the_snapshot_paths_then_dispatches() {
+        let store = store(vec![record("a", TaskStatus::Paused)]);
+        let layer = handle(&store, 2);
+        let mut new_task = record("a", TaskStatus::Waiting);
+        new_task.name = "renamed.bin".to_string();
+
+        let report = layer
+            .edit("a", &TaskOptions::default(), Some(&new_task))
+            .expect("edit 不应报错")
+            .expect("任务在");
+
+        assert!(report.needs_delete);
+        let old_path = std::env::temp_dir().join("gd3-ui-task-actions/a.bin");
+        assert_eq!(report.delete_paths, vec![old_path.clone()]);
+        assert_eq!(
+            layer.take_effects(),
+            vec![
+                TaskAction::DeleteFilesAt {
+                    task_id: "a".to_string(),
+                    paths: vec![old_path],
+                },
+                started("a", "run-1"),
+            ],
+            "deleteFiles 在 _cancelWork 之后、_schedule 的派发之前"
+        );
+        assert_eq!(status(&store, "a"), TaskStatus::Running);
+    }
+
+    #[test]
+    fn update_selection_restart_emits_unwatch_then_dispatches() {
+        let mut record = record("a", TaskStatus::Completed);
+        record.files = Some(vec![task_file(0, true), task_file(1, false)]);
+        let store = store(vec![record]);
+        let layer = handle(&store, 2);
+
+        let selected: BTreeSet<i64> = [0, 1].into_iter().collect();
+        let report = layer
+            .update_selection("a", &selected)
+            .expect("update_selection 不应报错")
+            .expect("任务在");
+
+        assert!(report.restarted);
+        assert_eq!(
+            layer.take_effects(),
+            vec![
+                TaskAction::UnwatchFile {
+                    task_id: "a".to_string(),
+                },
+                started("a", "run-1"),
+            ],
+            "`_unwatchFile` 在嵌套 `_cancelWork` 之前；这里没有工作可取消"
+        );
+    }
+
+    #[test]
+    fn update_selection_of_a_running_task_cancels_before_it_requeues() {
+        let mut record = record("a", TaskStatus::Waiting);
+        record.files = Some(vec![task_file(0, true), task_file(1, false)]);
+        record.steps = vec![gd3_core::task::TaskStep {
+            step_index: 0,
+            file_index: Some(1),
+            step_id: "stp_1".to_string(),
+            status: TaskStatus::Running,
+            progress: gd3_core::task::Progress::Int(0),
+            received_bytes: 0,
+            speed: 0,
+            extra: serde_json::Map::new(),
+            type_name: None,
+        }];
+        let store = store(vec![record]);
+        let layer = handle(&store, 2);
+        enqueue(&store, &["a"]);
+        assert_eq!(layer.pump(), vec!["a".to_string()]);
+        assert_eq!(layer.take_effects(), vec![started("a", "run-1")]);
+
+        let selected: BTreeSet<i64> = [0].into_iter().collect();
+        let report = layer
+            .update_selection("a", &selected)
+            .expect("update_selection 不应报错")
+            .expect("任务在");
+
+        assert!(report.cancel.is_some(), "运行中的文件被取消勾选");
+        assert_eq!(
+            layer.take_effects(),
+            vec![cancel("a", "run-1"), started("a", "run-2")],
+            "外层 _cancelWork 在 apply() 之前"
+        );
     }
 }
