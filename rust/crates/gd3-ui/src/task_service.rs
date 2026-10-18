@@ -114,6 +114,16 @@ impl TaskService {
         Ok((Self::from_records(outcome.records), outcome.failures))
     }
 
+    /// `loadSaved()` 的就地版本（引擎启动时用）：读盘后**替换**整个服务。
+    ///
+    /// Python 的 `TaskStore.loadSaved()` 会把记录并进已有的 `_tasks`，但引擎只在
+    /// 启动时调一次，那时服务必然是空的，所以直接替换与合并等价（有单测钉住）。
+    pub fn load_into(&mut self, path: &Path) -> io::Result<Vec<String>> {
+        let (service, failures) = TaskService::load(path)?;
+        *self = service;
+        Ok(failures)
+    }
+
     /// `list(self._store.tasks.values())`。
     pub fn records(&self) -> &[TaskRecord] {
         &self.records
@@ -300,6 +310,29 @@ impl TaskService {
             self.queue.wait(task_id);
         }
         resumed
+    }
+
+    /// `stop()`：把在跑/等待的任务标成 `PAUSED`。
+    ///
+    /// Python 的 `TaskService.stop()` 只 `setStatus(PAUSED)`，**不动队列**、
+    /// 也不 `_flushSoon()`——落盘靠 `Engine.stop()` 紧接着的那次 `flush()`
+    /// （而 `TaskStore.flush()` 无脏标记，每次都写）。Rust 的 `flush()` 有
+    /// `pending_flush` 短路，所以这里必须显式置脏，否则停机时的 `PAUSED`
+    /// 永远不会落盘（有单测 `stop_flush_persists_paused_status` 钉住）。
+    ///
+    /// 队列不动是**有意保留的缺陷**：停机后 `running_count()` 仍可能 >0，
+    /// 真正的协程取消归引擎层（`_cancelWork`）。
+    pub fn stop(&mut self) {
+        let mut changed = false;
+        for record in &mut self.records {
+            if matches!(record.status, TaskStatus::Running | TaskStatus::Waiting) {
+                record.status = TaskStatus::Paused;
+                changed = true;
+            }
+        }
+        if changed {
+            self.pending_flush = true;
+        }
     }
 
     /// `runningCount()`。

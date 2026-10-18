@@ -150,8 +150,8 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
 | P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**57 个模块**（56 个 `pub` + 私有 `format`）/ **34 964 行 `src/`**（含 `lib.rs` 3 489 行）、
-**6 个 Slint 文件 2 858 行**、**625 个单测**（`cargo test -p gd3-ui --lib`）。
+规模：**58 个模块**（57 个 `pub` + 私有 `format`）/ **36 201 行 `src/`**（含 `lib.rs` 3 490 行）、
+**6 个 Slint 文件 2 858 行**、**642 个单测**（`cargo test -p gd3-ui --lib`）。
 
 `app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
 无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
@@ -164,7 +164,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（625）
+cargo test -p gd3-ui --lib                 # 只跑单测（642）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 
@@ -178,8 +178,9 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
   非法 IPv6 括号、Markdown 缺片段标记——都在注释里写明与 Python 的差异；
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
-**尚未做**：`TaskService` 的引擎半边（托盘、单实例锁、引擎在 Phase 8 里逐项补），
-`Ghost-Downloader-3.py` 的入口仍走 Qt。二进制入口见下一节。
+**尚未做**：引擎里的各服务实现（`BrowserService` / `Aria2RpcService` / `FeatureService` /
+`RuntimeStatusService` 都还是桩，见下一节），托盘、单实例锁；`Ghost-Downloader-3.py`
+的入口仍走 Qt。二进制入口见下一节。
 
 ## Phase 8：启动入口（`gd3-ui` 二进制）
 
@@ -187,8 +188,10 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 `crates/gd3-ui/src/boot.rs`，对应仓库根的 `Ghost-Downloader-3.py`（268 行）：
 
 ```text
-Paths（paths.py）→ load_config（qconfig.load）→ TaskService::load + resume_saved
+Paths（paths.py）→ load_config（qconfig.load）→ Engine::new（装配）
+                  → Engine::start（loadSaved + resumeSaved + 起监听器）
                   → 窗口 + push_settings + 任务行 → 事件循环
+                  → Engine::stop（taskService.stop → flush → 收尾 → flush）
 ```
 
 - **路径语义**照抄 Qt 的「字符串拼接」而不是 `Path::join`：本机 `HOME` 为空时
@@ -198,9 +201,11 @@ Paths（paths.py）→ load_config（qconfig.load）→ TaskService::load + resu
   且**不写盘**（Python 的 `qconfig.load` 同样不写）；文件损坏 → 退回缺省并标记 `broken`；
 - **事件循环**：有 `DISPLAY`/`WAYLAND_DISPLAY` 走 winit 后端（`window.run()`），
   否则走 `MinimalSoftwareWindow`，跑 `--frames` 帧后退出；
-- **任务**：启动时读 `<APP_DATA_DIR>/tasks.jsonl`（坏行只计数），`resume_saved()` 把
-  `WAITING`/`RUNNING` 重新入队并把 `RUNNING` 回落到 `WAITING`；**没有引擎，所以只入队不派发**
-  （Python 的 `_schedule` 会顺带 `_pump`）。启动**不回写** `tasks.jsonl`。
+- **任务**：`Engine::start()` 读 `<APP_DATA_DIR>/tasks.jsonl`（坏行只计数），
+  `resume_saved()` 把 `WAITING`/`RUNNING` 重新入队并把 `RUNNING` 回落到 `WAITING`；
+  **只入队不派发**（Python 的 `_schedule` 会顺带 `_pump`，派发要真的起协程，等下载引擎迁过来）。
+  启动**不回写** `tasks.jsonl`；退出时 `Engine::stop()` 把 `RUNNING`/`WAITING` 落成 `PAUSED`
+  ——与 Python 一致（一次「启动完立刻退出」也会留下 `PAUSED`）。
 - **CLI**：`--silence`（对应 Python 的 `--silence`）、`--version`、`--help` 之外，
   另有四个 Rust 侧可测性开关 `--headless` / `--frames` / `--data-dir` / `--tasks-file`
   （Python 没有）。
@@ -228,9 +233,32 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
 - **`autoStart` 即入队，与 `fileSize` 无关**——Python 的 `if task.fileSize > 0:` 只包住
   磁盘检查，`_schedule()` 在块外无条件调用（首版按「`fileSize > 0` 才入队」写错了）。
 
+### 引擎装配（`engine.rs`）
+
+`app/engine.py` 只有 74 行，没有任何业务逻辑：它按固定顺序把服务拼起来（外加唯一一条
+信号连线 `taskService.nameConflicted → nameConflictQueue.add`），再按固定顺序
+`start`/`stop`。`engine.rs` 把这份**装配契约**搬过来——服务内部还是桩，但「谁在谁之后、
+谁连谁、停机按什么顺序收尾」由 `Engine::trace()`（`Vec<String>` 标签）逐条钉死：
+
+```text
+construct:CategoryService → construct:SpeedMeter → construct:TaskService
+→ construct:NameConflictQueue → connect:taskService.nameConflicted -> nameConflictQueue.add
+→ construct:RuntimeStatusService → construct:FeatureService → construct:BrowserService
+→ construct:browserListener → construct:Aria2RpcService → construct:aria2Listener
+```
+
+- **真的搬了**：`TaskService`（第 81/82 步）、`SpeedMeter`（整类）、
+  `NameConflictQueue`（复用 `name_conflict.rs`）、`CategoryService` 的 `_load`；
+- **桩**：`RuntimeStatusService` / `FeatureService` / `BrowserService` / `Aria2RpcService`
+  只保留装配点；监听器只保留后端开关（`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` == `"1"`
+  → `RustBrowserListener`，否则 `PortListener`）与配置快照，套接字层在 `gd3-servers`；
+- **配置是快照**：Python 的 `cfg.*` 是活对象（`PortListener` 连 `valueChanged`），
+  Rust 侧还没有响应式层，所以 `nameConflict` / `maxTaskNum` 每次用时现读（与 `lambda`
+  同构），监听器端口在构造时取快照；
+- `probeConflict` 恒 `None`（占位文件未迁移）→ 冲突队列不会弹窗，按 `keepBoth` 放行。
+
 未迁移（后续小步）：单实例锁（QSharedMemory）、D-Bus / URL scheme 接收、
-`app/engine.py` 的全部服务、托盘 / keepalive / 通知、功能包加载、更新检查、
-OOBE 分支、翻译器。
+托盘 / keepalive / 通知、功能包加载、更新检查、OOBE 分支、翻译器。
 
 ## 剩余工作（Phase 8）
 

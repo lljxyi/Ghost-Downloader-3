@@ -48,9 +48,13 @@
 //! - `HOME` 未设时 Python 用 `QStandardPaths`，这里退回 `"/"`（与上面实测一致）；
 //! - 配置解析失败时 Python 的 `@exceptionHandler()` 会中断 `QConfig.load`、保持缺省，
 //!   这里同样退回缺省，但**不写盘**（Python 也不写）；
-//! - 启动时读 `<APP_DATA_DIR>/tasks.jsonl`（与 Python `TaskStore._path` 同路径）并调
-//!   `TaskService::resume_saved()` 重新入队；但**没有引擎**，所以只入队不派发
-//!   （Python 的 `_schedule` 会顺带 `_pump`，那一步等引擎迁过来）；
+//! - 引擎装配走 [`crate::engine::Engine`]（镜像 `app/engine.py`）：`Engine::new` 拼服务、
+//!   `Engine::start()` 装载 `tasks.jsonl` + `resumeSaved` + 起两个监听器、`Engine::stop()`
+//!   停机收尾（含两次 `flush`）。`resume_saved` 只入队，**不 pump**——`_pump` 需要真的
+//!   派发协程，等下载引擎迁过来再接（第 82 步结论）；
+//! - 停机序列在**无头模式也会跑**（Python 没有无头模式，但「启动完立刻退出」在 Python 里
+//!   同样会走 `Engine.stop()`）：所以一次无头冒烟会把 `RUNNING`/`WAITING` 的任务落成
+//!   `PAUSED`，与真实退出行为一致；
 //! - `--tasks-file` 是 Rust 侧的可测性开关（Python 侧固定用 `APP_DATA_DIR`）。
 
 use std::path::{Path, PathBuf};
@@ -403,10 +407,11 @@ pub struct RunSummary {
     pub resumed: usize,
 }
 
-/// 启动闭环：路径 → 配置 → 窗口 → 事件循环。
+/// 启动闭环：路径 → 配置 → 引擎 → 窗口 → 事件循环 → 停机。
 ///
 /// 无头模式（`--headless` 或无显示服务）用 `MinimalSoftwareWindow` 跑 `frames` 帧后返回；
-/// 有显示服务时走 winit 后端、阻塞到窗口关闭（`window.run()`）。
+/// 有显示服务时走 winit 后端、阻塞到窗口关闭（`window.run()`）。两条路径最后都走
+/// [`crate::engine::Engine::stop`]。
 pub fn run(cli: &Cli) -> Result<RunSummary, String> {
     let paths = match &cli.data_dir {
         Some(dir) => Paths::with_app_data_dir(dir),
@@ -417,14 +422,15 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
     let headless = cli.headless || !has_display();
     let frames = cli.frames.unwrap_or(1);
     let tasks_path = cli.tasks_file.clone().unwrap_or_else(|| paths.tasks_path());
-    let (mut service, task_failures) = crate::task_service::TaskService::load(&tasks_path)
+    let mut engine = crate::engine::Engine::new(&loaded.config, &tasks_path);
+    let started = engine
+        .start()
         .map_err(|err| format!("任务列表读取失败：{err}"))?;
-    let resumed = service.resume_saved();
 
     if headless {
         let window = crate::create_headless();
         crate::push_settings(&window, &loaded.config, &default_download);
-        service.refresh(&window);
+        engine.tasks().refresh(&window);
         for _ in 0..frames {
             slint::platform::update_timers_and_animations();
             window.window().request_redraw();
@@ -433,9 +439,15 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
     } else {
         let window = crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?;
         crate::push_settings(&window, &loaded.config, &default_download);
-        service.refresh(&window);
+        engine.tasks().refresh(&window);
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;
     }
+
+    // 停机序列（`engine.py:41-49`）：`taskService.stop` → flush → 速度表/监听器/功能包
+    // 收尾 → 再 flush。窗口一关就走，与 Qt 的 `aboutToQuit` 同位置。
+    engine
+        .stop()
+        .map_err(|err| format!("任务列表落盘失败：{err}"))?;
 
     Ok(RunSummary {
         headless,
@@ -446,9 +458,9 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
         download_dir: paths.download_dir,
         urls: cli.urls.clone(),
         silent: cli.silent,
-        tasks: service.len(),
-        task_load_failures: task_failures.len(),
-        resumed: resumed.len(),
+        tasks: engine.tasks().len(),
+        task_load_failures: started.load_failures.len(),
+        resumed: started.resumed.len(),
     })
 }
 
@@ -759,7 +771,6 @@ mod tests {
         .join("\n")
             + "\n";
         std::fs::write(&tasks_path, body.as_bytes()).expect("写任务文件");
-        let before = std::fs::read(&tasks_path).expect("读回");
 
         let cli = Cli {
             headless: true,
@@ -771,11 +782,14 @@ mod tests {
         assert_eq!(summary.tasks, 3, "坏行不算任务");
         assert_eq!(summary.task_load_failures, 1, "坏行只计数");
         assert_eq!(summary.resumed, 2, "WAITING + RUNNING 重新入队");
-        assert_eq!(
-            std::fs::read(&tasks_path).expect("读回"),
-            before,
-            "启动不回写 tasks.jsonl（Python 只在改动后 flush）"
-        );
+        // 启动本身不写盘；写盘发生在停机（`Engine.stop` 的第一次 flush）。
+        // 与 Python 一致：`stop()` 把 RUNNING/WAITING 标成 PAUSED，COMPLETED 不动。
+        let text = std::fs::read_to_string(&tasks_path).expect("读回");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[0].contains("\"PAUSED\""), "{text}");
+        assert!(lines[1].contains("\"PAUSED\""), "{text}");
+        assert!(lines[2].contains("\"COMPLETED\""), "{text}");
     }
 
     #[test]
