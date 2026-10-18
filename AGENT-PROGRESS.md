@@ -6832,3 +6832,99 @@ self._speedMeter.waitForSpeedLimit)`）也因此缺一半。
   `stopSeeding`（:406）、`_seed`（:593）、`_onSeedingEnded`（:604）、`_pump`（:657）
   ——注意 `pause` / `resume` 里**没有**，它们只改状态；
 - 引擎轨迹（`Trace`）里补 `construct:SpeedMeter`，与既有 `construct:NameConflictQueue` 同形。
+
+## 第 105 步：把速度表接回 `TaskService`
+
+> 时间：2026-10-18 22:05（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 做了什么
+
+第 104 步的 `SpeedMeter` 当时只是个能用的模块，没有任何调用方。这一步把它接进
+`TaskService`，对齐 Python 的 `_refreshSpeedMeter()` 与四个调用点。
+
+| Python | Rust |
+|---|---|
+| `TaskService.__init__(…, speedMeter, …)`（:314-320） | `TaskService` 新字段 `speed_meter: SpeedMeter` |
+| `self._speedMeter.addSpeed`（:578 注入任务） | `TaskService::add_speed(n)` |
+| `self._speedMeter.waitForSpeedLimit`（:578） | `TaskService::speed_meter_should_wait(enabled, limit)` |
+| `_refreshSpeedMeter()`（:659-663） | 私有 `refresh_speed_meter()`：`should_run ? start() : stop()` |
+| `stopSeeding` 末尾（:406） | `stop_seeding` 末尾 |
+| `_seed` 末尾（:593） | `seed` 末尾（`start_seeding` 经 `seed` 覆盖） |
+| `_onSeedingEnded` 末尾（:604） | `on_seeding_ended` 末尾 |
+| `_pump` 末尾（:657） | `pump` 末尾 |
+| `speedChanged.emit(...)` / `coroutineRunner.cancel(...)` | 攒进 `speed_effects`，宿主 `take_speed_effects()` 取走 |
+| `_tick`（宿主每秒调） | `tick_speed_meter()` |
+| `_onTickFailed` | `on_speed_tick_failed()` |
+| `self._speedMeter.currentSpeed` | `speed_meter().current_speed()` |
+
+**`pause` / `resume` 里没有 `_refreshSpeedMeter()`**（实读 `grep -n`：只有 :406 / :593 /
+:604 / :657 四处）。这是容易搞错的地方——想当然会以为暂停就该停表，但 Python 的
+`pause` 走 `_cancelWork` + `setStatus` + `_pump`，`_pump` 末尾那一发自然会算。
+
+### 关键决策：效果进缓冲，而不是改四个返回类型
+
+Python 的 `_refreshSpeedMeter()` 是四个方法的**尾语句**，而那四个方法在 Rust 侧都已经有
+返回值：
+
+| 方法 | 现有返回 |
+|---|---|
+| `stop_seeding` | `CancelWork` |
+| `seed` | `Option<SeedingEvent>` |
+| `on_seeding_ended` | `SeedingEvent` |
+| `pump` | `Vec<String>` |
+
+要把 `Vec<SpeedEffect>` 一起吐出来，就得给四个返回类型各包一层报告结构，再改
+`engine.rs` 的四个包装（`Engine::pump` 的返回值还被引擎轨迹测试断言）以及
+`task_actions` 里的调用点——改动面横跨三个文件、几十条既有断言，而语义收益为零。
+
+所以改成**服务内缓冲**：`speed_effects: Vec<SpeedEffect>`，`refresh_speed_meter()` 把
+`start()` / `stop()` 的效果 `extend` 进去，宿主在**本轮动作结束后**调
+`take_speed_effects()` 一次性取走。这与 `pending_flush`（第 81 步把
+`_flushSoon()` 的 200ms 防抖退化成标记）是同一手法：**保留调用点、把「什么时候取」交给
+宿主**。
+
+四个调用点因此与 Python **一字不差**，不需要调用方记得「pump 之后还要再调一次」。
+
+### 9 条单测
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `pump_starts_the_speed_meter` | `pump` 派发了任务 → `[StartTicking{speed-1}]` |
+| `pump_with_nothing_to_dispatch_leaves_the_meter_alone` | 没派发 → 无效果（`stop()` 在没跑时不吐） |
+| `finishing_the_last_run_stops_the_meter` | `on_run_finished` → `pump` → 队列空 → `[Cancel, Emit(0)]` |
+| `seeding_starts_and_stops_the_meter` | `seed` → start；`on_seeding_ended` → stop |
+| `stop_seeding_refreshes_the_meter` | `stopSeeding` 是第三个调用点 |
+| `add_speed_and_tick_flow_through_the_service` | `add_speed` 累加、`tick_speed_meter` 发布并清零 |
+| `speed_meter_should_wait_delegates_to_the_meter` | 闸门谓词透传（等于上限不算超） |
+| `take_speed_effects_drains_the_buffer` | 取一次就空 |
+| `on_speed_tick_failed_lets_the_meter_start_again` | 失败后下一次 `pump` 发新 workId（`speed-2`） |
+
+### 已知差异（照抄，不修）
+
+- **`speed_meter_should_run` 的残留项**：`cancel_work` 的 `or` 短路缺陷（第 97 步记录）
+  会让 `_seeding` 里留一条，于是速度表一直跑。Python 同病，Rust 照抄；
+- **`stop()` 无条件 `Emit(0)`**：`pump` 里「队列本来就空」这一支不吐效果（因为 `stop()`
+  在没跑时直接返回），与 Python 一致；
+- **缓冲不清空语义**：宿主不取就一直攒。这与 `pending_flush` 一样，是「宿主必须消费」的
+  契约，写在方法文档里。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**819 passed / 0 failed**（第 104 步 810 + 9；8m27s 编译）；
+- `cargo test --workspace`：**1322 passed / 0 failed**（28 段；第 104 步 1313 + 9）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（4m23s，首跑即干净）；
+- Python 侧没改一行。
+
+### 下一步（第 106 步）
+
+`take_speed_effects()` 目前没有真正的消费者：`Engine` 只暴露 `tasks_mut()`，宿主（未来的
+Slint 主窗口 / `boot::run`）得自己记得取。下一步二选一：
+
+1. **给 `Engine` 补 `drain_speed_effects()`**：把效果同时记进 `Trace`（`speed:start` /
+   `speed:cancel` / `speed:emit:N`），并在 `Engine::pump` / 做种三个入口之后自动 drain——
+   这样引擎轨迹测试就能钉住「谁在什么时候起表」；
+2. 或者直接做 `app/services/browser_service.py`（597 行）——它需要 `gd3-net` 侧的
+   sources 端口，是 Phase 8 里剩下最大的一块。
+
+倾向 1：小、且能让第 104/105 步的成果在引擎层可见；`browser_service` 留到网络端口就位后。
