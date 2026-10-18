@@ -4262,3 +4262,62 @@ serializer 逐个镜像过来。
 - 下一步：第 80 步起进 Phase 8 主链路 —— `gd3-ui` 目前**没有二进制**（`Cargo.toml` 只有 lib），
   先加 `main.rs` + Slint 事件循环 + `TaskService` 绑定，再接托盘/Dock。
 - 卡点：无
+
+## 第 80 步：`gd3-ui` 二进制入口 + 启动序列（2026-10-18 06:58）
+
+Phase 7 收口时 `gd3-ui` 只有 lib（58 个 `.rs`、无 `main`、无事件循环）。
+这一步把 `Ghost-Downloader-3.py`（268 行，仓库根的真正入口）的启动序列搬成 Rust，
+让 Slint 侧第一次「真的能跑起来」——本机无显示器，所以跑的是无头软件渲染路径。
+
+- 做了什么：
+  - 新增 `crates/gd3-ui/src/boot.rs`（685 行）：
+    `Paths`（镜像 `app/config/paths.py` 58 行）、`Cli` + `parse_args`、
+    `is_launch_uri`/`is_wake_uri`（`url_scheme.py`）、`uris_from_argv`
+    （`application.py::urisFromArgv`）、`load_config`（`qconfig.load` 语义）、
+    `has_display`、`run`（路径 → 配置 → 窗口 + `push_settings` → 事件循环）、
+    `main_entry`（`--help`/`--version`/错误码 2）。
+  - 新增 `crates/gd3-ui/src/main.rs`（11 行）：只有 `boot::main_entry(env::args().skip(1))`。
+  - `lib.rs` 加一行 `pub mod boot;`（放在 `bootstrap_list` 前，保持字母序）。
+  - 不需要 `[[bin]]`：`src/main.rs` 与 `src/lib.rs` 并存时 cargo 自动生成同名 bin `gd3-ui`。
+- 实证结论：
+  - **本机 `HOME` 是空的**（`HOME=`），Qt 因此给 `HomeLocation='/'`、
+    `GenericDataLocation='//.local/share'`、`DownloadLocation='//Downloads'`。
+    双斜杠不是笔误：Qt 用**字符串拼接**（home + "/" + leaf），不做路径归一。
+    所以 `home_path_join` 也照抄拼接，`Path::join` 会归一掉（有单测钉住）。
+  - Python 的 `qconfig.load` 在**文件不存在时不写盘**；Rust 侧同样不写
+    （`--headless --frames 3 --data-dir <空目录>` 跑完目录仍为空）。
+  - 配置文件存在但损坏时 Python 的 `@exceptionHandler()` 中断 load、保持缺省；
+    Rust 退回缺省并把 `broken` 标出来（首版只区分「缺失/存在」，坏文件被打印成
+    `config=loaded`，本轮改成 `invalid->default`）。
+  - `urisFromArgv` 的判据是 `arg.find(':') > 1`：所以 `"a:b"` 与 `"C:/x"` **不算 URL**
+    （冒号在 index 1），会被当路径再判 `is_file()`；`ghostdownloader://...` 直接跳过。
+  - `isWakeUri` 是 `uri.rstrip("/") == "ghostdownloader://wake"`：大小写敏感，
+    `ghostdownloader://wake?x=1` 不算；命中即 `isSilent`。
+  - `app/config/constants.py::VERSION` 是 **`4.4.0`**（`pyproject.toml` 的
+    `version = 4.3.5` 是另一个数），二进制 `--version` 用前者。
+- 测试（`boot::tests`，15 个全绿）：CLI 全形态 / `=` 形式 / 未知参数 / 缺值与非法帧数 /
+  wake URI 静默（含尾斜杠、大小写、query）/ `uris_from_argv`（URL、含空格文件 →
+  `file://...%20...`、`a:b` 不算、`-z` 跳过）/ `home_path_join` 双斜杠 /
+  便携与非便携路径 / 配置缺失·存在·损坏三条 / 无头启动冒烟（含 `--frames 0`）。
+- 二进制实跑（`target/debug/gd3-ui`，本机无 `DISPLAY`）：
+  - `--version` → `Ghost Downloader v4.4.0`；`--help` → 帮助；`--nope` → 退出码 2；
+  - `--headless --frames 3 --data-dir <空目录>` →
+    `launched (headless, 3 frame(s), config=default, data=/tmp/tmp.sYqayzLgho)`，目录仍为空；
+  - 无参数（自动无头）→ `data=//.local/share/GhostDownloader`，与 Qt 实测一致；
+  - 把 `tests/fixtures/user_config_default_linux.json` 当配置 → `config=loaded`，
+    跑完 **md5 不变**（2166B，未被回写）；
+  - 坏配置（`{`）→ `config=invalid->default`，进程正常退出。
+- 验证：
+  - `cargo test -p gd3-ui --lib boot::`：**15 passed**；
+  - `cargo test --workspace`：**881 passed, 0 failed**（第 79 步 866 + 15）；
+  - `cargo clippy --workspace --all-targets -- -D warnings` **0 warning**（2m31s）；
+  - `cargo fmt --all --check` 通过；
+  - commit `0490908`（含 `rust/README.md`：新增「Phase 8：启动入口」一节，
+    规模改为 56 模块 / 34 113 行 / 599 单测）。
+- 未迁移（写进 `boot.rs` 模块头）：单实例锁（QSharedMemory）、D-Bus / URL scheme 接收、
+  `app/engine.py` 全部服务、托盘 / keepalive / 通知、功能包加载、更新检查、
+  OOBE 分支、翻译器。
+- 下一步：第 81 步做 `TaskService` 语义层（`app/services/task_service.py`）——
+  任务的增删改、`runningCount`/`tasksAllCompleted`、运行时事实（`CardRuntime`）的维护，
+  把 `boot::run` 里 `push_settings` 之后的「推任务行」接上。
+- 卡点：无
