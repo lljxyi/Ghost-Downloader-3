@@ -3527,3 +3527,30 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   `extension_install.rs` / `release_info.rs`（写前需重读源码，上次输出被截断）。
 - 卡点：无（`LiveEditState.pending_options` 显式承担 Python 闭包捕获
   `options` 的角色；`_onReparseFailed` 只收已本地化文本，UI 层不引 i18n 表）
+
+## 第 67 步：包信息 + 字幕选择对话框语义层（P3）（2026-10-18 01:28）
+- 做了什么：收口上一轮留下的两个未提交模块（`lib.rs` 两行注册一并入库）：
+  - `pack_info.rs`（418 行，9 测试）：`UpdateState`（IntEnum 1..6 显式数值，
+    供跨语言互认）+ `PackRowState`（`display_name`/`manifest_name`/`version_text`
+    = `v{version}`/`status_glyph`/`status_colors`/`retry_visible`）+
+    `PackInfoState`（`packs` → 行表，**`manifest is None` 直接跳过**，
+    `_rows[manifest.name]` 重名后者覆盖前者）+ `apply_update(target_id, state)`
+    （四状态表：AVAILABLE `↑`/DOWNLOADING `↓`/READY `✓`/FAILED `✗` + retry 显示，
+    IDLE/CHECKING **无分支**、不改任何东西）+ `retry_target()`。
+  - `subtitle_select.rs`（281 行，9 测试）：`SubtitleChoice`/`SubtitleRow` +
+    `SubtitleSelectState`（`checked: Vec<bool>` 与 `choices` 等长——**同一 langCode
+    出现两次时两行都勾上**，用位向量才能照抄 `set(selected)` 的成员测试）+
+    `set_checked`/`set_all`/`checked_count`/`summary_text`（`{0}/{1} 种语言`）/
+    `selected_languages`（**按模型顺序**，不是点击顺序）。
+- 实证结论（写进两个模块头）：
+  - 状态色四组都是 `(浅色, 深色)` 二元组，逐字进常量；
+  - `PackRow` 初值 `✓` + success 色，`retryButton` **初始隐藏**；
+  - `_rows` 的键是 `manifest.name` 而非类名 → 重名覆盖（测试锁「只有最后一个
+    行收到更新，但所有行都进布局」）；
+  - `_onUpdateChanged` 拿不到 target 就静默忽略。
+- 验证：
+  - `cargo fmt --all --check` 通过；`cargo clippy -p gd3-ui --all-targets -- -D warnings`
+    0 error（8m34s）。
+  - `cargo test -p gd3-ui --lib`：**237 → 255 passed**（pack_info 9 + subtitle_select 9）。
+- 下一步：P3 剩余两个对话框 `extension_install.py`(133) / `release_info.py`(123)。
+- 卡点：无
