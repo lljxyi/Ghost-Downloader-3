@@ -23,11 +23,12 @@
 //! - `_flushSoon()` 的 200ms 防抖退化成 `pending_flush` 标记 + 调用方 tick
 //!   （Python 用 `asyncio.sleep(0.2)` + `coroutineRunner.post(self.flush)`）。
 //!
-//! 为什么还没做 `actions::TaskService` 的 `impl`：那个 trait 收 `&self`，而这里的
-//! 方法全要 `&mut self`；且每个动作的第一步都是「取消协程 / 停做种 / 删文件」，
-//! 没有引擎就只能假装。第 97–99 步已经把 `pause` / `start` / `delete` /
-//! `redownload` / `startChecksum` 的**记账半边**补齐，接引擎时只需一层
-//! `RefCell` 适配器。
+//! 为什么 `actions::TaskService` 的 `impl` 不在这里：那个 trait 收 `&self`，而这里
+//! 的方法全要 `&mut self`；每个动作的第一步又都是「取消协程 / 停做种 / 删文件」，
+//! 没有引擎就只能假装。第 100 步把适配器放进 [`crate::task_actions`]
+//! （`RefCell` 端口 + 效果队列），本模块只补了它需要的两个记账原语：
+//! [`TaskService::schedule`]（`_schedule` = `queue.wait` + `_pump`）与
+//! [`TaskService::dispatch`]（`_dispatch` = `setStatus(RUNNING)` + `queue.run`）。
 //!
 //! # 已知差异
 //!
@@ -63,7 +64,13 @@
 //!   `Task.deletePlaceholders` 里「未完成步骤的 `step.outputPath`」那一段没法镜像
 //!   ——`TaskStep` 基类的 `outputPath` 恒为 `""`，真实路径来自 `HttpStep` /
 //!   `yt_dlp` / `bittorrent` 等步骤子类，Rust 侧的 `TaskStep` 只是数据行；所以只做
-//!   占位符文件那半边（与 `placeholder_paths()` 只返回 `[outputPath]` 是同一个缺口）。
+//!   占位符文件那半边（与 `placeholder_paths()` 只返回 `[outputPath]` 是同一个缺口）；
+//! - **改状态一律走 `TaskRecord::set_status`**（第 100 步）：`pause` / `stop` /
+//!   `resumeSaved` / `_rebalance` 都改成 `set_status`，因为 Python 的
+//!   `Task.setStatus` 会**连带改每个未完成 step 的状态**、再由 `updateStatus()`
+//!   反推任务状态（步骤混着 `COMPLETED` 时甚至可能反推出 `WAITING`）。直接赋
+//!   `record.status` 会漏掉这半边，`canPause`（读第一个 `RUNNING` 步骤）也就永远
+//!   看到旧值。
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -760,6 +767,16 @@ impl TaskService {
         true
     }
 
+    /// `_schedule(task)`（`task_service.py:569-571`）：`queue.wait` + `_pump()`。
+    ///
+    /// 返回尾部 `_pump()` 决定派发的 id。Python 的 `start` / `_onRunDone` 的
+    /// 做种分支 / `redownload` / `startAll` 都走这条，所以单独抽出来而不是让每个
+    /// 调用方自己「先 wait 再 pump」。
+    pub fn schedule(&mut self, task_id: &str, max_task_num: usize) -> Vec<String> {
+        self.queue.wait(task_id);
+        self.pump(max_task_num)
+    }
+
     /// `startSeeding(task)`（`task_service.py:397-400`）：`shouldSeed = True` +
     /// 落盘 + `_seed(task, isManual=True)`。
     ///
@@ -802,7 +819,9 @@ impl TaskService {
         self.task(task_id)?;
         let cancel = self.cancel_work(task_id);
         if let Some(record) = self.task_mut(task_id) {
-            record.status = TaskStatus::Paused;
+            // `Task.setStatus(PAUSED)`：连带把未完成的 step 也置成 `PAUSED`
+            // （再由 `updateStatus()` 反推任务状态，见模块头「已知差异」）。
+            record.set_status(TaskStatus::Paused);
         }
         self.pending_flush = true;
         let started = self.pump(max_task_num);
@@ -1068,6 +1087,30 @@ impl TaskService {
         self.queue.run(task_id, work_id);
     }
 
+    /// `_dispatch(task)`（`task_service.py:573-583`）的记账部分。
+    ///
+    /// ```python
+    /// task.setStatus(TaskStatus.RUNNING)
+    /// workId = self._coroutineRunner.submit(task.run(...))
+    /// self._queue.run(task.taskId, workId)
+    /// self.taskStarted.emit(task)
+    /// ```
+    ///
+    /// 协程提交与 `taskStarted` 归调用方（[`crate::task_actions`] 把它们摊成
+    /// `TaskAction::Started`）；这里只做「置 `RUNNING` + 用真 workId 顶掉
+    /// [`TaskService::pump`] 留下的空占位」。
+    ///
+    /// 与 `setStatus` 一样**不置 `pending_flush`**（Python 的 `_dispatch` 不
+    /// `_flushSoon`）。任务不在列表里 → `false`（Python 会 `AttributeError`）。
+    pub fn dispatch(&mut self, task_id: &str, work_id: &str) -> bool {
+        let Some(record) = self.task_mut(task_id) else {
+            return false;
+        };
+        record.set_status(TaskStatus::Running);
+        self.queue.run(task_id, work_id);
+        true
+    }
+
     /// `_onRunDone` / `_onRunFailed` 的记账部分，**含末尾的 `_pump()`**。
     ///
     /// Python 顺序：`queue.done` → `_flushSoon` → 发 `taskCompleted`/`taskFailed`
@@ -1136,7 +1179,7 @@ impl TaskService {
             }
             let work = self.cancel_work(&task_id);
             if let Some(record) = self.task_mut(&task_id) {
-                record.status = TaskStatus::Waiting;
+                record.set_status(TaskStatus::Waiting);
             }
             self.queue.wait(&task_id);
             report.cancelled.push((task_id.clone(), work));
@@ -1161,7 +1204,7 @@ impl TaskService {
         let mut resumed = Vec::new();
         for record in &mut self.records {
             if matches!(record.status, TaskStatus::Waiting | TaskStatus::Running) {
-                record.status = TaskStatus::Waiting;
+                record.set_status(TaskStatus::Waiting);
                 resumed.push(record.task_id.clone());
             }
         }
@@ -1328,7 +1371,7 @@ impl TaskService {
         let mut changed = false;
         for record in &mut self.records {
             if matches!(record.status, TaskStatus::Running | TaskStatus::Waiting) {
-                record.status = TaskStatus::Paused;
+                record.set_status(TaskStatus::Paused);
                 changed = true;
             }
         }
@@ -1345,6 +1388,16 @@ impl TaskService {
     /// `waitingOrder()`。
     pub fn waiting_order(&self) -> Vec<String> {
         self.queue.waiting_order()
+    }
+
+    /// `_queue.isRunning(taskId)`：`pauseAll` 的过滤条件之一。
+    pub fn is_running(&self, task_id: &str) -> bool {
+        self.queue.is_running(task_id)
+    }
+
+    /// `_queue.isWaiting(taskId)`：`pauseAll` 的过滤条件之一。
+    pub fn is_waiting(&self, task_id: &str) -> bool {
+        self.queue.is_waiting(task_id)
     }
 
     /// `moveToFront(taskIds)`：返回是否真的动了（`queueChanged` 的触发条件）。

@@ -69,6 +69,7 @@
 //! - Python 的 `_pump()` 在 `_schedule` 里被顺带调用；这里由调用方显式
 //!   [`Engine::pump`]（`resume_saved` 只入队，第 82 步的结论）。
 
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -541,6 +542,22 @@ impl Engine {
     /// 任务列表的写入口（UI 动作层用，等价于 Python 的 `engine.taskService`）。
     pub fn tasks_mut(&mut self) -> &mut TaskService {
         &mut self.tasks
+    }
+
+    /// 动作层句柄（第 100 步）：把 [`crate::actions::TaskService`] 的 11 个方法
+    /// 落到引擎自己这份 [`TaskService`] 上，副作用摊成
+    /// [`crate::task_actions::TaskAction`]。
+    ///
+    /// 借用形态是 `RefCell<&mut TaskService>`：`boot::run` 里引擎是局部变量
+    /// （没有 `Rc`），这个句柄只能**临时**持有——借出期间不能再碰 `engine.tasks`，
+    /// 拿到效果队列就 `drop` 掉。UI 要长期持有就让调用方自己拿
+    /// `Rc<RefCell<TaskService>>`（同一个 trait 的第三个 `impl`）。
+    ///
+    /// `maxTaskNum` 在构造时读一次：一次动作内配置不会变，等价于 Python 每次
+    /// `_pump` 现读 `cfg.maxTaskNum.value`。
+    pub fn task_actions(&mut self) -> crate::task_actions::TaskActions<RefCell<&mut TaskService>> {
+        let max = self.max_task_num();
+        crate::task_actions::TaskActions::with_max(RefCell::new(&mut self.tasks), max)
     }
 
     pub fn name_conflicts(&self) -> &NameConflictQueue {

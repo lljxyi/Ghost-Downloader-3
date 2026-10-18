@@ -68,6 +68,7 @@ pub mod single_instance;
 pub mod sort;
 pub mod speed;
 pub mod subtitle_select;
+pub mod task_actions;
 pub mod task_service;
 pub mod token_line_edit;
 pub mod track_bar;

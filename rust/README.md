@@ -260,7 +260,7 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
 ### 任务记账（`task_service.rs`）
 
 `app/services/task_service.py` 的 `TaskService`（705 行）把「存储/队列记账 + 引擎交互 +
-19 个信号」揉在一个类里。`task_service.rs` 只做**引擎无关**的那一半：
+19 个信号」揉在一个类里。`task_service.rs` 只做**引擎无关**的那一半（引擎那一半在 `task_actions.rs`，第 100 步）：
 
 - 任务列表是 `Vec<TaskRecord>`（插入序 = Python `dict` 的迭代序），队列记账转调
   `gd3_core::queue::TaskQueue`；
@@ -367,6 +367,65 @@ cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.
   （`TaskStep` 基类在 Rust 侧没有 `outputPath`，那是 `HttpStep`/`yt_dlp` 等子类的属性），
   只做占位符文件那半边——与第 93 步 `placeholder_paths()` 只返回 `[outputPath]` 是
   同一个缺口。
+
+### 动作层接线（`task_actions.rs`）
+
+`actions.rs` 算「点一下该调哪个服务方法」，`task_service.rs` 做记账半边并把「要取消的
+协程 / 要删的文件 / 该派发的 id」摊成报告——中间差一层：**谁把这些报告变成真的调用**。
+`task_actions.rs` 就是这一层，判定标准是 Python 的**调用序列**与**信号发射顺序**：
+
+```text
+pause(task)        _cancelWork → setStatus(PAUSED) → _flushSoon → taskPaused → _pump
+start(task)        (guard) → _schedule = queue.wait + _pump
+startSeeding(task) shouldSeed=True → _flushSoon → _seed(isManual=True)
+stopSeeding(task)  shouldSeed=False → _flushSoon → _cancelWork → _refreshSpeedMeter
+delete(task, df)   cancelChecksum → _unwatchFile → [fileDeleteDenied] → _cancelWork
+                   → onStopped{deleteFiles, deletePlaceholders} → _store.remove
+                   → _flushSoon → taskRemoved → _pump
+redownload(task)   cancelChecksum → _unwatchFile → _cancelWork
+                   → onStopped{deleteFiles, reset, _flushSoon, _schedule}
+setCategory(t, c)  task.category = c → _flushSoon
+moveToFront(ids)   if queue.moveToFront(ids): queueChanged
+startChecksum(t,a) _checksums[t]=work → submit(toChecksum(...)) → checksumStarted
+cancelChecksum(t)  if work: cancel(workId) → checksumStopped(t, None)
+```
+
+两个缺口与补法：
+
+- **`&self` vs `&mut self`**：`actions::TaskService` 的方法收 `&self`（Slint 回调是单槽
+  `Fn`，`TaskCommands` 用 `Rc<dyn actions::TaskService>` 持有），而 `TaskService` 的方法
+  全要 `&mut self`。用 `TaskStore` 端口把「怎么拿到 `&mut TaskService`」抽象掉，三个
+  `impl`：`RefCell<TaskService>`（UI 自持）、`RefCell<&mut TaskService>`（临时借引擎那份，
+  `Engine::task_actions()` 走这条）、`Rc<RefCell<TaskService>>`（长期共享）；
+- **没有协程运行时**：Python 每个动作都会 `coroutineRunner.submit/cancel`。Rust 侧退化成
+  `TaskAction` 效果队列——`TaskActions` 只**登记**要做什么，宿主按序消费。12 个变体：
+  `Started` / `CancelWork` / `Paused` / `Removed` / `DeleteDenied` / `DeleteFiles` /
+  `UnwatchFile` / `SeedingStarted` / `SeedingStopped` / `ChecksumStarted` /
+  `ChecksumStopped` / `QueueChanged`，每个都对应 Python 里的一行具体调用或一次信号。
+  workId 由 `TaskActions` 自己发号（`run-1` / `seed-2` / `checksum-3`，一个全局计数器 +
+  前缀区分类别），宿主只需把它当**不透明句柄**原样交回 `CancelWork`。
+
+顺序就是 Python 的发射顺序（`taskPaused` 在 `_pump` 之前、`taskRemoved` 在
+`taskStarted` 之前……）。唯一的语义差别是 `_cancelWork` 的 `finished=` 回调：Python 等
+协程真的停下才跑 `onStopped`，这里把 `CancelWork` 排在 `DeleteFiles` 之前，**宿主必须
+按序应用**（取消完成后再删文件），与第 99 步 `DeleteReport::delete_files` 的约定一致。
+
+配套的两个记账原语（补在 `task_service.rs`）：
+
+- `schedule(task_id, max_task_num) -> Vec<String>` = `_schedule` = `queue.wait` + `_pump`
+  （`start` / `_onRunDone` 的做种分支 / `redownload` / `startAll` 都走它）；
+- `dispatch(task_id, work_id) -> bool` = `_dispatch` 的记账半边 = `setStatus(RUNNING)` +
+  `queue.run(id, workId)`，用来把 `pump()` 留下的**空 workId 占位**换成真 id；与
+  `setStatus` 一样**不置 `pending_flush`**（Python 的 `_dispatch` 不 `_flushSoon`）。
+
+另外 `pause` / `stop` / `resumeSaved` / `_rebalance` 改状态时统一走
+`TaskRecord::set_status`：Python 的 `Task.setStatus` 会**连带改每个未完成 step 的状态**、
+再由 `updateStatus()` 反推任务状态（步骤混着 `COMPLETED` 时甚至可能反推出 `WAITING`）。
+直接赋 `record.status` 会漏掉这半边，`canPause`（读第一个 `RUNNING` 步骤）也就永远看到
+旧值。
+
+还没接的：`actions::UiHooks`（剪贴板 / 抽屉 / 编辑对话框 / 打开文件）落到
+`app.platform.desktop`，要等 Slint 窗口就位。
 
 ### 引擎装配（`engine.rs`）
 
@@ -895,9 +954,10 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **3122 行 / 72 单测**
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **3180 行 / 72 单测**
 （其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个、
-做种 9 个、校验与 `_rebalance` 9 个、删除/重下/分类/批量 7 个）。
+做种 9 个、校验与 `_rebalance` 9 个、删除/重下/分类/批量 7 个）；
+`task_actions.rs` **916 行 / 15 单测**（效果队列的顺序全部钉死）。
 
 ## 剩余工作（Phase 8）
 
