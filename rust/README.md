@@ -824,7 +824,7 @@ Python `add` 的顺序——`mkdir -p` 输出目录 → `resolve_conflict`（`cr
 `placeholder_paths_of` 是给「手上只有 `outputPath` 字符串」的调用方用的：`BilibiliTask`
 多文件时 `outputPath` 取 `Path(name).stem`，改名重试必须整条路径重算。
 
-规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1773 行 / 42 单测**
+规模：`placeholder.rs` **915 行 / 31 单测**；`task_service.rs` **1776 行 / 42 单测**
 （其中 `add_with_conflict` 10 个、`update_placeholders` 6 个、分类接线 4 个）。
 
 ## 剩余工作（Phase 8）

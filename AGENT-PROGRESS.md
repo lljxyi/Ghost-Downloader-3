@@ -5391,3 +5391,135 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
 ### 卡点
 
 无。
+
+## 第 95 步：分类匹配与输出目录推导（CategoryService 搬进 category.rs，2026-10-18 13:56）
+
+**目标**：补齐 `app/services/category_service.py`（223 行）里**还没迁**的那一半——
+`matchByName` / `categoryOf` / `folderOf` / `outputFolderOf`，以及
+`cfg.isCategoryEnabled` / `cfg.downloadFolder` 两个键的读取。第 83 步只搬了 `_load`
+（规则表 CRUD），`TaskService.add` 的第一步 `outputFolderOf` 一直是空的。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `gd3-ui/src/category.rs` | 650 → **1180 行 / 14 单测**；新增 `path_suffixes` / `normalized_suffixes` / `match_by_name_in` / `match_by_name`、`CategoryOutputSettings`、`OutputFolder`、`category_by_id` / `category_of` / `folder_of` / `output_folder_of`；`CategoryService` 整类从 `engine.rs` 搬来（`from_config` / `new` / `rules` / `set_rules` / `settings` / `set_settings` / `match_by_name` / `category_of` / `folder_of` / `output_folder_of`）+ 7 单测 |
+| `gd3-ui/src/file_select.rs` | 814 行 / 9 单测；`path_suffixes` / `normalized_suffixes` 改成 `pub use crate::category::{…}`；`match_by_name` 变薄包装（把 `CategoryInfo` 投影成 `(&str, &[String])` 委托 `match_by_name_in`）；`path_suffixes_matches_cpython_313` 单测搬去 `category.rs` |
+| `gd3-ui/src/task_service.rs` | 1622 → **1776 行 / 42 单测**；字段 `categories: CategoryService`（`Default` = 空规则 + 关闭）+ `categories()` / `set_categories()`；`add_with_conflict` 在 duplicate 检查后、`to_safe_filename` 前插 `output_folder_of` 写回；模块 doc「已知差异」补「分类服务是克隆」；4 新单测 + helper `categories(folder)` |
+| `gd3-ui/src/engine.rs` | 1189 → **1176 行**；删掉 `CategoryService` 桩，改 `pub use crate::category::CategoryService`；`Engine::new` 里 `tasks.set_categories(category.clone())`；新增 `Engine::push_categories()` |
+| `rust/README.md` | 799 → 837 行；新增 `### 分类匹配与输出目录（category.rs）`（映射表 + `OutputFolder` 语义 + 2 条差异 + 规模行）；「任务记账」的已知差异改成「第一步是 `outputFolderOf`」；规模行 `task_service.rs` **1776 行 / 42 单测** |
+
+### `outputFolderOf` 的三条分支（`category_service.py:184-192`）
+
+```text
+if not cfg.isCategoryEnabled.value:      # 分支 1：原样返回
+    return task.outputFolder, task.category          # 注意 category 也不猜
+if categoryId is None:                   # 分支 2：按名字猜
+    categoryId = categoryOf(task)
+if categoryId and Path(folder) == Path(cfg.downloadFolder.value):   # 分支 3
+    folder = Path(folderOf(categoryId) or folder)    # folderOf 为 None 时保持原目录
+```
+
+`categoryOf`（:173-176）：`task.files is not None and len(task.files) > 1` → `""`
+（多文件任务按目录走，不按名字猜）；否则 `matchByName(task.name)`。
+
+`matchByName`（:157-171）：候选 = `[".".join(suffixes[-2:]), suffixes[-1]]`，
+**逐候选遍历全部分类**（分类内按 `extensions` 顺序），命中即返回。所以
+`a.tar.gz` 先试 `tar.gz` 再试 `gz`，`a.mp3.mp4` 先试 `mp3.mp4` 再试 `mp4`——
+长候选优先是既有行为。
+
+`folderOf`（:178-182）：未知分类 / `folder` 缺失或空串 → `None`；否则
+`category.folder.replace("{default}", cfg.downloadFolder.value)`（**全替换**，
+不是只换第一个）。
+
+### 关键决策
+
+- **`CategoryService` 从 `engine.rs` 搬进 `category.rs`，`engine` 只 `pub use`。**
+  `TaskService` 需要直接持有它；留在 `engine` 会造 `task_service → engine` 的反向依赖。
+- **`match_by_name_in<'a, I: IntoIterator<Item = (&'a str, &'a [String])>>` 作共享内核。**
+  `category::match_by_name`（规则表）与 `file_select::match_by_name`（`CategoryInfo`
+  投影）必须用**同一套候选顺序**，否则两处会漂移（文件选择对话框的分类过滤与
+  下载落地的分类判断本来就必须一致）。`file_select` 的 `path_suffixes` /
+  `normalized_suffixes` 因此改成 `pub use`，不再各存一份。
+- **`OutputFolder { category: Option<String>, folder: PathBuf }` 保留 `None` / `Some("")` 之别。**
+  Python 用 `if categoryId is None` 才猜分类、用 `if categoryId` 才换目录，两种空值
+  语义不同；压成一个 `Option` 会丢分支（`""` 来自 `categoryOf` 没命中，必须「不猜也不换」）。
+- **默认目录判定用 `Path` 相等（逐组件）而非字符串相等。**
+  与 Python `Path(...) == Path(...)` 同口径：`/d/`、`/d/.`、`/d//` 都等价；
+  **替换出来的目录显式过 `posix_normpath`**（对齐 `Path(str)`），
+  **未替换时逐字节保留入参**（避免把 `""` 归一成 `"."` 这类副作用）。
+- **`CategoryOutputSettings::from_config` 走 `settings::read_bool` / `read_text`。**
+  按 `SPECS` 缺省兜底，与 Python `ConfigItem.value` 的「缺键即缺省」一致；
+  不用 `config.get(...)`（那会把缺键当 `None` 再各自写缺省，两处容易漂）。
+- **`TaskService` 持有克隆 + `set_categories()` / `Engine::push_categories()`。**
+  Python 是同一个实例（改规则立刻可见），Rust 侧必须显式重推；`Default` =
+  空规则 + 关闭 → 没接线的调用方行为与第 94 步完全一致（38 个旧单测零改动）。
+- **`add_with_conflict` 里先写 `output_folder` 再写 `category`。**
+  `folder_string(&self)` 借用 `resolved`，先移动 `category` 会
+  `E0382: borrow of partially moved value`。
+
+### 与 Python 的差异
+
+1. **分类服务是克隆**（见上），改规则后要显式 `set_categories`；
+2. **前导 `//` 不镜像**：Python `Path("//a/b")` 保留双斜杠（POSIX 特例），
+   Rust `posix_normpath` 压成单根——与第 85 步 `path.rs` 记录的差异同源；
+3. **`posix_normpath` 只作用于「替换出来的」目录**，未替换时逐字节透传入参。
+
+### 单测（7 个新增，`category.rs` 共 14）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `path_suffixes_matches_cpython_313` | 12 条金值（从 `file_select.rs` 搬来），含 `a.` → `[]`、`.bashrc`、`a..b` |
+| `match_by_name_prefers_the_longer_suffix_chain` | `a.tar.gz` → archive（先试 `tar.gz`）、`a.mp3.mp4` → video、`a.mp3.gz` → archive |
+| `category_of_skips_multi_file_tasks` | `files` 长度 > 1 → `""`；长度 1 → 照猜 |
+| `folder_of_replaces_every_default_placeholder` | `{default}` 多次出现全替换；`folder == None` → `None` |
+| `output_folder_of_only_rewrites_the_default_folder` | 8 条分支：关闭 / 显式 `""` / 未知 id / 自定义目录 / 尾斜杠 / `/.` / `//` / 多文件 |
+| `output_folder_of_normalizes_like_pathlib` | 替换结果过 `posix_normpath`，未替换逐字节透传 |
+| `service_reads_both_config_keys` | `from_config` 读 `isCategoryEnabled` / `downloadFolder`，缺键按 `SPECS` 缺省 |
+
+`task_service.rs` 4 个新增（`categories(folder)` helper 造服务）：
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `add_with_conflict_moves_the_task_into_the_category_folder` | `movie.mkv` + 默认目录 → `cat_video` + `…/Video` |
+| `add_with_conflict_keeps_a_custom_folder_but_sets_the_category` | 自定义目录 → 只定分类、目录不动 |
+| `add_with_conflict_respects_an_explicit_category` | 显式 `Some("")` → 不猜也不换 |
+| `add_with_conflict_leaves_the_folder_alone_when_categories_are_disabled` | 关闭 → `(None, 目录不变)` |
+
+金值全部由 venv 里的 Python 实测（`CategoryService.__new__` + 手填 `_categories`，
+模块级 `cfg` 换 `SimpleNamespace`，避免真读配置）。
+
+### 验证
+
+- `cargo check -p gd3-ui --lib --tests`：46s 通过（中途修 `E0425` / `E0382` / `E0063`）；
+- `cargo test -p gd3-ui --lib`：**679 passed**；
+- `cargo test --workspace`：**1180 passed / 0 failed**（28 个 test result 段，
+  第 94 步 1170 + 7 + 4 - 1 搬走的）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（4m04s，
+  抓到 1 处 `manual_contains` → 改 `extensions.contains(&candidate)`）；
+- `cargo fmt --all` + `--check`：通过；
+- Python 侧没改一行，不跑 Python 全量；
+- 代码 commit `ac1facd`。
+
+### 踩坑记录
+
+- **第三次踩 `Edit` 的坑**：往 scratch 脚本里「插入注释」时，`PUT n.=n:` 实际
+  **覆盖**了下一行 `url: String::new(),`，编译报 `E0063: missing field url`。
+  改文件一律「`sed -n` 核对 + Python 字符串替换（带 `assert count == 1`）」。
+- **`cargo fmt && … && setsid … &` 会把整条 `&&` 链后台化**（含 `fmt`），
+  之后 `--check` 读到的还是未格式化的源码。`fmt` 必须单独前台跑。
+
+### 下一步（第 96 步候选，按价值/风险）
+
+1. **`TaskService.probe_conflict` 接线**（`task_service.py:388-390`）：`name_conflict.rs`
+   + `add_with_conflict` 都已就位，`PlaceholderRegistry::is_unfinished` 可查
+   「未完成」，缺的是 `Engine::on_name_conflicted` 到卡片的这一段；
+2. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：造 `Script` / `Territory`
+   枚举后可搬，纯函数、无 I/O；
+3. **`app/services/runtime_status.py`（195 行）**：需先给 `pack::BinaryRuntime` 补
+   `install` / `fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
+4. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
