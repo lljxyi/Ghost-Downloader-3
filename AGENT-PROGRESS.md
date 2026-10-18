@@ -5165,3 +5165,120 @@ Phase 8 的「插件运行时」地基。`app/models/pack.py` 310 行里**能搬
      `app/services/runtime_status.py`（195 行，需先给 `pack::BinaryRuntime` 补
      `install`/`fetch_latest_version` 的同步签名）→ D-Bus / keepalive 仍排最后。
 - 卡点：无
+
+## 第 93 步：把 placeholder 接进 gd3-ui::task_service（2026-10-18 12:39）
+
+**目标**：第 92 步把「建占位符 + 冲突决策」做成了与 `Task` 无关的纯函数，这一步把它接回
+`TaskService`，补齐 Python `TaskService.add`（`app/services/task_service.py:358-383`）里
+`TaskStore.add`（`:62-90`）那一段。
+
+### 改动清单
+
+`gd3-core` 侧两处前置改动（都是为了让「按候选名字重算路径」成为可能）：
+
+| 文件 | 改动 |
+|---|---|
+| `task.rs` | 抽出 `pub fn output_path_for(&self, name: &str) -> String`；`output_path()` 改为委托 |
+| `placeholder.rs` | 新增 `pub fn placeholder_paths_of(output_path: &str) -> Vec<PathBuf>` |
+| `lib.rs` | re-export 补 `placeholder_paths_of` |
+
+`gd3-ui/src/task_service.rs`（909 → 1271 行，21 → 32 单测）：
+
+- imports：`std::fs`、`std::path::{Path, PathBuf}`、`gd3_core::filename::{DEFAULT_MAX_FILENAME_LENGTH,
+  to_safe_filename}`、`gd3_core::placeholder::{CreateError, NameConflictChoice, PlaceholderRegistry,
+  create_placeholders, placeholder_paths_of, resolve_conflict}`；
+- `pub struct AddReport { name, replaced: Vec<String>, overwrite_failed: bool,
+  outcome: Option<AddOutcome> }`；
+- `TaskService` 新增字段 `placeholders: PlaceholderRegistry`，配 `placeholders()` 只读访问器；
+- `add_with_free_space` 的尾段（磁盘检查 + `queue.wait`）抽成私有
+  `fn schedule_add(&mut self, task_id, file_size, auto_start, free_space) -> AddOutcome`，
+  两条 add 路径共用；
+- 新增 `pub fn add_with_conflict<D: FnMut(&Path) -> bool>(record, choice, auto_start,
+  free_space, delete_recoverably) -> Result<AddReport, CreateError>`；
+- `remove()` 补 `self.placeholders.remove(task_id)`（Python 的 `delete` 也会
+  `_removePlaceholders`）；
+- 模块 doc 的「已知差异」重写：`add()`/`add_with_free_space()` 不解决冲突、
+  `add_with_conflict()` 不调 `CategoryService.outputFolderOf()`。
+
+### `add_with_conflict` 的执行顺序（逐条对齐 Python）
+
+```text
+1. 已存在同 taskId            -> Ok(AddReport { outcome: Some(Duplicate) })，不进冲突循环
+2. name = toSafeFilename(name, "download", 200)   # Task.__post_init__ 的不变量
+3. shouldSeed = True
+4. fs::create_dir_all(outputFolder)               # mkdir(parents=True, exist_ok=True)
+5. resolve_conflict(name, choice,
+       create = |candidate| create_placeholders(placeholder_paths_of(
+                    record.output_path_for(candidate)), &[], is_output_folder),
+       is_unfinished = |path| registry.is_unfinished(path, |id| records[id].status),
+       delete_recoverably)
+6. Ok(None)  -> Ok(AddReport { outcome: None })    # nameConflicted + return False
+7. replaced = registry.replaced_tasks(paths)       # 按占位符顺序去重
+8. for id in replaced: self.remove(id)             # taskRemoved
+9. records.push(record); registry.set(taskId, outputFolder, name, paths)
+10. pending_flush = true; schedule_add(...)        # 磁盘检查 + 入队
+```
+
+### 关键决策
+
+- **`AddReport.outcome: Option<AddOutcome>` 而不是往 `AddOutcome` 里加变体。**
+  `None` 精确表达 Python 的 `nameConflicted` + `return False`——任务**没**加进
+  `_store._tasks`，调用方要拿同一个 `Task` 重新问用户选什么。塞进 `AddOutcome` 会让
+  「已加入/未加入」这个二分变得不可穷举。
+- **`output_path_for(name)` 抽成独立方法。** `BilibiliTask` 多文件时 `outputPath` 取
+  `outputFolder / Path(name).stem`，改名重试的每个候选名字都要**整条重算**，不能只换路径
+  最后一段（否则 `a(1).bin` 会算成 `a.bin(1)`）。
+- **`add_with_conflict` 入口补一次 `to_safe_filename(..., "download", 200)`。** 复刻
+  `Task.__post_init__` 的不变量，防止调用方塞进带 `/` 的名字把占位符建到输出目录之外；
+  该函数幂等，对已安全的名字无副作用。
+- **`delete_recoverably` 由调用方注入**，单测传 `|_| false`（`never_trash`）保持
+  hermetic；生产传 `gd3_core::trash::delete_recoverably`，`Err` 按 `false` 处理即可
+  （与 Python 的 `try/except` 一致）。
+- **错误类型是 `CreateError` 而不是 `io::Error`。** `create_dir_all` 的失败手动映射成
+  `CreateError::Io { path, error }`：Python 里 `mkdir` 的 `OSError` 与建占位符的
+  `OSError` 是同一种冒泡，而 `CreateError::Taken` 是改名循环用尽 10_000 次的上限信号。
+  （首版写 `io::Result`，`?` 直接编译失败——`From<CreateError> for io::Error` 不存在。）
+- **`schedule_add` 抽出来而不是复制。** 两条 add 路径的尾段（`fileSize > 0 && free <
+  fileSize` → `DiskSpaceInsufficient` 不入队；否则 `queue.wait`）必须逐字一致，
+  第 81 步那版「`fileSize > 0` 才入队」的 bug 就出在这段。
+
+### 单测（10 个，全部 hermetic：`TempDir` + `AtomicU32` + `Drop`）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `..._creates_placeholder_and_registers_it` | `mkdir -p` 输出目录 + 0 字节占位符 + `owner == taskId` |
+| `..._renames_when_placeholder_is_taken` | `KeepBoth` → `a(1).bin`，两个任务都在 |
+| `..._ask_leaves_the_task_out` | 无主占位符 + `Ask` → `outcome == None`、`len == 0`、不置 `pending_flush`、原文件不动 |
+| `..._overwrite_reuses_the_name` | 回收站移入成功 → **同名**重试，`trashed == [path]` |
+| `..._overwrite_failure_degrades_to_keep_both` | 移入失败 → `overwrite_failed == true` + `a(1).bin` + 原文件保留 |
+| `..._reports_replaced_task` | `replaced == ["a"]`、旧任务被 `remove`、登记转给 `b` |
+| `..._short_circuits_on_duplicate` | 同 taskId → `Duplicate`，`delete_recoverably` 一次都不调 |
+| `..._never_overwrites_unfinished_task` | `Running` 占位符 → 只改名，`calls == 0` |
+| `..._creates_a_directory_for_multi_file_tasks` | `files.len() == 2` → 占位符是目录 |
+| `..._uses_the_same_tail_as_plain_add` | `DiskSpaceInsufficient` 仍留在列表、不入队；`autoStart=false` → `queued: false` |
+
+### 验证
+
+- `cargo check -p gd3-ui --lib --tests`：44s 通过（首版 1 个 E0277，见上「错误类型」）；
+- `cargo test -p gd3-ui --lib`：**663 passed**（+10）；
+- `cargo test --workspace`：**1161 passed / 0 failed**（28 个 test result 段，
+  第 92 步 1151 + 10，编译约 11 分钟）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（1m15s）；
+- `cargo fmt --all --check` 通过；
+- Python 侧没改一行，不跑 Python 全量；
+- 代码 commit `40fb910`。
+
+### 下一步（第 94 步候选，按价值/风险）
+
+1. **`TaskStore.updatePlaceholders`**（`task_service.py:91-121`，改名/移动占位符）：
+   `PlaceholderRegistry` 已就位，剩下 `zip(oldPaths, newPaths)` + `move` + `.ghd` 搬运，
+   纯文件操作，风险低；
+2. **`buildFontFamilies`**（`app/platform/desktop.py:15-45`）：造 `Script`/`Territory`
+   枚举后可搬，纯函数；
+3. **`app/services/runtime_status.py`（195 行）**：需先给 `pack::BinaryRuntime` 补
+   `install`/`fetch_latest_version` 的同步签名（Python 是 `async` 且要网络）；
+4. D-Bus / keepalive：仍排最后（`zbus` 在离线缓存里，但编译代价大）。
+
+### 卡点
+
+无。
