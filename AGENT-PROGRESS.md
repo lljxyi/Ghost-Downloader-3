@@ -3638,3 +3638,68 @@ Python 侧卡片是「数据驱动的表」：`FieldSpec.formats` / `ButtonSpec.
   `category_settings.rs`（P4 第二批），随后 `option_cards` / `token_line_edit`
   / `markdown_viewer` / `bootstrap_list` / `range_slider`。
 - 卡点：无（clippy 单轮 11~12 分钟，故按「多模块攒一批再跑」推进）
+
+## 第 71 步：P4 第二批四模块（track_bar / band_selector / progress_toast / category_settings）（2026-10-18 04:10）
+- 做了什么：`lib.rs` 注册四模块（`band_selector` 于 `banners` 前、
+  `category_settings` 于 `category` 后、`progress_toast` 于 `profile` 后、
+  `track_bar` 于 `tree_view` 前），四模块合计 46 单测：
+  - `track_bar.rs`（562 行，13 测试）：`TrackKind` 四轨道（`tooltip`
+    视频/音频/字幕/封面、`icon` VIDEO/HEADPHONE/LANGUAGE/PHOTO、
+    `is_primary` 只含 video/audio/cover、`has_menu` 只含 video/audio）、
+    `TrackButtonState`（`icon_fill` 未勾选才 `#808080`）、
+    `TrackBar::{set_checked→bool, set_track_enabled, prevent_all_off,
+    set_options, menu_items, on_track_deselected, on_option_picked, click,
+    layout_order}`。
+  - `band_selector.rs`（603 行，13 测试）：`BandSignal` 三信号用
+    `Vec` + `take_signals()` 缓冲；`mouse_press/move/release`、
+    `on_scroll_changed`、`on_auto_scroll`、`cancel_drag`、`window_deactivate`、
+    `update_band`（`first/last` 与自动滚动两侧边距）。
+  - `progress_toast.rs`（521 行，11 测试）：`bar_color` 未知状态兜
+    DOWNLOADING、`ToastIcon` 三态、`ProgressToastState::{apply, fill_tick,
+    user_close, bar_width, bar_top}`（`{:.0}` 半值取偶）。
+  - `category_settings.rs`（333 行，9 测试）：`to_category_name`（无译文层
+    恒等）、`icon_or_tag`（`ICON_CHOICES ∪ {TAG}` 白名单）、
+    `CategoryRow::from_rule`、`CategoryRulesCard::{new, reload, rows, content}`
+    （`"已配置 {n} 个分类"`）、`CategoryRequest` 四值 +
+    `edit_request`（`categoryById` 查空即 `None`）。
+- 实证结论（写进四个模块头）：
+  - `TrackButton.nextCheckState` 被 override 成 `pass` → 点击**永不**翻转
+    勾选；`setTrackEnabled(False)` 因 `sender.isEnabled()` 为假而**可以真熄灯**；
+    `_preventAllOff` 的 primary 不含字幕，但三盏全灭时字幕同样被拉回；
+  - `setOptions` 的非法 `selected` 在**未勾选**时被完全忽略；`_onTrackDeselected`
+    先 `setChecked(False)`，被拉回才保留 `_selectedValue`；
+  - `band_selector._updateBand(lastX, pos.y())` 收的是**控件坐标**（不是视口
+    坐标）——`top = min(startY, y)`、`bottom = max(startY, y)`，所以向上拖到
+    负数时 `bottom` 仍等于 `startY`；`eventFilter` 首行 `if not _isEnabled:
+    return False`（禁用时连 pending 都不清）；
+  - `progress_toast.COLORS` 只有三态，`COLORS.get(state, COLORS[DOWNLOADING])`
+    兜底；FAILED 把 `_displayProgress` 直接置 100 并停表；`paintEvent` 在
+    `_displayProgress <= 0` 直接 return；
+  - `category_settings` 的 `_toSummary` 与 `category.rs::summary_of` 同口径
+    （超过 4 项时括号里的数字是**总项数**，video 预设实测 20 项）。
+- 修掉的**测试算错**（实现均与 Python 一致，是断言写错）：
+  - `band_selector::band_maps_rows_by_stride`：向上拖到 `-30` 时
+    `bottom = max(10, -30) = 10` → `(0, 0)`，不是 `(-1, -1)`；
+  - `band_selector::press_offsets_viewport_by_scroll_value`：`_updateBand` 用
+    控件坐标 → `top = 200 → 5`，断言应为 `BandChanged(5, 6)`；
+  - `track_bar::menu_items_mirror_open_menu`：`TrackBar` 初始就勾着 video+audio，
+    测「未勾选」前必须先 `set_checked(Video, false)`；后半段测「勾选 + v2」前
+    也要先补 `set_checked(Video, true)`；
+  - `track_bar::option_pick_and_deselect`：「最后一盏 primary 熄不掉」的场景里
+    video 必须已熄（原测试把它又点亮了，于是 audio 合法熄灯）；
+  - `category_settings::new_preserves_category_order_and_ids`：video 预设是
+    20 个扩展名，不是 8。
+- 修掉的两处 clippy（`-D warnings`）：`progress_toast.rs` 的
+  `doc_lazy_continuation`（收尾段升成独立 bullet）、`track_bar.rs` 的
+  `collapsible_if`（改 let-chain，edition 2024）。
+- 验证：
+  - `cargo fmt --all --check` 通过；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings` 0 error（12m04s）；
+  - `cargo test -p gd3-ui --lib`：**317 → 363 passed**（track_bar 13 +
+    band_selector 13 + progress_toast 11 + category_settings 9）。
+  - commit `5d215fb`。
+- 下一步：P4 剩余组件——`option_cards.rs`(303)、`token_line_edit.rs`(273)、
+  `bootstrap_list.rs`(266)、`markdown_viewer.rs`(215)、`range_slider.rs`(331)，
+  然后 P1 设置页收尾（`setting_cards.rs` 949、`setting_card_group.rs` 290、
+  `card_groups.rs` 191）。
+- 卡点：无（clippy 单轮 12 分钟，仍按「多模块攒一批再跑」推进）
