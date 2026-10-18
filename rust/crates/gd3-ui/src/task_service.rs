@@ -278,6 +278,30 @@ impl TaskService {
         started
     }
 
+    /// `resumeSaved()`：启动时把持久化里的 `WAITING`/`RUNNING` 重新排进队列。
+    ///
+    /// Python 的 `resumeSaved()` 还做两件引擎侧的事：已完成任务的
+    /// `_watchFile`/`_seed`，以及每个任务发 `taskAdded`。这里只做
+    /// 「`RUNNING` → `WAITING` + `queue.wait`」，返回重新入队的 id。
+    ///
+    /// Python 的 `_schedule` 会顺带 `_pump()`，但没有引擎时「派发」无意义，
+    /// 所以**不在这里 pump**——调用方在引擎就绪后自己 `pump(maxTaskNum)`。
+    /// 状态从 `RUNNING` 改回 `WAITING` 也不主动置 `pending_flush`：
+    /// Python 的 `setStatus` 同样不落盘，要等下一次真实改动才写。
+    pub fn resume_saved(&mut self) -> Vec<String> {
+        let mut resumed = Vec::new();
+        for record in &mut self.records {
+            if matches!(record.status, TaskStatus::Waiting | TaskStatus::Running) {
+                record.status = TaskStatus::Waiting;
+                resumed.push(record.task_id.clone());
+            }
+        }
+        for task_id in &resumed {
+            self.queue.wait(task_id);
+        }
+        resumed
+    }
+
     /// `runningCount()`。
     pub fn running_count(&self) -> usize {
         self.queue.running_count()
@@ -585,6 +609,43 @@ mod tests {
         assert_eq!(outcome.started, vec!["b".to_string()]);
         assert!(!outcome.all_completed, "刚接上一个等待任务，不算全完成");
         assert_eq!(service.running_count(), 1);
+    }
+
+    #[test]
+    fn resume_saved_requeues_waiting_and_running_only() {
+        let mut service = TaskService::from_records(vec![
+            record("a", TaskStatus::Waiting, 10),
+            record("b", TaskStatus::Running, 10),
+            record("c", TaskStatus::Completed, 10),
+            record("d", TaskStatus::Paused, 10),
+        ]);
+        assert_eq!(
+            service.resume_saved(),
+            vec!["a".to_string(), "b".to_string()],
+            "只重排 WAITING/RUNNING，且保插入序"
+        );
+        assert_eq!(
+            service.task("b").expect("任务在").status,
+            TaskStatus::Waiting,
+            "RUNNING 回落到 WAITING"
+        );
+        assert_eq!(
+            service.task("c").expect("任务在").status,
+            TaskStatus::Completed
+        );
+        assert_eq!(
+            service.task("d").expect("任务在").status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            service.waiting_order(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(service.running_count(), 0, "不 pump：没有引擎就不假装派发");
+        assert!(
+            !service.pending_flush(),
+            "与 Python 的 setStatus 一样不主动落盘"
+        );
     }
 
     #[test]

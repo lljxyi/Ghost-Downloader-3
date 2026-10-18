@@ -150,8 +150,8 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
 | P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**57 个模块**（56 个 `pub` + 私有 `format`）/ **34 790 行 `src/`**（含 `lib.rs` 3 489 行）、
-**6 个 Slint 文件 2 858 行**、**620 个单测**（`cargo test -p gd3-ui --lib`）。
+规模：**57 个模块**（56 个 `pub` + 私有 `format`）/ **34 964 行 `src/`**（含 `lib.rs` 3 489 行）、
+**6 个 Slint 文件 2 858 行**、**625 个单测**（`cargo test -p gd3-ui --lib`）。
 
 `app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
 无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
@@ -164,7 +164,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（620）
+cargo test -p gd3-ui --lib                 # 只跑单测（625）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 
@@ -187,7 +187,8 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 `crates/gd3-ui/src/boot.rs`，对应仓库根的 `Ghost-Downloader-3.py`（268 行）：
 
 ```text
-Paths（paths.py）→ load_config（qconfig.load）→ 窗口 + push_settings → 事件循环
+Paths（paths.py）→ load_config（qconfig.load）→ TaskService::load + resume_saved
+                  → 窗口 + push_settings + 任务行 → 事件循环
 ```
 
 - **路径语义**照抄 Qt 的「字符串拼接」而不是 `Path::join`：本机 `HOME` 为空时
@@ -197,12 +198,16 @@ Paths（paths.py）→ load_config（qconfig.load）→ 窗口 + push_settings �
   且**不写盘**（Python 的 `qconfig.load` 同样不写）；文件损坏 → 退回缺省并标记 `broken`；
 - **事件循环**：有 `DISPLAY`/`WAYLAND_DISPLAY` 走 winit 后端（`window.run()`），
   否则走 `MinimalSoftwareWindow`，跑 `--frames` 帧后退出；
+- **任务**：启动时读 `<APP_DATA_DIR>/tasks.jsonl`（坏行只计数），`resume_saved()` 把
+  `WAITING`/`RUNNING` 重新入队并把 `RUNNING` 回落到 `WAITING`；**没有引擎，所以只入队不派发**
+  （Python 的 `_schedule` 会顺带 `_pump`）。启动**不回写** `tasks.jsonl`。
 - **CLI**：`--silence`（对应 Python 的 `--silence`）、`--version`、`--help` 之外，
-  另有三个 Rust 侧可测性开关 `--headless` / `--frames` / `--data-dir`（Python 没有）。
+  另有四个 Rust 侧可测性开关 `--headless` / `--frames` / `--data-dir` / `--tasks-file`
+  （Python 没有）。
 
 ```bash
 cargo run -p gd3-ui --bin gd3-ui -- --headless --frames 3 --data-dir /tmp/gd3-data
-# Ghost Downloader v4.4.0 launched (headless, 3 frame(s), config=default, data=/tmp/gd3-data)
+# Ghost Downloader v4.4.0 launched (headless, 3 frame(s), config=default, data=/tmp/gd3-data, tasks=0, resumed=0)
 cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.py）
 ```
 

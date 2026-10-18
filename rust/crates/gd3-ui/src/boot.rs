@@ -47,7 +47,11 @@
 //!   加的可测性开关（`--headless` 走 `MinimalSoftwareWindow`，跑固定帧数后退出）；
 //! - `HOME` 未设时 Python 用 `QStandardPaths`，这里退回 `"/"`（与上面实测一致）；
 //! - 配置解析失败时 Python 的 `@exceptionHandler()` 会中断 `QConfig.load`、保持缺省，
-//!   这里同样退回缺省，但**不写盘**（Python 也不写）。
+//!   这里同样退回缺省，但**不写盘**（Python 也不写）；
+//! - 启动时读 `<APP_DATA_DIR>/tasks.jsonl`（与 Python `TaskStore._path` 同路径）并调
+//!   `TaskService::resume_saved()` 重新入队；但**没有引擎**，所以只入队不派发
+//!   （Python 的 `_schedule` 会顺带 `_pump`，那一步等引擎迁过来）；
+//! - `--tasks-file` 是 Rust 侧的可测性开关（Python 侧固定用 `APP_DATA_DIR`）。
 
 use std::path::{Path, PathBuf};
 
@@ -66,6 +70,8 @@ pub const DESKTOP_ID: &str = "io.github.xiaoyouchr.GhostDownloader";
 pub const URL_SCHEME: &str = "ghostdownloader";
 /// `paths.py` 与 `Ghost-Downloader-3.py` 共用的配置文件名。
 pub const USER_CONFIG_FILE: &str = "UserConfig.json";
+/// `task_service.py::TaskStore.__init__` 里硬编码的 `APP_DATA_DIR / "tasks.jsonl"`。
+pub const TASKS_FILE: &str = "tasks.jsonl";
 
 // ---------------------------------------------------------------------------
 // 路径
@@ -169,6 +175,11 @@ impl Paths {
     pub fn user_config_path(&self) -> PathBuf {
         self.app_data_dir.join(USER_CONFIG_FILE)
     }
+
+    /// `APP_DATA_DIR / "tasks.jsonl"`。
+    pub fn tasks_path(&self) -> PathBuf {
+        self.app_data_dir.join(TASKS_FILE)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +197,8 @@ pub struct Cli {
     pub frames: Option<u32>,
     /// 数据目录覆盖（Rust 扩展，测试用）。
     pub data_dir: Option<PathBuf>,
+    /// `tasks.jsonl` 覆盖（Rust 扩展，测试用；缺省 `<APP_DATA_DIR>/tasks.jsonl`）。
+    pub tasks_file: Option<PathBuf>,
     pub help: bool,
     pub version: bool,
     /// 位置参数里识别出的 URL / 文件 URI（`application.py::urisFromArgv`）。
@@ -202,6 +215,7 @@ Ghost Downloader (Rust/Slint)
   --headless           强制无头模式（不依赖显示服务，跑固定帧数后退出）
   --frames <N>         无头模式驱动的帧数（缺省 1）
   --data-dir <PATH>    覆盖数据目录（测试用，Python 侧无此参数）
+  --tasks-file <PATH>  覆盖任务列表文件（测试用，Python 侧无此参数）
   -V, --version        打印版本
   -h, --help           打印本帮助
 ";
@@ -281,11 +295,19 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
                 let value = args.get(index).ok_or("--data-dir 缺少取值")?;
                 cli.data_dir = Some(PathBuf::from(value));
             }
+            "--tasks-file" => {
+                index += 1;
+                let value = args.get(index).ok_or("--tasks-file 缺少取值")?;
+                cli.tasks_file = Some(PathBuf::from(value));
+            }
             other if other.starts_with("--frames=") => {
                 cli.frames = Some(parse_frames(&other["--frames=".len()..])?);
             }
             other if other.starts_with("--data-dir=") => {
                 cli.data_dir = Some(PathBuf::from(&other["--data-dir=".len()..]));
+            }
+            other if other.starts_with("--tasks-file=") => {
+                cli.tasks_file = Some(PathBuf::from(&other["--tasks-file=".len()..]));
             }
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("未知参数：{other}"));
@@ -373,6 +395,12 @@ pub struct RunSummary {
     pub download_dir: PathBuf,
     pub urls: Vec<String>,
     pub silent: bool,
+    /// 装载后的任务数（`tasks.jsonl` 里的有效行）。
+    pub tasks: usize,
+    /// 坏行数（Python 侧只记日志后跳过）。
+    pub task_load_failures: usize,
+    /// `resumeSaved()` 重新入队的任务数。
+    pub resumed: usize,
 }
 
 /// 启动闭环：路径 → 配置 → 窗口 → 事件循环。
@@ -388,10 +416,15 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
     let default_download = paths.download_dir.to_string_lossy().to_string();
     let headless = cli.headless || !has_display();
     let frames = cli.frames.unwrap_or(1);
+    let tasks_path = cli.tasks_file.clone().unwrap_or_else(|| paths.tasks_path());
+    let (mut service, task_failures) = crate::task_service::TaskService::load(&tasks_path)
+        .map_err(|err| format!("任务列表读取失败：{err}"))?;
+    let resumed = service.resume_saved();
 
     if headless {
         let window = crate::create_headless();
         crate::push_settings(&window, &loaded.config, &default_download);
+        service.refresh(&window);
         for _ in 0..frames {
             slint::platform::update_timers_and_animations();
             window.window().request_redraw();
@@ -400,6 +433,7 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
     } else {
         let window = crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?;
         crate::push_settings(&window, &loaded.config, &default_download);
+        service.refresh(&window);
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;
     }
 
@@ -412,6 +446,9 @@ pub fn run(cli: &Cli) -> Result<RunSummary, String> {
         download_dir: paths.download_dir,
         urls: cli.urls.clone(),
         silent: cli.silent,
+        tasks: service.len(),
+        task_load_failures: task_failures.len(),
+        resumed: resumed.len(),
     })
 }
 
@@ -439,7 +476,7 @@ pub fn main_entry(args: Vec<String>) -> std::process::ExitCode {
         Ok(summary) => {
             if summary.headless {
                 println!(
-                    "Ghost Downloader v{} launched (headless, {} frame(s), config={}, data={})",
+                    "Ghost Downloader v{} launched (headless, {} frame(s), config={}, data={}, tasks={}, resumed={})",
                     VERSION,
                     summary.frames,
                     if summary.config_created {
@@ -450,6 +487,8 @@ pub fn main_entry(args: Vec<String>) -> std::process::ExitCode {
                         "loaded"
                     },
                     summary.app_data_dir.display(),
+                    summary.tasks,
+                    summary.resumed,
                 );
             }
             ExitCode::SUCCESS
@@ -681,5 +720,79 @@ mod tests {
         };
         let summary = run(&cli).expect("无头启动应成功");
         assert_eq!(summary.frames, 0);
+    }
+
+    /// `tasks.jsonl` 的一行（其余字段走 serde 缺省）。
+    fn task_line(task_id: &str, status: &str) -> String {
+        format!(
+            r#"{{"name":"{task_id}.bin","url":"https://example.com/{task_id}","packId":"","taskId":"{task_id}","status":"{status}","fileSize":10}}"#
+        )
+    }
+
+    #[test]
+    fn parses_tasks_file_flag_in_both_forms() {
+        let cli = parse_args(args(&["--tasks-file", "/tmp/t.jsonl"])).expect("解析应成功");
+        assert_eq!(cli.tasks_file, Some(PathBuf::from("/tmp/t.jsonl")));
+        let cli = parse_args(args(&["--tasks-file=/tmp/t.jsonl"])).expect("解析应成功");
+        assert_eq!(cli.tasks_file, Some(PathBuf::from("/tmp/t.jsonl")));
+        assert!(parse_args(args(&["--tasks-file"])).is_err(), "缺取值应报错");
+    }
+
+    #[test]
+    fn tasks_path_defaults_to_app_data_dir() {
+        let dir = temp_dir("tasks-path");
+        let paths = Paths::with_app_data_dir(&dir);
+        assert_eq!(paths.tasks_path(), dir.join(TASKS_FILE));
+        assert_eq!(TASKS_FILE, "tasks.jsonl");
+    }
+
+    #[test]
+    fn headless_run_loads_tasks_from_app_data_dir() {
+        let dir = temp_dir("tasks");
+        let tasks_path = dir.join(TASKS_FILE);
+        let body = [
+            task_line("a", "WAITING"),
+            task_line("b", "RUNNING"),
+            task_line("c", "COMPLETED"),
+            "{bad json".to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(&tasks_path, body.as_bytes()).expect("写任务文件");
+        let before = std::fs::read(&tasks_path).expect("读回");
+
+        let cli = Cli {
+            headless: true,
+            frames: Some(1),
+            data_dir: Some(dir.clone()),
+            ..Cli::default()
+        };
+        let summary = run(&cli).expect("无头启动应成功");
+        assert_eq!(summary.tasks, 3, "坏行不算任务");
+        assert_eq!(summary.task_load_failures, 1, "坏行只计数");
+        assert_eq!(summary.resumed, 2, "WAITING + RUNNING 重新入队");
+        assert_eq!(
+            std::fs::read(&tasks_path).expect("读回"),
+            before,
+            "启动不回写 tasks.jsonl（Python 只在改动后 flush）"
+        );
+    }
+
+    #[test]
+    fn tasks_file_override_wins_over_app_data_dir() {
+        let dir = temp_dir("tasks-override");
+        let tasks_path = dir.join("elsewhere.jsonl");
+        std::fs::write(&tasks_path, (task_line("x", "WAITING") + "\n").as_bytes())
+            .expect("写任务文件");
+        let cli = Cli {
+            headless: true,
+            frames: Some(0),
+            data_dir: Some(dir.join("data")),
+            tasks_file: Some(tasks_path),
+            ..Cli::default()
+        };
+        let summary = run(&cli).expect("无头启动应成功");
+        assert_eq!(summary.tasks, 1);
+        assert_eq!(summary.resumed, 1);
     }
 }
