@@ -176,6 +176,28 @@ impl SettingsWriter {
         self.store.borrow().get(attr)
     }
 
+    /// 按**名字**写一项（UI 的每个 typed 动作都走同一条 [`ConfigStore::set`] 路）。
+    ///
+    /// 给 `boot` 的 `--set ATTR=VALUE`（以及将来任何按名驱动的宿主）用：属性名不在
+    /// [`gd3_core::settings::SPECS`] 里时进 [`Self::take_failures`]（Python 侧走属性
+    /// 访问，编译期就不可能拼错，所以这条只用来挡住 Rust 侧的字面量）。
+    ///
+    /// 返回 `Some` 表示确实整文件回写过（同一次改动也会进 [`Self::take_changes`]）；
+    /// `None` = Python 的提前返回（`if item.value == value: return`）或写盘失败。
+    pub fn set_named(&self, attr: &str, value: &Value) -> Option<ConfigChange> {
+        match self.store.borrow_mut().set(attr, value) {
+            Ok(Some(change)) => {
+                self.changes.borrow_mut().push(change.clone());
+                Some(change)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.failures.borrow_mut().push(error);
+                None
+            }
+        }
+    }
+
     /// 取走并清空「已落盘的改动」。
     pub fn take_changes(&self) -> Vec<ConfigChange> {
         std::mem::take(&mut *self.changes.borrow_mut())

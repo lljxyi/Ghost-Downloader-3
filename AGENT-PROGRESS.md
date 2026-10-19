@@ -9249,3 +9249,30 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
   验收 + Python 侧读回（`SettingsWriter` 已经在第 117 步接过 cfg 回写，这一步补
   验收与差异记录）。
 - 卡点：无
+
+## 第 129 步：Phase 8c —— `UserConfig.json` Python ↔ Rust 往返验收 + `--set` 开关（2026-10-19 18:08）
+
+`SettingsWriter`/`ConfigStore` 在第 117 步就接过了 cfg 回写，但「逐字节一致」一直没被
+**真 Python 写的文件**验过。这一步补验收，并给自动化加一个按名写配置的开关。
+
+- 做了什么：
+  - `settings_writer.rs`：新增 `set_named(&self, attr: &str, value: &Value)` —— UI 的每个
+    typed 动作其实都是同一件事（`ConfigStore::set` → 整文件回写），这个入口按名字走，
+    未知属性名进 `take_failures()`；
+  - `boot.rs`：新增 `--set ATTR=VALUE`（可重复，`--set=A=B` 也支持）。取值先按 JSON 解析
+    （`5` / `true` / `[1,2]` / `"文本"`），失败就当裸字符串（路径、`auto` 这类枚举）。
+    应用点在 `writer.adopt(engine.config())` **之后**（用户显式设置优先于引擎首次生成的
+    令牌），写完把新值推给引擎 + `refresh_services()`（引擎持的是克隆）。
+- 验证：
+  - `cargo test -p gd3-ui --lib`：**1164 passed / 0 failed**（第 127 步 1159 + 5）；
+  - 新增 `tests/test_config_roundtrip.py`：**4 passed** —— 用 `qconfig.load`/`qconfig.save`
+    真写出配置 → `gd3-ui --headless --frames 0` 读→写回 → **逐字节一致**；
+    `--set maxTaskNum=7` 之后**只有那一行变**（`"MaxTaskNum": 3,` → `7,`）；
+    `qconfig.load` 读回 7 且 `browserExtensionPairToken`/`downloadFolder` 一字未动；
+    裸字符串与 JSON 布尔的取值口径各一条。
+- 过程中的实证结论（值得记下）：
+  - Python 写的文件被 Rust 原样写回，**缩进 / 键序 / 空数组形态全都一致**；
+  - 唯一的自动差异是 `Browser`/`BrowserExtensionPairToken` 为空时被生成一个 —— 那是
+    `browser_service.py:189-190` 的行为（第 118 步已对齐），不是格式漂移。
+- 下一步：第 130 步 —— Phase 8f（托盘 / Dock 降级 + 平台 API 方案记录）与 8g 收口。
+- 卡点：无

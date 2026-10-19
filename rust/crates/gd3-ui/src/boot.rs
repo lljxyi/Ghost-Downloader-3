@@ -68,6 +68,7 @@ use std::time::Duration;
 use gd3_core::config::UserConfig;
 use gd3_core::settings;
 use gd3_core::task::TaskStatus;
+use serde_json::Value;
 // `window()`/`run()` 来自 `ComponentHandle`，不在 prelude 里。
 use slint::ComponentHandle;
 
@@ -234,6 +235,9 @@ pub struct Cli {
     pub until_idle: bool,
     /// `--until-idle` 的上限秒数（缺省 [`IDLE_TIMEOUT`]）。
     pub idle_timeout: Option<u64>,
+    /// `--set ATTR=VALUE`（可重复）：按 [`settings::SPECS`] 的属性名写一项配置。
+    /// 原始形态存在这里（解析期只校验 `ATTR=VALUE` 的形状，取值到写盘时才解析）。
+    pub sets: Vec<String>,
     pub help: bool,
     pub version: bool,
     /// 位置参数里识别出的 URL / 文件 URI（`application.py::urisFromArgv`）。
@@ -255,6 +259,8 @@ Ghost Downloader (Rust/Slint)
   --tasks-file <PATH>  覆盖任务列表文件（测试用，Python 侧无此参数）
   --until-idle         跑到没有任务在跑再退出（隐含无头；真下载，冒烟用）
   --idle-timeout <SEC> --until-idle 的上限秒数（缺省 300）
+  --set ATTR=VALUE     写一项配置（可重复；取值先按 JSON 解析，失败即裸字符串；
+                       属性名见 settings::SPECS，如 --set maxTaskNum=5）
   -V, --version        打印版本
   -h, --help           打印本帮助
 ";
@@ -340,6 +346,11 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
                 cli.tasks_file = Some(PathBuf::from(value));
             }
             "--until-idle" => cli.until_idle = true,
+            "--set" => {
+                index += 1;
+                let value = args.get(index).ok_or("--set 缺少取值")?;
+                cli.sets.push(parse_set_pair(value)?);
+            }
             "--idle-timeout" => {
                 index += 1;
                 let value = args.get(index).ok_or("--idle-timeout 缺少取值")?;
@@ -356,6 +367,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
             }
             other if other.starts_with("--idle-timeout=") => {
                 cli.idle_timeout = Some(parse_idle_timeout(&other["--idle-timeout=".len()..])?);
+            }
+            other if other.starts_with("--set=") => {
+                cli.sets.push(parse_set_pair(&other["--set=".len()..])?);
             }
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("未知参数：{other}"));
@@ -383,6 +397,24 @@ fn parse_idle_timeout(value: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
         .map_err(|_| format!("--idle-timeout 需要非负整数，收到：{value}"))
+}
+
+/// `--set ATTR=VALUE`：这里只校验形状（`ATTR` 非空且有 `=`），取值留给
+/// [`parse_set_value`]。
+fn parse_set_pair(value: &str) -> Result<String, String> {
+    match value.split_once('=') {
+        Some((attr, _)) if !attr.trim().is_empty() => Ok(value.to_string()),
+        _ => Err(format!("--set 需要 ATTR=VALUE 形态，收到：{value}")),
+    }
+}
+
+/// `--set` 的取值：先当 JSON 解析（`5` / `true` / `"文本"` / `[]`），失败就当裸
+/// 字符串（路径、`auto` 这类枚举字面量）。
+///
+/// 与 Python 侧口径一致：`cfg.set` 收到什么类型就是什么类型，字符串在 JSON 里要带
+/// 引号，裸写也当字符串。
+fn parse_set_value(raw: &str) -> Value {
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +590,35 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         }
     });
 
+    // `--set ATTR=VALUE`：与设置页走**同一条**写盘路径（`SettingsWriter` →
+    // `ConfigStore::set` → 整文件回写）。写完再把新值推给引擎 —— 引擎持的是克隆，
+    // 不显式同步就只有 UI 变了（同 `set_drain_handler` 里的口径）。
+    //
+    // 顺序在 `writer.adopt` 之后：`adopt` 要把引擎首次生成的
+    // `browserExtensionPairToken` 落盘，用户显式 `--set` 的优先级更高。
+    for raw in &cli.sets {
+        let (attr, value) = raw
+            .split_once('=')
+            .expect("parse_args 已经校验过 --set 的形状");
+        writer.set_named(attr.trim(), &parse_set_value(value.trim()));
+    }
+    if !cli.sets.is_empty() {
+        let failures = writer.take_failures();
+        if !failures.is_empty() {
+            return Err(format!(
+                "--set 写盘失败：{}",
+                failures
+                    .iter()
+                    .map(|failure| failure.to_string())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+        let mut engine = engine.borrow_mut();
+        *engine.config_mut() = writer.config();
+        engine.refresh_services();
+    }
+
     // 窗口先建：`Runtime` 要拿它装 tick 定时器。两条驱动路径（无头手动推 / 有头
     // 事件循环）除驱动方式外完全一样，所以装配只写一次。
     let window = if headless {
@@ -720,6 +781,8 @@ pub fn main_entry(args: Vec<String>) -> std::process::ExitCode {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use serde_json::json;
 
     fn temp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -1066,6 +1129,89 @@ mod tests {
         assert!(lines[0].contains("\"PAUSED\""), "{text}");
         assert!(lines[1].contains("\"PAUSED\""), "{text}");
         assert!(lines[2].contains("\"COMPLETED\""), "{text}");
+    }
+
+    #[test]
+    fn parses_set_flags_in_both_forms() {
+        let cli = parse_args(args(&[
+            "--set",
+            "maxTaskNum=5",
+            "--set=downloadFolder=/tmp/dl",
+        ]))
+        .expect("解析应成功");
+        assert_eq!(
+            cli.sets,
+            vec![
+                "maxTaskNum=5".to_string(),
+                "downloadFolder=/tmp/dl".to_string()
+            ]
+        );
+        assert!(Cli::default().sets.is_empty());
+    }
+
+    #[test]
+    fn rejects_a_set_flag_without_an_equals_sign() {
+        let err = parse_args(args(&["--set", "maxTaskNum"])).expect_err("应报错");
+        assert!(err.contains("ATTR=VALUE"), "{err}");
+        assert!(parse_args(args(&["--set", "=5"])).is_err(), "属性名不能空");
+        assert!(parse_args(args(&["--set"])).is_err(), "缺取值");
+        assert!(parse_args(args(&["--set="])).is_err());
+    }
+
+    #[test]
+    fn set_values_take_json_when_they_look_like_json() {
+        assert_eq!(parse_set_value("5"), json!(5));
+        assert_eq!(parse_set_value("true"), json!(true));
+        assert_eq!(parse_set_value("[1, 2]"), json!([1, 2]));
+        assert_eq!(parse_set_value("\"text\""), json!("text"));
+        // 裸写就是字符串（路径里不可能带引号）。
+        assert_eq!(parse_set_value("/tmp/a b"), json!("/tmp/a b"));
+        assert_eq!(parse_set_value("auto"), json!("auto"));
+    }
+
+    #[test]
+    fn headless_run_applies_set_to_the_config_file() {
+        let dir = temp_dir("set");
+        let cli = Cli {
+            headless: true,
+            frames: Some(0),
+            data_dir: Some(dir.clone()),
+            sets: vec![
+                "maxTaskNum=5".to_string(),
+                "clientProfile=chrome".to_string(),
+            ],
+            ..Cli::default()
+        };
+        let summary = ran(&cli);
+        assert!(summary.config_created, "首次启动会把配置写出来");
+
+        let written =
+            UserConfig::load(&dir.join(USER_CONFIG_FILE)).expect("--set 之后应当有配置文件");
+        assert_eq!(settings::read_i64(&written, "maxTaskNum"), Some(5));
+        assert_eq!(
+            settings::read_text(&written, "clientProfile").as_deref(),
+            Some("chrome")
+        );
+        // 没动过的项保持缺省。
+        assert_eq!(
+            settings::read_i64(&written, "preBlockNum"),
+            settings::read_i64(&settings::default_config(), "preBlockNum")
+        );
+    }
+
+    #[test]
+    fn an_unknown_set_attribute_fails_the_run() {
+        let dir = temp_dir("set-unknown");
+        let cli = Cli {
+            headless: true,
+            frames: Some(0),
+            data_dir: Some(dir),
+            sets: vec!["noSuchAttribute=1".to_string()],
+            ..Cli::default()
+        };
+        let err = run(&cli).expect_err("未知属性名要报错");
+        assert!(err.contains("--set 写盘失败"), "{err}");
+        assert!(err.contains("noSuchAttribute"), "{err}");
     }
 
     #[test]
