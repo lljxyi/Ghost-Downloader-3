@@ -7696,3 +7696,110 @@ str(PurePosixPath("/a/b/../c"))          # '/a/c'      —— posix_normpath 的
    第 109/110/111 步的三个模块已经把它们的逻辑全搬完，桩本身只剩接线；
 2. Phase 7 P0：`main_window.py`(753) + `cards/task_cards.py`(569) +
    `dialogs/task_drawer.py`(523)。
+
+## 第 112 步：`Engine` 的两个零大小桩收敛（`BrowserService` / `Aria2RpcService`）
+
+时间：2026-10-19 04:00（lib 测试）/ 04:24（clippy）
+
+第 109/110/111 步把 `aria2_rpc.py` 与 `browser_service.py` 的逻辑搬完了，但 `engine.rs`
+里 `BrowserService`(:177) / `Aria2RpcService`(:188) 还是两个零大小桩。本步把它们收敛成
+「只剩接线」的薄结构——**一行逻辑都不复制**，全部转调已有的三个模块。
+
+### 先确认边界
+
+`grep -rn '\.browser()\|\.aria2()\|BrowserService\|Aria2RpcService' crates/` 除 `engine.rs`
+只命中注释 → 桩可以自由改形，没有外部调用者。
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `browser_service.py` 帧层 | `gd3-servers::websocket` | Phase 5/6 |
+| `browser_service.py` 载荷层 | `gd3-ui::browser_payload` | 第 110 步 |
+| `browser_service.py` 会话状态机 | `gd3-ui::browser_session`（`BrowserHub`） | 第 111 步 |
+| `aria2_rpc.py` 协议层 | `gd3-servers::aria2` | 第 109 步 |
+| `aria2_rpc.py` 应用层 | `gd3-ui::aria2_actions` | 第 109 步 |
+| **装配 + 配置快照** | **`gd3-ui::engine`** | **本步** |
+
+### 做了什么
+
+- `BrowserService`：从 `#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]` 零大小
+  改成 `{ hub: BrowserHub }` + `derive(Debug, Clone)`（`BrowserHub` 只有 `Debug, Clone`）。
+  `new(config: &mut UserConfig, settings: &EngineConfig)` / `hub()` / `hub_mut()` /
+  `token()` / `apply_config(...)`。
+- `Aria2RpcService`：从零大小改成 `{ should_draft_taken_download: bool }`（`Copy` 仍成立），
+  `new(flag)` / getter / setter / `apply_task_options(features, presets, request)`。
+- 五个模块级助手：`browser_token` / `payload_defaults` / `should_draft_taken_download` /
+  `presets_of` / `store_name_conflict_choice`。
+- `Engine` 八个新方法：`browser_mut` / `handle_browser_message` / `browser_connected` /
+  `browser_disconnected` / `browser_tasks_changed` / `regenerate_browser_token` /
+  `apply_aria2_request` / `refresh_services`。
+- `Engine::new`：`let config = config.clone()` → `let mut config`（令牌要写回）；
+  `BrowserService::new(&mut config, &settings)`；`Aria2RpcService::new(should_draft_taken_download(&config))`。
+- 模块头那条「`browserService` / `aria2RpcService` 仍是桩」改写成现状（解析器链仍是空的，
+  所以两条入口在没有 pack 时都只会得到 `ParseFailed`）。
+- `rust/README.md` 新增 `## 服务装配（Engine 的 BrowserService / Aria2RpcService）` 一节。
+
+### 六条结构决策
+
+1. **构造期副作用照搬**：`browser_service.py:189-190` 的
+   `if not cfg.browserExtensionPairToken.value: cfg.set(..., token_urlsafe(16))` 是
+   `__init__` 里唯一的写操作、**不在任何消息路径上**，所以 `new` 收 `&mut UserConfig`，
+   空令牌就地生成并写回。`token_urlsafe(16)` = 16 字节 → 22 字符，
+   `gd3_core::pair_token::generate()` 同口径（第 111 步已核）。**落盘归 Phase 8**：
+   只改内存克隆，传进来的 `UserConfig` 不动（测试钉住了这一点）。
+2. **`Aria2RpcService` 只留一项状态**：`_onTaskParsed` 里除
+   `cfg.shouldDraftTakenDownload.value` 之外没有别的服务状态。
+3. **`Engine` 提供两个「借用合成」入口**：`handle_browser_message` 一次调用内同时借
+   `features` / `tasks` / `browser` 三个**不同字段**，装好 `SessionContext` 交给
+   `BrowserHub::handle_message`，效果队列交出去后借用结束——形态同 `task_actions`。
+4. **`delete_recoverably` 接真实现**（上一轮遗留的待决项）：`xdg_data_home` 取
+   `crate::boot::generic_data_location()`（`$XDG_DATA_HOME` 或 `~/.local/share`），
+   uid 取 `gd3_core::trash::current_uid()`（`trash.rs:201`，已是 `pub`）。**不退化成
+   `|_| false`**。
+5. **`apply_aria2_request` 现读 `shouldDraftTakenDownload`**：Python 在 `_onTaskParsed`
+   （`aria2_rpc.py:220`）里每次现读 `cfg`，所以设置页改完立刻生效。
+   `Aria2RpcService` 自己那份快照是给「没有 `Engine` 的宿主」用的，靠
+   `refresh_services()` 同步——两条路径都在测试里钉住。
+6. **配置变更靠显式 `refresh_services()`**：Python 每处现读 `cfg`，Rust 侧 `BrowserHub`
+   持快照（`token` / `defaults` / `should_draft` / `max_task_num`）。
+   `refresh_services()` 重取这四项 + `Aria2RpcService` 的开关，**不动监听器**。
+
+### 与 Python 的已知差异
+
+- **11 个信号连线不存在**：`taskAdded` / … / `speedChanged` 在 Python 里接
+  `_onTasksChanged`；Rust 侧由宿主在任务变化时直接调 `Engine::browser_tasks_changed()`
+  （`QTimer.singleShot(0, ...)` 的延迟合并已在第 111 步拆成
+  `note_tasks_changed` / `send_snapshots` 两步）。
+- **`cfg.set` 的落盘**：见决策 1。
+- **`loadCrx`（crx 解包）与 `fileWatcher` 仍归宿主**：`zip` crate 不在离线缓存里。
+
+### 九条新单测
+
+`engine.rs` 现 **1566 行 / 26 单测**（17 + 9）。
+
+| 测试 | 钉住什么 |
+|---|---|
+| `browser_service_generates_a_pair_token_on_construction` | 空令牌 → 22 字符 + 写回引擎那份 cfg + 不动入参克隆 |
+| `an_existing_pair_token_is_kept` | 非空令牌不重生成 |
+| `payload_defaults_read_the_three_config_items` | `downloadFolder` / `preBlockNum` / `currentHeaders()` |
+| `a_browser_hello_reaches_the_hub_with_the_engine_token` | 端到端：`ConnectionChanged` + `Send` + 认证置位 + `store` 不触发热更 |
+| `a_browser_hello_with_a_stale_token_is_closed` | 令牌不符 → 末尾 `Close`，`is_authenticated` 仍 `false` |
+| `regenerating_the_browser_token_writes_back_to_the_config` | 新令牌 ≠ 旧令牌、22 字符、hub 与 cfg 同步 |
+| `an_aria2_request_without_parsers_reports_a_parse_failure` | 空解析器链 → `Aria2Effect::ParseFailed`（不是 `AddTask`） |
+| `refresh_services_reloads_the_aria2_draft_flag` | 快照未刷新时仍是旧值，`refresh_services()` 之后才变 |
+| `the_store_choice_mirrors_the_config_choice` | `gd3_ui` 与 `gd3_core` 两份 `NameConflictChoice` 的转换（含非法值收敛） |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --lib`：**21.27s**，首轮零编译错；
+- `cargo test -p gd3-ui --lib`：**917 passed / 0 failed**（908 + 9），编译 ~10 分钟
+  （03:50→04:00）；
+- - `cargo test --workspace`：**1426 passed / 0 failed**（28 段，1417 + 9），编译+跑 04:01→04:18；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（4m02s，零告警一次通过）；
+- Python 侧没改一行。
+
+### 下一步（第 113 步）
+
+回 Phase 7 **P0 主线**：`windows/main_window.py`(753) + `cards/task_cards.py`(569) +
+`dialogs/task_drawer.py`(523)，约 1850 行。先读 Python 源确认主窗口的模型装配
+（任务列表 / 分类树 / 排序过滤）与三处 Qt 信号的 Rust 对应物，再决定拆成几个模块。
