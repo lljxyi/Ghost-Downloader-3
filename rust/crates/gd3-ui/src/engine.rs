@@ -60,12 +60,16 @@
 //! - `TaskStore.flush()` 没有脏标记（每次都整文件重写），Rust 的 `flush()` 有
 //!   `pending_flush` 短路：停机时若一个 `RUNNING`/`WAITING` 任务都没有，
 //!   `tasks.jsonl` 不会被重新写一遍（字节内容等价，只是少了这次写盘）；
-//! - `featureService` / `browserService` / `aria2RpcService` 仍是桩：装配点保留，
-//!   行为没有。三者共用一条 `parse` 端口（`featureService.parse` 被
-//!   `browser_service.py:496` 与 `aria2_rpc.py:218` 各调一次），而它的默认实现是
-//!   **Python 插件**（`features/` 下 `FeaturePack` 子类的 `pack.parsers` /
-//!   `pack.pages()` / `pack.config` / `taskCardClass`），Rust 无法加载；
-//!   `gd3-core::loader`（第 87 步）只搬了「按依赖排序 manifest 列表」；
+//! - `featureService` 的**解析器链**已搬（第 108 步，`crate::feature_service`）：
+//!   `register` 的稳定排序、`parse` 的身份预设前置、`match` / `matchPassive`、
+//!   `No parser matched: <url>` 都在；**pack 本身搬不了**——`loadPacks` 要
+//!   `importlib` 加载 `features/` 下的 Python 子类，`pack.parsers` /
+//!   `pack.pages()` / `pack.config` / `taskCardClass` 全是 Python 对象。
+//!   `gd3-core::loader`（第 87 步）只搬了「按依赖排序 manifest 列表」。
+//!   所以 `activate()` / `deactivate()` 在无 pack 时是空转（Python 同）；
+//! - `browserService` / `aria2RpcService` 仍是桩：装配点保留，行为没有。
+//!   两者共用 `featureService.parse` 这条端口（`browser_service.py:496` 与
+//!   `aria2_rpc.py:218` 各调一次），所以它们能接上的前提是先有 pack；
 //!   `loadCrx` / `deleteRecoverably` / `fileWatcher` 同理；
 //! - `probeConflict` 已接线（第 96 步）：`TaskConflictActions::probe` 转调
 //!   [`TaskService::probe_conflict_by_id`]，即 `TaskStore.probeConflict` +
@@ -86,6 +90,7 @@ use gd3_core::config::UserConfig;
 use gd3_core::settings;
 
 pub use crate::category::CategoryService;
+pub use crate::feature_service::FeatureService;
 use crate::name_conflict::{
     ConflictActions, ConflictEvent, ConflictTask, DialogOutcome, NameConflictChoice,
     NameConflictQueue, ProbeTarget,
@@ -163,16 +168,8 @@ fn max_task_num(config: &UserConfig) -> usize {
 // 桩服务
 // ---------------------------------------------------------------------------
 
-/// `app/services/feature_service.py`（约 240 行）的桩：功能包装载、解析器链、
-/// `parse` 都未迁移。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FeatureService;
-
-impl FeatureService {
-    pub fn new() -> Self {
-        FeatureService
-    }
-}
+// `FeatureService` 不再是桩：真实现见 `crate::feature_service`（上面 `pub use`）。
+// `Engine::new` 的装配点、`Engine::start` / `Engine::stop` 的调用点都保留。
 
 /// `app/services/browser_service.py`（约 500 行）的桩：配对、WebSocket 帧、
 /// 建任务动作都未迁移。
@@ -515,6 +512,14 @@ impl Engine {
         &self.features
     }
 
+    /// 注册解析器的写入口（`FeatureService.register` 的落点）。
+    ///
+    /// Python 在 `load()` 里遍历 `loadPacks()` 的结果逐个 `register`；Rust 没有
+    /// pack 可加载，宿主（扩展安装流程 / 测试）直接往链里塞 [`TaskParser`]。
+    pub fn features_mut(&mut self) -> &mut FeatureService {
+        &mut self.features
+    }
+
     pub fn browser(&self) -> &BrowserService {
         &self.browser
     }
@@ -560,6 +565,8 @@ impl Engine {
         let resumed = self.tasks.resume_saved();
 
         self.trace.push("start:featureService.activate".to_string());
+        self.features.activate();
+
         self.trace.push("start:browserListener.start".to_string());
         self.browser_listener.start();
         self.trace.push("start:aria2Listener.start".to_string());
@@ -596,6 +603,7 @@ impl Engine {
 
         self.trace
             .push("stop:featureService.deactivate".to_string());
+        self.features.deactivate();
 
         self.trace.push("stop:flush#2".to_string());
         self.tasks.flush(&self.tasks_path)?;

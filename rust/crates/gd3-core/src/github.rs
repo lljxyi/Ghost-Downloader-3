@@ -9,6 +9,11 @@
 //! - `hostname` 是 lowercase、去掉端口与 userinfo 的 host；
 //! - `path` 不含 query / fragment；
 //! - scheme 必须是 `http` / `https` 且 host 非空才可能命中。
+//!
+//! URL 解析本身在 `crate::url`（第 108 步抽出：`http_pack` 与 `gd3-ui` 的
+//! 身份预设前置共用同一份 `urlparse` 子集）。
+
+use crate::url::parse_url;
 
 const GITHUB_HOSTS: [&str; 10] = [
     "api.github.com",
@@ -22,100 +27,6 @@ const GITHUB_HOSTS: [&str; 10] = [
     "raw.github.com",
     "release-assets.githubusercontent.com",
 ];
-
-/// 极简 `urlparse` 子集：`hostname` 与 lowercase 之后的 `path`。
-pub(crate) struct ParsedUrl {
-    pub(crate) scheme: String,
-    pub(crate) host: String,
-    pub(crate) path: String,
-}
-
-/// 与 Python `urlparse(url)` 在三个字段上等价的最小解析（`pub(crate)`：
-/// `http_pack` 的 `HttpParser.match` / `matchPassive` 复用它）。
-///
-/// 没有 `://` 的输入不会产生 host（Python 里这种输入的 `netloc` 为空）。
-pub(crate) fn parse_url(url: &str) -> ParsedUrl {
-    let colon = url.find(':');
-    let (scheme, rest) = match colon {
-        Some(idx) => {
-            let prefix = &url[..idx];
-            let valid = !prefix.is_empty()
-                && prefix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
-            if valid {
-                (prefix.to_ascii_lowercase(), &url[idx + 1..])
-            } else {
-                return ParsedUrl {
-                    scheme: String::new(),
-                    host: String::new(),
-                    path: url.to_ascii_lowercase(),
-                };
-            }
-        }
-        None => {
-            return ParsedUrl {
-                scheme: String::new(),
-                host: String::new(),
-                path: url.to_ascii_lowercase(),
-            };
-        }
-    };
-
-    let (host, path) = match rest.strip_prefix("//") {
-        Some(after) => {
-            let end = after.find(['/', '?', '#']).unwrap_or(after.len());
-            let authority = &after[..end];
-            let path = after[end..]
-                .split(['?', '#'])
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            (authority.to_string(), path)
-        }
-        None => {
-            let path = rest
-                .split(['?', '#'])
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            (String::new(), path)
-        }
-    };
-
-    ParsedUrl {
-        scheme,
-        host: hostname(&host),
-        path,
-    }
-}
-
-/// 对齐 Python `parsed.hostname`：去 userinfo、去端口、IPv6 去前后括号、lowercase。
-fn hostname(authority: &str) -> String {
-    let without_userinfo = match authority.rfind('@') {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    };
-    if let Some(stripped) = without_userinfo.strip_prefix('[') {
-        // IPv6：`[::1]:8080` → `::1`
-        return stripped
-            .split(']')
-            .next()
-            .unwrap_or(stripped)
-            .to_ascii_lowercase();
-    }
-    match without_userinfo.rfind(':') {
-        Some(idx)
-            if without_userinfo[idx + 1..]
-                .chars()
-                .all(|c| c.is_ascii_digit())
-                && !without_userinfo[idx + 1..].is_empty() =>
-        {
-            without_userinfo[..idx].to_ascii_lowercase()
-        }
-        _ => without_userinfo.to_ascii_lowercase(),
-    }
-}
 
 fn strip_www(host: &str) -> &str {
     host.strip_prefix("www.").unwrap_or(host)

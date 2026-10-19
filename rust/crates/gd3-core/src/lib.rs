@@ -28,6 +28,7 @@ pub mod store;
 pub mod task;
 pub mod task_error;
 pub mod trash;
+pub mod url;
 pub mod version;
 
 pub use checksum::{

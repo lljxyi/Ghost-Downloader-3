@@ -36,6 +36,7 @@ pub mod editors;
 pub mod engine;
 pub mod extension_install;
 pub mod facts;
+pub mod feature_service;
 pub mod file_select;
 pub mod filter;
 mod format;

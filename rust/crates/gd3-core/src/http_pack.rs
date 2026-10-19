@@ -5,10 +5,11 @@
 //! `matchPassive` 再要求 lowercase 之后的 path 以 `DOWNLOADABLE_EXTENSIONS` 里的
 //! 某个扩展名结尾。
 //!
-//! URL 解析复用 `github::parse_url` 的极简 `urlparse` 子集，语义对 Python 现状照抄
+//! URL 解析复用 `crate::url::parse_url` 的极简 `urlparse` 子集（第 108 步从
+//! `github.rs` 抽出），语义对 Python 现状照抄
 //! （没有 `://` 就没有 scheme；scheme 只认 ASCII 字母数字与 `+. -`）。
 
-use super::github::parse_url;
+use crate::url::parse_url;
 
 /// 镜像 `DOWNLOADABLE_EXTENSIONS`（`pack.py` 顶部的一份 frozenset，顺序无关紧要：
 /// `matchPassive` 只问「是否以其中之一结尾」）。

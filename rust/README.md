@@ -178,9 +178,10 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
   非法 IPv6 括号、Markdown 缺片段标记——都在注释里写明与 Python 的差异；
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
-**尚未做**：引擎里的各服务实现（`BrowserService` / `Aria2RpcService` / `FeatureService` /
-`RuntimeStatusService` 都还是桩，见下一节），托盘；`Ghost-Downloader-3.py`
-的入口仍走 Qt。二进制入口见下一节。
+**尚未做**：`BrowserService` / `Aria2RpcService` 两个服务（还是桩，见下一节）；
+托盘；`Ghost-Downloader-3.py` 的入口仍走 Qt。二进制入口见下一节。
+（`RuntimeStatusService` 第 102 步搬完、第 107 步删掉空壳桩；`FeatureService` 的
+解析器链第 108 步搬完，见「功能包内核」一节。）
 
 ## Phase 8：启动入口（`gd3-ui` 二进制）
 
@@ -464,14 +465,15 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
   `NameConflictQueue`（复用 `name_conflict.rs`）、`CategoryService` 的 `_load`、
   `RuntimeStatusService`（第 102 步的 `runtime_status.rs`，第 107 步删掉空壳桩改为
   `pub use`）；
-- **桩**：`FeatureService` / `BrowserService` / `Aria2RpcService` 只保留装配点。三者共用
-  一条 `parse` 端口（`featureService.parse` 被 `browser_service.py:496` 与
-  `aria2_rpc.py:218` 各调一次），而它的默认实现是 **Python 插件**——`features/` 下
-  `FeaturePack` 子类的 `pack.parsers` / `pack.pages()` / `pack.config` /
-  `taskCardClass`，Rust 无法加载；`gd3-core::loader`（第 87 步）只搬了「按依赖排序
-  manifest 列表」。监听器只保留后端开关（`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` ==
-  `"1"` → `RustBrowserListener`，否则 `PortListener`）与配置快照，套接字层在
-  `gd3-servers`；
+- **`FeatureService` 的解析器链是真的**（第 108 步，`feature_service.rs`）：`register`
+  的稳定序、`parse` 的身份预设前置、`match` / `matchPassive`、`No parser matched`
+  都在；`activate()` / `deactivate()` 在无 pack 时空转（Python 同）。**pack 本身搬不了**
+  ——见「功能包内核」一节的结构性 N/A 表；
+- **桩**：`BrowserService` / `Aria2RpcService` 只保留装配点。两者共用
+  `featureService.parse` 这条端口（`browser_service.py:496` 与 `aria2_rpc.py:218`
+  各调一次），所以它们能接上的前提是先有 pack。监听器只保留后端开关
+  （`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` == `"1"` → `RustBrowserListener`，否则
+  `PortListener`）与配置快照，套接字层在 `gd3-servers`；
 - **配置是快照**：Python 的 `cfg.*` 是活对象（`PortListener` 连 `valueChanged`），
   Rust 侧还没有响应式层，所以 `nameConflict` / `maxTaskNum` 每次用时现读（与 `lambda`
   同构），监听器端口在构造时取快照；
@@ -1225,6 +1227,37 @@ Python 的 `Engine.stop()` 里也有一发 `self.speedMeter.stop()`（`engine.py
 （删掉第 83 步那份弱化 `SpeedMeter` 与 2 条重复单测，补 `drain_speed_effects` 与 2 条
 引擎级测试）。
 
+## URL host 口径（`gd3-core::url`）
+
+「从 URL 里抠 host」在 Python 侧就是 `urlparse(url).hostname or ""`，散落三处：
+`feature_service.parse`（身份预设）、`http_pack`（加速站判断）、`github`（下载地址改写）。
+第 108 步把共用的解析抽成 `gd3-core::url`（179 行 / 4 单测）：
+
+```rust
+pub fn host_of(url: &str) -> String;                 // 唯一 pub 项
+pub(crate) struct ParsedUrl { scheme, host, path }
+pub(crate) fn parse_url(url: &str) -> ParsedUrl;
+```
+
+`ParsedUrl` / `parse_url` 保持 `pub(crate)`：它们带着「path 被 lowercase」这个降级
+（CPython 的 `urlsplit` 只 lowercase scheme 与 host），不该成为公共契约。
+
+`hostname` 的边界按 CPython `_hostinfo` 实测复刻，**不是**「看起来合理」的写法：
+
+| 输入 | `hostname` | 说明 |
+|---|---|---|
+| `https://host:notaport/x` | `host` | 端口在**第一个** `:` 处切掉，**不校验**端口是不是数字 |
+| `https://host:8080/x` | `host` | 同上 |
+| `https://[::1]:8080/x` | `::1` | IPv6 去掉方括号；没端口时也不带括号 |
+| `https://user:pw@host/x` | `host` | userinfo 在**最后一个** `@` 处切 |
+| `//host/x` | `host` | 无 scheme 也认 |
+| `mailto:a@b.com` | `""` | scheme 不在 `uses_netloc` 里 → 没有 host |
+| `ed2k://\|file\|x\|1\|h\|/` | `\|file\|x\|1\|h\|` | `_hostinfo` 不挑食，netloc 长什么样就返回什么样 |
+
+**旧实现（原来 `github.rs` 里那份）用 `rfind(':')` + `is_ascii_digit` 判断端口**：
+`https://host:notaport/x` 会得到 `host:notaport`，身份预设就漏命中。抽出来时一并修正；
+`host_of_mirrors_urlparse_hostname` 里 20 组期望值都是 CPython 实取，不是手推。
+
 ## 身份预设命中（`gd3-ui::identity`）
 
 `app/client.py::matchIdentityPreset(host)`（:83-94）是 `FeatureService.parse()` 的前置：
@@ -1246,8 +1279,59 @@ pub fn match_identity_preset<'a>(
 - `isEnabled` 为假整条跳过；空模式串只在 host 为空时命中（走 `elif host == pattern`）。
 
 `presets` 由调用方给（`cfg.identityPresets` 的现值），模块不持有配置快照——与
-`speed_meter::should_wait` 同一个口径。`host` 也由调用方从 URL 取
-（`urlparse(options.url).hostname`），本函数不做 URL 解析。
+`speed_meter::should_wait` 同一个口径。`host` 也由调用方从 URL 取：第 108 步之后用
+`gd3_core::url::host_of(url)`（即 `urlparse(url).hostname or ""`，见上一节），
+本函数不做 URL 解析。
+
+## 功能包内核（`gd3-ui::feature_service`）
+
+`app/services/feature_service.py`（约 240 行）里能搬的那部分：解析器链。597 行 / 15 单测。
+
+```rust
+pub trait TaskParser {
+    fn priority(&self) -> i64 { 100 }                 // pack.py:42
+    fn matches(&self, options: &Map<String, Value>) -> bool;
+    fn matches_passive(&self, options: &Map<String, Value>) -> bool { self.matches(options) }
+    fn parse(&mut self, options: &Map<String, Value>) -> Result<TaskRecord, TaskError>;
+}
+
+pub struct ParserChain { /* Vec<Box<dyn TaskParser>> */ }
+pub struct FeatureService { parsers: ParserChain }
+```
+
+四条口径：
+
+- **`register` 是稳定序**：插到第一个 `priority` 更大的解析器之前，等价于 Python
+  `self._parsers.sort(key=lambda p: p.priority)`（`feature_service.py:61`）的稳定排序，
+  但不必每次 O(n log n)；
+- **`parse` 先做身份预设再匹配**（:77-89）：`clientProfile` 为空时
+  `match_identity_preset(host_of(url))`，把预设里的 `clientProfile` / `userAgent` 填进
+  options。`apply_identity_preset` 就地改 `&mut Map`（Python 的 `replace` 造新对象，
+  但调用方拿到的本来就是副本，语义等价）；
+- **无匹配 → `NoParserMatched { url }`**，经 `to_task_error()` 落成
+  `TaskError::io("No parser matched: <url>")`，即 Python
+  `toTaskError(ValueError(...))` 的 `发生了意外错误：No parser matched: <url>`；
+- **`matches` / `matches_passive` 只塞 `{"url": url}`**：现有八个解析器的 `match` 只读
+  `options.url`（`features/*/pack.py` 实测），读配置留给调用方。
+
+`is_truthy` 完整镜像 Python 真值判定（`None` / `""` / `0` / `false` / 空容器为假），
+因为预设里的 `clientProfile` 既可能是 `""` 也可能是缺键。
+
+### 搬不了的部分（结构性 N/A，不是「还没做」）
+
+| Python | 为什么 N/A |
+|---|---|
+| `load()` / `loadPacks()` | 要 `importlib` 加载 `features/` 下的 Python 子类 |
+| `pack.parsers` / `pack.pages()` | 返回的是 Python 类对象 |
+| `pack.config.createRuntimeCard` / `fileAssociationToggle` | 造 Qt 卡片、连 Qt 信号 |
+| `pack.taskCardClass` / `draftCardClass` | 返回 Qt 卡片类 |
+| `register` 里的 `pack.parse = self.parse` 等注入 | 给 Python 对象打属性 |
+| `activate()` / `deactivate()` 的协程等待 | 没有 pack 就没有协程；两侧在无 pack 时都空转 |
+| `_registerAssociations` | 走 `app.platform.file_association`（Qt 信号） |
+
+`Engine::start()` / `Engine::stop()` 仍然调用 `activate()` / `deactivate()`
+（空转，但调用点在 `engine.py:23` / `:44` 的位置上），`Engine::features_mut()` 是宿主
+（扩展安装流程 / 测试）注册解析器的写入口。
 
 ## 剩余工作（Phase 8）
 
