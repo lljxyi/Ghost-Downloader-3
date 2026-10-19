@@ -180,7 +180,8 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
 **尚未做**：`config_store` 未接进 `boot::run`（接线条件见「配置落盘」一节末尾）；
-`loadCrx` 的 crx 解包与 `fileWatcher` 归宿主；`Ghost-Downloader-3.py` 的入口仍走 Qt。
+`loadCrx` 的 crx 解包与 `fileWatcher` 归宿主；`update_service` 未接（网络半边见
+「更新源纯逻辑层」一节）；`Ghost-Downloader-3.py` 的入口仍走 Qt。
 二进制入口见下一节。
 （`RuntimeStatusService` 第 102 步搬完、第 107 步删掉空壳桩；`FeatureService` 的
 解析器链第 108 步搬完；`BrowserService` / `Aria2RpcService` 第 112 步收敛，见「服务装配」
@@ -1878,6 +1879,144 @@ def set(self, item, value, save=True, copy=True):
 | `unknown_keys_on_disk_are_dropped_by_the_load` | 磁盘多出来的组/键在 load 时丢 |
 | `reload_picks_up_an_external_write` | `reload()` 重读外部改动 |
 | `py_eq_mirrors_python_equality` | `3 == 3.0` / `true == 1` / `"3" != 3` / dict 不看键序 |
+
+## 更新源纯逻辑层（`gd3-core::sources`）
+
+`app/sources.py`(295) 是「双源竞速」的唯一入口：`github` 与 `gitcode` 各一套端点，
+每个 `fetch*` 先用 `buildClient()` 起 HTTP，再在多个镜像之间
+`asyncio.gather(..., return_exceptions=True)`（全跑完取最优）或
+`asyncio.staggered.staggered_race(...)`（错开 `STAGGER_DELAY` 起跑，第一个成功者胜）。
+第 114 步只搬**不碰网络**的那半截，落成 `crates/gd3-core/src/sources.rs`（608 行 / 20 单测）。
+放 `gd3-core` 而不是 `gd3-ui`：它是纯逻辑（无网络、无 Qt），而下一步的
+`update_service` 在 `gd3-ui`，依赖方向天然正确。
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `Repo` / `nameOn` / `buildSources` | `Repo` / `name_on` / `build_sources` | 第 114 步 |
+| `SourceEndpoints` / `SOURCES` / `SOURCE_ORDER` / `STAGGER_DELAY` | 同名 `SourceEndpoints` / `SOURCES` / `SOURCE_ORDER` / `STAGGER_DELAY` | 第 114 步 |
+| `buildDownloadUrl` / `buildRawUrl` / `buildPypiUrl` | `build_download_url` / `build_raw_url` / `build_pypi_url` | 第 114 步 |
+| `fetchPypiFile` 的候选表 | `pypi_file_candidates` | 第 114 步 |
+| 六处 `raise TaskError("…")` | 六个构造函数 | 第 114 步 |
+| `fetchLatestRelease` 的挑选 | `newest_by_version` | 第 114 步 |
+| `staggered_race` 的挑选 | `first_success` | 第 114 步 |
+| `fetchPypiReleases` 的合并 | `merge_pypi_releases` | 第 114 步 |
+| `Release` / `ReleaseAsset` / `fromResponse` | `gd3-ui::release_info` | 第 68 步 |
+| `buildClient` / `fetchFile` / `resp.json()` | **未迁移** | 归宿主 |
+
+### 结构
+
+```rust
+pub struct SourceEndpoints { pub api, download, raw, raw_infix: &'static str }
+pub const SOURCES: [(&str, SourceEndpoints); 2];   // gitcode 在前（Python dict 的插入序）
+pub const SOURCE_ORDER: [&str; 2];                 // ["github", "gitcode"]
+pub const STAGGER_DELAY: f64;                      // 0.05
+pub fn endpoints(source: &str) -> Option<&'static SourceEndpoints>;
+
+pub struct Repo { pub name: String, pub mirrors: Vec<(String, String)> }
+impl Repo {
+    pub fn new(name: impl Into<String>, mirrors: Vec<(String, String)>) -> Self;
+    pub fn name_on(&self, source: &str) -> Option<&str>;
+    pub fn build_sources(&self) -> Vec<&'static str>;
+}
+pub fn app_repo() -> Repo;                         // update.py:9 的 APP_REPO
+
+pub const PYPI_MIRRORS: [(&str, &str); 2];
+pub const PYPI_FILES: &str;
+pub const PYPI_FILES_MIRROR: &str;
+pub fn build_download_url(repo: &Repo, tag: &str, asset: &str, source: &str) -> Option<String>;
+pub fn build_raw_url(repo: &Repo, branch: &str, path: &str, source: &str) -> Option<String>;
+pub fn build_pypi_url(package: &str, source: &str) -> String;
+pub fn pypi_file_candidates(url: &str) -> Vec<String>;
+
+// 六条失败文案：Python 直接 raise，这里摊成构造函数，宿主拿不到任何源时用它
+pub fn latest_release_failure(repo_name: &str) -> TaskError;
+pub fn json_failure(repo_name: &str, branch: &str, path: &str) -> TaskError;
+pub fn raw_file_failure(repo_name: &str, branch: &str, path: &str) -> TaskError;
+pub fn download_failure(repo_name: &str, tag: &str, asset: &str) -> TaskError;
+pub fn pypi_releases_failure(package: &str) -> TaskError;
+pub fn pypi_file_failure(url: &str) -> TaskError;
+
+// 三个聚合口径
+pub fn first_success<T, E>(completions: Vec<(usize, Result<T, E>)>) -> Option<(usize, T)>;
+pub fn newest_by_version<T, E>(
+    results: Vec<Result<T, E>>,
+    version_of: impl Fn(&T) -> &str,
+) -> Option<T>;
+pub fn merge_pypi_releases<E>(
+    results: Vec<Result<Map<String, Value>, E>>,
+) -> Option<Map<String, Value>>;
+```
+
+### 六条实证语义（2026-10-19 实读 `app/sources.py` + CPython 3.13 实测）
+
+1. **`SOURCES` 的插入序是 `gitcode` 在前**（`sources.py:38`），`SOURCE_ORDER` 才是
+   `("github", "gitcode")`（`:53`）。`buildSources()` 按 `SOURCE_ORDER` 过滤，所以尝试顺序
+   恒为 github → gitcode，与 dict 的书写顺序无关。Rust 侧两个常量各按各的顺序落地：
+   `SOURCES` 保 dict 序只为了让「表内容」能逐字对比。
+2. **`nameOn("github")` 恒返回 `self.name`**，不看 `mirrors["github"]`——`mirrors` 里放
+   `github` 键是死数据（`app/update.py:9` 的 `APP_REPO` 正是如此）。其它源走
+   `mirrors.get(source)`，缺键 → `None` → `buildSources()` 跳过该源。
+3. **`buildPypiUrl` 的未知源回退到 PyPI 官方**（`PYPI_MIRRORS.get(source, PYPI_MIRRORS["github"])`），
+   而 `buildDownloadUrl` / `buildRawUrl` 的未知源是 `KeyError`（`SOURCES[source]`）。
+   Rust 侧前者照抄回退，后者返回 `None`。
+4. **`staggered_race` 全失败时返回 `(None, None, exceptions)`，不抛**：实测
+   `[bad, bad]` → `(None, None, [RuntimeError, RuntimeError])`、`[]` → `(None, None, [])`。
+   `sources.py` 的 `if index is None: raise TaskError(...)` 就是这条路径。
+5. **`staggered_race` 的胜者不一定是下标最小的**：实测 `[slow, fast]`（`delay=0.01`）→
+   `('fast', 1, [CancelledError(), None])`——第一个协程还没失败、但已过 `delay` 秒时下一个
+   也会起跑，谁先完成谁赢；赢家那格是 `None`，**被取消的输家是 `CancelledError()`**。
+   所以 `first_success` 把「完成顺序」当入参，纯逻辑层不模拟时序。
+6. **`fetchPypiReleases` 的合并方向是反的**：`for result in reversed(succeeded): releases |= result`
+   ——先合并**后**到的源，再合并靠前的源，于是 `SOURCE_ORDER` 里靠前的 github 覆盖 gitcode；
+   键序按首次插入位置保留（实测 `['1.0', '2.0', '3.0']`，`2.0` 取 github 的值）。
+   `serde_json` 开了 `preserve_order`，`Map` 就是 `IndexMap`，口径一致。
+
+`gather` 那条路径（`fetchLatestRelease`，`:126-134`）是**严格大于**：
+`if parseVersion(result.version) > parseVersion(chosen.version)`，同版本取**先出现**者。
+`parse_version` 已在 `gd3-core::version`（去尾零、元组比较），`newest_by_version` 直接复用，
+用闭包取版本串——`Release` 不重复定义，两个 crate 都能调。
+
+### 与 Python 的已知差异
+
+- **未知源的 `KeyError` 退化成 `None`**：`buildDownloadUrl(repo, …, source="x")` 在 Python
+  抛 `KeyError("x")`，Rust 返回 `None`。调用方只可能从 `Repo::build_sources()` 取值，
+  两者不可达。
+- **`mirrors` 用 `Vec` 而不是 `Map`**：Python 的 dict 保插入序、重复键后者覆盖；
+  `name_on` 用 `iter().rev().find()` 复刻「后者覆盖」。用 `Map` 会静默丢掉重复键这条语义。
+- **`merge_pypi_releases` 的失败类型是泛型**：Python 的 `return_exceptions=True` 会把任意
+  `BaseException` 塞进结果表，Rust 侧只关心「是不是 `Err`」。
+- **`fetchLatestRelease` 的 `headers` 分叉没搬**：`source == "github"` 时加
+  `accept: application/vnd.github+json`，这属于 HTTP 层（`gd3-net`），不在本模块。
+- **网络与解包全归宿主**：`buildClient` / `fetchFile` / `resp.json()` / `staggered_race` 的
+  真调度都不在这里；`update_service` 接线时由宿主提供「候选表 + 完成顺序」，
+  纯逻辑层只回答「拿到这些结果之后选谁」。
+
+### 二十条新单测
+
+`crates/gd3-core/src/sources.rs` **608 行 / 20 单测**（`cargo test -p gd3-core --lib` 由 313 变 333）。
+
+| 测试 | 钉住什么 |
+|---|---|
+| `source_order_differs_from_the_dict_order` | `SOURCES[0]` 是 gitcode、`SOURCE_ORDER[0]` 是 github |
+| `the_endpoint_table_is_mirrored_verbatim` | 8 个端点字段逐字 + `STAGGER_DELAY == 0.05` |
+| `github_ignores_the_mirror_entry` | `mirrors["github"]` 是死数据 |
+| `a_missing_mirror_drops_the_source` | 缺镜像 → 该源被 `build_sources()` 跳过 |
+| `an_unknown_mirror_key_is_carried_but_never_tried` | `name_on("other")` 有值但不在 `SOURCE_ORDER` 里 |
+| `a_duplicate_mirror_key_keeps_the_last_value` | `Vec` 复刻 dict 的「后者覆盖」 |
+| `download_urls_match_the_python_strings` | 两源下载地址金值（`github` / `gitcode`） |
+| `raw_urls_match_the_python_strings` | 两源 raw 地址金值（含 `/-/git/raw/` 中缀） |
+| `an_unknown_source_has_no_endpoints` | 未知源 → `endpoints` / `build_*` 全 `None` |
+| `pypi_urls_fall_back_to_the_official_index` | 未知源回退 + gitcode 的 `/json/` 特例 |
+| `pypi_file_candidates_only_mirror_pythonhosted_urls` | 只有 `files.pythonhosted.org` 才加镜像候选 |
+| `the_app_repo_mirrors_update_py` | `APP_REPO` 的名字、单镜像、`build_sources()` |
+| `newest_by_version_skips_failures` | 跳过 `Err` 后取版本最大者 |
+| `newest_by_version_keeps_the_first_on_a_tie` | `v4.4.0` 与 `4.4` 同版本 → 取先出现者 |
+| `newest_by_version_returns_none_when_every_source_fails` | 全 `Err` / 空表 → `None` |
+| `first_success_returns_the_first_completion` | 先完成的下标 1 胜出，不是下标 0 |
+| `first_success_returns_none_when_every_source_fails` | 全 `Err` / 空表 → `None` |
+| `merge_pypi_releases_lets_the_earlier_source_win` | 靠前源覆盖 + 键序 `['1.0','2.0','3.0']` |
+| `merge_pypi_releases_returns_none_when_every_source_fails` | 全 `Err` → `None` |
+| `failure_messages_match_the_python_wording` | 六条 `TaskError` 的 `format()` 逐字 |
 
 ## 剩余工作（Phase 8）
 

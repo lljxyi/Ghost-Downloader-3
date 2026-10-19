@@ -24,6 +24,7 @@ pub mod placeholder;
 pub mod queue;
 pub mod run_at_login;
 pub mod settings;
+pub mod sources;
 pub mod store;
 pub mod task;
 pub mod task_error;

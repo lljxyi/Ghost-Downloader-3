@@ -7929,3 +7929,129 @@ def set(self, item, value, save=True, copy=True):
 `app/sources.py`(295) + `app/services/update_service.py`(335) 是 Phase 8 之外仅剩的两块
 整块未镜像逻辑。先做 `sources.py` 的纯逻辑半边（端点表 / URL 拼接 / 两个聚合口径 /
 六条失败文案），`update_service` 的网络与解包留到接线时。
+## 第 114 步：`gd3-core::sources`（更新源的纯逻辑层）
+
+时间：2026-10-19 05:00
+
+第 103 步的笔记里留了一条欠账：「暂缓 `update_service`，等 `sources` 端口成形」。
+`app/sources.py`(295) 与 `app/services/update_service.py`(335) 是 Phase 8 之外仅剩的
+两块整块未镜像逻辑。本步先做 `sources.py` 里**不碰网络**的那半截，落成
+`crates/gd3-core/src/sources.rs`（**608 行 / 20 单测**）+ `lib.rs:27` 一行。
+
+### 为什么放 `gd3-core` 而不是 `gd3-ui`
+
+它是纯逻辑：没有 HTTP、没有 Qt、没有 `Engine`。而下一步的 `update_service` 在
+`gd3-ui`，`gd3-ui → gd3-core` 的依赖方向天然正确。放 `gd3-ui` 会让
+「`sources` 依赖 `release_info`」变成同 crate 内的隐式耦合，反而不便单测。
+
+### 边界：搬什么、不搬什么
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `Repo` / `nameOn` / `buildSources` | `Repo` / `name_on` / `build_sources` | 本步 |
+| `SourceEndpoints` / `SOURCES` / `SOURCE_ORDER` / `STAGGER_DELAY` | 同名 | 本步 |
+| `buildDownloadUrl` / `buildRawUrl` / `buildPypiUrl` | 同名 snake_case | 本步 |
+| `fetchPypiFile` 的候选表 | `pypi_file_candidates` | 本步 |
+| 六处 `raise TaskError("…")` | 六个构造函数 | 本步 |
+| `fetchLatestRelease` 的挑选 | `newest_by_version` | 本步 |
+| `staggered_race` 的挑选 | `first_success` | 本步 |
+| `fetchPypiReleases` 的合并 | `merge_pypi_releases` | 本步 |
+| `Release` / `ReleaseAsset` / `fromResponse` | `gd3-ui::release_info` | 第 68 步（不重复定义） |
+| `buildClient` / `fetchFile` / `resp.json()` / 真调度 | **未迁移** | 归宿主（`update_service` 接线时） |
+
+### 六条实证语义（实读 `app/sources.py` + CPython 3.13 实测）
+
+1. **`SOURCES` 的插入序是 `gitcode` 在前**（`sources.py:38`），`SOURCE_ORDER` 才是
+   `("github", "gitcode")`（`:53`）。`buildSources()` 按 `SOURCE_ORDER` 过滤，所以尝试
+   顺序恒为 github → gitcode，与 dict 的书写顺序无关。Rust 侧两个常量各按各的顺序落地。
+2. **`nameOn("github")` 恒返回 `self.name`**，不看 `mirrors["github"]`——`mirrors` 里放
+   `github` 键是死数据（`app/update.py:9` 的 `APP_REPO` 正是如此）。其它源走
+   `mirrors.get(source)`，缺键 → `None` → `buildSources()` 跳过该源。
+3. **`buildPypiUrl` 的未知源回退到 PyPI 官方**（`PYPI_MIRRORS.get(source, PYPI_MIRRORS["github"])`），
+   而 `buildDownloadUrl` / `buildRawUrl` 的未知源是 `KeyError`（`SOURCES[source]`）。
+4. **`staggered_race` 全失败时返回 `(None, None, exceptions)`，不抛**：实测
+   `[bad, bad]` → `(None, None, [RuntimeError, RuntimeError])`、`[]` → `(None, None, [])`。
+5. **`staggered_race` 的胜者不一定是下标最小的**：实测 `[slow, fast]`（`delay=0.01`）→
+   `('fast', 1, [CancelledError(), None])`——第一个协程还没失败、但已过 `delay` 秒时下一个
+   也会起跑，谁先完成谁赢；赢家那格是 `None`，**被取消的输家是 `CancelledError()`**。
+6. **`fetchPypiReleases` 的合并方向是反的**：`for result in reversed(succeeded): releases |= result`
+   ——先合并后到的源，再合并靠前的源，于是 `SOURCE_ORDER` 里靠前的 github 覆盖 gitcode；
+   键序按首次插入位置保留（实测 `['1.0', '2.0', '3.0']`，`2.0` 取 github 的值）。
+
+`gather` 那条路径（`fetchLatestRelease`，`:126-134`）是**严格大于**：
+`if parseVersion(result.version) > parseVersion(chosen.version)`，同版本取先出现者。
+
+### 五条结构决策
+
+1. **`first_success` 把「完成顺序」当入参**：`staggered_race` 的胜者由时序决定，纯逻辑层
+   不模拟 `STAGGER_DELAY`。宿主拿到「按完成顺序排列的 `(下标, 结果)`」后交给它。
+2. **`Release` 不重复定义**：已在 `gd3-ui::release_info`（第 68 步）。`newest_by_version`
+   用闭包 `version_of` 取版本串，两个 crate 都能调，也顺带让测试能用轻量的
+   `(String, &'static str)` 代替整个 `Release`。
+3. **`mirrors` 用 `Vec` 而不是 `Map`**：Python 的 dict 保插入序、重复键后者覆盖；
+   `name_on` 用 `iter().rev().find()` 复刻「后者覆盖」。用 `Map` 会静默丢掉这条语义。
+4. **未知源的 `KeyError` 退化成 `None`**（`build_download_url` / `build_raw_url`），
+   `build_pypi_url` 按 Python 回退官方。调用方只可能从 `Repo::build_sources()` 取值，
+   两者不可达。
+5. **六条失败文案摊成构造函数**而不是 `impl From<…>`：Python 是六处独立的 `raise`，
+   参数组合各不相同（`repo/branch/path`、`repo/tag/asset`、`package`、`url`），
+   摊平后每个函数的入参就是占位符的入参，`format()` 口径由 `TaskError` 保证。
+
+### 与 Python 的已知差异
+
+- **`merge_pypi_releases` 的失败类型是泛型**：Python 的 `return_exceptions=True` 会把任意
+  `BaseException` 塞进结果表，Rust 侧只关心「是不是 `Err`」。
+- **`fetchLatestRelease` 的 `headers` 分叉没搬**：`source == "github"` 时加
+  `accept: application/vnd.github+json`，这属于 HTTP 层（`gd3-net`）。
+- **`fetchPypiFile` 的 `Range: bytes=0-0` 探针没搬**：同上，归宿主。
+
+### 二十条新单测
+
+`crates/gd3-core/src/sources.rs` **608 行 / 20 单测**（`-p gd3-core --lib` 由 313 变 333）。
+
+| 测试 | 钉住什么 |
+|---|---|
+| `source_order_differs_from_the_dict_order` | `SOURCES[0]` 是 gitcode、`SOURCE_ORDER[0]` 是 github |
+| `the_endpoint_table_is_mirrored_verbatim` | 8 个端点字段逐字 + `STAGGER_DELAY == 0.05` |
+| `github_ignores_the_mirror_entry` | `mirrors["github"]` 是死数据 |
+| `a_missing_mirror_drops_the_source` | 缺镜像 → 该源被 `build_sources()` 跳过 |
+| `an_unknown_mirror_key_is_carried_but_never_tried` | `name_on("other")` 有值但不在 `SOURCE_ORDER` 里 |
+| `a_duplicate_mirror_key_keeps_the_last_value` | `Vec` 复刻 dict 的「后者覆盖」 |
+| `download_urls_match_the_python_strings` | 两源下载地址金值 |
+| `raw_urls_match_the_python_strings` | 两源 raw 地址金值（含 `/-/git/raw/` 中缀） |
+| `an_unknown_source_has_no_endpoints` | 未知源 → `endpoints` / `build_*` 全 `None` |
+| `pypi_urls_fall_back_to_the_official_index` | 未知源回退 + gitcode 的 `/json/` 特例 |
+| `pypi_file_candidates_only_mirror_pythonhosted_urls` | 只有 `files.pythonhosted.org` 才加镜像候选 |
+| `the_app_repo_mirrors_update_py` | `APP_REPO` 的名字、单镜像、`build_sources()` |
+| `newest_by_version_skips_failures` | 跳过 `Err` 后取版本最大者 |
+| `newest_by_version_keeps_the_first_on_a_tie` | `v4.4.0` 与 `4.4` 同版本 → 取先出现者 |
+| `newest_by_version_returns_none_when_every_source_fails` | 全 `Err` / 空表 → `None` |
+| `first_success_returns_the_first_completion` | 先完成的下标 1 胜出，不是下标 0 |
+| `first_success_returns_none_when_every_source_fails` | 全 `Err` / 空表 → `None` |
+| `merge_pypi_releases_lets_the_earlier_source_win` | 靠前源覆盖 + 键序 `['1.0','2.0','3.0']` |
+| `merge_pypi_releases_returns_none_when_every_source_fails` | 全 `Err` → `None` |
+| `failure_messages_match_the_python_wording` | 六条 `TaskError` 的 `format()` 逐字 |
+
+### 编译期踩到的一个坑
+
+测试助手 `fn version_of(item: &(String, &'static str)) -> &str` 触发 `E0106`
+（missing lifetime specifier）：`&'static str` 出现在入参里之后，返回值的生命周期
+无法再靠 elision 推出来。改成显式 `<'a>(item: &'a (String, &'static str)) -> &'a str`
+即通过——与「测试辅助函数返回 `impl Fn` 且捕获引用时必须显式生命周期」是同一类问题。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-core --lib`：**6.84s**，首轮零编译错；
+- `cargo test -p gd3-core --lib sources`：**20 passed**（`/tmp/t114_src.log`）；
+- `cargo test -p gd3-core --lib`：**333 passed / 0 failed**（313 + 20，`/tmp/t114_core.log`）；
+- `cargo test --workspace`：**1461 passed / 0 failed**（28 段，1441 + 20，`/tmp/t114_ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（1m34s，`/tmp/c114.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 115 步）
+
+`app/services/update_service.py`(335)：`checkForUpdates` 的版本比较与资产挑选
+（`assetScore` / `bestAsset` 已在 `gd3-ui::release_info`）、下载进度与 `installArchive`
+的解包（`zip` / `xz2` 不在离线缓存里 → 解包归宿主）。先读源码确认「哪些是纯逻辑、
+哪些必须走网络」，再决定是否继续拆。
