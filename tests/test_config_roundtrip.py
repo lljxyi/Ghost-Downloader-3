@@ -6,12 +6,22 @@
 最后 Python 侧能读回新值。
 
 这条测试同时钉住「单一写者」口径：Rust 回写时**不能**顺手改别的字段（比如把
-`HistoryDownloadFolder` 重排、把空数组写成 `[]`、改缩进）。
+`HistoryDownloadFolder` 重排、把空数组写成 `[]`、改缩进），也**不能**丢掉它不认识的
+组 —— 第 130 步之前它确实丢过：`ConfigStore::rebuild` 照 `SPECS` 重建整份文件，
+把 feature pack 的组（`Bilibili` / `BitTorrent` / `ED2k` / `FFmpeg` / `FTP` /
+`GitHub` / `HuggingFace` / `M3U8` / `YtDlp`）整段删掉（真配置 163 行 → 66 行）。
+
+所以 fixture 会把 `features/*/config.py` 全导一遍（`PackConfig.__init_subclass__`
+把它们的 `ConfigItem` 挂到全局 `cfg` 上，`app/models/pack.py:62-71`），让写出的档
+**与真机一致**，并且**与测试执行顺序无关** —— 否则只有「别的测试先导入过某个 pack」
+时才会出现那些组（第 130 步就是这样在全量跑里红了）。
 """
 
 from __future__ import annotations
 
+import importlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,6 +31,18 @@ from app.config.cfg import cfg
 from app.platform.ui_backend import findRustUiBinary
 
 CONFIG_NAME = "UserConfig.json"
+ROOT = Path(__file__).parents[1]
+PACK_GROUPS = (
+    "Bilibili",
+    "BitTorrent",
+    "ED2k",
+    "FFmpeg",
+    "FTP",
+    "GitHub",
+    "HuggingFace",
+    "M3U8",
+    "YtDlp",
+)
 
 
 def rustBinary() -> Path:
@@ -39,7 +61,17 @@ def runRust(data_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
-def changed_lines(before: str, after: str) -> list[tuple[str, str]]:
+def loadPackConfigs() -> None:
+    """把 `features/*/config.py` 全导进来，让 `cfg` 里出现 feature pack 的组。
+
+    真机上这件事发生在 `app/startup.py:65-78`（`importPackConfigs` + `PackConfig.load`）；
+    测试里没有那条启动路径，所以要自己导，否则写出的档只有 9 个基础组。
+    """
+    for path in sorted((ROOT / "features").glob("*/config.py")):
+        importlib.import_module(f"features.{path.parent.name}.config")
+
+
+def changedLines(before: str, after: str) -> list[tuple[str, str]]:
     """逐行比（行数必须一样，否则说明整文件被重排了）。"""
     old = before.splitlines()
     new = after.splitlines()
@@ -50,6 +82,10 @@ def changed_lines(before: str, after: str) -> list[tuple[str, str]]:
 @pytest.fixture
 def python_written_config(tmp_path, qapp, monkeypatch):
     """用 Python 的写盘路径产出一份 `UserConfig.json`（不写进真实数据目录）。"""
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    loadPackConfigs()
+
     path = tmp_path / CONFIG_NAME
     qconfig.load(str(path), cfg)
     # 令牌非空：Rust 侧只在为空时才生成（`browser_service.py:190`），
@@ -62,6 +98,16 @@ def python_written_config(tmp_path, qapp, monkeypatch):
     return path
 
 
+def test_the_python_side_writes_the_pack_groups(python_written_config):
+    """先确认 fixture 自己没退化：写出的档里确实有 feature pack 的组。"""
+    import json
+
+    data = json.loads(python_written_config.read_text(encoding="utf-8"))
+
+    missing = [group for group in PACK_GROUPS if group not in data]
+    assert not missing, f"fixture 少了这些组：{missing}"
+
+
 def test_rust_rewrites_a_python_written_config_byte_for_byte(python_written_config):
     before = python_written_config.read_text(encoding="utf-8")
 
@@ -69,7 +115,7 @@ def test_rust_rewrites_a_python_written_config_byte_for_byte(python_written_conf
 
     assert completed.returncode == 0, completed.stderr
     after = python_written_config.read_text(encoding="utf-8")
-    assert after == before, changed_lines(before, after)
+    assert after == before, changedLines(before, after)
 
 
 def test_set_changes_exactly_one_line(python_written_config):
@@ -79,7 +125,23 @@ def test_set_changes_exactly_one_line(python_written_config):
 
     assert completed.returncode == 0, completed.stderr
     after = python_written_config.read_text(encoding="utf-8")
-    assert changed_lines(before, after) == [('        "MaxTaskNum": 3,', '        "MaxTaskNum": 7,')]
+    assert changedLines(before, after) == [('        "MaxTaskNum": 3,', '        "MaxTaskNum": 7,')]
+
+
+def test_rust_does_not_drop_the_pack_groups(python_written_config):
+    """`--set` 之后，它不认识的组要一字不动（第 130 步的回归点）。"""
+    import json
+
+    before = json.loads(python_written_config.read_text(encoding="utf-8"))
+
+    completed = runRust(python_written_config.parent, "--set", "maxTaskNum=7")
+
+    assert completed.returncode == 0, completed.stderr
+    after = json.loads(python_written_config.read_text(encoding="utf-8"))
+
+    assert list(after) == list(before), "组的顺序被改了"
+    for group in PACK_GROUPS:
+        assert after[group] == before[group], f"{group} 组被改了"
 
 
 def test_python_reads_the_value_rust_wrote_back(python_written_config):

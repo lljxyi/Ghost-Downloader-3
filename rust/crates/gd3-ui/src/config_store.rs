@@ -65,10 +65,15 @@
 //!   `cfg.set(cfg.themeColor, ...)` 都会落盘；Rust 存的是 `#aarrggbb` 串，同值会
 //!   提前返回。app 里没有 `cfg.set(cfg.themeColor, ...)`（主题色走
 //!   `setThemeColor(color, save=False)`，**不落盘**），这条差异不可达。
-//! - **磁盘上的未知键在 `load` 就丢**：Python 的 `QConfig.load` 只按 `item.key`
-//!   匹配已知项，`toDict()` 又只从类属性重建，所以多出来的组/键既读不进内存、
-//!   也不会被下次 `save()` 写回。Rust 侧 [`ConfigStore::load`] 直接归一化成
-//!   「42 项全量」，等价。
+//! - **未知组/键保留，不丢**（第 130 步改正）：`dir(Config)` 之外还有 feature pack
+//!   的项 —— `PackConfig.__init_subclass__`（`app/models/pack.py:62-71`）把每个
+//!   `ConfigItem` `setattr` 到**全局 `cfg.__class__`** 上，所以 `toDict()` 会连
+//!   `Bilibili` / `BitTorrent` / `ED2k` / `FFmpeg` / `FTP` / `GitHub` /
+//!   `HuggingFace` / `M3U8` 组一起写。Rust 侧没有这些 spec，[`rebuild`] 于是把
+//!   不认识的组与键**原样搬运**。这比「照 `SPECS` 重建」更保守：真配置实测 163 行，
+//!   重建只剩 66 行 —— 那等于把用户的 BT/ED2K/网盘配置整段删掉。
+//!   代价：连「谁都没注册过的野键」也会被带回去（Python 会在下次 `save()` 丢掉）。
+//!   单一写者场景下宁可留着，也不要静默删用户数据。
 //! - **没有全局单例**：Python 的 `qconfig` 是模块级实例，`load` 通过改
 //!   `_cfg`/`file` 把写入目标接到 app 的 `cfg` 上。Rust 侧 [`ConfigStore`] 自己
 //!   持有 `(config, path)`，不需要那层间接。
@@ -191,7 +196,7 @@ impl ConfigStore {
     ///
     /// - 文件不存在 → 保留缺省值，**不写盘**（Python 的 `load` 也不写）；
     /// - 内容不是合法 JSON / 组层级不是对象 → `io::ErrorKind::InvalidData`；
-    /// - 已知项按 `deserialize` + `correct` 收下，未知组/键丢掉。
+    /// - 已知项按 `deserialize` + `correct` 收下，未知组/键原样保留（见 [`rebuild`]）。
     pub fn load(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let loaded = match UserConfig::load(&path) {
@@ -273,7 +278,8 @@ impl ConfigStore {
     /// 整文件回写：`mkdir(parents=True, exist_ok=True)` + `json.dump(indent=4)`。
     ///
     /// 内容由 [`settings::SPECS`] 重建（同 Python 的 `toDict()` 遍历 `dir(class)`），
-    /// 所以磁盘上多出来的未知键**不会**被写回 —— 这是 Python 的行为。
+    /// 磁盘上多出来的未知组/键（feature pack 的配置）**原样带回去** —— 与
+    /// Python 一致（`PackConfig` 把它们的项挂到了全局 `cfg` 上）。
     pub fn save(&self) -> io::Result<()> {
         if let Some(parent) = self.path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -291,11 +297,48 @@ impl ConfigStore {
 }
 
 /// 把任意 `UserConfig` 归一化成「[`settings::SPECS`] 全量 + 落盘形态」。
+///
+/// ## 未知组 / 未知键必须原样保留
+///
+/// `UserConfig.json` 不止 42 项：`features/*/config.py` 的 `PackConfig` 子类在
+/// `__init_subclass__`（`app/models/pack.py:62-71`）里把每个 `ConfigItem` 挂到
+/// **全局 `cfg.__class__`** 上，因此 Python 的 `toDict()` 会把 feature pack 的
+/// 组（`Bilibili` / `BitTorrent` / `ED2k` / `FFmpeg` / `FTP` / `GitHub` /
+/// `HuggingFace` / `M3U8`）一起写进同一个文件。
+///
+/// Rust 侧没有这些 spec，所以只能**原样搬运**：组位置按源顺序、组内未知键附在
+/// 已知键之后。若照 `SPECS` 重建整份文件，Rust 作为单一写者回写一次就会把用户的
+/// BT / ED2K / B 站 / M3U8 / HF / GitHub / FTP / FFmpeg 配置整段抹掉
+/// （第 130 步实测：163 行的真配置被写成 66 行）。
 fn rebuild(source: &UserConfig) -> UserConfig {
-    let mut out = UserConfig::new();
+    let mut known = UserConfig::new();
     for spec in settings::SPECS {
         let logical = spec.read(source);
-        spec.write(&mut out, &logical);
+        spec.write(&mut known, &logical);
+    }
+
+    let mut out = UserConfig::new();
+    for (group, items) in source.groups.iter() {
+        let Some(known_items) = known.entries(group) else {
+            // 整个组都是 Rust 不认识的（feature pack）→ 原样带上。
+            out.groups.insert(group.clone(), items.clone());
+            continue;
+        };
+        let mut merged = known_items.clone();
+        if let Value::Object(source_items) = items {
+            for (key, value) in source_items {
+                if !merged.contains_key(key) {
+                    merged.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        out.groups.insert(group.clone(), Value::Object(merged));
+    }
+    // 源里没有的已知组（空文件 / 旧档缺键）按 `SPECS` 顺序补在末尾。
+    for (group, items) in known.groups.iter() {
+        if !out.groups.contains_key(group) {
+            out.groups.insert(group.clone(), items.clone());
+        }
     }
     out
 }
@@ -373,6 +416,44 @@ mod tests {
         assert_eq!(loaded.config(), &settings::default_config());
         assert!(!loaded.path().exists());
         assert_eq!(loaded.get("maxTaskNum"), Some(json!(3)));
+    }
+
+    /// 真配置不止 42 项：`features/*/config.py` 的 `PackConfig` 子类会把项挂到
+    /// 全局 `cfg.__class__` 上，所以 `UserConfig.json` 里有 Rust 不认识的组。
+    /// 第 130 步实测过：真配置 163 行，按 `SPECS` 重建后只剩 66 行。
+    #[test]
+    fn unknown_pack_groups_are_preserved_verbatim() {
+        let (_dir, store) = store("packs");
+        let mut on_disk = settings::default_config();
+        on_disk.groups.insert(
+            "BitTorrent".to_string(),
+            json!({
+                "EnableDHT": true,
+                "WebTrackerSources": ["https://trackerslist.com/best.txt"],
+                "StorageMode": "sparse",
+            }),
+        );
+        on_disk
+            .groups
+            .insert("ED2k".to_string(), json!({ "EnableKad": true }));
+        // 已知组里多出来的键同样不能丢（未来 Python 侧加项时就在这里）。
+        if let Some(items) = on_disk.groups.get_mut("GeneralDownload") {
+            items
+                .as_object_mut()
+                .expect("组是对象")
+                .insert("FutureKey".to_string(), json!(7));
+        }
+        std::fs::write(store.path(), on_disk.to_json_text()).expect("先写一份真配置");
+
+        let loaded = ConfigStore::load(store.path()).expect("load");
+        assert_eq!(loaded.config(), &on_disk, "未知组/键被丢掉了");
+        loaded.save().expect("整文件回写");
+
+        assert_eq!(
+            read(store.path()),
+            on_disk.to_json_text(),
+            "写回不是逐字节一致"
+        );
     }
 
     #[test]
@@ -526,17 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_on_disk_are_dropped_by_the_load() {
-        let (_dir, store) = store("drop-unknown");
+    fn unknown_keys_on_disk_survive_the_round_trip() {
+        // 第 130 步改正：旧实现照 `SPECS` 重建整份文件，未知键被丢掉；
+        // 但 Python 的 `toDict()` 里含 feature pack 挂到全局 `cfg` 上的项，
+        // 所以「未知」多半是**别的模块的合法配置**，删掉就是数据丢失。
+        let (_dir, store) = store("keep-unknown");
         let mut on_disk = settings::default_config();
         on_disk.set("GeneralDownload", "FutureKey", json!(1));
         std::fs::write(store.path(), on_disk.to_json_text()).expect("写一份带未知键的档");
 
         let loaded = ConfigStore::load(store.path()).expect("load");
-        // Python 的 `QConfig.load` 只按 `item.key` 匹配已知项，未知键进不了内存。
-        assert_eq!(loaded.config().get("GeneralDownload", "FutureKey"), None);
+        assert_eq!(
+            loaded.config().get("GeneralDownload", "FutureKey"),
+            Some(&json!(1))
+        );
         loaded.save().expect("save");
-        assert!(!read(store.path()).contains("FutureKey"));
+        assert!(read(store.path()).contains("FutureKey"), "未知键被删掉了");
+        assert_eq!(read(store.path()), on_disk.to_json_text(), "逐字节一致");
     }
 
     #[test]

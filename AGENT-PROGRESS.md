@@ -9276,3 +9276,48 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
     `browser_service.py:189-190` 的行为（第 118 步已对齐），不是格式漂移。
 - 下一步：第 130 步 —— Phase 8f（托盘 / Dock 降级 + 平台 API 方案记录）与 8g 收口。
 - 卡点：无
+
+## 第 130 步：Phase 8c 数据丢失修复 —— Rust 回写不再删掉 feature pack 的配置组（2026-10-19 21:39）
+
+跑 Phase 8 收口的质量门时，Python 全量里冒出一条**新增**失败：
+`tests/test_config_roundtrip.py::test_set_changes_exactly_one_line`（第 129 步自己写的）。
+单跑绿、全量红 —— 追下去发现是**真 bug，不是测试脆弱**。
+
+- 症状：`--set maxTaskNum=7` 之后 `UserConfig.json` 从 **163 行变 66 行**。
+- 根因：`ConfigStore::rebuild`（`gd3-ui/src/config_store.rs`）照 `settings::SPECS`
+  （42 项 / 9 个组）重建整份文件再落盘，**它不认识的组/键全丢**。
+  而真机上 `UserConfig.json` 远不止 42 项：`features/*/config.py` 的 `PackConfig`
+  子类在 `__init_subclass__`（`app/models/pack.py:62-71`）里把每个 `ConfigItem`
+  `setattr` 到**全局 `cfg.__class__`** 上，`toDict()` 于是连 `Bilibili` / `BitTorrent` /
+  `ED2k` / `FFmpeg` / `FTP` / `GitHub` / `HuggingFace` / `M3U8` / `YtDlp` 一起写盘。
+  也就是说：`GHOST_UI=slint` 下 Rust 作为单一写者，只要用户改任何一项设置（或 CLI `--set`），
+  **BT / ED2K / B 站 / 网盘 / GitHub 的配置会被整段静默删除**。
+- 为什么单跑绿：那些组只在「同进程里已经 import 过某个 pack」时才出现在 `cfg` 上；
+  单跑 `test_config_roundtrip.py` 时 `cfg` 只有 9 个基础组，于是「重建」看不出差别。
+- 做了什么：
+  - `config_store.rs::rebuild` 改为**保序合并**：源里的组按原位置输出，已知组用归一化值
+    + 源里多出来的键原样附在组尾，Rust 不认识的组整体原样带上；源里没有的已知组按
+    `SPECS` 顺序补在末尾。代价（写进模块头“与 Python 的已知差异”）：连「谁都没注册过的
+    野键」也会被带回去（Python 下次 `save()` 会丢掉）—— 单一写者场景下宁可留着，
+    也不要静默删用户数据。
+  - 旧单测 `unknown_keys_on_disk_are_dropped_by_the_load` 编码的正是这个错行为，
+    改名为 `unknown_keys_on_disk_survive_the_round_trip` 并反转断言；新增
+    `unknown_pack_groups_are_preserved_verbatim`（含「已知组里多出来的键」）。
+  - `tests/test_config_roundtrip.py`：fixture 现在显式 `importlib` 全导
+    `features/*/config.py`（= 真机 `app/startup.py:65-78` 的注册路径），
+    写出的档与真机一致（18 个组）且**与测试执行顺序无关**；新增两条断言：
+    fixture 自己写出 pack 组、`--set` 后这些组与组序一字不动。
+- 验证：
+  - `cargo test -p gd3-ui --lib`：**1165 passed**（1164 + 1 新回归测试，1 条旧测试改写）；
+  - `cargo fmt --all --check` OK；`cargo clippy --workspace --all-targets -- -D warnings` exit 0；
+  - `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`：**全绿**；
+  - `tests/test_config_roundtrip.py`：**6 passed**（含 18 组真配置的逐字节往返）；
+  - Python 全量：`3 failed, 1370 passed, 8 skipped, 35 errors`，与
+    `/root/baseline-failures.txt` 逐行 `comm` 比对 —— **新增 0、消失 0**。
+- 附带发现（写进 AGENT-DONE 的注意事项）：本机 `android/` 目录不存在（`.gitignore` 里，
+  且 `9c17647 refactor: remove Qt Android` 已删），`tests/test_android_pack_import.py`
+  在模块级读 `android/app/build.gradle.kts` → 收集期报错，**默认 pytest 会整轮中断**
+  （`Interrupted: 1 error during collection`），跑全量必须带
+  `--continue-on-collection-errors`（基线文件里第 25 行就是这个错，说明基线也是这么跑的）。
+- 下一步：第 131 步 —— Phase 8 收口：质量门汇总 + `AGENT-DONE`。
+- 卡点：无
