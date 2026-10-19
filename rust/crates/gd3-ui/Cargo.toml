@@ -8,9 +8,19 @@ license = "GPL-3.0"
 [dependencies]
 flate2.workspace = true
 gd3-core = { path = "../gd3-core" }
+gd3-net = { path = "../gd3-net" }
 regex.workspace = true
 serde_json.workspace = true
 slint = "1.18.1"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "time",
+    "io-util",
+    "sync",
+    "fs",
+] }
 uuid.workspace = true
 
 [build-dependencies]

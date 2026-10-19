@@ -168,7 +168,8 @@ fn port_attr(config: &UserConfig, attr: &str) -> u16 {
 }
 
 /// `cfg.maxTaskNum`（`RangeValidator(1, 10)`）。
-fn max_task_num(config: &UserConfig) -> usize {
+/// `cfg.maxTaskNum`（`_pump` 的并发上限）。`TaskRunner` 每轮 tick 现读。
+pub fn max_task_num(config: &UserConfig) -> usize {
     int_attr(config, "maxTaskNum").max(1) as usize
 }
 

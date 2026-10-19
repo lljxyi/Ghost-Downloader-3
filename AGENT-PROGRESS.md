@@ -9115,3 +9115,48 @@ Phase 8 只剩：
   `DraftHost::parse` 而不是 `coroutineRunner.submit`。
 - 下一步：Phase 8e —— 把 `gd3-net` 的 `HttpEngine` 接进运行期（任务真的能下载）。
 - 卡点：无
+
+## 第 126 步：Phase 8e —— 下载引擎接线（`gd3-ui::task_runner` + 真下载 E2E）（2026-10-19 15:15）
+
+第 119 步把 `TaskService._pump`/`_dispatch` 的**记账**搬完了，但没有东西去跑
+`Task.run`。这一步补上「谁真的去下载」：`TaskRunner`（UI 线程的
+pump/drain）+ 工作线程里的 `HttpEngine`（Phase 5 的成果）。
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/task_runner.rs`（1625 行，含 31 条单测）：
+    - **计划层**：`pending_positions()`（`Task.pendingSteps()` 的下标版：
+      按 `stepIndex` 升序、任务不是 `RUNNING` 时一条都不给、跳过未选中/已完成）、
+      `step_output_path()`（`Task.toFilePath`）、`plan_job()`（把 `TaskStep.extra`
+      里平铺的 `url`/`fileSize`/`headers`/`clientProfile`/`userAgent`/
+      `subworkerCount`/`canUseRangeRequests`/`httpByteOffset` 摊成 `DownloadStep`）；
+    - **`RunnerEvent`**：Progress / StepFinished / TaskFinished / TaskFailed /
+      Cancelled，每条都带 `workId`（暂停后重派发的旧事件整条丢掉）；
+    - **`Spawner` trait**：生产实现 `ThreadSpawner`（一个多线程 tokio runtime，
+      `shutdown_timeout(2s)`），测试里是 `FakeSpawner`；
+    - **`TaskRunner`**：`pump` / `dispatch` / `drain` / `pause` / `cancel_all` /
+      `shutdown`，账目口径见模块头（进度不改盘、`.ghd` 只在整任务完成后删、
+      Cancelled 不做队列记账）。
+  - `Cargo.toml`：加 `gd3-net` + `tokio`（rt-multi-thread/macros/net/time/io-util/sync/fs）。
+  - `lib.rs`：`pub mod task_runner;`。
+  - `engine.rs`：`max_task_num()` 改 `pub`（runner 现读 `cfg.maxTaskNum`）。
+  - 新增 `rust/crates/gd3-ui/tests/runner_e2e.rs`（217 行）：用 `gd3-net` 的测试
+    HTTP 服务 + **生产** `TaskRunner`/`HttpEngine` 跑两条链路。
+- 验证：
+  - `cargo test -p gd3-ui --lib`：**1146 passed / 0 failed**（第 125 步 1115 + 31）；
+  - `cargo test -p gd3-ui --test runner_e2e`：**2 passed**（200 KB 逐字节一致 +
+    `tasks.jsonl` 落盘再读回；4 MB 慢速下载 → 暂停保住 `.ghd` → 恢复 → 完成 →
+    `.ghd` 删除）；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings`：干净；
+  - `cargo fmt --all`：通过。
+- 修掉的实现缺陷（单测逮到的）：
+  - `dispatch` 原来是**先算 job 再置 `RUNNING`**，而 `pending_positions()` 在任务不是
+    `RUNNING` 时返回空表 → 每个任务都会派发成「零步骤」。Python 的顺序是
+    `task.setStatus(RUNNING)` → `task.run(...)`（里面才读 `pendingSteps()`）→
+    `queue.run(...)`，已按 Python 顺序改正（单测
+    `pump_dispatches_every_waiting_task_and_spawns_one_job_each` 钉住）。
+- 已知差异（写在模块头）：
+  - 只支持 HTTP 步骤（建任务链路仍在 Python 侧），非 HTTP pack 按「无待跑步骤」处理；
+  - 限速钩子（`SpeedMeter::waitForSpeedLimit`）与 `shouldPreserveLastModified` 未接；
+- 下一步：第 127 步 —— 把 `TaskRunner` 接进 `boot::run`（tick 定时器 +
+  `--until-idle` 无头开关），让 `cargo run -p gd3-ui` 真的会下载。
+- 卡点：无

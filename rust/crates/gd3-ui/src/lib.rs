@@ -84,6 +84,7 @@ pub mod subtitle_select;
 pub mod task_actions;
 pub mod task_draft;
 pub mod task_draft_ui;
+pub mod task_runner;
 pub mod task_service;
 pub mod token_line_edit;
 pub mod track_bar;
