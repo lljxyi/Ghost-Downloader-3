@@ -2018,6 +2018,105 @@ pub fn merge_pypi_releases<E>(
 | `merge_pypi_releases_returns_none_when_every_source_fails` | 全 `Err` → `None` |
 | `failure_messages_match_the_python_wording` | 六条 `TaskError` 的 `format()` 逐字 |
 
+## 更新检查（`gd3-ui::update_service`）
+
+`app/services/update_service.py`(335) 把四件事混在一个类里：①状态表（`_infos` +
+`_emit` 的合并语义）、②`versions.json` 的解析与挑选、③HTTP 下载 + 校验 + 解包、
+④`subprocess.Popen` 起 updater。`crates/gd3-ui/src/update_service.rs`（**1492 行 /
+49 单测**）只搬**决策**，执行全归宿主。
+
+### 边界
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `UpdateState` / `UpdateInfo` | 同名 | 本步 |
+| `_emit` 的合并与缺省值 | `UpdateTable::emit` + `EmitFields` | 本步 |
+| `_check` | `plan_check` → `Vec<UpdateStep>` | 本步 |
+| `_downloadApp` 的挑选 | `plan_app_download` → `AppDecision` | 本步 |
+| `_downloadPack` 的挑选 | `plan_pack_download` → `PackPlan` | 本步 |
+| `toChecksum != parseChecksum(sha)` | `checksum_accepted` | 本步 |
+| `apply` | `plan_apply` → `Vec<ApplyAction>` | 本步 |
+| `_startUpdater` 的 argv | `updater_command` → `UpdaterCommand` | 本步 |
+| `installPendingPacks` 的改名 | `pending_pack_id` | 本步 |
+| `buildPlatformKey` | `build_platform_key` | 本步 |
+| `fetchJson` / `fetchReleaseAsset` / `fetchRawFile` | `gd3-core::sources` + `gd3-net` | 第 114 步 |
+| `zipfile` / `tarfile` / `hdiutil` / `Popen` / `toChecksum` 的实算 | **未迁移** | 归宿主 |
+
+### 八条实证语义（实读 `app/services/update_service.py`）
+
+1. **`_emit` 只合并五个键**：`replace(current, state=state, **{k: v for k, v in kwargs
+   if k in ("label", "currentVersion", "latestVersion", "progress", "error")})`。没传的
+   键**保留旧值**——`_emit("app", IDLE)` 不会清空 `label` / `currentVersion`。新建时的
+   缺省是 `label = targetId`、`currentVersion = VERSION if targetId == "app" else ""`、
+   `latestVersion = ""`、`progress = 0`、`error = None`。
+2. **`_infos` 是 dict，`apply()` 按插入序遍历**：先跑所有 `READY` 的 pack，再处理 `app`。
+   `_emit` 对已存在的键**原地更新**、不改位置。顺序是硬语义——`_startUpdater` 会拉起
+   updater 顶掉当前进程，必须排在所有 pack 之后。
+3. **`patch.get("from") == VERSION` 是精确相等**，不是 `isNewer`：补丁只对「正好是
+   当前版本」的安装生效。
+4. **`if patch` / `if not full` 走的是 Python 真值**：`patches[platformKey]` 是 `{}` 时
+   整条补丁路径不生效；`full[platformKey]` 是 `{}` / `""` / `0` 时一律
+   `TaskError("当前平台无可用更新")`。Rust 侧用私有的 `py_truthy` 复刻。
+5. **`sha` 为空串就跳过校验**（`if sha and ...`）；`parseChecksum` 取第一个空白分隔
+   字段并 `lower()`，所以 `"abc123  app.exe"` 与 `"ABC123"` 等价。
+6. **`gdMinVersion` 的跳过条件是 `VERSION <= gdMin` 且 `gdMin != VERSION`**：
+   `not isNewer(remoteGdMin, VERSION)` 排掉「比当前旧」，再排掉相等。
+7. **`buildPlatformKey` 的两个 map 都是 `KeyError`**（`OS_MAP[sys.platform]` 先求值），
+   退化成 `None`；`platform_key_failure` 复刻 `toTaskError` 后的
+   `发生了意外错误：'i686'`（`str(KeyError(x))` 带引号）。
+8. **`tag = f"v{version}"`**：`versions.json` 里的 `version` 不带 `v` 前缀。
+   解包三分支里 **darwin 优先于后缀**（macOS 的 `full[platformKey].file` 是 `.zip`
+   也走 `hdiutil`），其余按 `Path.suffix == ".xz"` 分 `tarfile` / `zipfile`。
+
+### 三条结构决策
+
+1. **`plan_check` / `plan_apply` 返回动作表而不是直接改状态**：纯函数、可断言 emit
+   顺序；宿主按序喂 `UpdateTable::emit` 并转发 `changed` 信号。
+2. **`EmitFields` 用 `Option` 表达「没传」**：`None` = 保留旧值，正好对上
+   `kwargs.get(...)` 的语义；`UpdateTable::emit` 是唯一改表入口。
+3. **`updater_command` 的返回值带 `Detach`**：`Win32` =
+   `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`，`Unix` = `start_new_session=True`。
+   两个「记日志然后 return」的分支用 `UpdaterSkip::{Missing, NoPayload}` 区分。
+
+### 与 Python 的已知差异
+
+- **`toTaskError` 归宿主**：`_download` 的 `except Exception` 那一层不在本模块，
+  宿主把 IO / HTTP 错误包成 `TaskError` 再 `emit(FAILED)`。本模块只产出文案
+  （`versions_failure` / `checksum_failure` / `platform_failure` / `dmg_no_app` /
+  `hdiutil_failure` / `platform_key_failure`）。
+- **非 dict 的 `data.get("app", {})`**：Python 抛 `AttributeError`，Rust 的
+  `Value::get` 对非对象返回 `None`，当空表处理。
+- **`_emit(error=None)` 与「不传 error」在 `replace` 分支有差别**（前者清空）；
+  Python 侧没有调用点走那条路，Rust 用 `Option<TaskError>` 表示「不覆盖」。
+- **`pending_pack_id("_pending")` 返回 `None`**：Python 的 `removesuffix` 给出空串，
+  `target = featuresDir / ""` == `featuresDir`，`rmtree` 会把整个 FEATURES_DIR 删掉。
+  该分支是纯数据丢失，不复刻。
+- **`packData.get("file", default)` 的非字符串值**：Python 会把 `5` 拼成
+  `dist/packs/5`，Rust 只认字符串，其余回退 `<packId>.zip`。
+- **解包与进程启动不在这里**：`zip` / `xz2` crate 不在离线缓存里，`zipfile` /
+  `tarfile("r:xz")` / `hdiutil` / `Popen` 全归宿主。
+
+### 四十九条新单测
+
+`crates/gd3-ui/src/update_service.rs` **1492 行 / 49 单测**（`cargo test -p gd3-ui --lib`
+由 932 变 981）。
+
+| 组 | 钉住什么 |
+|---|---|
+| `emit_defaults_*` / `emit_keeps_*` / `emit_overwrites_*` / `emit_records_*` | 五键合并、`app` 与 pack 的 `label` / `currentVersion` 缺省、`error` 落地 |
+| `emit_keeps_the_insertion_order` | 同键原地更新、不改位置 |
+| `can_download_only_accepts_available` | 只放行 `AVAILABLE` |
+| `update_state_ints_match_the_int_enum` | `IntEnum` 的 1..6 |
+| `build_platform_key_*` / `platform_key_failure_*` | 两 map 的五个映射、未知键 → `None`、失败文案带引号 |
+| `pack_dir_candidate_filters_hidden_and_pending` | `.` 开头与 `_pending` 结尾 |
+| `plan_check_*`（10 条） | `CHECKING` 先行、fetch 失败、版本比较、android 早退、pack 的六种跳过条件、`gdMinVersion` 三种边界 |
+| `plan_app_download_*`（9 条） | 补丁优先 / `from` 不等 / 空 patch 表 / 完整包 / `.xz` / darwin 优先 / 缺 `full` / 缺 `file` |
+| `plan_pack_download_*` | 缺省文件名、远端路径前缀、落地名恒为 `<packId>.zip` |
+| `checksum_accepted_*` | 空 sha 跳过、大小写不敏感、只取第一段、不匹配 |
+| `plan_apply_*` | pack 先于 updater、非 `READY` 不动作、没有 `app` 条目不拉 updater |
+| `pending_pack_id_strips_the_suffix` | 后缀剥离、空 id 拒绝、重复后缀 |
+| `updater_name_*` / `app_dir_*` / `updater_command_*`（5 条） | `updater.exe` 与 `updater`、macOS 上溯两级、argv 五项、补丁优先于 `app_new`、`Detach` 分平台、两个 skip 分支 |
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

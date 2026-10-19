@@ -8055,3 +8055,128 @@ def set(self, item, value, save=True, copy=True):
 （`assetScore` / `bestAsset` 已在 `gd3-ui::release_info`）、下载进度与 `installArchive`
 的解包（`zip` / `xz2` 不在离线缓存里 → 解包归宿主）。先读源码确认「哪些是纯逻辑、
 哪些必须走网络」，再决定是否继续拆。
+## 第 115 步：`gd3-ui::update_service`（更新检查的决策层）
+
+时间：2026-10-19 05:29
+
+第 114 步的笔记留的欠账：「`update_service` 的版本比较与资产挑选……先读源码确认
+哪些是纯逻辑、哪些必须走网络」。本步把 `app/services/update_service.py`(335) 里
+**不碰网络、不碰文件系统副作用、不起进程**的那半截落成
+`crates/gd3-ui/src/update_service.rs`（**1492 行 / 49 单测**）+ `lib.rs:85` 一行。
+
+### 四块职责的拆法
+
+Python 的 `UpdateService` 把四件事混在一个类里，本步按「决策 / 执行」切：
+
+| 职责 | Python | 归谁 |
+|---|---|---|
+| ① 状态表 | `_infos` + `_emit`（`:317-335`） | `UpdateTable` / `EmitFields` |
+| ② `versions.json` 的解析挑选 | `_check`（`:139-180`） | `plan_check` → `Vec<UpdateStep>` |
+| ③ HTTP 下载 + 校验 + 解包 | `_download` / `_downloadApp` / `_downloadPack` | 挑选归 `plan_*_download`，IO 归宿主 |
+| ④ `Popen` 起 updater | `_startUpdater`（`:287-315`） | argv 归 `updater_command`，`Popen` 归宿主 |
+
+### 为什么放 `gd3-ui`
+
+它要 `VERSION`（`gd3-ui::boot::VERSION`）与 `PackManifest`（`gd3-core::pack`），
+且是 UI 侧的更新提示来源（`changed` 信号喂设置页 / 关于页）。放 `gd3-core` 会让
+core 依赖 `boot` 的版本常量，方向反了。
+
+### 八条实证语义（实读源码 + `cat -n` 核对行号）
+
+1. **`_emit` 只合并五个键**：`replace(current, state=state, **{k: v for k, v in kwargs
+   if k in ("label", "currentVersion", "latestVersion", "progress", "error")})`。没传的
+   键保留旧值——`_emit("app", IDLE)` 不会清空 `label` / `currentVersion`。新建时缺省
+   `label = targetId`、`currentVersion = VERSION if targetId == "app" else ""`、
+   `latestVersion = ""`、`progress = 0`、`error = None`。
+2. **`_infos` 是 dict，`apply()` 按插入序遍历**：先跑所有 `READY` 的 pack，再处理 `app`。
+   `_emit` 对已存在的键原地更新、不改位置。顺序是硬语义——`_startUpdater` 会拉起
+   updater 顶掉当前进程，必须排在所有 pack 之后。
+3. **`patch.get("from") == VERSION` 是精确相等**，不是 `isNewer`：补丁只对「正好是
+   当前版本」的安装生效。
+4. **`if patch` / `if not full` 走 Python 真值**：`patches[platformKey]` 是 `{}` 时整条
+   补丁路径不生效；`full[platformKey]` 是 `{}` / `""` / `0` 时一律
+   `TaskError("当前平台无可用更新")`。Rust 侧用私有 `py_truthy` 复刻。
+5. **`sha` 为空串就跳过校验**（`if sha and ...`）；`parseChecksum` 取第一个空白分隔
+   字段并 `lower()`，所以 `"abc123  app.exe"` 与 `"ABC123"` 等价。
+6. **`gdMinVersion` 的跳过条件是 `VERSION <= gdMin` 且 `gdMin != VERSION`**：
+   `not isNewer(remoteGdMin, VERSION)` 排掉「比当前旧」，再排掉相等。
+7. **`buildPlatformKey` 的两个 map 都是 `KeyError`**（`OS_MAP[sys.platform]` 先求值）
+   → `None`；`platform_key_failure` 复刻 `toTaskError` 之后的
+   `发生了意外错误：'i686'`（`str(KeyError(x))` 带引号）。
+8. **`tag = f"v{version}"`**：`versions.json` 的 `version` 不带 `v` 前缀。解包三分支里
+   **darwin 优先于后缀**（macOS 的 `full[platformKey].file` 是 `.zip` 也走 `hdiutil`），
+   其余按 `Path.suffix == ".xz"` 分 `tarfile` / `zipfile`。
+
+### 三条结构决策
+
+1. **`plan_check` / `plan_apply` 返回动作表而不是直接改状态**：纯函数、可断言 emit
+   顺序；宿主按序喂 `UpdateTable::emit` 并转发 `changed` 信号。与第 111 步
+   `SessionEffect` 是同一手法。
+2. **`EmitFields` 用 `Option` 表达「没传」**：`None` = 保留旧值，正好对上
+   `kwargs.get(...)`；`UpdateTable::emit` 是唯一改表入口。
+3. **`updater_command` 的返回值带 `Detach`**：`Win32` =
+   `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`，`Unix` = `start_new_session=True`；
+   两个「记日志然后 return」的分支用 `UpdaterSkip::{Missing, NoPayload}` 区分，
+   宿主据此复刻两条不同日志。
+
+### 与 Python 的已知差异
+
+- **`toTaskError` 归宿主**：`_download` 的 `except Exception` 那一层不在本模块。本模块
+  只产出六条文案（`versions_failure` / `checksum_failure` / `platform_failure` /
+  `dmg_no_app` / `hdiutil_failure` / `platform_key_failure`）。`hdiutil_failure` 直接
+  给 `TaskError::io`，因为 `RuntimeError` 在 Python 侧也是走 `toTaskError` 的兜底分支。
+- **非 dict 的 `data.get("app", {})`**：Python 抛 `AttributeError`，Rust 的
+  `Value::get` 对非对象返回 `None`，当空表处理（第 114 步同一口径）。
+- **`_emit(error=None)` 与「不传 error」在 `replace` 分支有差别**（前者清空）；
+  Python 侧没有调用点走那条路，Rust 用 `Option<TaskError>` 表示「不覆盖」。
+- **`pending_pack_id("_pending")` 返回 `None`**：Python 的 `removesuffix` 给出空串，
+  `target = featuresDir / ""` == `featuresDir`，`rmtree` 会把整个 FEATURES_DIR 删掉。
+  该分支是纯数据丢失，不复刻（注释里写明了）。
+- **`packData.get("file", default)` 的非字符串值**：Python 会把 `5` 拼成
+  `dist/packs/5`，Rust 只认字符串，其余回退 `<packId>.zip`。
+- **解包与进程启动不在这里**：`zip` / `xz2` crate 不在离线缓存里；`zipfile` /
+  `tarfile("r:xz")` / `hdiutil` / `Popen` 全归宿主。
+
+### 四十九条新单测
+
+`-p gd3-ui --lib` 由 932 变 981。分组见 `rust/README.md` 的同名一节，这里只记三条
+最容易回归的：
+
+| 测试 | 钉住什么 |
+|---|---|
+| `emit_keeps_the_fields_it_was_not_given` | `_emit` 的五键合并（漏了这条，进度条会把 label 清空） |
+| `plan_check_allows_a_pack_whose_gd_min_version_matches` | `gdMin == VERSION` 不能跳过（`!=` 那半个条件） |
+| `plan_apply_runs_the_packs_before_the_updater` | pack 先于 `StartUpdater` |
+
+### 编译期踩到的一个坑（重要）
+
+**`Edit` 工具的 `PUT n.=m:` 行号与 `sed -n` 差 1~2，且替换是整段覆盖**：本步两次
+用 `PUT` 想改一个小片段，结果把相邻十几行真实代码整段吃掉（`plan_app_download`
+的 `full` 分支、`app_dir` 测试的尾部、`updater_dirs` 助手全被抹掉），只能靠 Python
+按唯一字符串重写。结论：**行号编辑一律不用 `Edit`**，改用
+`python3` + `assert text.count(old) == 1` 的字符串替换。
+
+另：第一批落盘的模块头表格里 20 处 `file:line` 是估的（偏 1~13 行不等），本步按
+`cat -n app/services/update_service.py` 实测值逐条校正，`fix_us_lines.py` 里留了
+「旧串 → 新串」的对照。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**1m13s**，首轮零编译错；
+- `cargo test -p gd3-ui --lib update_service`：**49 passed**（`/tmp/t115_us2.log`；
+  首轮 42 passed / 7 failed，全是我自己测试里把 `data.get("app")` 当成 app 段传——
+  `app_data()` 助手本身返回的就是 app 段，改成 `Some(&data)` 后全绿）；
+- `cargo test -p gd3-ui --lib`：**981 passed / 0 failed**（932 + 49，`/tmp/t115_ui.log`）；
+- `cargo test --workspace`：**1510 passed / 0 failed**（28 段，1461 + 49，`/tmp/t115_ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（1m56s，`/tmp/c115.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 116 步）
+
+`app/sources.py` 与 `app/services/update_service.py` 这两块整块未镜像逻辑到此清空。
+剩下的是「接线」：`boot::run` 里把 `UpdateTable` / `plan_check` / `plan_app_download` /
+`plan_pack_download` / `plan_apply` / `updater_command` 接到 `gd3-net` 的 HTTP 客户端与
+Slint 的更新卡片上，解包（zip / tar.xz / dmg）需要宿主的系统工具或新 crate。
+在那之前先看 `rust/README.md` 的「剩余工作（Phase 8）」——Phase 8 的判定标准是
+「主窗口能无头启动 + 冒烟测试」，接线不能破坏它。

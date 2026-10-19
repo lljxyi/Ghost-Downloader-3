@@ -82,6 +82,7 @@ pub mod task_service;
 pub mod token_line_edit;
 pub mod track_bar;
 pub mod tree_view;
+pub mod update_service;
 pub mod window;
 
 slint::include_modules!();
