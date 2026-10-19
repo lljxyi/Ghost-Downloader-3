@@ -1880,6 +1880,137 @@ def set(self, item, value, save=True, copy=True):
 | `reload_picks_up_an_external_write` | `reload()` 重读外部改动 |
 | `py_eq_mirrors_python_equality` | `3 == 3.0` / `true == 1` / `"3" != 3` / dict 不看键序 |
 
+## 设置页回写（`gd3-ui::settings_writer`）
+
+设置页的每个控件在第 32–39 步就接成了 `SettingsActions` 的一个闭包，但闭包体一直是空的
+（`install_settings_actions` 只在测试里被调用）。第 113 步把 `QConfig.set` 的语义落成
+`ConfigStore`，这一步把两端接起来：**动作 → 属性名 → `ConfigStore::set`**，于是设置页的
+编辑终于能落盘。`crates/gd3-ui/src/settings_writer.rs` **852 行 / 15 单测**。
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `qconfig.set(item, value)`（`qfluentwidgets/common/config.py:288`） | `ConfigStore::set` | 第 113 步 |
+| `SpinBoxSettingCard` → `cfg.set(item, int(v/division))`（`setting_cards.py:85`） | `SettingsWriter` 的整数动作 | 第 117 步 |
+| `PercentSpinBoxSettingCard` → `cfg.set(item, v/100)`（`:115`） | `dpi_scale` | 第 117 步 |
+| `LineEditSettingCard` → `cfg.set(item, text())`（`:138`） | `aria2_rpc_token` 等文本动作 | 第 117 步 |
+| `cfg.set(cfg.downloadFolder, path)`（`setting_page.py:427`） | `download_folder` | 第 117 步 |
+| `cfg.set(cfg.browserExtensionPairToken, token_urlsafe(16))`（`browser_service.py:190`） | `regenerate_pair_token` | 第 117 步 |
+| 列表写（`headersPreset*` / `identityPreset*` / `category*`） | `defer("<slint 名>")` | 待办 |
+| 平台副作用（剪贴板 / 商店 / 扩展解包） | `defer("<slint 名>")` | 待办 |
+
+### 27 个标量动作 ↔ 属性名
+
+`SettingsActions` 共 49 个字段，这一步填了 27 个（全部「一个动作 → 一个 cfg 键」）。
+
+| 字段 | 方法 | cfg 属性名 | 收什么单位 |
+|---|---|---|---|
+| `folder` | `download_folder` | `downloadFolder` | 路径串（`FolderValidator` 归一成正斜杠绝对路径） |
+| `max_task_num` | `max_task_num` | `maxTaskNum` | 1–10 整数 |
+| `pre_block_num` | `pre_block_num` | `preBlockNum` | 1–64 整数 |
+| `category_enabled` | `category_enabled` | `isCategoryEnabled` | bool |
+| `speed_limitation` | `speed_limitation` | `speedLimitation` | **字节**（1024–104857600） |
+| `auto_speed_up` | `auto_speed_up` | `autoSpeedUp` | bool |
+| `max_reassign_size` | `max_reassign_size` | `maxReassignSize` | 64–… 整数 |
+| `preserve_last_modified` | `preserve_last_modified` | `shouldPreserveLastModified` | bool |
+| `verify_ssl` | `verify_ssl` | `shouldVerifySsl` | bool（`restart=True`） |
+| `name_conflict` | `name_conflict` | `nameConflict` | 字面量 `keepBoth` / `overwrite` / `ask` |
+| `use_system_dns` | `use_system_dns` | `shouldUseSystemDns` | bool |
+| `proxy_changed` | `proxy_server` | `proxyServer` | 字面量 `Off` / `Auto` / 拼好的 URL |
+| `aria2_enabled` | `aria2_enabled` | `isAria2RpcEnabled` | bool |
+| `aria2_rpc_port` | `aria2_rpc_port` | `aria2RpcPort` | 1024–65535 |
+| `aria2_rpc_token` | `aria2_rpc_token` | `aria2RpcToken` | 原样串（无 validator，不 trim） |
+| `aria2_emulate_fingerprint` | `aria2_emulate_fingerprint` | `aria2RpcEmulateFingerprint` | bool |
+| `browser_enabled` | `browser_enabled` | `isBrowserExtensionEnabled` | bool |
+| `browser_draft_taken` | `browser_draft_taken` | `shouldDraftTakenDownload` | bool |
+| `browser_port` | `browser_port` | `browserExtensionPort` | 1024–65535 |
+| `pair_token_regenerate` | `regenerate_pair_token` | `browserExtensionPairToken` | 无入参，返回新令牌 |
+| `client_profile` | `client_profile` | `clientProfile` | 字面量 `auto` / `raw` / 家族名 |
+| `url_scheme_enabled` | `url_scheme_enabled` | `isUrlSchemeRegistered` | bool |
+| `check_update_at_startup` | `check_update_at_startup` | `shouldCheckUpdateAtStartup` | bool |
+| `run_at_login` | `run_at_login` | `shouldRunAtLogin` | bool |
+| `close_mode` | `close_mode` | `closeMode` | 字面量 `Ask` / `Background` / `Quit` |
+| `clipboard_listener` | `clipboard_listener` | `isClipboardListenerEnabled` | bool |
+| `dpi_scale` | `dpi_scale` | `dpiScale` | 0.0–5.0 浮点（`restart=True`） |
+
+**「动作收配置单位」** 这条惯例在这里兑现：`speed_limitation` 收字节而不是 KB/s，
+`dpi_scale` 收 0–5 浮点而不是百分数，`name_conflict` / `close_mode` / `client_profile` 收
+字面量而不是下拉框索引。换算全在 `install_settings_actions` 那一层
+（`speed::from_display_kb` / `conflict::option_of_index` / `close_mode` 的索引表 …）。
+
+### 22 个未接的动作（`defer` 清单）
+
+`defer` 不是静默丢弃 —— `take_deferred()` 会把动作名交出去，测试里钉住了这份名单。
+
+| 类别 | 动作（Slint 回调名） | 为什么留后 |
+|---|---|---|
+| 列表写 | `headersPresetPicked` / `headersPresetRemoveRequested` / `headersPresetAddRequested` / `headersPresetEditRequested` / `headersPresetEditClosed` / `headersPresetEditAccepted` | 要读列表、改一项、再整表写回（`JsonConfigSerializer`），删除前还有确认框 |
+| 列表写 | `identityPresetToggled` / `identityPresetRemoveRequested` / `identityPresetAddRequested` / `identityPresetEditRequested` / `identityPresetEditClosed` / `identityPresetEditAccepted` | 同上（`isEnabled` 由调用方经 `apply_identity_preset_draft` 继承） |
+| 列表写 | `categoryResetRequested` / `categoryRemoveRequested` / `categoryAddRequested` / `categoryEditRequested` / `categoryEditClosed` / `categoryEditAccepted` | 同上（`categoryRules` 是 `JsonList`） |
+| 平台副作用 | `copyPairToken` / `openStoreUrl` / `chromiumInstall` / `exportCrx` | 剪贴板、拉起浏览器、解包 CRX 归平台层 |
+
+### 结构
+
+```rust
+pub struct SettingsWriter {
+    store: RefCell<ConfigStore>,           // 已加载的 cfg + 落盘路径
+    changes: RefCell<Vec<ConfigChange>>,   // 已落盘的改动（宿主取走）
+    failures: RefCell<Vec<ConfigStoreError>>,
+    deferred: RefCell<Vec<&'static str>>,  // 待办清单
+}
+```
+
+`RefCell` 是必需的：Slint 的回调都是 `Fn`（不可变捕获），而 `ConfigStore::set` 要
+`&mut self`。单线程 UI 上不存在跨线程争用。
+
+对外只有「读 + 取走」两类方法（`path` / `config` / `get` / `take_changes` /
+`take_failures` / `take_deferred`），写入一律经 `actions()` 装出来的闭包或那 27 个方法。
+
+### 三条结构决策
+
+1. **写盘复用 `ConfigStore::set`**，不在这里重写 `correct()` / `serialize()` /
+   「相等早退」/「整文件回写」四件事。第 113 步已经逐条对齐过 `QConfig.set`；
+   这里多写一遍只会多一份会漂的副本。
+2. **效果靠 `take_changes()` 显式取走，不在这里发信号**。Python 的 `valueChanged` 是
+   同步回调，宿主（`boot::run`）拿到 `ConfigChange` 后要决定「重推 UI / 重启服务 /
+   提示重启」，这些不属于配置层。
+3. **`actions()` 每个闭包只做一次方法调用**。`Rc<Self>` 先 clone 成 49 个绑定再分别
+   `move` 进闭包 —— 显式但不绕，`install_settings_actions` 那边看到的就是
+   「一个字段一个动作」。
+
+### 与 Python 的已知差异
+
+- **写盘失败的收集方式**：Python 在 `cfg.set` 里直接抛 `OSError`（调用栈中断）；
+  这里塞进 `take_failures()`，宿主下一帧统一处理。内存里的值**已经改了**
+  （与 Python 的「先改值再 `save()`」一致），但 `ConfigChange` 不会产出
+  —— `ConfigStore::set` 在 `save()` 失败时返回 `Err`，改动记录随之丢失。
+- **重推 UI 不在写盘路径上**：Python 的 `valueChanged` 会让卡片自己回读 `correct()`
+  之后的值（例如端口被夹到 1024），这里要宿主调 `push_settings` 重推。
+- **`pair_token_regenerate` 是 `Fn()`**：Python 里重新生成后要 `setText` 到只读框上；
+  这里新令牌从 `take_changes()[0].value` 取，闭包返回值被丢弃。
+
+### 十五条新单测
+
+`settings_writer.rs` **852 行 / 15 单测**。全部只碰临时目录里的 `UserConfig.json`，
+**不创建 Slint 窗口**（直接调 `(actions.max_task_num)(7)` 这种装箱闭包）。
+
+| 测试 | 钉住什么 |
+|---|---|
+| `a_scalar_action_writes_the_whole_file` | 一次动作写出全量 42 项；期望文件由 `settings::write` 独立算出 |
+| `an_unchanged_value_leaves_the_file_alone` | 同值 → 无改动、无失败、**文件不出现** |
+| `an_out_of_range_value_is_clamped_before_it_lands` | `99` → `10`、`80` → `1024` |
+| `the_speed_action_takes_bytes` | 收字节；下限夹到 `1024` |
+| `text_actions_store_the_literal` | 六个文本/枚举动作的属性名与落盘字面量 |
+| `the_pair_token_action_reports_a_fresh_token` | 22 字符 + 落盘 + `previous == ""` |
+| `the_zero_dpi_scale_is_already_the_default` | 缺省落盘是 int `0`，`0.0` 相等早退 |
+| `the_restart_actions_are_flagged` | `shouldVerifySsl` / `dpiScale` 带 `restart`，`maxTaskNum` 不带 |
+| `a_save_failure_is_collected_and_the_value_stays_in_memory` | 父目录被文件占住 → `Save` 失败进 `take_failures`，内存保留新值 |
+| `every_scalar_action_reaches_the_store` | 27 个动作全表遍历，属性名逐个对上，且不进待办清单 |
+| `the_deferred_actions_name_what_is_still_missing` | 22 个待办名精确匹配，且不碰文件、不进改动列表 |
+| `the_config_snapshot_follows_the_writes` | `config()` 快照跟着写 |
+| `changes_are_taken_once` | 取走即清空 |
+| `open_leaves_a_missing_file_alone` | `open` 不建文件（`qconfig.load` 同序） |
+| `an_unknown_attribute_never_comes_out_of_the_actions` | 拼错属性名 → `UnknownAttribute` 进 failures，不 panic |
+
 ## 更新源纯逻辑层（`gd3-core::sources`）
 
 `app/sources.py`(295) 是「双源竞速」的唯一入口：`github` 与 `gitcode` 各一套端点，

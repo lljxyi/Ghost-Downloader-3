@@ -70,6 +70,7 @@ pub mod setting_card_group;
 pub mod setting_cards;
 pub mod settings_group;
 pub mod settings_spec;
+pub mod settings_writer;
 pub mod shell;
 pub mod single_instance;
 pub mod sort;

@@ -8266,3 +8266,73 @@ Slint 的更新卡片上，解包（zip / tar.xz / dmg）需要宿主的系统�
 （zip / tar.xz / dmg）需要宿主系统工具或新 crate（`zip` / `xz2` 不在离线缓存里）。
 接线前先看 `rust/README.md` 的「剩余工作（Phase 8）」——判定标准是「主窗口能无头启动 +
 冒烟测试」，接线不能破坏它。
+## 第 117 步：`gd3-ui::settings_writer`（设置页回写的 cfg 半边）
+
+**2026-10-19 06:06**
+
+第 32–39 步把设置页每个控件接成了 `SettingsActions` 的一个闭包，但闭包体一直是空的
+（`install_settings_actions` 只在测试里被调用，生产路径没接）。第 113 步的 `ConfigStore`
+已经能复刻 `QConfig.set`，这一步把两端接起来：**动作 → 属性名 → `ConfigStore::set`**。
+`crates/gd3-ui/src/settings_writer.rs`（**852 行 / 15 单测**）。
+
+### 覆盖面
+
+`SettingsActions` 49 个字段：
+
+| 类别 | 个数 | 处理 |
+|---|---|---|
+| 单个标量 → 一个 cfg 键 | **27** | 填真实现（各一个 `pub fn`，`actions()` 里装箱） |
+| 列表写（`headersPreset*` / `identityPreset*` / `category*`） | 18 | `defer("<slint 回调名>")` |
+| 平台副作用（剪贴板 / 商店 / 解包 CRX / 拉起浏览器） | 4 | 同上 |
+
+`take_deferred()` 是**待办清单**，不是静默丢弃 —— 测试里钉住了 22 个名字的精确顺序。
+
+### 三条结构决策
+
+1. **写盘复用 `ConfigStore::set`**：`correct()` / `serialize()` / 相等早退 / 整文件回写
+   四件事第 113 步已逐条对齐过 `QConfig.set`，这里不写第二份会漂的副本。
+2. **效果靠 `take_changes()` 显式取走**，不在这里发信号。Python 的 `valueChanged` 是同步
+   回调，宿主（`boot::run`）要决定「重推 UI / 重启服务 / 提示重启」，不属于配置层。
+3. **`actions()` 每个闭包只做一次方法调用**：`Rc<Self>` 先 clone 成 49 个绑定再分别
+   `move` 进去。显式但不绕，`install_settings_actions` 那边看到的就是「一个字段一个动作」。
+
+`RefCell` 是必需的：Slint 回调都是 `Fn`（不可变捕获），而 `ConfigStore::set` 要 `&mut self`。
+
+### 一条实测纠错（实现对、测试错）
+
+`nameConflict` 的取值是 `["keepBoth", "overwrite", "ask"]`（`gd3-core/src/settings.rs:105`），
+**没有 `rename`**。测试里先写成 `"rename"`，`Kind::Options` 的 `correct()` 把它拉回缺省
+`keepBoth` → 断言 `json!("rename")` 失败。**以 `NAME_CONFLICT_VALUES` 为准改测试**
+（`every_scalar_action_reaches_the_store` 里那处同样换成 `overwrite`）。
+
+### 与 Python 的已知差异
+
+- **写盘失败不抛**：Python 在 `cfg.set` 里直接抛 `OSError` 中断调用栈；这里塞进
+  `take_failures()`，宿主下一帧统一处理。内存里的值**已经改了**（与「先改值再 `save()`」
+  同序），但 `ConfigStore::set` 在 `save()` 失败时返回 `Err`，`ConfigChange` 随之丢失
+  —— 所以失败的那一次不会有改动记录。
+- **重推 UI 不在写盘路径上**：Python 的 `valueChanged` 让卡片自己回读 `correct()` 之后的值
+  （端口被夹到 1024 之类），这里要宿主调 `push_settings` 重推。
+- **`pair_token_regenerate` 是 `Fn()`**：新令牌从 `take_changes()[0].value` 取，闭包返回值丢弃。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**1m04s**，零错零警告（`/tmp/ck117a.log`）；
+- `cargo test -p gd3-ui --lib settings_writer`：**15 passed**（`/tmp/t117b.log`）；
+- `cargo test -p gd3-ui --lib`：**996 passed / 0 failed**（981 + 15，`/tmp/t117lib.log`）；
+- `cargo test --workspace`：**1551 passed / 0 failed / 28 段**（1536 + 15，`/tmp/t117ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c117.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 118 步）
+
+接线：`boot::run` 里 `SettingsWriter::open(...)` → `Rc::new` → `install_settings_actions(window,
+writer.actions())`，然后每帧（或每个动作之后）做三件事：
+
+1. `take_failures()` 非空 → 提示「配置保存失败」（Python 会抛 `OSError`）；
+2. `take_changes()` 里的 `ConfigChange` → 按 `attr` 调 `Engine::refresh_services()`，
+   `restart == true` 时提示「重启后生效」；
+3. 有改动就 `push_settings(window, &writer.config(), ...)` 重推（`correct()` 可能夹紧过值）。
+
+`take_deferred()` 非空说明用户点了还没接的按钮 —— 接线期先 `eprintln!` 记一笔，别静默。
