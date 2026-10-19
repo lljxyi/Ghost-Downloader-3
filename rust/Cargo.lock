@@ -1682,6 +1682,7 @@ dependencies = [
  "serde_json",
  "slint",
  "slint-build",
+ "uuid",
 ]
 
 [[package]]

@@ -8420,3 +8420,110 @@ assert_eq!(settings::read_i64(&written, "maxTaskNum"), Some(3));
    （`zip` / `xz2` 不在离线缓存里）。
 2. P1 剩余：22 个 `defer` 项（`headersPreset*` / `identityPreset*` / `category*` 的列表写回，
    以及剪贴板 / 商店 / CRX 解包 / 拉起浏览器四个平台副作用）。
+
+## 第 119 步：`settings_writer` 的列表写回（9 个动作）
+
+**2026-10-19 06:52**
+
+第 117 步只把「一个动作 → 一个属性名 → 一个值」接成真写，22 个动作 `defer` 记账；
+第 118 步把 writer 装到窗口上，于是 `defer` 的名单每次点击都进宿主日志 —— 待办清单开始
+叫唤。这一步把其中 9 个「列表写回」接完，剩 13 个（4 个平台副作用 + 9 个对话框开合）。
+
+### 覆盖面
+
+```text
+Slint 回调 → SettingsActions → SettingsWriter::headers_preset_* / identity_preset_* / category_*
+                                      ↓ list() / set_list()
+                               ConfigStore::set（correct → serialize → 整文件回写）
+                                      ↓ take_changes()
+                               SettingsBridge::drain → 重推 42 项 + 宿主钩子
+```
+
+| 动作 | Python 源 | 写回 |
+|---|---|---|
+| `headers_preset_pick` | `setting_cards.py:715-717` | `currentHeadersPreset` |
+| `headers_preset_remove` | `setting_cards.py:738-775` | `headersPresets` + `currentHeadersPreset` 回退 |
+| `headers_preset_submit` | `setting_cards.py:719-736` | 追加（`-1`）/ 替换 |
+| `identity_preset_toggle` | `setting_cards.py:588-593` | 复制行、改 `isEnabled` |
+| `identity_preset_remove` | `setting_cards.py:595-614` | 删一项（可删空） |
+| `identity_preset_submit` | `setting_cards.py:566-586` | 追加 / 替换（继承 `isEnabled`） |
+| `category_reset` | `category_settings.py:147-148` | 八预设 |
+| `category_remove` | `category_settings.py:144-145` | 命中才写 |
+| `category_submit` | `category_settings.py:129-142` | 命中替换 / 否则追加 |
+
+### 三条照抄 Python 的细节
+
+1. **`currentHeadersPreset` 存原始索引**：`_onRemoveClicked` 写 `max(0, current - 1)`，
+   读的是 `cfg.currentHeadersPreset.value`（`:756`），没夹到 `len - 1`。读侧
+   `currentHeadersPresetIndex()` 再夹。两段夹紧各在各的位置。
+2. **列表读写走 `Value`**：Python 复制 dict、改一项、整表写回，未知键与键序都留着。
+   `{**preset, "isEnabled": checked}`（`:592`）对已存在键保持位置 —— `Map::insert` 同语义。
+   换成强类型 `IdentityPreset` 往返会丢未来新增的键。
+3. **`headers_preset_remove` 的 `len > 1` 守卫**：Python 靠 `canRemove`（`:705`）置灰按钮；
+   这里没有按钮状态，写成函数级守卫。删空会让 `correct()` 补回「默认」预设
+   （`settings.rs:739`），等于删了又长出来。
+
+### `category_*` 走强类型（与 headers/identity 相反）
+
+`CategoryService._save()` 写 `[asdict(c) ...]`（`category_service.py:144-146`），`_load`
+又 `Category.fromDict` —— 未知键在加载时就丢了。所以这里同样「过一遍 dataclass」：
+`categories()` = `parse_rules(...)`（空表 → 八预设，镜像 `_load`），`write_categories()`
+= `rules_to_json(...)` 再解回 `Value`。那份串已被单测钉成 `json.dumps(ensure_ascii=False)`
+口径，与 `Kind::JsonList` 的 `serialize`（`py_json_dumps`）同口径，往返不改字节。
+
+### 补上 `category::new_category_id()`
+
+`category.rs` 的头注释一直写着「读侧不生成随机 ID，保留空串由写侧处理」（`:15`、`:385`、
+`:742`）—— 这一步补欠账：`new_category_id()` = `cat_` + `uuid4().hex`（32 位小写十六进制），
+镜像 `Category.categoryId` 的 `default_factory`（`category_service.py:103`）。为此给
+`gd3-ui/Cargo.toml` 打开 `uuid.workspace = true`（`uuid` 在离线缓存里，`gd3-core` 已在用）。
+
+### 一个照抄时差点漏掉的语义：`identity_preset_submit` 继承 `isEnabled`
+
+Slint 草稿恒带 `is_enabled: true`，但 Python 的 `PresetEditDialog.preset()` 在编辑态把原值
+抄回来（`preset_edit.py:121-122`）：
+
+```python
+result["isEnabled"] = True
+if self._preset is not None:
+    result["isEnabled"] = self._preset.get("isEnabled", True)
+```
+
+不继承的话，**编辑一个已停用的预设会把它悄悄启用**。替换分支读旧行的 `isEnabled`
+（缺键当 `true`）覆盖草稿值；新建分支用草稿自己的值。单测
+`submitting_an_identity_preset_inherits_the_stored_enabled_flag` 钉住。
+
+### 与 Python 的已知差异
+
+- **越界容错**：Python 的 `_onEditClicked` 直接索引会抛 `IndexError`，这里静默返回。
+- **`category_submit` 合并两条路**：差别只在「编辑一个已被删掉的分类」这种陈旧 id 场景
+  （Python 不写、这里追加）。
+- **`headers_preset_submit` 用 `index == -1` 表示新建**：Slint 的 `headersEditIndex` 缺省 `-1`。
+
+### 一条实测纠错（测试错、实现对）
+
+`settings_bridge::deferred_actions_are_reported_not_executed` 原来用
+`copyPairToken` + `categoryResetRequested` 两个动作钉「待办不进改动列表」。这一步之后
+`categoryResetRequested` 会真写盘 → 断言挂。挂得对：换成 `categoryAddRequested`
+（开对话框，仍是待办）。另一条 `resetting_categories_writes_the_eight_presets` 里我先写了
+`folder == null`，实测是 `"{default}/Video"` —— 八预设的 `folder` 本来就有值，改断言。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：零错零警告（`/tmp/ck119b.log`）；
+- `cargo test -p gd3-ui --lib settings_writer`：**30 passed**（16 + 14，`/tmp/t119b.log`）；
+- `cargo test -p gd3-ui --lib`：**1022 passed / 0 failed**（1008 + 14，`/tmp/t119lib2.log`）；
+- `cargo test --workspace`：**1577 passed / 0 failed / 28 段**（`/tmp/t119ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c119.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 120 步）
+
+1. 9 个对话框动作（`*AddRequested` / `*EditRequested` / `*EditClosed`）的 UI 控制器：
+   需要 `&AppWindow`，用 `lib.rs` 已有的 `open_headers_preset_edit` / `open_identity_preset_edit`
+   / `open_category_edit`；`SettingsActions` 的这 9 个字段得改成收 `Rc<AppWindow>` 的版本
+   或在 `settings_bridge` 里另装一层。
+2. 4 个平台副作用：剪贴板（`clipboard.rs` 已有）、商店 URL（`open_url`）、CRX 解包、拉起浏览器。
+3. `update_service` 接线（受 `zip` / `xz2` 离线缺包限制）。
+4. P2–P6 剩余 UI。

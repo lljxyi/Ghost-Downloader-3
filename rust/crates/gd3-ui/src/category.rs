@@ -413,6 +413,16 @@ pub fn reset_categories() -> Vec<CategoryRule> {
     default_rules()
 }
 
+/// 镜像 `Category.categoryId` 的 `default_factory`（`category_service.py:103`）：
+/// `cat_{uuid4().hex}` —— 前缀加 32 位小写十六进制。
+///
+/// 读侧 [`parse_rules`] 不生成随机 ID（空串原样留着，交给写侧），所以新分类的 ID
+/// 由写侧在这里补，等价于 Python「构造 `Category` 时就拿到 ID」。
+pub fn new_category_id() -> String {
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    format!("cat_{hex}")
+}
+
 /// 镜像 `CategoryService.reorder`：按给定 id 顺序重排。Python 先建
 /// `{categoryId: category}` 字典（重复 id 后者覆盖前者）再按 id 取，
 /// 取出的项数与当前项数不等 → 整体放弃（返回 false，调用方不写盘）；

@@ -326,12 +326,11 @@ mod tests {
         bridge.install(&window);
 
         window.invoke_copyPairToken();
-        window.invoke_categoryResetRequested();
+        // 第 119 步之后 `categoryResetRequested` 会真写盘，这里换一个仍待办的
+        // 对话框动作（开合类）来钉「待办不进改动列表」。
+        window.invoke_categoryAddRequested();
         let drained = bridge.drain(&window);
-        assert_eq!(
-            drained.deferred,
-            ["copyPairToken", "categoryResetRequested"]
-        );
+        assert_eq!(drained.deferred, ["copyPairToken", "categoryAddRequested"]);
         assert!(drained.changes.is_empty());
         assert!(!drained.repushed);
         assert!(!path.exists());

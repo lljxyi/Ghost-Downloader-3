@@ -2112,6 +2112,142 @@ assert_eq!(settings::read_i64(&written, "maxTaskNum"), Some(3));
 定时器测试用 `slint::platform::update_timers_and_animations()` + 2ms sleep 手动泵帧
 （`HeadlessPlatform` 没覆写 `now()`，定时器走真实单调时钟）。
 
+## 设置页回写的列表半边（`gd3-ui::settings_writer`，第 119 步）
+
+第 117 步只做了「一个动作 → 一个属性名 → 一个值」。剩下 22 个动作全部 `defer`。
+这一步把其中 9 个「列表写回」接成真写，剩 13 个（4 个平台副作用 + 9 个对话框开合）
+继续待办 —— 后者要 `&AppWindow` 改编辑态属性，而 `SettingsWriter` 不持窗口。
+
+列表写回的共性：**读列表 → 改一项 → 整表写回**。Python 的写法一律是
+
+```python
+presets = list(cfg.headersPresets.value)   # 浅拷贝
+presets[index] = ...                       # 改一项
+cfg.set(cfg.headersPresets, presets)       # 整表写回（触发 correct + serialize + 整文件回写）
+```
+
+| 动作 | Python 源 | 写回 |
+|---|---|---|
+| `headers_preset_pick` | `setting_cards.py:715-717` | `currentHeadersPreset` |
+| `headers_preset_remove` | `setting_cards.py:738-775` | `headersPresets`，必要时 `currentHeadersPreset` 回退一格 |
+| `headers_preset_submit` | `setting_cards.py:719-736` | 追加（`index == -1`）/ 替换 |
+| `identity_preset_toggle` | `setting_cards.py:588-593` | 复制该行、改 `isEnabled`、整表写回 |
+| `identity_preset_remove` | `setting_cards.py:595-614` | 删一项、整表写回（**不动**当前索引） |
+| `identity_preset_submit` | `setting_cards.py:566-586` | 追加 / 替换，替换时继承 `isEnabled` |
+| `category_reset` | `category_settings.py:147-148` | 八预设整表写回 |
+| `category_remove` | `category_settings.py:144-145` | 命中才写（Python 用列表推导，重复 id 一起删） |
+| `category_submit` | `category_settings.py:129-142` | 按 `categoryId` 命中 → 替换；否则追加 |
+
+`ConfigStore::set` 已经承担 `correct()` / `serialize()` / 相等早退 / 整文件回写，
+所以这九个方法只是「拼出新的整表 `Value`」。两个私有助手撑起半边：
+
+```rust
+fn list(&self, attr: &str) -> Vec<Value>          // 取逻辑值（已过 correct）
+fn set_list(&self, attr: &'static str, items: Vec<Value>)
+```
+
+### 照抄 Python 的三处细节
+
+**① `currentHeadersPreset` 存原始索引，不是夹紧后的。** `_onRemoveClicked` 里写的是
+`max(0, current - 1)`，其中 `current = cfg.currentHeadersPreset.value`（`:756`）——
+没有先夹到 `len - 1`。所以 `current = 5`、列表只剩 3 项时删第 0 项，落盘是 4；
+读侧 `currentHeadersPresetIndex()`（`cfg.py:347-348`）再夹成 `len - 1`。
+两段夹紧各在各的位置，少一段就会把「用户选的是第 5 项」这个意图擦掉。
+
+**② 列表读写走 `Value` 而不是强类型结构。** Python 复制的是 dict 本身：未知键、
+键序都留着。`_onToggled` 更明确 —— `{**preset, "isEnabled": checked}`（`:592`）
+展开后 `isEnabled` 若已存在则**保持原位置**，`serde_json::Map` 在 `preserve_order`
+下 `insert` 已存在的键正是同一语义（值换、位置不换）。换成
+`IdentityPreset` 往返会丢掉未来新增的键。
+
+**③ `headers_preset_remove` 有 `len > 1` 函数级守卫。** Python 不检查，它靠
+`canRemove = len(presets) > 1`（`:705`）把删除按钮置灰。Rust 侧没有按钮状态可依赖，
+所以把同一条件写成守卫：列表被删空时 `HeadersPresetListValidator.correct` 会补回
+「默认」预设（`settings.rs:739`），等于**删了又长出来**。
+
+### `category_*` 反过来走强类型
+
+`CategoryService._save()` 写的是 `[asdict(c) for c in self._categories]`
+（`category_service.py:144-146`），`_load` 又是 `Category.fromDict(...)` —— 未知键在
+加载时就丢了。所以这里与 Python 同样「过一遍 dataclass」：
+
+```rust
+fn categories(&self) -> Vec<CategoryRule> {
+    let raw = self.get("categoryRules").map(|value| value.to_string());
+    category::parse_rules(raw.as_deref())        // 空表 → 八预设（`_load` 的回落）
+}
+fn write_categories(&self, rules: Vec<CategoryRule>) {
+    let text = category::rules_to_json(&rules);  // 已被单测钉成 json.dumps 口径
+    self.set("categoryRules", serde_json::from_str(&text).unwrap());
+}
+```
+
+`rules_to_json` 的输出串与 `Kind::JsonList` 的 `serialize`（`py_json_dumps`）同口径，
+往返不改变字节，所以这里多一次 `from_str` 不会让落盘文本漂移。
+
+新分类的 id 来自 `Category.categoryId` 的 `default_factory`
+（`f"cat_{uuid4().hex}"`，`category_service.py:103`）。`category.rs` 原先的注释就写着
+「读侧不生成随机 ID，保留空串由写侧处理」—— 这一步补上了那个欠账
+`category::new_category_id()`（`cat_` + 32 位小写十六进制），并在 `gd3-ui` 打开
+`uuid.workspace = true`。
+
+### `identity_preset_submit` 的替换分支必须继承 `isEnabled`
+
+Slint 的身份预设草稿恒带 `is_enabled: true`（`*EditAccepted` 只有 name / profile /
+UA / hosts 四个输入）。但 Python 的编辑对话框会把原值抄回来：
+
+```python
+# preset_edit.py:113-123
+result = {..., "isEnabled": True}
+if self._preset is not None:
+    result["isEnabled"] = self._preset.get("isEnabled", True)
+```
+
+不继承的话，**编辑一个已停用的预设会把它悄悄启用**。所以替换分支读旧行的
+`isEnabled`（缺键当 `true`）覆盖草稿值；新建分支用草稿自己的值。
+
+### 与 Python 的已知差异
+
+- **越界容错**：Python 的 `_onEditClicked` 直接 `presets[index]`，越界抛 `IndexError`；
+  这里 `index < 0 || index >= len` 一律静默返回。
+- **`category_submit` 合并了添加/编辑两条路**：Python 的 `_onAddClicked` 无条件追加、
+  `_onEditClicked` 查不到就 `return`。合并后「`categoryId` 命中 → 替换，否则追加」，
+  差别只在「编辑一个已被删掉的分类」这种陈旧 id 场景：Python 不写，这里会追加。
+- **`headers_preset_submit` 的 `index == -1` 表示新建**：Slint 的 `headersEditIndex`
+  缺省 `-1`（`appwindow.slint:84`），Python 是 `_onAddClicked` / `_onEditClicked` 两个入口。
+
+### 测试（14 条新增，`settings_writer` 共 30 条）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `picking_a_headers_preset_writes_the_raw_index` | 原样写 2；`RangeValidator` 把 120 夹成 99 |
+| `removing_a_headers_preset_pulls_the_current_index_back_one` | 删第 0 项后 `current` 1 → 0 |
+| `removing_a_later_headers_preset_keeps_the_current_index` | 删 `index > current` 不动 `current` |
+| `the_last_headers_preset_cannot_be_removed` | `len <= 1` 时零改动 |
+| `removing_a_headers_preset_ignores_out_of_range_indexes` | `-1` / `9` 都零改动 |
+| `submitting_a_headers_preset_appends_or_replaces` | 追加项只有 `name`/`headers` 两个键；替换改第 0 项 |
+| `submitting_a_headers_preset_ignores_out_of_range_indexes` | `index = 5`（列表 1 项）零改动 |
+| `toggling_an_identity_preset_keeps_the_other_keys` | 只改 `isEnabled`，键数不变；越界零改动 |
+| `removing_an_identity_preset_can_empty_the_list` | 可删到空表（无回落） |
+| `submitting_an_identity_preset_inherits_the_stored_enabled_flag` | 停用预设编辑后仍停用；新建走草稿值 |
+| `resetting_categories_writes_the_eight_presets` | 8 项、`cat_video` / `视频` / `{default}/Video`、5 个键 |
+| `removing_a_category_only_writes_on_a_hit` | 未命中零改动；命中后 7 项 |
+| `submitting_a_category_replaces_a_known_id` | `cat_video` 命中 → 替换、仍是 8 项 |
+| `submitting_a_category_generates_an_id_for_new_rules` | 空 id → `cat_` + 32 位小写十六进制 |
+| `the_deferred_actions_name_what_is_still_missing` | 13 个待办名按点击顺序列出，不碰文件 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：零错零警告；
+- `cargo test -p gd3-ui --lib settings_writer`：**30 passed**；
+- `cargo test -p gd3-ui --lib`：**1022 passed / 0 failed**（1008 + 14）；
+- `cargo test --workspace`：**1577 passed / 0 failed / 28 段**（1563 + 14）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**；
+- `settings_bridge::deferred_actions_are_reported_not_executed` 从
+  `categoryResetRequested` 换成 `categoryAddRequested` —— 前者这一步开始真写盘，
+  后者才是「开对话框」的待办动作。测试挂得对，改的是测试。
+
 ## 更新源纯逻辑层（`gd3-core::sources`）
 
 `app/sources.py`(295) 是「双源竞速」的唯一入口：`github` 与 `gitcode` 各一套端点，
@@ -2489,10 +2625,12 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
 `categoryRules` 等）都要排在它后面。
 
 这条已经落地：第 113 步 `config_store`（读写语义）→ 第 117 步 `settings_writer`
-（动作 → cfg 键）→ 第 118 步 `settings_bridge`（装到窗口上 + 宿主钩子）。剩下的是：
+（动作 → cfg 键）→ 第 118 步 `settings_bridge`（装到窗口上 + 宿主钩子）→ 第 119 步
+`settings_writer` 的列表写回。剩下的是：
 
 1. **更新检查接线**：`update_service` 的 `plan_*` 接到 `gd3-net::sources::WreqTransport`
    与更新卡片；解包（zip / tar.xz / dmg）要宿主工具或新 crate（`zip` / `xz2` 不在离线缓存里）。
-2. **22 个 `defer` 项**：`headersPreset*` / `identityPreset*` / `category*` 的列表写回，
-   以及剪贴板 / 商店 / CRX 解包 / 拉起浏览器四个平台副作用。
+2. **13 个 `defer` 项**：剪贴板 / 商店 / CRX 解包 / 拉起浏览器四个平台副作用，以及
+   `headersPreset*` / `identityPreset*` / `category*` 的九个「开对话框 / 关对话框」动作
+   （要 `&AppWindow` 改 `headersEditIndex` / `*EditVisible`）。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

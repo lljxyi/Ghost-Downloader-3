@@ -10,6 +10,7 @@ gd3-core = { path = "../gd3-core" }
 regex.workspace = true
 serde_json.workspace = true
 slint = "1.18.1"
+uuid.workspace = true
 
 [build-dependencies]
 slint-build = "1.18.1"

@@ -31,15 +31,46 @@
 //!   `name_conflict` / `close_mode` / `client_profile` 收字面量 —— 索引→字面量与显示
 //!   单位→配置单位的换算都在 `install_settings_actions` 那一层做完了。
 //!
-//! ## 本步的边界（没做的部分）
+//! ## 列表写回（第 119 步）
 //!
-//! 只做「**单个标量 → 一个 cfg 键**」。其余动作一律走 [`SettingsWriter::defer`] 记一笔，
-//! 由各自的接线步接管：
+//! 九个动作不是「一个属性名 + 一个值」，而要**读列表 → 改一项 → 整表写回**：
+//!
+//! | 动作 | Python 源 | 写回 |
+//! |---|---|---|
+//! | [`SettingsWriter::headers_preset_pick`] | `setting_cards.py:715-717` | `currentHeadersPreset` |
+//! | [`SettingsWriter::headers_preset_remove`] | `setting_cards.py:738-775` | `headersPresets`，必要时 `currentHeadersPreset` 回退一格 |
+//! | [`SettingsWriter::headers_preset_submit`] | `setting_cards.py:719-736` | 追加（`index == -1`）/ 替换 |
+//! | [`SettingsWriter::identity_preset_toggle`] | `setting_cards.py:588-593` | 复制该行、改 `isEnabled`、整表写回 |
+//! | [`SettingsWriter::identity_preset_remove`] | `setting_cards.py:595-614` | 删一项、整表写回（**不动**当前索引） |
+//! | [`SettingsWriter::identity_preset_submit`] | `setting_cards.py:566-586` | 追加（`index == -1`）/ 替换，替换时继承 `isEnabled` |
+//! | [`SettingsWriter::category_reset`] | `category_settings.py:147-148` | 八预设整表写回 |
+//! | [`SettingsWriter::category_remove`] | `category_settings.py:144-145` | 命中才写（Python 用列表推导，重复 id 一起删） |
+//! | [`SettingsWriter::category_submit`] | `category_settings.py:129-142` | 按 `categoryId` 命中 → 替换；否则追加 |
+//!
+//! 三条照抄 Python 的细节：
+//!
+//! - **`currentHeadersPreset` 存的是原始索引，不是夹紧后的**：`_onRemoveClicked`
+//!   读 `cfg.currentHeadersPreset.value`（`:756`），所以 `current = 5`、列表只剩 3 项时
+//!   删第 0 项会把 5 写成 4；读侧 `currentHeadersPresetIndex()` 再夹成 `len - 1`。
+//! - **列表读写走 `Value` 而不是强类型结构**：Python 是 `list(cfg.x.value)` 复制 dict、
+//!   改一项、整表写回，未知键与键序都留着。`{**preset, "isEnabled": checked}`
+//!   （`:592`）也不重排已有键 —— `Map::insert` 对已存在的键同语义。
+//! - **`headers_preset_remove` 有 `len > 1` 前置条件**：Python 靠 `canRemove` 把删除按钮
+//!   置灰（`:705` `canRemove=len(presets) > 1`），这里把同一条件写成函数级守卫 ——
+//!   列表被删空时 `correct()` 会补回「默认」预设，等于删了又长出来。
+//!
+//! `category_*` 三个动作反过来走 [`crate::category`] 的强类型 `CategoryRule`：Python 的
+//! `CategoryService._save()` 写的是 `[asdict(c) ...]`（`category_service.py:144-146`），
+//! 未知键在 `_load`（`:136-143`）就丢了，所以这里与 Python 同样「过一遍 dataclass」。
+//!
+//! ## 还没接的部分
+//!
+//! 十三个动作仍走 [`SettingsWriter::defer`]：
 //!
 //! | 类别 | 动作 | 为什么留后 |
 //! |---|---|---|
-//! | 列表写 | `headers_preset_*` / `identity_preset_*` / `category_*` | 要读列表、改一项、再整表写回，且删除前有确认框；等对应的对话框/卡片镜像（P1/P3）落地 |
 //! | 平台副作用 | `pair_token_copy` / `store_url_open` / `chromium_install` / `chromium_crx_export` | 剪贴板、浏览器、扩展解包归平台层 |
+//! | 对话框开合 | `headers_preset_*` / `identity_preset_*` / `category_*` 的 `*_requested` 与 `*_edit_closed` | 要 `&AppWindow` 改 `headersEditIndex` / `*EditVisible`，而 [`SettingsWriter`] 不持窗口 |
 //!
 //! `take_deferred()` 能列出被记下的动作名，测试里钉住了这份名单 —— 它是一张**待办清单**，
 //! 不是「悄悄丢掉用户的编辑」。
@@ -63,6 +94,44 @@ use serde_json::{Value, json};
 
 use crate::SettingsActions;
 use crate::config_store::{ConfigChange, ConfigStore, ConfigStoreError};
+use crate::{category, headers, identity};
+
+/// `headers::HeaderPreset` → `HeadersPresetEditDialog.preset()` 的形状
+/// （`headers_preset_edit.py:58-62`）：`{"name": str, "headers": {name: value}}`。
+///
+/// 键序 `name` 在前：Python 的 dict 字面量就是这个顺序，落盘时由
+/// `json.dumps` 原样写出。
+fn header_preset_value(preset: &headers::HeaderPreset) -> Value {
+    let mut headers_map = serde_json::Map::new();
+    for (name, value) in &preset.headers {
+        headers_map.insert(name.clone(), Value::from(value.clone()));
+    }
+    let mut row = serde_json::Map::new();
+    row.insert("name".to_string(), Value::from(preset.name.clone()));
+    row.insert("headers".to_string(), Value::Object(headers_map));
+    Value::Object(row)
+}
+
+/// `identity::IdentityPreset` → `PresetEditDialog.preset()` 的五个键
+/// （`preset_edit.py:113-123`，键序照抄）。
+fn identity_preset_value(preset: &identity::IdentityPreset) -> Value {
+    let mut row = serde_json::Map::new();
+    row.insert("name".to_string(), Value::from(preset.name.clone()));
+    row.insert(
+        "clientProfile".to_string(),
+        Value::from(preset.client_profile.clone()),
+    );
+    row.insert(
+        "userAgent".to_string(),
+        Value::from(preset.user_agent.clone()),
+    );
+    row.insert(
+        "hosts".to_string(),
+        Value::Array(preset.hosts.iter().cloned().map(Value::from).collect()),
+    );
+    row.insert("isEnabled".to_string(), Value::Bool(preset.is_enabled));
+    Value::Object(row)
+}
 
 /// 设置页动作的落盘端。
 ///
@@ -303,6 +372,185 @@ impl SettingsWriter {
     }
 
     // -----------------------------------------------------------------------
+    // 列表动作（第 119 步）
+    // -----------------------------------------------------------------------
+
+    /// 读一项列表的**逻辑值**（已过 `deserialize` + `correct`）。
+    ///
+    /// 缺键/类型不符 → 空表：42 项恒有值，这条分支只挡手改坏的配置。
+    fn list(&self, attr: &str) -> Vec<Value> {
+        match self.get(attr) {
+            Some(Value::Array(items)) => items,
+            _ => Vec::new(),
+        }
+    }
+
+    /// 整表写回一项列表（`correct()` / `serialize()` / 整文件回写仍在 [`ConfigStore::set`]）。
+    fn set_list(&self, attr: &'static str, items: Vec<Value>) {
+        self.set(attr, Value::Array(items));
+    }
+
+    /// `Network/CurrentHeadersPreset`：`setting_cards.py:715-717` 的 `_onPick`。
+    ///
+    /// Python 原样写索引，由 `RangeValidator(0, 99)`（`cfg.py:332-334`）夹紧；读侧
+    /// `currentHeadersPresetIndex()` 再夹到 `len - 1` —— 两段夹紧都不在这里。
+    pub fn headers_preset_pick(&self, index: i64) {
+        self.set("currentHeadersPreset", json!(index));
+    }
+
+    /// `Network/HeadersPresets`：`setting_cards.py:738-775` 的 `_onRemoveClicked`。
+    ///
+    /// 顺序照抄：先写列表，再读 `currentHeadersPreset`，`index <= current` 时回退一格
+    /// （下限 0）。删除按钮在只剩一项时置灰（`:705`），同一条件在此守卫 —— 列表被删空
+    /// 时 `correct()` 会补回「默认」预设，等于删了又长出来。
+    pub fn headers_preset_remove(&self, index: i64) {
+        let mut items = self.list("headersPresets");
+        if index < 0 || index as usize >= items.len() || items.len() <= 1 {
+            return;
+        }
+        items.remove(index as usize);
+        self.set_list("headersPresets", items);
+        let current = self
+            .get("currentHeadersPreset")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+        if index <= current {
+            self.set("currentHeadersPreset", json!((current - 1).max(0)));
+        }
+    }
+
+    /// `Network/HeadersPresets`：`setting_cards.py:719-736` 的添加/编辑收尾。
+    ///
+    /// `index == -1` = 新建（Slint 的 `headersEditIndex` 用 `-1` 表示新建，见
+    /// `ui/settings_page.slint:892`），否则替换该行。越界忽略：Python 在
+    /// `_onEditClicked`（`:729`）里直接索引会抛 `IndexError`，Rust 侧容错。
+    pub fn headers_preset_submit(&self, index: i64, preset: &headers::HeaderPreset) {
+        let mut items = self.list("headersPresets");
+        let value = header_preset_value(preset);
+        if index < 0 {
+            items.push(value);
+        } else {
+            let Some(slot) = items.get_mut(index as usize) else {
+                return;
+            };
+            *slot = value;
+        }
+        self.set_list("headersPresets", items);
+    }
+
+    /// `Network/IdentityPresets`：`setting_cards.py:588-593` 的 `_onToggled`。
+    ///
+    /// `presets[index] = {**presets[index], "isEnabled": checked}`：复制该行、只改一个
+    /// 键。`Map::insert` 对已存在的键保留原位置，与 Python 的 dict 展开一致。
+    pub fn identity_preset_toggle(&self, index: i64, checked: bool) {
+        if index < 0 {
+            return;
+        }
+        let mut items = self.list("identityPresets");
+        let Some(row) = items.get_mut(index as usize).and_then(Value::as_object_mut) else {
+            return;
+        };
+        row.insert("isEnabled".to_string(), Value::Bool(checked));
+        self.set_list("identityPresets", items);
+    }
+
+    /// `Network/IdentityPresets`：`setting_cards.py:595-614` 的 `_onRemoveClicked`。
+    ///
+    /// Python 只有越界守卫（`index < 0 or index >= len(presets)` → `return`），**没有**
+    /// 「至少留一项」的限制：删空之后 `IdentityPresetListValidator.correct` 保留空表。
+    pub fn identity_preset_remove(&self, index: i64) {
+        let mut items = self.list("identityPresets");
+        if index < 0 || index as usize >= items.len() {
+            return;
+        }
+        items.remove(index as usize);
+        self.set_list("identityPresets", items);
+    }
+
+    /// `Network/IdentityPresets`：`setting_cards.py:566-586` 的添加/编辑收尾。
+    ///
+    /// `index == -1` = 新建（Slint 的 `identityEditIndex` 缺省 `-1`）。**替换分支继承
+    /// 既有 `isEnabled`**：Python 的 `PresetEditDialog.preset()` 在编辑态把原值抄回来
+    /// （`preset_edit.py:121-122`），而 Slint 草稿恒带 `true` —— 不继承会悄悄启用停用预设。
+    pub fn identity_preset_submit(&self, index: i64, preset: &identity::IdentityPreset) {
+        let mut items = self.list("identityPresets");
+        let mut value = identity_preset_value(preset);
+        if index < 0 {
+            items.push(value);
+        } else {
+            let Some(slot) = items.get_mut(index as usize) else {
+                return;
+            };
+            let enabled = slot
+                .get("isEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if let Some(row) = value.as_object_mut() {
+                row.insert("isEnabled".to_string(), Value::Bool(enabled));
+            }
+            *slot = value;
+        }
+        self.set_list("identityPresets", items);
+    }
+
+    /// `Category/CategoryRules`：`category_settings.py:147-148` 的「恢复默认」
+    /// → `CategoryService.reset`（`category_service.py:212-214`）。
+    pub fn category_reset(&self) {
+        self.write_categories(category::reset_categories());
+    }
+
+    /// `Category/CategoryRules`：`category_settings.py:144-145` 的 `_onRemoveClicked`
+    /// → `CategoryService.removeCategory`（`category_service.py:206-210`）。
+    ///
+    /// 没命中就不写盘（Python 比长度）。
+    pub fn category_remove(&self, category_id: &str) {
+        let mut rules = self.categories();
+        if category::remove_category(&mut rules, category_id) {
+            self.write_categories(rules);
+        }
+    }
+
+    /// `Category/CategoryRules`：`category_settings.py:129-142` 的添加/编辑收尾。
+    ///
+    /// Python 是两条路：`_onAddClicked` → `addCategory`（无条件追加）；
+    /// `_onEditClicked` 先 `categoryById`、查不到就 `return`，命中才 `updateCategory`。
+    /// 这里按「`categoryId` 是否命中」合并成一条：命中 → 替换，否则追加。
+    ///
+    /// 新分类的 `categoryId` 来自 `Category.categoryId` 的 `default_factory`
+    /// （`cat_{uuid4().hex}`，`category_service.py:103`）；对话框回发的草稿 id 是空串
+    /// （`categoryEditId` 缺省 `""`，见 `ui/appwindow.slint:109`），所以这里补生成。
+    pub fn category_submit(&self, rule: &category::CategoryRule) {
+        let mut next = rule.clone();
+        if next.category_id.is_empty() {
+            next.category_id = category::new_category_id();
+        }
+        let mut rules = self.categories();
+        if !category::update_category(&mut rules, next.clone()) {
+            category::add_category(&mut rules, next);
+        }
+        self.write_categories(rules);
+    }
+
+    /// 当前分类表：`CategoryService._load`（`category_service.py:136-143`）口径 ——
+    /// `categoryRules` 为空 → 八预设。
+    fn categories(&self) -> Vec<category::CategoryRule> {
+        let raw = self.get("categoryRules").map(|value| value.to_string());
+        category::parse_rules(raw.as_deref())
+    }
+
+    /// `CategoryService._save`（`category_service.py:144-146`）：
+    /// `cfg.set(cfg.categoryRules, [asdict(c) ...])`。
+    ///
+    /// 走 [`category::rules_to_json`] 再解回 `Value`：那份串已经被单测钉成 Python
+    /// `json.dumps(ensure_ascii=False)` 口径，而 [`ConfigStore::set`] 会再序列化一次
+    /// （`Kind::JsonList` → `py_json_dumps`，同口径），往返不改变字节。
+    fn write_categories(&self, rules: Vec<category::CategoryRule>) {
+        let text = category::rules_to_json(&rules);
+        let value = serde_json::from_str::<Value>(&text).unwrap_or(Value::Array(Vec::new()));
+        self.set("categoryRules", value);
+    }
+
+    // -----------------------------------------------------------------------
     // 动作集
     // -----------------------------------------------------------------------
 
@@ -311,8 +559,8 @@ impl SettingsWriter {
     /// 每个闭包只做「一个属性名 + 一个值」；单位换算、索引→字面量、URL 拼装
     /// 都在 `install_settings_actions` 那一层（见 `lib.rs` 的同名注释）。
     ///
-    /// 其余 22 个动作（列表写 18 个 + 平台副作用 4 个）调 [`SettingsWriter::defer`]：
-    /// 它们要么得先读列表改一项再整表写回（删除前还有确认框），要么归平台层。
+    /// 其余 13 个动作（平台副作用 4 个 + 对话框开合 9 个）调 [`SettingsWriter::defer`]：
+    /// 前者归平台层，后者要 `&AppWindow` 改编辑态属性。
     /// 这不是静默丢弃 —— [`SettingsWriter::take_deferred`] 会把名字交出去。
     pub fn actions(self: &Rc<Self>) -> SettingsActions {
         let folder = Rc::clone(self);
@@ -411,11 +659,11 @@ impl SettingsWriter {
             store_url_open: Box::new(move |_| store_url_open.defer("openStoreUrl")),
             chromium_install: Box::new(move || chromium_install.defer("chromiumInstall")),
             chromium_crx_export: Box::new(move || chromium_crx_export.defer("exportCrx")),
-            headers_preset_pick: Box::new(move |_| {
-                headers_preset_pick.defer("headersPresetPicked")
+            headers_preset_pick: Box::new(move |index| {
+                headers_preset_pick.headers_preset_pick(index)
             }),
-            headers_preset_remove: Box::new(move |_| {
-                headers_preset_remove.defer("headersPresetRemoveRequested")
+            headers_preset_remove: Box::new(move |index| {
+                headers_preset_remove.headers_preset_remove(index)
             }),
             headers_preset_add_requested: Box::new(move || {
                 headers_preset_add_requested.defer("headersPresetAddRequested")
@@ -426,14 +674,14 @@ impl SettingsWriter {
             headers_preset_edit_closed: Box::new(move || {
                 headers_preset_edit_closed.defer("headersPresetEditClosed")
             }),
-            headers_preset_edit_submit: Box::new(move |_| {
-                headers_preset_edit_submit.defer("headersPresetEditAccepted")
+            headers_preset_edit_submit: Box::new(move |(index, preset)| {
+                headers_preset_edit_submit.headers_preset_submit(index, &preset)
             }),
-            identity_preset_toggle: Box::new(move |_, _| {
-                identity_preset_toggle.defer("identityPresetToggled")
+            identity_preset_toggle: Box::new(move |index, checked| {
+                identity_preset_toggle.identity_preset_toggle(index, checked)
             }),
-            identity_preset_remove: Box::new(move |_| {
-                identity_preset_remove.defer("identityPresetRemoveRequested")
+            identity_preset_remove: Box::new(move |index| {
+                identity_preset_remove.identity_preset_remove(index)
             }),
             identity_preset_add_requested: Box::new(move || {
                 identity_preset_add_requested.defer("identityPresetAddRequested")
@@ -444,11 +692,11 @@ impl SettingsWriter {
             identity_preset_edit_closed: Box::new(move || {
                 identity_preset_edit_closed.defer("identityPresetEditClosed")
             }),
-            identity_preset_edit_submit: Box::new(move |_| {
-                identity_preset_edit_submit.defer("identityPresetEditAccepted")
+            identity_preset_edit_submit: Box::new(move |(index, preset)| {
+                identity_preset_edit_submit.identity_preset_submit(index, &preset)
             }),
-            category_reset: Box::new(move || category_reset.defer("categoryResetRequested")),
-            category_remove: Box::new(move |_| category_remove.defer("categoryRemoveRequested")),
+            category_reset: Box::new(move || category_reset.category_reset()),
+            category_remove: Box::new(move |id| category_remove.category_remove(&id)),
             category_add_requested: Box::new(move || {
                 category_add_requested.defer("categoryAddRequested")
             }),
@@ -458,9 +706,7 @@ impl SettingsWriter {
             category_edit_closed: Box::new(move || {
                 category_edit_closed.defer("categoryEditClosed")
             }),
-            category_edit_submit: Box::new(move |_| {
-                category_edit_submit.defer("categoryEditAccepted")
-            }),
+            category_edit_submit: Box::new(move |rule| category_edit_submit.category_submit(&rule)),
         }
     }
 }
@@ -736,6 +982,44 @@ mod tests {
         assert!(writer.take_deferred().is_empty(), "标量动作不进待办清单");
     }
 
+    fn header_preset(name: &str, pairs: &[(&str, &str)]) -> headers::HeaderPreset {
+        headers::HeaderPreset {
+            name: name.to_string(),
+            headers: pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    fn identity_preset(name: &str, enabled: bool) -> identity::IdentityPreset {
+        identity::IdentityPreset {
+            name: name.to_string(),
+            client_profile: "chrome".to_string(),
+            user_agent: "ua".to_string(),
+            hosts: vec!["example.com".to_string()],
+            is_enabled: enabled,
+        }
+    }
+
+    fn rule(category_id: &str, name: &str) -> category::CategoryRule {
+        category::CategoryRule {
+            category_id: category_id.to_string(),
+            name: name.to_string(),
+            icon: "VIDEO".to_string(),
+            extensions: vec!["mp4".to_string()],
+            folder: None,
+        }
+    }
+
+    /// 某项列表的逻辑值（写完立刻读回，等价于 Python 侧的 `cfg.x.value`）。
+    fn list_of(writer: &Rc<SettingsWriter>, attr: &str) -> Vec<Value> {
+        match writer.get(attr) {
+            Some(Value::Array(items)) => items,
+            other => panic!("{attr} 应当是数组：{other:?}"),
+        }
+    }
+
     #[test]
     fn the_deferred_actions_name_what_is_still_missing() {
         let (path, writer) = writer("deferred");
@@ -744,45 +1028,15 @@ mod tests {
         (actions.store_url_open)("https://microsoftedge.microsoft.com/addons".into());
         (actions.chromium_install)();
         (actions.chromium_crx_export)();
-        (actions.headers_preset_pick)(0);
-        (actions.headers_preset_remove)(1);
         (actions.headers_preset_add_requested)();
         (actions.headers_preset_edit_requested)(0);
         (actions.headers_preset_edit_closed)();
-        (actions.headers_preset_edit_submit)((
-            0,
-            headers::HeaderPreset {
-                name: "x".into(),
-                headers: Vec::new(),
-            },
-        ));
-        (actions.identity_preset_toggle)(0, false);
-        (actions.identity_preset_remove)(1);
         (actions.identity_preset_add_requested)();
         (actions.identity_preset_edit_requested)(0);
         (actions.identity_preset_edit_closed)();
-        (actions.identity_preset_edit_submit)((
-            0,
-            identity::IdentityPreset {
-                name: "n".into(),
-                client_profile: "raw".into(),
-                user_agent: "ua".into(),
-                hosts: Vec::new(),
-                is_enabled: true,
-            },
-        ));
-        (actions.category_reset)();
-        (actions.category_remove)("cat_video".into());
         (actions.category_add_requested)();
         (actions.category_edit_requested)("cat_video".into());
         (actions.category_edit_closed)();
-        (actions.category_edit_submit)(category::CategoryRule {
-            category_id: "cat_video".into(),
-            name: "视频".into(),
-            icon: "VIDEO".into(),
-            extensions: Vec::new(),
-            folder: None,
-        });
 
         assert_eq!(
             writer.take_deferred(),
@@ -791,29 +1045,239 @@ mod tests {
                 "openStoreUrl",
                 "chromiumInstall",
                 "exportCrx",
-                "headersPresetPicked",
-                "headersPresetRemoveRequested",
                 "headersPresetAddRequested",
                 "headersPresetEditRequested",
                 "headersPresetEditClosed",
-                "headersPresetEditAccepted",
-                "identityPresetToggled",
-                "identityPresetRemoveRequested",
                 "identityPresetAddRequested",
                 "identityPresetEditRequested",
                 "identityPresetEditClosed",
-                "identityPresetEditAccepted",
-                "categoryResetRequested",
-                "categoryRemoveRequested",
                 "categoryAddRequested",
                 "categoryEditRequested",
                 "categoryEditClosed",
-                "categoryEditAccepted",
             ]
         );
         // 待办清单里的动作一个都不碰文件，也不进改动列表。
         assert!(writer.take_changes().is_empty());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn picking_a_headers_preset_writes_the_raw_index() {
+        let (_path, writer) = writer("pick");
+        writer.headers_preset_pick(2);
+        let changes = writer.take_changes();
+        assert_eq!(attrs(&changes), ["currentHeadersPreset"]);
+        assert_eq!(changes[0].value, json!(2));
+
+        // `RangeValidator(0, 99)`：Python 侧超界会被夹到 99。
+        writer.headers_preset_pick(120);
+        assert_eq!(writer.take_changes()[0].value, json!(99));
+    }
+
+    #[test]
+    fn removing_a_headers_preset_pulls_the_current_index_back_one() {
+        let (_path, writer) = writer("headers-remove");
+        writer.headers_preset_submit(-1, &header_preset("A", &[("X-Test", "1")]));
+        writer.headers_preset_pick(1);
+        assert_eq!(list_of(&writer, "headersPresets").len(), 2);
+
+        writer.headers_preset_remove(0);
+        let items = list_of(&writer, "headersPresets");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], json!("A"));
+        assert_eq!(items[0]["headers"], json!({"X-Test": "1"}));
+        assert_eq!(writer.get("currentHeadersPreset"), Some(json!(0)));
+    }
+
+    #[test]
+    fn removing_a_later_headers_preset_keeps_the_current_index() {
+        let (_path, writer) = writer("headers-keep");
+        writer.headers_preset_submit(-1, &header_preset("A", &[]));
+        writer.headers_preset_submit(-1, &header_preset("B", &[]));
+        writer.headers_preset_pick(0);
+
+        writer.headers_preset_remove(2);
+        assert_eq!(list_of(&writer, "headersPresets").len(), 2);
+        assert_eq!(writer.get("currentHeadersPreset"), Some(json!(0)));
+    }
+
+    #[test]
+    fn the_last_headers_preset_cannot_be_removed() {
+        let (_path, writer) = writer("headers-last");
+        assert_eq!(list_of(&writer, "headersPresets").len(), 1);
+        writer.headers_preset_remove(0);
+        // 删空会让 `correct()` 补回「默认」预设 —— 等于删了又长出来，所以直接不写。
+        assert!(writer.take_changes().is_empty());
+        assert_eq!(list_of(&writer, "headersPresets").len(), 1);
+    }
+
+    #[test]
+    fn removing_a_headers_preset_ignores_out_of_range_indexes() {
+        let (_path, writer) = writer("headers-range");
+        writer.headers_preset_submit(-1, &header_preset("A", &[]));
+        writer.take_changes();
+
+        writer.headers_preset_remove(-1);
+        writer.headers_preset_remove(9);
+        assert!(writer.take_changes().is_empty());
+        assert_eq!(list_of(&writer, "headersPresets").len(), 2);
+    }
+
+    #[test]
+    fn submitting_a_headers_preset_appends_or_replaces() {
+        let (_path, writer) = writer("headers-submit");
+        writer.headers_preset_submit(-1, &header_preset("A", &[("X-Test", "1")]));
+        let items = list_of(&writer, "headersPresets");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["name"], json!("A"));
+        // `headers_preset_edit.py:58-62`：只有 `name` 与 `headers` 两个键。
+        assert_eq!(
+            items[1].as_object().map(|row| row.len()),
+            Some(2),
+            "落盘形状只能有 name/headers"
+        );
+
+        writer.headers_preset_submit(0, &header_preset("B", &[("Y-Test", "2")]));
+        let items = list_of(&writer, "headersPresets");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], json!("B"));
+        assert_eq!(items[0]["headers"], json!({"Y-Test": "2"}));
+    }
+
+    #[test]
+    fn submitting_a_headers_preset_ignores_out_of_range_indexes() {
+        let (_path, writer) = writer("headers-submit-range");
+        writer.headers_preset_submit(5, &header_preset("A", &[]));
+        assert!(writer.take_changes().is_empty());
+        assert_eq!(list_of(&writer, "headersPresets").len(), 1);
+    }
+
+    #[test]
+    fn toggling_an_identity_preset_keeps_the_other_keys() {
+        let (_path, writer) = writer("identity-toggle");
+        let before = list_of(&writer, "identityPresets");
+        assert_eq!(before.len(), 1);
+
+        writer.identity_preset_toggle(0, false);
+        let after = list_of(&writer, "identityPresets");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["isEnabled"], json!(false));
+        // `{**preset, "isEnabled": checked}`：其余键原样，键数不变。
+        assert_eq!(after[0]["name"], before[0]["name"]);
+        assert_eq!(
+            after[0].as_object().map(|row| row.len()),
+            before[0].as_object().map(|row| row.len())
+        );
+
+        writer.identity_preset_toggle(3, true);
+        assert_eq!(
+            list_of(&writer, "identityPresets")[0]["isEnabled"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn removing_an_identity_preset_can_empty_the_list() {
+        let (_path, writer) = writer("identity-remove");
+        writer.identity_preset_remove(0);
+        assert_eq!(list_of(&writer, "identityPresets"), Vec::<Value>::new());
+        // `IdentityPresetListValidator` 没有回落：空表就是空表。
+        writer.identity_preset_remove(0);
+        assert_eq!(list_of(&writer, "identityPresets"), Vec::<Value>::new());
+    }
+
+    #[test]
+    fn submitting_an_identity_preset_inherits_the_stored_enabled_flag() {
+        let (_path, writer) = writer("identity-submit");
+        writer.identity_preset_toggle(0, false);
+
+        // 草稿恒带 `is_enabled: true`（Slint 侧没有这个输入），编辑态要继承原值。
+        writer.identity_preset_submit(0, &identity_preset("改过的名字", true));
+        let items = list_of(&writer, "identityPresets");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], json!("改过的名字"));
+        assert_eq!(items[0]["isEnabled"], json!(false));
+        assert_eq!(items[0]["hosts"], json!(["example.com"]));
+
+        // 新建走草稿自己的值。
+        writer.identity_preset_submit(-1, &identity_preset("新的", false));
+        let items = list_of(&writer, "identityPresets");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1]["isEnabled"], json!(false));
+        assert_eq!(items[1]["clientProfile"], json!("chrome"));
+    }
+
+    #[test]
+    fn resetting_categories_writes_the_eight_presets() {
+        let (_path, writer) = writer("category-reset");
+        assert_eq!(list_of(&writer, "categoryRules"), Vec::<Value>::new());
+
+        writer.category_reset();
+        let items = list_of(&writer, "categoryRules");
+        assert_eq!(items.len(), 8);
+        assert_eq!(items[0]["categoryId"], json!("cat_video"));
+        assert_eq!(items[0]["name"], json!("视频"));
+        // `asdict()` 会带上 `folder`，八预设的取值是 `{default}/X`。
+        assert_eq!(items[0]["folder"], json!("{default}/Video"));
+        assert_eq!(
+            items[0].as_object().map(|row| row.len()),
+            Some(5),
+            "asdict 只有 categoryId/name/icon/extensions/folder 五个键"
+        );
+    }
+
+    #[test]
+    fn removing_a_category_only_writes_on_a_hit() {
+        let (_path, writer) = writer("category-remove");
+        writer.category_reset();
+        writer.take_changes();
+
+        writer.category_remove("cat_nope");
+        assert!(writer.take_changes().is_empty());
+        assert_eq!(list_of(&writer, "categoryRules").len(), 8);
+
+        writer.category_remove("cat_video");
+        assert_eq!(attrs(&writer.take_changes()), ["categoryRules"]);
+        let items = list_of(&writer, "categoryRules");
+        assert_eq!(items.len(), 7);
+        assert!(
+            items
+                .iter()
+                .all(|item| item["categoryId"] != json!("cat_video"))
+        );
+    }
+
+    #[test]
+    fn submitting_a_category_replaces_a_known_id() {
+        let (_path, writer) = writer("category-update");
+        writer.category_reset();
+        writer.take_changes();
+
+        writer.category_submit(&rule("cat_video", "影片"));
+        let items = list_of(&writer, "categoryRules");
+        assert_eq!(items.len(), 8);
+        assert_eq!(items[0]["categoryId"], json!("cat_video"));
+        assert_eq!(items[0]["name"], json!("影片"));
+        assert_eq!(items[0]["extensions"], json!(["mp4"]));
+    }
+
+    #[test]
+    fn submitting_a_category_generates_an_id_for_new_rules() {
+        let (_path, writer) = writer("category-add");
+        writer.category_reset();
+        writer.take_changes();
+
+        writer.category_submit(&rule("", "自定义"));
+        let items = list_of(&writer, "categoryRules");
+        assert_eq!(items.len(), 9);
+        let id = items[8]["categoryId"].as_str().expect("新分类要有 id");
+        assert_eq!(id.len(), 36, "cat_ + uuid4().hex（32 位）");
+        let hex = id.strip_prefix("cat_").expect("前缀");
+        assert_eq!(hex.len(), 32);
+        assert!(
+            hex.chars()
+                .all(|ch| ch.is_ascii_hexdigit() && !ch.is_uppercase())
+        );
     }
 
     #[test]
