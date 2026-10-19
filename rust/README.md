@@ -2018,6 +2018,136 @@ pub fn merge_pypi_releases<E>(
 | `merge_pypi_releases_returns_none_when_every_source_fails` | 全 `Err` → `None` |
 | `failure_messages_match_the_python_wording` | 六条 `TaskError` 的 `format()` 逐字 |
 
+## 更新源的网络半边（`gd3-net::sources`）
+
+第 114 步的 `gd3_core::sources` 只搬了纯逻辑（URL 拼接、失败文案、挑选口径）。这一步补上
+`app/sources.py` 剩下的半边：**竞速、`gather` 合并、流式落盘**。
+`crates/gd3-net/src/sources.rs`（**1204 行 / 26 单测**）不碰 `gd3-ui`，`update_service`
+接线时依赖 `gd3-net` 即可。
+
+### 对照表
+
+| Python | 这里 | 说明 |
+|---|---|---|
+| `fetchJson(repo, branch, path)`（`sources.py:135`） | `fetch_json` | `staggered_race` 两个 raw 地址，返回 `(JSON, 获胜源)` |
+| `fetchLatestRelease(repo)`（`:101`） | `fetch_latest_release` | `gather` 两个 API，取 `parseVersion` 最大者 |
+| `probeDownloadUrl(repo, tag, asset)`（`:191`） | `probe_download_url` | `Range: bytes=0-0` 竞速，返回可用 URL |
+| `fetchReleaseAsset(repo, tag, asset, path, onProgress)`（`:204`） | `fetch_release_asset` | 先探测再流式下载，返回实际用的 URL |
+| `fetchPypiReleases(package)`（`:241`） | `fetch_pypi_releases` | `gather` 两个索引，按 `SOURCE_ORDER` 反序合并 |
+| `fetchPypiFile(url, path, onProgress)`（`:265`） | `fetch_pypi_file` | `pythonhosted` 多一个镜像候选，竞速探测后下载 |
+| `app/client.py::fetchFile(url, path, onProgress)`（`:162`） | `write_stream` + `Transport::download` | 流循环与传输层分开，前者可离线测 |
+
+`fetchRawFile`（`sources.py:162`）**没有对应函数**：`gd3-core` 里的 raw 下载走 `HttpEngine`，
+那条路径已有自己的重试与分片语义，不该被这里的「Range 探测 + 单流」覆盖。
+
+### 结构
+
+| 位置 | 内容 |
+|---|---|
+| `sources.rs:60-64` | `JSON_TIMEOUT`(15s) / `PROBE_TIMEOUT`(10s) / `FETCH_READ_TIMEOUT`(30s) —— 对应 `buildClient(timeout=15)` / `(timeout=10)` / `(readTimeout=30)` |
+| `:91` | `FetchError { Status(u16), Transport(String) }` + `Display` / `Error` |
+| `:110` | `BoxFetch<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>` |
+| `:115` | `trait Transport { get_json / probe / download }`，三个方法都返回 `BoxFetch` |
+| `:142` | `WreqTransport { profile }` —— 真实现，`build_client` + `crate::engine::to_header_map` |
+| `:224` / `:231` | `describe()`（任意 `Display` → `FetchError::Transport`）/ `content_length()` |
+| `:243` | `write_stream()` —— `fetchFile` 的流循环 |
+| `:302` / `:309` | `Attempt<'a, T>` / `race_first_ok()` —— `staggered_race` 的等价物 |
+| `:359` / `:367` / `:379` | `raw_attempts()` / `download_attempts()` / `boxed()` |
+| `:387`–`:570` | 七个 `pub async fn` + 私有 `Candidate` |
+| `:573` | `mod tests`（26 条） |
+
+**为什么 HTTP 要走 `Transport` 抽象**：`staggered_race` 的「谁先完成谁赢」与 `gather` 后的
+「按 `SOURCE_ORDER` 合并」都是**时序语义**。没有这层，就只能靠真网络去验证，而真网络既慢
+又不确定。桩可以精确指定每个源的延迟与失败形态。
+
+**为什么 `fetch_latest_release` 返回原始 JSON 而不是 `Release`**：`Release` 定义在
+`gd3_ui::release_info`（第 68 步），`gd3-net` 不能反向依赖 `gd3-ui`。所以这里返回
+`(Value, &'static str)`，`version_of` 闭包由调用方给（就是 `tag_name` → `name` → 空串那三步）。
+
+**为什么 `staggered_race` 不 spawn**：用 `FuturesUnordered` + `select!` 手写，attempt 可以
+借用 `&dyn Transport`，不必先 `Arc` 一遍。胜出即 `return`，其余 future 随 `FuturesUnordered`
+一起 drop —— 与 Python 取消输家等价。
+
+**为什么 `fetchFile` 要拆**：真正的 `wreq` 调用只剩「建 client → 发请求 → 拿 `bytes_stream()`」，
+空块跳过 / 进度百分比 / 父目录创建全在 `write_stream` 里，能离线测。
+
+### 六条实证语义
+
+1. **`buildClient` 的三个超时口径不同**：`fetchJson` / `fetchLatestRelease` 用 `timeout=15`
+   （整体），`probeDownloadUrl` 用 `timeout=10`，`fetchFile` 用 `readTimeout=30` —— **不给总超时**，
+   只限单次读。所以 `FETCH_READ_TIMEOUT` 传给 `wreq` 的读超时，不是 `timeout`。
+2. **`raise_for_status()` 只对 4xx/5xx 抛**：3xx 会继续 `resp.json()`。这里 `>= 400` 才判
+   `FetchError::Status`，与 `gd3-net::hf` 的口径一致。
+3. **`int(headers.get("content-length", b"0"))` 在非数字上抛 `ValueError`**，会把整个下载打断。
+   这里退回 0（= 不回调进度）—— 与「没给 content-length」同一条路径。
+4. **`fetchPypiReleases` 的合并方向是反的**（第 114 步已记）：`for result in reversed(succeeded)`
+   → 靠前的源覆盖靠后的，键序按首次插入位置。`merge_pypi_releases` 直接复用。
+5. **`gather` 那条路径是严格大于**：`if parseVersion(result.version) > parseVersion(chosen.version)`，
+   同版本取**先出现**者（`newest_by_version`）。
+6. **`fetchLatestRelease` 的 `accept` 头只给 github**：
+   `headers = {"accept": "application/vnd.github+json"} if source == "github" else {}`。
+
+### 与 Python 的已知差异
+
+- **`content-length` 解析失败当 0**（见上第 3 条）。
+- **非 2xx 一律 `Status`**：Python 3xx 会继续解析，这里只有 `>= 400` 才算错，与 Python 一致；
+  差异在于 `Status` 是**枚举值**而不是异常对象，调用方拿不到 `resp.text`。
+- **未知源的 URL 拼接被跳过**：`build_download_url` / `build_raw_url` 对未知源返回 `None`
+  （第 114 步的刻意设计），所以那种源不会进竞速。
+- **`fetch_latest_release` 的版本提取只认字符串**：Python 是 `str(data.get(key) or "")`，
+  数字会被 `str()` 化；这里非字符串当空串（`{"tag_name": 5}` 这种输入不存在）。
+- **`write_stream` 出错也 `flush()`**：Python 的 `with open(...)` 在异常路径上会 `close()`
+  （= flush）。`tokio::fs::File` 自带缓冲，不 flush 会丢掉最后一段 —— 这是**照抄语义**，
+  不是新增行为。
+- **`WreqTransport` 不设 `readTimeout` 之外的连接池参数**：`build_client` 的 profile 决定指纹，
+  其余走默认。
+
+### 二十六条新单测
+
+`crates/gd3-net/src/sources.rs` **1204 行 / 26 单测**（`cargo test -p gd3-net --lib` 由 73 变 99）。
+
+| 分组 | 测试 | 钉住什么 |
+|---|---|---|
+| 竞速 | `fetch_json_takes_the_first_source_that_answers` | 首个 `Ok` 胜出，返回源名 |
+| | `fetch_json_prefers_the_faster_source` | github 80ms / gitcode 0ms / `STAGGER_DELAY` 50ms → gitcode 赢 |
+| | `fetch_json_reports_the_python_failure` | 全失败 → `json_failure` 文案 |
+| 探测 | `probe_download_url_asks_for_a_single_byte` | 两个源都收到 `Range: bytes=0-0` |
+| | `probe_download_url_reports_the_download_failure` | 全失败 → `download_failure` 文案 |
+| 资产 | `fetch_release_asset_downloads_the_probed_url` | 探测胜者的 URL 被下载 |
+| | `fetch_release_asset_does_not_download_when_the_probe_fails` | 探测失败 → 不建文件 |
+| | `fetch_release_asset_reports_a_download_failure` | 下载失败 → 错误透传 |
+| PyPI 索引 | `fetch_pypi_releases_lets_the_earlier_source_win` | 键序 `["1.0","3.0","2.0"]`，`1.0` 取 github 的值 |
+| | `fetch_pypi_releases_keeps_going_with_one_source_down` | 一个源失败仍合并另一个 |
+| | `fetch_pypi_releases_reports_the_failure` | 全失败 → `pypi_releases_failure` |
+| | `fetch_pypi_releases_rejects_a_payload_without_releases` | 缺 `releases` 键算失败项 |
+| PyPI 文件 | `fetch_pypi_file_falls_back_to_the_mirror` | `pythonhosted` 地址会加 BFSU 候选 |
+| | `fetch_pypi_file_does_not_mirror_other_urls` | 其它地址只有一个候选，失败文案用原 URL |
+| | `fetch_pypi_file_reports_the_failure` | 全失败 → `pypi_file_failure` |
+| release | `fetch_latest_release_picks_the_newest_version` | `parse_version` 最大者 |
+| | `fetch_latest_release_skips_a_failing_source` | 一个源失败仍选另一个 |
+| | `fetch_latest_release_reports_the_failure` | 全失败 → `latest_release_failure` |
+| | `fetch_latest_release_sends_the_github_accept_header` | github 带 `accept`、gitcode 不带 |
+| 流式落盘 | `write_stream_reports_progress_against_content_length` | `received / total * 100` |
+| | `write_stream_skips_the_callback_without_a_content_length` | `total == 0` 不回调 |
+| | `write_stream_creates_the_parent_directory` | `mkdir(parents=True)` |
+| | `write_stream_reports_a_transport_error` | 流中断 → `Transport`，已写内容保留 |
+| 杂项 | `content_length_falls_back_to_zero` | 缺头 / 非数字 → 0 |
+| | `fetch_error_renders_both_shapes` | `HTTP 404` / 原文 |
+| | `wreq_transport_keeps_its_profile` | `profile()` 回原值 |
+
+### 本轮修掉的两个真缺陷
+
+两个都是**先写完、测试才照出来**的，值得记：
+
+1. **`race_first_ok` 一个 attempt 都没起跑**：原写法是循环里 `sleep(Duration::ZERO)` 当「立即」，
+   而 tokio 定时器有 1ms 粒度，零时长 `sleep` 首次 poll 仍是 `Pending`；此时
+   `FuturesUnordered` 是空的，`inflight.next()` 立刻给 `Ready(None)`，`biased` 选中后者直接
+   `break` → 恒 `None`。8 条测试全挂在这一条。改法：**循环外先 `inflight.push(make(0))`**，
+   `next = 1`。
+2. **`write_stream` 出错丢数据**：`tokio::fs::File` 自带缓冲，原来在 `Err` 分支直接
+   `return Err(..)`，文件为空。Python 的 `with open(...)` 在异常路径上会 `close()`（= flush）。
+   改法：`failure: Option<FetchError>` + `break`，循环后**无条件 `flush()`** 再返回。
+
 ## 更新检查（`gd3-ui::update_service`）
 
 `app/services/update_service.py`(335) 把四件事混在一个类里：①状态表（`_infos` +

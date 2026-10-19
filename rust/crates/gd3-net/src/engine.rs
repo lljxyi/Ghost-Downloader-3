@@ -772,7 +772,7 @@ fn write_at(file: &std::fs::File, data: &[u8], offset: u64) -> io::Result<usize>
     file.write_at(data, offset)
 }
 
-fn to_header_map(headers: &[(String, String)]) -> Result<HeaderMap, NetError> {
+pub(crate) fn to_header_map(headers: &[(String, String)]) -> Result<HeaderMap, NetError> {
     let mut map = HeaderMap::new();
     for (name, value) in headers {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(NetError::io)?;

@@ -8180,3 +8180,89 @@ core 依赖 `boot` 的版本常量，方向反了。
 Slint 的更新卡片上，解包（zip / tar.xz / dmg）需要宿主的系统工具或新 crate。
 在那之前先看 `rust/README.md` 的「剩余工作（Phase 8）」——Phase 8 的判定标准是
 「主窗口能无头启动 + 冒烟测试」，接线不能破坏它。
+
+## 第 116 步：`gd3-net::sources`（更新源的网络半边）
+
+**2026-10-19 05:48**
+
+第 114 步把 `app/sources.py` 的纯逻辑（URL 拼接、失败文案、挑选口径）搬进了
+`gd3_core::sources`；这一步补网络半边。`crates/gd3-net/src/sources.rs`
+（**1204 行 / 26 单测**）不碰 `gd3-ui`，`update_service` 接线时依赖 `gd3-net` 即可。
+
+### 对照表
+
+| Python | 这里 | 说明 |
+|---|---|---|
+| `fetchJson`（`sources.py:135`） | `fetch_json` | `staggered_race` 两个 raw 地址 |
+| `fetchLatestRelease`（`:101`） | `fetch_latest_release` | `gather` 两个 API，取版本最大者 |
+| `probeDownloadUrl`（`:191`） | `probe_download_url` | `Range: bytes=0-0` 竞速 |
+| `fetchReleaseAsset`（`:204`） | `fetch_release_asset` | 先探测再流式下载 |
+| `fetchPypiReleases`（`:241`） | `fetch_pypi_releases` | `gather` 两个索引，反序合并 |
+| `fetchPypiFile`（`:265`） | `fetch_pypi_file` | `pythonhosted` 多一个镜像候选 |
+| `client.py::fetchFile`（`:162`） | `write_stream` + `Transport::download` | 流循环与传输层分开 |
+
+`fetchRawFile`（`sources.py:162`）**故意不搬**：`gd3-core` 的 raw 下载走 `HttpEngine`，
+已有自己的重试与分片语义，不该被这里的「Range 探测 + 单流」覆盖。
+
+### 五条结构决策
+
+1. **HTTP 走 `trait Transport`**（`get_json` / `probe` / `download`，三个方法都返回
+   `BoxFetch<'a, T>`）。没有这层，「竞速先完成者胜」「gather 后按 `SOURCE_ORDER` 合并」
+   只能靠真网络验证；桩可以精确指定每个源的延迟与失败形态。
+2. **`Release` 不搬过来**：`Release` 在 `gd3-ui::release_info`（第 68 步），`gd3-net`
+   不能反向依赖 UI → `fetch_latest_release` 返回 `(Value, &'static str)`，
+   `version_of` 闭包由调用方给（`tag_name` → `name` → 空串三步）。
+3. **`staggered_race` 不 spawn**：`FuturesUnordered` + `biased select!` 手写，attempt 借用
+   `&dyn Transport` 即可，不必先 `Arc`。胜出即 `return`，其余 future 随队列 drop
+   —— 与 Python 取消输家等价。
+4. **`fetchFile` 拆两半**：`wreq` 调用只剩「建 client → 发请求 → 拿 `bytes_stream()`」，
+   空块跳过 / 进度百分比 / 父目录创建全在 `write_stream`，可离线测。
+5. **`content-length` 解析失败当 0**（Python 抛 `ValueError` 打断整个下载）；
+   **`>= 400` 才判 `Status`**（`raise_for_status` 只对 4xx/5xx 抛，3xx 继续解析）。
+
+### 修掉的两个真缺陷
+
+两个都是**先写完、测试才照出来**的：
+
+1. **`race_first_ok` 一个 attempt 都没起跑**。原写法想用 `sleep(Duration::ZERO)` 当「立即」，
+   而 **tokio 定时器有 1ms 粒度，零时长 `sleep` 首次 poll 仍是 `Pending`**；此时
+   `FuturesUnordered` 是空的，`inflight.next()` 立刻给 `Ready(None)`，`biased` 选中后者
+   直接 `break` → 恒 `None`。8 条测试全挂在这一条。改法：**循环外先
+   `inflight.push(make(0))`，`next = 1`**。
+2. **`write_stream` 出错丢数据**。`tokio::fs::File` 自带缓冲，原来在流的 `Err` 分支直接
+   `return Err(..)`，文件为空。Python 的 `with open(...)` 在异常路径上会 `close()`
+   （= flush）。改法：`failure: Option<FetchError>` + `break`，循环后**无条件 `flush()`**。
+
+### 二十六条新单测
+
+`-p gd3-net --lib` 由 73 变 99。分组表见 `rust/README.md` 的同名一节，这里只记三条
+最容易回归的：
+
+| 测试 | 钉住什么 |
+|---|---|
+| `fetch_json_prefers_the_faster_source` | github 80ms / gitcode 0ms / `STAGGER_DELAY` 50ms → gitcode 赢（时序语义） |
+| `fetch_pypi_releases_lets_the_earlier_source_win` | 键序 `["1.0","3.0","2.0"]`，`1.0` 取 github 的值 |
+| `fetch_release_asset_does_not_download_when_the_probe_fails` | 探测失败不建文件（准入在下载之前） |
+
+一条 clippy 红灯：`clippy::type_complexity` 对测试桩的
+`Mutex<Vec<(String, Vec<(String, String)>)>>` → 抽
+`type RecordedHeaders = Vec<(String, Vec<(String, String)>)>;`。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-net --all-targets`：**5.63s**，零错零警告（`/tmp/ck116b.log`）；
+- `cargo test -p gd3-net --lib sources`：**26 passed**（`/tmp/t116b.log`）；
+- `cargo test -p gd3-net --lib`：**99 passed**（73 + 26，`/tmp/t116net.log`）；
+- `cargo test --workspace`：**1536 passed / 0 failed / 28 段**（1510 + 26，`/tmp/t116ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c116b.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 117 步）
+
+`app/sources.py` 与 `app/services/update_service.py` 的未镜像逻辑到此清空。剩下是**接线**：
+`boot::run` 把 `UpdateTable` / `plan_check` / `plan_app_download` / `plan_pack_download` /
+`plan_apply` / `updater_command` 接到 `WreqTransport` 与 Slint 的更新卡片上。解包
+（zip / tar.xz / dmg）需要宿主系统工具或新 crate（`zip` / `xz2` 不在离线缓存里）。
+接线前先看 `rust/README.md` 的「剩余工作（Phase 8）」——判定标准是「主窗口能无头启动 +
+冒烟测试」，接线不能破坏它。

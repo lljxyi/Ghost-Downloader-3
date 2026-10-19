@@ -8,6 +8,7 @@ pub mod hf;
 pub mod plan;
 pub mod probe;
 pub mod ranges;
+pub mod sources;
 
 pub use engine::{
     HttpEngine, ProgressCallback, SpeedGate, TransferProgress, build_client, is_fatal_io_error,
