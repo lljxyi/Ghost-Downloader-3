@@ -63,9 +63,11 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gd3_core::config::UserConfig;
 use gd3_core::settings;
+use gd3_core::task::TaskStatus;
 // `window()`/`run()` 来自 `ComponentHandle`，不在 prelude 里。
 use slint::ComponentHandle;
 
@@ -83,6 +85,10 @@ pub const USER_CONFIG_FILE: &str = "UserConfig.json";
 pub const TASKS_FILE: &str = "tasks.jsonl";
 /// `startup.py:49` 传给 `Engine` 的 `extensionFolder` 叶子名。
 pub const EXTENSION_FOLDER: &str = "browser_extension";
+/// `--until-idle` 的缺省上限（秒）。Python 没有这个开关，取这个值只为「不无限挂住」。
+pub const IDLE_TIMEOUT: u64 = 300;
+/// 停机时等工作线程收工的时长（超过就放手，`.ghd` 已经保住，下次启动续传）。
+pub const WORKER_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // 路径
@@ -224,6 +230,10 @@ pub struct Cli {
     pub data_dir: Option<PathBuf>,
     /// `tasks.jsonl` 覆盖（Rust 扩展，测试用；缺省 `<APP_DATA_DIR>/tasks.jsonl`）。
     pub tasks_file: Option<PathBuf>,
+    /// 推到没有任务在跑再退出（Rust 扩展，冒烟用；隐含无头）。
+    pub until_idle: bool,
+    /// `--until-idle` 的上限秒数（缺省 [`IDLE_TIMEOUT`]）。
+    pub idle_timeout: Option<u64>,
     pub help: bool,
     pub version: bool,
     /// 位置参数里识别出的 URL / 文件 URI（`application.py::urisFromArgv`）。
@@ -243,6 +253,8 @@ Ghost Downloader (Rust/Slint)
   --frames <N>         无头模式驱动的帧数（缺省 1）
   --data-dir <PATH>    覆盖数据目录（测试用，Python 侧无此参数）
   --tasks-file <PATH>  覆盖任务列表文件（测试用，Python 侧无此参数）
+  --until-idle         跑到没有任务在跑再退出（隐含无头；真下载，冒烟用）
+  --idle-timeout <SEC> --until-idle 的上限秒数（缺省 300）
   -V, --version        打印版本
   -h, --help           打印本帮助
 ";
@@ -327,6 +339,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
                 let value = args.get(index).ok_or("--tasks-file 缺少取值")?;
                 cli.tasks_file = Some(PathBuf::from(value));
             }
+            "--until-idle" => cli.until_idle = true,
+            "--idle-timeout" => {
+                index += 1;
+                let value = args.get(index).ok_or("--idle-timeout 缺少取值")?;
+                cli.idle_timeout = Some(parse_idle_timeout(value)?);
+            }
             other if other.starts_with("--frames=") => {
                 cli.frames = Some(parse_frames(&other["--frames=".len()..])?);
             }
@@ -335,6 +353,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Cli, String>
             }
             other if other.starts_with("--tasks-file=") => {
                 cli.tasks_file = Some(PathBuf::from(&other["--tasks-file=".len()..]));
+            }
+            other if other.starts_with("--idle-timeout=") => {
+                cli.idle_timeout = Some(parse_idle_timeout(&other["--idle-timeout=".len()..])?);
             }
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("未知参数：{other}"));
@@ -356,6 +377,12 @@ fn parse_frames(value: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
         .map_err(|_| format!("--frames 需要非负整数，收到：{value}"))
+}
+
+fn parse_idle_timeout(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("--idle-timeout 需要非负整数，收到：{value}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +456,10 @@ pub struct RunSummary {
     pub task_load_failures: usize,
     /// `resumeSaved()` 重新入队的任务数。
     pub resumed: usize,
+    /// 停机后处于 `COMPLETED` 的任务数（无头冒烟据此判定「真的下完了」）。
+    pub completed: usize,
+    /// `--until-idle` 推了多少个 tick（没开就是 0）。
+    pub runner_ticks: u32,
     /// 运行期间第二个实例送来的交接消息（`take_handoffs` 的结果）。
     pub handoffs: Vec<crate::single_instance::Handoff>,
 }
@@ -469,7 +500,8 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         Err(err) => return Err(format!("单实例锁创建失败：{err}")),
     };
     let default_download = paths.download_dir.to_string_lossy().to_string();
-    let headless = cli.headless || !has_display();
+    // `--until-idle` 隐含无头：它就是给「没有显示服务也要真下载」的冒烟用的。
+    let headless = cli.headless || cli.until_idle || !has_display();
     let frames = cli.frames.unwrap_or(1);
     let tasks_path = cli.tasks_file.clone().unwrap_or_else(|| paths.tasks_path());
 
@@ -526,21 +558,47 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         }
     });
 
+    // 窗口先建：`Runtime` 要拿它装 tick 定时器。两条驱动路径（无头手动推 / 有头
+    // 事件循环）除驱动方式外完全一样，所以装配只写一次。
+    let window = if headless {
+        crate::create_headless()
+    } else {
+        crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?
+    };
+    bridge.install(&window);
+    crate::settings_dialogs::install(&window, Rc::clone(&writer));
+    crate::extension_actions::install(
+        &window,
+        crate::extension_actions::ExtensionActions::new(
+            Rc::clone(&writer),
+            paths.extension_folder(),
+            Rc::new(crate::extension_actions::SystemEffects),
+        ),
+    );
+    crate::extension_install::install(&window, Rc::new(crate::extension_install::SystemGuide));
+    crate::push_settings(&window, &writer.config(), &default_download);
+
+    // 下载运行期（`task_runner` → 工作线程 → `gd3-net`）。设置每 tick 现读
+    // `engine.config()`，所以设置页改 `maxTaskNum` 下一 tick 就生效（Python 的
+    // `_rebalance`）。
+    let mut runtime = crate::runtime::Runtime::new(
+        Rc::clone(&engine),
+        Rc::new(RefCell::new(crate::task_runner::TaskRunner::new(
+            crate::task_runner::RunnerSettings::from_config(engine.borrow().config()),
+        ))),
+        window.clone_strong(),
+    );
+    runtime.refresh();
+
+    let mut runner_ticks = 0u32;
     if headless {
-        let window = crate::create_headless();
-        bridge.install(&window);
-        crate::settings_dialogs::install(&window, Rc::clone(&writer));
-        crate::extension_actions::install(
-            &window,
-            crate::extension_actions::ExtensionActions::new(
-                Rc::clone(&writer),
-                paths.extension_folder(),
-                Rc::new(crate::extension_actions::SystemEffects),
-            ),
-        );
-        crate::extension_install::install(&window, Rc::new(crate::extension_install::SystemGuide));
-        crate::push_settings(&window, &writer.config(), &default_download);
-        engine.borrow().tasks().refresh(&window);
+        // 无头：`slint::Timer` 不会自己走，所以 `--until-idle` 手动按 tick 间隔推进
+        // 运行期（真下载）；不带这个开关时保持 `--frames` 的「只启动不派发」冒烟语义。
+        if cli.until_idle {
+            runner_ticks = runtime.run_until_idle(Duration::from_secs(
+                cli.idle_timeout.unwrap_or(IDLE_TIMEOUT),
+            ));
+        }
         for _ in 0..frames {
             slint::platform::update_timers_and_animations();
             window.window().request_redraw();
@@ -550,20 +608,9 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         bridge.drain(&window);
         bridge.stop();
     } else {
-        let window = crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?;
-        bridge.install(&window);
-        crate::settings_dialogs::install(&window, Rc::clone(&writer));
-        crate::extension_actions::install(
-            &window,
-            crate::extension_actions::ExtensionActions::new(
-                Rc::clone(&writer),
-                paths.extension_folder(),
-                Rc::new(crate::extension_actions::SystemEffects),
-            ),
-        );
-        crate::extension_install::install(&window, Rc::new(crate::extension_install::SystemGuide));
-        crate::push_settings(&window, &writer.config(), &default_download);
-        engine.borrow().tasks().refresh(&window);
+        // 有头：窗口事件循环驱动 tick 定时器（`Runtime::install`），阻塞到窗口关闭
+        // （Python 的 `app.exec()`）。
+        runtime.install();
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;
         bridge.stop();
     }
@@ -574,8 +621,14 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     let handoffs = instance.take_handoffs();
     instance.release();
 
-    // 停机序列（`engine.py:41-49`）：`taskService.stop` → flush → 速度表/监听器/功能包
-    // 收尾 → 再 flush。窗口一关就走，与 Qt 的 `aboutToQuit` 同位置。
+    // 停机序列（`engine.py:41-49`）：先把在跑的工作线程取消掉（`.ghd` 保住），再走
+    // `taskService.stop` → flush → 速度表/监听器/功能包收尾 → 再 flush。窗口一关就走，
+    // 与 Qt 的 `aboutToQuit` 同位置。顺序不能反：`Engine.stop` 之后 `TaskService` 已经
+    // 收工，晚到的运行期事件没人收。
+    for task_id in runtime.shutdown(WORKER_SHUTDOWN_WAIT) {
+        eprintln!("任务 {task_id} 未在停机等待内收工（`.ghd` 已保住，下次启动可续传）");
+    }
+    drop(window);
     engine
         .borrow_mut()
         .stop()
@@ -593,6 +646,14 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         tasks: engine.borrow().tasks().len(),
         task_load_failures: started.load_failures.len(),
         resumed: started.resumed.len(),
+        completed: engine
+            .borrow()
+            .tasks()
+            .records()
+            .iter()
+            .filter(|record| record.status == TaskStatus::Completed)
+            .count(),
+        runner_ticks,
         handoffs,
     }))
 }
@@ -625,7 +686,7 @@ pub fn main_entry(args: Vec<String>) -> std::process::ExitCode {
         Ok(RunOutcome::Ran(summary)) => {
             if summary.headless {
                 println!(
-                    "Ghost Downloader v{} launched (headless, {} frame(s), config={}, data={}, tasks={}, resumed={})",
+                    "Ghost Downloader v{} launched (headless, {} frame(s), config={}, data={}, tasks={}, resumed={}, completed={}, ticks={})",
                     VERSION,
                     summary.frames,
                     if summary.config_created {
@@ -638,6 +699,8 @@ pub fn main_entry(args: Vec<String>) -> std::process::ExitCode {
                     summary.app_data_dir.display(),
                     summary.tasks,
                     summary.resumed,
+                    summary.completed,
+                    summary.runner_ticks,
                 );
             }
             ExitCode::SUCCESS

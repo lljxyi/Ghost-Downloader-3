@@ -9160,3 +9160,63 @@ pump/drain）+ 工作线程里的 `HttpEngine`（Phase 5 的成果）。
 - 下一步：第 127 步 —— 把 `TaskRunner` 接进 `boot::run`（tick 定时器 +
   `--until-idle` 无头开关），让 `cargo run -p gd3-ui` 真的会下载。
 - 卡点：无
+
+## 第 127 步：Phase 8e/8g —— 把 `TaskRunner` 接进运行期（`gd3-ui::runtime` + `boot::run` 真下载）（2026-10-19 17:45）
+
+第 126 步有了「谁去下载」（`TaskRunner`），但没人按 tick 推它、没人把结果落盘、没人刷 UI。
+这一步补上**宿主层**，让 `cargo run -p gd3-ui` 真的会下载。
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/runtime.rs`（646 行，含 13 条单测）：
+    - `tick_host()` 一次 tick 的全部动作 —— 现读 `RunnerSettings::from_config` →
+      `pump`（派发等待队列）→ `drain`（收工作线程事件）→ 到点则 `tick_speed_meter`
+      → 有改动才 `flush(tasks.jsonl)` → 有改动/有进度才 `refresh`（重画列表）；
+    - `RunnerTick`（`started` / `progressed` / `finished` / `failed` / `flushed` /
+      `flush_error` / `speed`）作为「这一轮做了什么」的可断言产物；
+    - `Runtime`：`new` / `install`（`slint::Timer` 100ms）/ `tick` / `is_idle` /
+      `run_until_idle`（无头手动推 + `update_timers_and_animations`）/ `pause` /
+      `start` / `refresh` / `shutdown`；
+  - `lib.rs`：`pub mod runtime;`（`runtime` < `runtime_status`）；
+  - `boot.rs`：
+    - 新增 CLI `--until-idle` / `--idle-timeout <SEC>`（缺省 300）+ 常量
+      `IDLE_TIMEOUT` / `WORKER_SHUTDOWN_WAIT`；`--until-idle` **隐含无头**；
+    - `run()` 重排：窗口先建（有头/无头只差 `create_headless` 与 `AppWindow::new`），
+      装配只写一次；接 `Runtime`；有头走 `runtime.install()` + `window.run()`，
+      无头且 `--until-idle` 走 `runtime.run_until_idle()`；
+    - 停机顺序：`runtime.shutdown(5s)`（取消工作线程、保住 `.ghd`）**先于**
+      `engine.stop()`（落盘）；
+    - `RunSummary` += `completed` / `runner_ticks`；无头摘要行 += `completed=` / `ticks=`；
+  - 新增 `rust/crates/gd3-ui/tests/runtime_e2e.rs`（279 行，2 条端到端）：
+    (a) 写 `tasks.jsonl`（一行一条）→ `boot::run(--until-idle)` → 真下载 200 KB
+    → 逐字节一致 + `.ghd` 删除 + 回写后是 `COMPLETED`；(b) 慢速服务 →
+    `Runtime::pause`（`.ghd` 保住、状态 PAUSED）→ `Runtime::start` → 续传 →
+    2 MB 逐字节一致 + `.ghd` 删除。
+- 验证：
+  - `cargo test -p gd3-ui`：`--lib` **1159 passed / 0 failed**（第 126 步 1146 + 13）；
+    `--test runtime_e2e` **2 passed**；`--test runner_e2e` **2 passed**；
+  - `cargo clippy -p gd3-ui --all-targets -- -D warnings`：干净；
+  - `cargo fmt --all --check`：通过；
+  - **真 CLI 全链路**（`python3 -m http.server 18731` + 手写 `tasks.jsonl`）：
+    `./target/debug/gd3-ui --data-dir /tmp/cli-smoke/data --until-idle` → 退出码 0，
+    摘要 `tasks=1, resumed=1, completed=1, ticks=2`，`cmp` 输出逐字节一致，
+    `dl/` 里只剩 `payload.bin`（`.ghd` 已删）；
+  - **Python 能读回**：`.venv/bin/python` 里 `Task.fromDict(json.loads(line))` →
+    `taskId=smoke` / `status=4`(COMPLETED) / `toFilePath(0)=/tmp/cli-smoke/dl/payload.bin`
+    / `steps[0].status=4`；
+  - `--version` / `--help` / `--headless --frames 3`（不带 `--until-idle`）全部退出 0。
+- 顺带修掉的实现缺陷（单测逮到的）：
+  - `Runtime::refresh` 原来自己调 `push_task_records(..., |_| Default::default())`，
+    会丢掉 `isSeeding`/`canSeed`/`hasOutputFile` 三个运行期事实 —— 改成走
+    `TaskService::refresh`（与 `boot.rs` 原来那行完全等价）；
+  - `tick_host` 里 `drain` 与 `pump` 的顺序一度写反（clippy 重构时），已改回
+    `pump` → `drain`（与 Python `_schedule` → `_dispatch` 一致）。
+- 设计取舍（写进模块头）：
+  - **无头不带 `--until-idle` 时不推运行期** —— 保住 `--frames` 的「只启动不派发」
+    冒烟语义（否则既有 boot 单测会去真的连 `https://example.com`）。真下载的冒烟走
+    `--until-idle`；
+  - 速度表按 tick 判 1 秒（Python 是每任务一个协程定时器），数字落在 `RunnerTick::speed`。
+- 已知差异：限速钩子（`SpeedMeter::waitForSpeedLimit`）与 `shouldPreserveLastModified`
+  仍未接；建任务链路（解析器）仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的任务。
+- 下一步：第 128 步 —— `Ghost-Downloader-3.py` 里 `GHOST_UI=slint` 分派（exec `gd3-ui`，
+  缺省 qt 不变），然后 `UserConfig.json` 单一写者口径（8c）与 8a/8f/8g 收口。
+- 卡点：无

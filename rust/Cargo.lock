@@ -1679,10 +1679,12 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "gd3-core",
+ "gd3-net",
  "regex",
  "serde_json",
  "slint",
  "slint-build",
+ "tokio",
  "uuid",
 ]
 
