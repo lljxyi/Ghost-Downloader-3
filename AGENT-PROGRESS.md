@@ -8645,3 +8645,148 @@ category_add / category_edit / category_close
 2. `update_service` 接线：`plan_*` 接到 `gd3-net::sources::WreqTransport` 与更新卡片；
    解包受 `zip` / `xz2` 离线缺包限制。
 3. P2–P6 剩余 UI：建任务链路、其它对话框、组件库、OOBE、平台外壳。
+
+## 第 121 步：`gd3-ui::extension_crx`（自读 ZIP 中央目录 + 真实 CRX 解包）
+
+**2026-10-19 08:05**
+
+第 122 步要给设置页的四张扩展卡接线（复制配对令牌 / 商店链接 / 本地安装 / 导出 crx），
+其中三张都绕不开 `app/assets/chrome_extension.crx`。Python 侧的路径是
+`loadCrx()`（`desktop.py:118`）读 `:/res/chrome_extension.crx` →
+`BrowserService.install()`（`browser_service.py:196-205`）拆 CRX 头 → `zipfile.extractall(folder)`。
+离线缓存里**没有 `zip` crate**（`sha2` / `xz2` 同样缺），但 `flate2 1.1.10` 本来就在
+`Cargo.lock` 里（slint 的传递依赖），所以这一步**自己读 ZIP 中央目录**，把容器这一层做实：
+`crates/gd3-ui/src/extension_crx.rs`（**695 行 / 13 单测**）。
+
+### 覆盖面
+
+```text
+crx_bytes() ──→ payload(crx) ──→ entries(zip) ──→ read_entry(zip, &entry)
+  include_bytes!     Cr24 + v3         EOCD 反扫          method 0 原样
+                     12 + headerSize   中央目录遍历        method 8 DeflateDecoder
+                                                     └──→ unpack(crx, folder) → Vec<String>
+                                                          sanitize() 逐条净化
+export(crx, path) ── fs::write
+```
+
+| Python 源 | 语义 | 这里 |
+|---|---|---|
+| `desktop.py:118` `loadCrx()` | `QResource(":/res/chrome_extension.crx").data()` | `crx_bytes()`（`include_bytes!`，341 464 字节） |
+| `browser_service.py:200` | `struct.unpack_from("<I", crx, 8)` | `payload(crx) -> Result<&[u8], CrxError>` |
+| `browser_service.py:201` | `extensionFolder.mkdir(parents=True, exist_ok=True)` | `unpack` 第一句 |
+| `browser_service.py:202-203` | `zipfile.ZipFile(...).extractall(folder)` | `entries` + `unpack` |
+| `setting_page.py:487-495` | `f.write(loadCrx())` | `export(crx, path)` |
+
+`Paths::extension_folder()`（`boot.rs:197`）= `app_data_dir.join(EXTENSION_FOLDER)`，
+镜像 `startup.py:49` 传给 `Engine` 的 `extensionFolder`；`EXTENSION_FOLDER = "browser_extension"`
+放在 `boot.rs:85`（与 `CONFIG_FILE` / `LOCK_FILE` 一排）。
+
+### 为什么自己写 ZIP 读
+
+- `zip` crate 不在离线缓存里，这一步又必须能跑通（否则第 122 步的安装卡永远 defer）；
+- 需要的子集极小：**EOCD 定位 + 中央目录遍历 + 本地头定位 + inflate**，约 200 行；
+- `flate2` 已在锁里，`flate2::read::DeflateDecoder` 直接可用，不引入新 crate 版本；
+- 以后更新包解 xz 时，同一套 `entries` / `read_entry` 可复用（载荷同构）。
+
+代价是**不校验 CRC32**：Python 的 `ZipExtFile` 读完比对 CRC，这里只比对「解压后长度 ==
+中央目录 `file_size`」。扩展包是打进二进制的自家产物，CRC 换不来保障却要再拖 `crc32fast`。
+单测里的合成 ZIP 因此把 CRC 留 0（`ZipBuilder` 的注释写明了）。
+
+### 解包口径：先跑 Python 再写实现
+
+对真实 crx 跑了一遍 `.venv/bin/python` 的 `extractall`，逐项对照后才动手：
+
+| 实测事实 | 落到实现里 |
+|---|---|
+| 载荷 **42 项 = 11 目录 + 31 文件**，全部 `compress_type = 8` | 只需 stored / deflate 两条分支（仍留着 method 0，为了通用） |
+| 目录靠**名字以 `/` 结尾**判定（`ZipInfo.is_dir()`），不看 `external_attr` | `Entry::is_dir = name.ends_with('/')` |
+| **不还原权限与 mtime**：目录 `0o755`、文件 `0o644`（umask 决定），mtime 是解包时刻 | 不 `chmod`、不 `utime`，`fs::write` 就完 |
+| 顺序 = `infolist()` 序（中央目录序，**不是字典序**，首项是 `_locales/`） | 按中央目录序落盘，`create_dir_all(parent)` 兜底父目录 |
+| `manifest.json` 2084 字节、`background.js` 101 558 字节 | 单测钉住这两个数，作为 inflate 正确性的端到端证据 |
+
+`unpack` 返回落盘清单 `Vec<String>`：Python 的 `extractall` 无返回值，这里给第 122 步
+「解包后弹安装引导」用，也方便断言顺序与幂等。
+
+### 路径净化：照抄 `_extract_member` 的 POSIX 分支
+
+CPython 是**丢分量**，不是「解析」：
+
+```python
+arcname = member.filename.replace('/', os.sep)      # POSIX 无操作
+arcname = os.path.splitdrive(arcname)[1]            # POSIX 无操作
+invalid = ('', os.path.curdir, os.path.pardir)
+arcname = os.sep.join(x for x in arcname.split(os.sep) if x not in invalid)
+```
+
+于是 `a/../b` → `a/b`、`/abs/x` → `abs/x`、`a//b` → `a/b`、`../..` → 空；而 `..\..\x`
+在 POSIX 上**不拆反斜杠**，整串是一个文件名。`sanitize()` 逐条照做，
+`sanitize_drops_python_invalid_parts` 用九行表钉住。`escaping_paths_are_clamped_to_the_folder`
+是安全侧的证据：`../evil.txt` / `/abs.txt` / `a/../../b.txt` 三个条目解包后全部落在
+`folder` 内，上级目录一个文件都没多。
+
+Windows 的 `_sanitize_windows_name`（保留名 / 冒号 / 尾随点）**没搬**，与
+`gd3-core::desktop` 的 `*_on(os, ..)` 家族同一思路：等平台外壳那一步按 `cfg!(windows)` 分派。
+
+### 十三条单测
+
+| 覆盖面 | 断言 |
+|---|---|
+| 容器头 | `Cr24` / 版本 3 / `headerSize == 1310` / 载荷以本地头签名开头 |
+| 中央目录 | 42 项、11 目录 + 31 文件、全 method 8、首项 `_locales/` |
+| 真实解包 | 11 目录 + 31 文件、`manifest.json` 2084、`background.js` 101 558 |
+| 幂等 | 解包两次，返回清单与磁盘树都不变 |
+| 路径净化 | 九行表 |
+| 坏魔数 | `BadMagic(*b"NOPE")` |
+| 短头 / v2 | `Truncated(_)` / `UnsupportedVersion(2)` |
+| stored 分支 | 合成 ZIP（method 0）原样拷贝 |
+| deflate 分支 | 合成 ZIP（method 8），压缩后确实变小 + 解压等值 |
+| 未知方法 | method 12 → `UnsupportedMethod(12)` |
+| 逃逸路径 | 三个逃逸条目全部夹在 `folder` 内 |
+| 缺 EOCD | 截尾 ZIP → `Zip(_)`；`b"PK"` → `Truncated(_)` |
+| 导出 | `export()` 写出的字节与 `crx_bytes()` 逐字节相同 |
+
+合成 ZIP 由测试内的 `ZipBuilder`（`dir` / `stored` / `deflated` / `raw` / `push` / `finish`）
+造：本地头 + 中央目录 + EOCD，`wrap()` 再套一个假 CRX 头 —— 「解压分支」与「真实包」
+两条路径都有覆盖，且不依赖外部工具。
+
+### 与 Python 的已知差异
+
+- **不校验 CRC32**（见上）。
+- **不支持 ZIP64**：crx 341 KB 走不到；`entries` 见到 `0xffff` 哨兵直接
+  `Zip("ZIP64 不受支持")`，不静默错读。
+- **头部越界立刻报错**：Python 的 `crx[12 + headerSize:]` 越界时静默给空串（后面才
+  `BadZipFile`），这里直接 `Truncated("CRX 载荷")`。
+- **`unpack` 返回落盘清单**：Python 无返回值（见上）。
+- **净化后为空的条目跳过**：Python 会拿 `folder` 本身当目标（目录项无害，文件项
+  `IsADirectoryError`）。自家包里没有这种条目，跳过比崩掉合理。
+
+### 两次编译错（都是自己写出来的）
+
+1. `let mut crx = wrap(&zip);` → `unused_mut`：`payload` 只借不写；
+2. `deflated_entries_are_inflated` 里 `payload(&wrap(&zip))` —— 临时值在语句末被 drop，
+   借用活不过 `entries`。改成先 `let crx = wrap(&zip);` 再借。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过（`FMT_OK`）；
+- `cargo check -p gd3-ui --lib`：**24.38s，零错零警告**；
+- `cargo test -p gd3-ui --lib extension_crx`：**13 passed**（`/tmp/t121b.log`）；
+- `cargo test -p gd3-ui --lib`：**1047 passed / 0 failed**（1034 + 13，`/tmp/t121lib.log`）；
+- `cargo test --workspace`：**1602 passed / 0 failed / 28 段**（`/tmp/t121ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c121.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 122 步）
+
+四个平台副作用接线（`take_deferred()` 里剩的全部）：
+
+1. `copyPairToken` → 写剪贴板。`clipboard.rs` 只是**监听器**状态机，没有写入器；
+   `arboard 3.7.0` 在缓存里但会拖 `x11rb` / `wl-clipboard-rs` 一串依赖，优先考虑
+   spawn `wl-copy` / `xclip` / `xsel`（失败静默），并在宿主钩子里留口子；
+2. `openStoreUrl` → 拉起默认浏览器（Python 是 `QDesktopServices.openUrl`，
+   `gd3-core::desktop::open_chromium_url` 是 Chromium 专用，不能直接复用）；
+3. `chromiumInstall` → `extension_crx::unpack(crx_bytes(), &paths.extension_folder())`
+   + 安装引导框（`ExtensionInstallDialog`）；
+4. `exportCrx` → 保存对话框 + `extension_crx::export`（离线无 `rfd`，走宿主钩子）。
+
+顺带：`pair_token_regenerate` 之后也要把新令牌复制到剪贴板（`setting_page.py:443-448`）。

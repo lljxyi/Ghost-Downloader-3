@@ -6,6 +6,7 @@ description = "Ghost-Downloader-3 的 Slint UI crate（Phase 7 起步；strangle
 license = "GPL-3.0"
 
 [dependencies]
+flate2.workspace = true
 gd3-core = { path = "../gd3-core" }
 regex.workspace = true
 serde_json.workspace = true

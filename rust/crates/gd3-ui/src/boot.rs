@@ -81,6 +81,8 @@ pub const URL_SCHEME: &str = "ghostdownloader";
 pub const USER_CONFIG_FILE: &str = "UserConfig.json";
 /// `task_service.py::TaskStore.__init__` 里硬编码的 `APP_DATA_DIR / "tasks.jsonl"`。
 pub const TASKS_FILE: &str = "tasks.jsonl";
+/// `startup.py:49` 传给 `Engine` 的 `extensionFolder` 叶子名。
+pub const EXTENSION_FOLDER: &str = "browser_extension";
 
 // ---------------------------------------------------------------------------
 // 路径
@@ -188,6 +190,12 @@ impl Paths {
     /// `APP_DATA_DIR / "tasks.jsonl"`。
     pub fn tasks_path(&self) -> PathBuf {
         self.app_data_dir.join(TASKS_FILE)
+    }
+
+    /// `APP_DATA_DIR / "browser_extension"`：`startup.py:49` 传给 `Engine` 的
+    /// `extensionFolder`，`browser_service.py:201` 把扩展解到这里。
+    pub fn extension_folder(&self) -> PathBuf {
+        self.app_data_dir.join(EXTENSION_FOLDER)
     }
 
     /// 单实例锁的 socket 路径（`APP_DATA_DIR / "instance.sock"`）。
@@ -775,6 +783,11 @@ mod tests {
         assert!(!paths.portable);
         assert_eq!(paths.app_data_dir, data_home.join(APP_NAME));
         assert_eq!(paths.user_data_dir, data_home.join(APP_NAME));
+        // `startup.py:49`：`APP_DATA_DIR / "browser_extension"`。
+        assert_eq!(
+            paths.extension_folder(),
+            data_home.join(APP_NAME).join(EXTENSION_FOLDER)
+        );
     }
 
     #[test]

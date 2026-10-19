@@ -38,6 +38,7 @@ pub mod drawer;
 pub mod edit_task;
 pub mod editors;
 pub mod engine;
+pub mod extension_crx;
 pub mod extension_install;
 pub mod facts;
 pub mod feature_service;

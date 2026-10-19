@@ -2719,6 +2719,128 @@ window.on_headersPresetEditAccepted(move |d| {
 - **收框时机**：Python 是模态 `dialog.exec()`，收框与写 cfg 在同一栈帧；这里 `*EditAccepted`
   先收框再调动作，宿主看到改动时框已经关了（差一帧以内）。
 
+## 浏览器扩展的 CRX 容器（`gd3-ui::extension_crx`，第 121 步）
+
+设置页的四张扩展卡（复制配对令牌 / 商店链接 / 本地安装 / 导出 crx）都绕不开
+`app/assets/chrome_extension.crx`：Python 侧 `loadCrx()`（`desktop.py:118`）读
+`:/res/chrome_extension.crx`，`BrowserService.install()`（`browser_service.py:196-205`）
+先拆 CRX 头再 `zipfile.ZipFile(...).extractall(folder)`。离线缓存里没有 `zip` crate，
+但 `flate2` 在（1.1.10，本来就在 `Cargo.lock` 里，slint 的传递依赖），所以这一步
+**自己读 ZIP 中央目录**，把容器这一层做实。`crates/gd3-ui/src/extension_crx.rs`
+（**695 行 / 13 单测**）。
+
+### 覆盖面
+
+| Python 源 | 语义 | 这里 |
+|---|---|---|
+| `desktop.py:118` `loadCrx()` | `QResource(":/res/chrome_extension.crx")` 的字节 | `crx_bytes()`（`include_bytes!`，341 464 字节） |
+| `browser_service.py:200` | `struct.unpack_from("<I", crx, 8)` 取头部长度 | `payload(crx) -> &[u8]` |
+| `browser_service.py:201` | `extensionFolder.mkdir(parents=True, exist_ok=True)` | `unpack` 第一句 |
+| `browser_service.py:202-203` | `zipfile.ZipFile(...).extractall(folder)` | `entries(zip)` + `unpack(crx, folder)` |
+| `setting_page.py:487-495` | `f.write(loadCrx())` | `export(crx, path)` |
+
+`Paths::extension_folder()`（`boot.rs`）= `APP_DATA_DIR / "browser_extension"`，镜像
+`startup.py:49` 传给 `Engine` 的 `extensionFolder`。
+
+### CRX v3 的头部
+
+```text
+偏移 0  "Cr24"
+偏移 4  版本（u32 LE）= 3
+偏移 8  headerSize（u32 LE）→ 载荷从 12 + headerSize 开始
+```
+
+本仓的 crx：`headerSize = 1310`，载荷 340 142 字节，是标准 ZIP。**v2 的头部布局不同**
+（`pubkeyLen` / `sigLen` 两个字段），这里明确报 `UnsupportedVersion(2)` 而不是瞎猜。
+
+### 解包口径（实测，不是猜的）
+
+用 `.venv/bin/python` 对真实 crx 跑了一遍 `extractall`，再逐项对照：
+
+| 实测事实 | 影响 |
+|---|---|
+| 载荷 **42 项 = 11 个目录 + 31 个文件**，全部 `compress_type = 8`（deflate） | 只需 stored / deflate 两条解压分支 |
+| 目录靠**名字以 `/` 结尾**判定（`ZipInfo.is_dir()`），不看 `external_attr` | `Entry::is_dir = name.ends_with('/')` |
+| `extractall` **不还原权限与 mtime**：目录 `0o755`、文件 `0o644`（umask 决定），mtime 是解包时刻 | 不 `chmod`、不 `utime` |
+| 顺序是 `infolist()` 序（= 中央目录序），父目录由 `os.makedirs(upperdirs)` 兜底 | 按中央目录序落盘，`create_dir_all(parent)` |
+| `manifest.json` 2084 字节、`background.js` 101 558 字节 | 单测钉住这两个数（解压正确性的端到端证据） |
+
+### 路径净化：照抄 `_extract_member` 的 POSIX 分支
+
+CPython 的处理是**丢分量**，不是「解析」：
+
+```python
+arcname = member.filename.replace('/', os.sep)      # POSIX 无操作
+arcname = os.path.splitdrive(arcname)[1]            # POSIX 无操作
+invalid = ('', os.path.curdir, os.path.pardir)
+arcname = os.sep.join(x for x in arcname.split(os.sep) if x not in invalid)
+```
+
+所以 `a/../b` → `a/b`、`/abs/x` → `abs/x`、`a//b` → `a/b`、`../..` → 空；而
+`..\..\x` 在 POSIX 上**不拆反斜杠**，整串是一个文件名。`sanitize()` 逐条照做，
+单测 `sanitize_drops_python_invalid_parts` 用九行表钉住。
+
+`escaping_paths_are_clamped_to_the_folder` 是安全侧的证据：`../evil.txt` / `/abs.txt` /
+`a/../../b.txt` 三个条目解包后全部落在 `folder` 内，上级目录一个文件都没多。
+
+### 为什么自己写 ZIP 读
+
+- `zip` crate 不在离线缓存里（`sha2` / `xz2` 同样缺），这一步又必须能跑通；
+- 需要的子集极小：EOCD 定位 + 中央目录遍历 + 本地头定位 + inflate，**约 200 行**；
+- `flate2` 已在锁里，`DeflateDecoder` 直接可用，不引入新依赖版本。
+
+代价是**不校验 CRC32**：Python 的 `ZipExtFile` 读完会比对 CRC，这里只比对「解压后
+长度与中央目录里的 `file_size`」。扩展包是打进二进制的自家产物，CRC 校验换不来额外
+保障，却要再拖 `crc32fast`。
+
+### 十三条单测
+
+| 覆盖面 | 断言 |
+|---|---|
+| 容器头 | `Cr24` / 版本 3 / `headerSize == 1310` / 载荷以本地头签名开头 |
+| 中央目录 | 42 项、11 目录 + 31 文件、全 method 8、首项 `_locales/`（**不是字典序**） |
+| 真实解包 | 落盘 11 目录 + 31 文件、`manifest.json` 2084、`background.js` 101 558 |
+| 幂等 | 解包两次，返回清单与磁盘树都不变 |
+| 路径净化 | 九行表（见上） |
+| 坏魔数 | `BadMagic` |
+| 短头 / v2 | `Truncated` / `UnsupportedVersion(2)` |
+| stored 分支 | 合成 ZIP（method 0）原样拷贝 |
+| deflate 分支 | 合成 ZIP（method 8），压缩后确实变小 + 解压等值 |
+| 未知方法 | method 12 → `UnsupportedMethod(12)` |
+| 逃逸路径 | 三个逃逸条目全部夹在 `folder` 内 |
+| 缺 EOCD | 截尾 ZIP → `Zip(_)`；`b"PK"` → `Truncated(_)` |
+| 导出 | `export()` 写出的字节与 `crx_bytes()` 逐字节相同 |
+
+合成 ZIP 由测试内的 `ZipBuilder` 造（本地头 + 中央目录 + EOCD，CRC 留 0，因为不校验），
+`wrap()` 再套一个假 CRX 头 —— 这样「解压分支」与「真实包」两条路径都有覆盖。
+
+### 与 Python 的已知差异
+
+- **不校验 CRC32**（见上）。
+- **不支持 ZIP64**：crx 341 KB，`allowZip64` 走不到；`entries` 见到 `0xffff` 哨兵直接报错。
+- **头部越界报错**：Python 的 `crx[12 + headerSize:]` 越界时静默给空串（后面才 `BadZipFile`），
+  这里立刻 `Truncated("CRX 载荷")`。
+- **`unpack` 返回落盘清单**：Python 的 `extractall` 无返回值；清单给下一步的「解包后弹
+  安装引导」用，也方便断言顺序。
+- **净化后为空的条目跳过**：Python 会拿 `folder` 本身当目标（目录项无害，文件项
+  `IsADirectoryError`）。自家包里没有这种条目。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --lib`：24.38s，零错零警告；
+- `cargo test -p gd3-ui --lib extension_crx`：**13 passed**（`/tmp/t121b.log`）；
+- `cargo test -p gd3-ui --lib`：**1047 passed / 0 failed**（1034 + 13，`/tmp/t121lib.log`）；
+- `cargo test --workspace`：**1602 passed / 0 failed / 28 段**（`/tmp/t121ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c121.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 122 步）
+
+四个平台副作用的接线（`take_deferred()` 里剩下的全部）：`copyPairToken`（写剪贴板）、
+`openStoreUrl`（拉起浏览器）、`chromiumInstall`（`extension_crx::unpack` + 安装引导框）、
+`exportCrx`（保存对话框 + `extension_crx::export`）。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
@@ -2734,7 +2856,10 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
 剩下的是：
 
 1. **更新检查接线**：`update_service` 的 `plan_*` 接到 `gd3-net::sources::WreqTransport`
-   与更新卡片；解包（zip / tar.xz / dmg）要宿主工具或新 crate（`zip` / `xz2` 不在离线缓存里）。
-2. **4 个 `defer` 项**：剪贴板（`clipboard.rs` 已有实现）/ 商店 URL / CRX 解包 /
-   拉起浏览器四个平台副作用。
+   与更新卡片；解包要宿主工具或新 crate —— **ZIP 读已由第 121 步的 `extension_crx`
+   提供**（CRX 与 zip 载荷同构，`entries` / `read_entry` 可直接复用），剩 tar.xz / dmg
+   受 `xz2` 离线缺包限制。
+2. **4 个 `defer` 项**（`take_deferred()`）：剪贴板 / 商店 URL / CRX 解包 / 导出 crx。
+   CRX 解包与导出所需的容器层已就位（`extension_crx::unpack` / `export`），
+   第 122 步只做接线与宿主钩子。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
