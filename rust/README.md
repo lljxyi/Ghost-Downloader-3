@@ -3122,6 +3122,140 @@ open_chromium_url}` + `extension_actions::copy_text` + `eprintln!`。
 - `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，`Finished dev profile in 3m 34s`（`/tmp/c123clip.log`）；
 - Python 侧没改一行。
 
+## 更新检查的执行骨架（`gd3-ui::update_service`，第 124 步）
+
+第 115 步把 `app/services/update_service.py` 的**计划层**搬完了：`plan_check` /
+`plan_app_download` / `plan_pack_download` / `plan_apply` / `updater_command` 都是
+「给定输入 → 算出应该发生什么」的纯函数，49 条单测逐条钉住。但 Python 的
+`UpdateService` 是 async 的：`_check` 会 `await fetchJson`，`_download` 会
+`await fetchReleaseAsset`，中间状态全摊在协程的局部变量里。
+
+Rust 侧不能这么写——`gd3-ui` 刻意不依赖 tokio（同 `aria2_actions.rs` 的口径）。
+这一步补的是**执行骨架**：把四条入口串成同步状态机，异步动作全部摊成
+`UpdateEffect` 交给宿主，宿主执行完再把结果喂回来。
+
+### 状态流转
+
+```text
+check() ──[Emit(CHECKING), FetchVersions]──▶ 宿主抓 versions.json
+       ◀── versions_ready(Option<Value>, &[LocalPack]) ── [Emit(…)]
+
+download(id) ──[Emit(DOWNLOADING), Mkdir, FetchAsset|FetchRaw]──▶ 宿主下载
+       ◀── download_progress(id, p) ── [Emit(DOWNLOADING, progress)]
+       ◀── download_finished(id) ── [Checksum] 或 [Emit(READY)]
+       ◀── checksum_finished(id, actual) ── 对：[Emit(READY)] / 完整包：[RemoveDir, Unpack]
+       ◀── unpack_finished(id, error) ── [RemoveFile, Emit(READY)]
+       ◀── download_failed(id, error) ── [Emit(FAILED)]
+
+apply() ──[Unpack(Zip, staging/<id>.zip, features/<id>_pending)…, StartUpdater|SkipUpdater]
+```
+
+`Emit` 变体里带着的那条 `UpdateStep` **已经写进 `UpdateRuntime::table()`**，宿主只需
+把它转发给 UI；其余九种变体都是宿主必须真做的事。
+
+### `UpdateEffect` 的十个变体
+
+| 变体 | 对应 Python | 谁执行 |
+|---|---|---|
+| `Emit(UpdateStep)` | `_emit(...)` | 转发给 UI |
+| `FetchVersions` | `fetchJson(APP_REPO, "main", "versions.json")` | `gd3-net::sources` |
+| `Mkdir(PathBuf)` | `STAGING_DIR.mkdir(parents=True, exist_ok=True)` | 宿主 |
+| `RemoveDir(PathBuf)` | `if newDir.exists(): shutil.rmtree(newDir)` | 宿主 |
+| `RemoveFile(PathBuf)` | `path.unlink(missing_ok=True)` | 宿主 |
+| `FetchAsset { tag, file, dest }` | `fetchReleaseAsset(APP_REPO, tag, file, dest, onProgress)` | `gd3-net::sources` |
+| `FetchRaw { path, dest }` | `fetchRawFile(APP_REPO, "main", path, dest, onProgress)` | `gd3-net::sources` |
+| `Checksum { path, expected }` | `toChecksum(path, "sha256", …)` | `gd3-core::checksum` |
+| `Unpack { kind, archive, target }` | `extractZip` / `extractTarXz` / `extractDmg` | 平台工具 |
+| `StartUpdater(UpdaterCommand)` | `subprocess.Popen(args, **detach)` | 宿主 |
+| `SkipUpdater(UpdaterSkip)` | `_startUpdater` 的两个「记日志然后 return」 | 宿主记日志 |
+
+`Checksum` 带的是**原始校验和串**（`"abc123  file.zip"`）而不是解析后的十六进制：
+`parse_checksum` 在 `gd3-core` 里，比较也留在状态机（`checksum_accepted`），宿主只负责
+算 sha256 并回报十六进制。
+
+### `Pending`：Python 的局部变量必须显式存下来
+
+Python 的 `_downloadApp` 把「下什么、下到哪、校验和多少、解到哪个目录」摊在局部变量里，
+`await` 之后继续用。异步化之后这些变量必须活过整个下载链路，所以有一个私有枚举：
+
+```rust
+enum Pending {
+    Patch { dest, sha256 },                                  // 下完 → 校验 → READY，不解包
+    Full  { dest, sha256, unpack, new_dir },                 // 下完 → 校验 → RemoveDir → Unpack
+    Pack  { dest, sha256 },                                  // 下完 → 校验 → READY（解包推迟到 apply）
+}
+```
+
+`pending` 是 `BTreeMap<String, Pending>`：`is_pending(id)` 就是查询入口，四条
+`*_finished` 都靠它决定「这一步该干什么」。没有记录就直接返回空 `Vec`——重复回调
+（宿主重试、UI 连点）不会把表改坏。
+
+### 三个容易写错的语义
+
+1. **`versions_ready` 要 `.skip(1)`**：`plan_check` 的第一条恒是 `CHECKING`，那是
+   `check()` 已经发过的。宿主若照单全收，UI 会收到两条同状态通知，进度条闪一下。
+   代码里有 `debug_assert_eq!` 守住「第一条确实是 CHECKING」，将来 `plan_check` 改
+   形状会立刻炸在测试里。
+2. **`RemoveDir` 无条件发**：Python 是 `if newDir.exists(): rmtree`。这里把存在性判定
+   推给宿主——`remove_dir_all` 对不存在的路径返回 `Ok(())` 的语义刚好等价，
+   状态机少一次文件系统调用，单测也不用造目录。
+3. **`unpack_finished` 失败时不删归档**：Python 的 `unlink` 在 `extract` 之后，异常时
+   归档留着好排查。所以失败分支只发一条 `Emit(FAILED)`，成功分支才是
+   `[RemoveFile, Emit(READY)]`。
+
+另外 `versions_ready(None, …)`（抓 `versions.json` 失败）**不动 `self.versions`**：
+Python 的 `_fetchVersions` 抛异常时 `_versionsData` 保持上一次的值，重试还能用。
+
+### 二十条单测
+
+| 测试 | 钉住什么 |
+|---|---|
+| `check_emits_checking_and_asks_for_the_versions_file` | 两条效果 + label 带版本号 + 表已更新 |
+| `versions_ready_does_not_repeat_the_checking_step` | `.skip(1)`；AVAILABLE 的 label / latestVersion |
+| `versions_ready_reports_a_fetch_failure` | 抓取失败 → IDLE + 「无法获取版本信息」 |
+| `a_failed_fetch_keeps_the_previous_versions_data` | 失败不清 `_versionsData` |
+| `download_refuses_a_target_that_is_not_available` | 无记录 / `CHECKING` 都不下载 |
+| `download_asks_for_the_full_package_of_the_platform` | `Emit` + `Mkdir` + `FetchAsset` 的 tag/file/dest |
+| `the_full_package_is_checksummed_unpacked_and_cleaned_up` | 校验大小写不敏感；`RemoveDir` → `Unpack` → `RemoveFile` → `READY` |
+| `a_patch_is_never_unpacked` | 补丁落到 `patch.hdiff`；sha 为空直接 `READY` |
+| `a_missing_platform_package_fails_the_target` | `full[platformKey]` 缺失 → FAILED（`Mkdir` 仍在失败之前） |
+| `a_pack_downloads_from_the_dist_directory` | `dist/packs/youtube.zip` → `staging/youtube.zip` |
+| `a_bad_checksum_removes_the_file_and_fails` | 对不上：`RemoveFile` + 「校验失败」 |
+| `an_unpack_failure_keeps_the_archive` | 失败分支只有一条 `Emit` |
+| `a_download_error_marks_the_target_failed` | `except Exception` 的出口 |
+| `progress_keeps_the_downloading_state` | 进度只改 `progress`，状态仍是 `DOWNLOADING` |
+| `apply_unpacks_the_packs_before_starting_the_updater` | pack 解到 `features/<id>_pending`，updater 最后 |
+| `apply_skips_the_updater_when_the_binary_is_missing` | `SkipUpdater(Missing(…))` |
+| `apply_does_nothing_without_ready_targets` | 空表 → 空效果 |
+| `the_host_reports_the_platform_key` | `Host::platform_key()` + `is_win32` / `is_darwin` |
+| `an_unknown_platform_key_fails_the_app_download` | `buildPlatformKey` 抛 `KeyError` 的 `toTaskError` 形态 |
+| `the_staging_path_is_used_for_every_artifact` | 所有产物都落在 `STAGING_DIR` 下 |
+
+### 与 Python 的已知差异
+
+1. **`download()` 先发 `Mkdir` 再判平台**：Python 的 `_download` 在
+   `try: STAGING_DIR.mkdir(...)` 之后才进 `_downloadApp`，平台不支持时目录也已经建了。
+   Rust 侧顺序一致，单测里因此是 `Emit` + `Mkdir` + `Emit(FAILED)` 三条。
+2. **`_applyPack` 的 `if not zipPath.is_file(): return` 归宿主**：状态机照发 `Unpack`，
+   宿主发现归档不在就跳过——这样「文件系统状态」不会渗进状态机，单测不用造 zip。
+3. **`SkipUpdater` 只表达「为什么没拉起」**：Python 的两条分支各写一行日志，日志文案
+   留给宿主（`UpdaterSkip` 的两个变体名已经足够区分）。
+4. **没有 `finally` 里的 `pending` 清理**：Python 靠协程结束自动回收；这里每个终结分支
+   （成功 / 校验失败 / 解包失败 / 下载异常）都显式 `pending.remove`，单测逐条验
+   `is_pending() == false`。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**3m 08s，零错零警告**（`/tmp/c124a.log`）；
+- `cargo test -p gd3-ui --lib runtime_tests`：**20 passed**（`/tmp/t124b.log`）；
+- `cargo test -p gd3-ui --lib`：**1087 passed / 0 failed**（`/tmp/t124c.log`；1067 + 20）；
+- `cargo test --workspace`：**1643 passed / 0 failed / 28 段**（`/tmp/t124ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，
+  `Finished dev profile in 25m 42s`（`/tmp/c124clip.log`；比第 123 步的 3m 34s 慢得多，
+  因为 `--workspace` 测试跑完后 clippy 的缓存键全变了，整条依赖链重新 check）；
+- Python 侧没改一行。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
@@ -3137,10 +3271,13 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
 第 122 步 `extension_actions`（五个平台副作用，`defer` 机制随之删除）。
 **设置页的动作集已经全部接线**，剩下的是：
 
-1. **更新检查接线**：`update_service` 的 `plan_*` 接到 `gd3-net::sources::WreqTransport`
-   与更新卡片；解包要宿主工具或新 crate —— **ZIP 读已由第 121 步的 `extension_crx`
-   提供**（CRX 与 zip 载荷同构，`entries` / `read_entry` 可直接复用），剩 tar.xz / dmg
-   受 `xz2` 离线缺包限制。
+1. **更新检查接线**：第 115 步的计划层（`plan_*`）与第 124 步的执行层
+   （`UpdateRuntime` 的十个 `UpdateEffect`）都已就位，剩下的是**宿主适配**：
+   `FetchAsset` / `FetchRaw` 走 `gd3-net::sources::{fetch_release_asset,
+   fetch_raw_file}`、`Checksum` 走 `gd3_core::checksum`、`Unpack` 的 zip 走
+   `extension_crx`（CRX 与 zip 载荷同构，`entries` / `read_entry` 可直接复用）。
+   这层需要 tokio，必须放在 `gd3-ui` 之外的宿主层；剩 tar.xz / dmg 受 `xz2`
+   离线缺包限制。之后才是更新卡片 / 进度条 UI。
 2. ~~**安装引导框**~~：第 123 步完成（`gd3-ui::extension_install` +
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

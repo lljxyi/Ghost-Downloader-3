@@ -62,6 +62,7 @@
 //! - **解包与进程启动不在这里**：`zipfile` / `tarfile("r:xz")` / `hdiutil` /
 //!   `subprocess.Popen` 都归宿主（`zip` / `xz2` crate 不在离线缓存里）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -793,6 +794,465 @@ pub fn platform_key_failure(os: &str, machine: &str) -> TaskError {
     TaskError::io(format!("'{missing}'"))
 }
 
+// ── 执行骨架：`UpdateService` 的四条入口 ──────────────────────────────────
+//
+// 上面全是「给定输入算出应该发什么」，这一节把四条入口（`check` / `download` /
+// `apply` / 校验与解包的后续）串成**可暂停、可恢复**的状态机：
+//
+// ```text
+// check() ──[Emit(CHECKING), FetchVersions]──▶ 宿主抓 versions.json
+//        ◀── versions_ready(Option<Value>, &[LocalPack]) ── [Emit(…)]
+//
+// download(id) ──[Emit(DOWNLOADING), Mkdir, FetchAsset|FetchRaw]──▶ 宿主下载
+//        ◀── download_finished(id) ── [Checksum] 或 [Emit(READY)]
+//        ◀── checksum_finished(id, actual) ── 对：[Emit(READY)] / 完整包：[RemoveDir, Unpack]
+//        ◀── unpack_finished(id, error) ── [RemoveFile, Emit(READY)]
+//
+// apply() ──[Unpack(Zip, staging/<id>.zip, features/<id>_pending)…, StartUpdater]
+// ```
+//
+// 每个 `[..]` 是一批 [`UpdateEffect`]，宿主按序执行，执行完把结果喂回对应的
+// `*_finished`。`Emit` 已经写进 [`UpdateRuntime::table`]，宿主只需转发给 UI。
+//
+// **为什么不是 async**：`gd3-ui` 刻意不依赖 tokio（见 `aria2_actions.rs` 的同类说明）。
+// 把「下载」摊成 `FetchAsset` / `FetchRaw` / `Checksum` / `Unpack` 四个效果，
+// 宿主用 `gd3-net::sources::WreqTransport` + `gd3_core::checksum` + 平台工具执行，
+// 状态机本身在单测里同步跑完。
+
+/// 宿主环境：Python 里是模块级全局（`VERSION` / `sys.platform` / `APP_DATA_DIR` /
+/// `FEATURES_DIR` / `EXECUTABLE_DIR` / `os.getpid()` / `sys.executable`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    /// `VERSION`。
+    pub app_version: String,
+    /// `sys.platform`（`"win32"` / `"darwin"` / `"linux"`）。
+    pub os: String,
+    /// `platform.machine()`。
+    pub machine: String,
+    /// `IS_ANDROID`。
+    pub is_android: bool,
+    /// `STAGING_DIR`。
+    pub staging_dir: PathBuf,
+    /// `FEATURES_DIR`。
+    pub features_dir: PathBuf,
+    /// `EXECUTABLE_DIR`。
+    pub executable_dir: PathBuf,
+    /// `os.getpid()`。
+    pub pid: u32,
+    /// `Path(sys.executable).resolve()`。
+    pub interpreter: PathBuf,
+}
+
+impl Host {
+    /// `sys.platform == "win32"`。
+    pub fn is_win32(&self) -> bool {
+        self.os == "win32"
+    }
+
+    /// `sys.platform == "darwin"`。
+    pub fn is_darwin(&self) -> bool {
+        self.os == "darwin"
+    }
+
+    /// [`build_platform_key`]，入参取自本结构。
+    pub fn platform_key(&self) -> Option<String> {
+        build_platform_key(&self.os, &self.machine)
+    }
+}
+
+/// 状态机吐给宿主的一个动作。
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpdateEffect {
+    /// 一条 `_emit`：**已经写进** [`UpdateRuntime::table`]，这里只是通知宿主。
+    Emit(UpdateStep),
+    /// `fetchJson(APP_REPO, "main", "versions.json")` → [`UpdateRuntime::versions_ready`]。
+    FetchVersions,
+    /// `STAGING_DIR.mkdir(parents=True, exist_ok=True)`。
+    Mkdir(PathBuf),
+    /// `if newDir.exists(): shutil.rmtree(newDir)`——**无条件发**，宿主按
+    /// `remove_dir_all` 的「不存在也算成功」语义执行。
+    RemoveDir(PathBuf),
+    /// `Path.unlink(missing_ok=True)`。
+    RemoveFile(PathBuf),
+    /// `fetchReleaseAsset(APP_REPO, tag, file, dest, onProgress)` → [`UpdateRuntime::download_finished`]。
+    FetchAsset {
+        /// `v{version}`。
+        tag: String,
+        /// asset 名（`patch["file"]` / `full["file"]`）。
+        file: String,
+        /// 落地路径。
+        dest: PathBuf,
+    },
+    /// `fetchRawFile(APP_REPO, "main", path, dest, onProgress)` → [`UpdateRuntime::download_finished`]。
+    FetchRaw {
+        /// `dist/packs/{filename}`。
+        path: String,
+        /// 落地路径。
+        dest: PathBuf,
+    },
+    /// `toChecksum(path, "sha256", …)` → [`UpdateRuntime::checksum_finished`]。
+    Checksum {
+        /// 要算的文件。
+        path: PathBuf,
+        /// `parseChecksum(sha)` 之前的原始串（比较在状态机里做）。
+        expected: String,
+    },
+    /// `extractZip` / `extractTarXz` / `extractDmg` → [`UpdateRuntime::unpack_finished`]。
+    Unpack {
+        /// 解包方式。
+        kind: UnpackKind,
+        /// 归档路径。
+        archive: PathBuf,
+        /// 目标目录。
+        target: PathBuf,
+    },
+    /// `subprocess.Popen(args, **detach)`。
+    StartUpdater(UpdaterCommand),
+    /// `_startUpdater` 的两个「记日志然后 return」分支。
+    SkipUpdater(UpdaterSkip),
+}
+
+/// 正在下载的目标的续跑信息（Python 把计划摊在 `_downloadApp` 的局部变量里，
+/// 这里必须存下来，因为下载是异步的）。
+#[derive(Clone, Debug, PartialEq)]
+enum Pending {
+    /// 补丁：下完 → 校验 → READY，**不解包**。
+    Patch { dest: PathBuf, sha256: String },
+    /// 完整包：下完 → 校验 → 删 `app_new` → 解包 → 删归档 → READY。
+    Full {
+        dest: PathBuf,
+        sha256: String,
+        unpack: UnpackKind,
+        new_dir: PathBuf,
+    },
+    /// Pack：下完 → 校验 → READY（解包推迟到 `apply()`）。
+    Pack { dest: PathBuf, sha256: String },
+}
+
+impl Pending {
+    fn dest(&self) -> &Path {
+        match self {
+            Self::Patch { dest, .. } | Self::Full { dest, .. } | Self::Pack { dest, .. } => dest,
+        }
+    }
+
+    fn sha256(&self) -> &str {
+        match self {
+            Self::Patch { sha256, .. } | Self::Full { sha256, .. } | Self::Pack { sha256, .. } => {
+                sha256
+            }
+        }
+    }
+}
+
+/// `UpdateService` 的状态机半边：一张 [`UpdateTable`] + `_versionsData` + 续跑表。
+#[derive(Clone, Debug)]
+pub struct UpdateRuntime {
+    host: Host,
+    table: UpdateTable,
+    versions: Option<Value>,
+    pending: BTreeMap<String, Pending>,
+}
+
+impl UpdateRuntime {
+    /// `UpdateService.__init__`（`:114-117`）：空表、无 `_versionsData`。
+    pub fn new(host: Host) -> Self {
+        Self {
+            table: UpdateTable::new(host.app_version.clone()),
+            host,
+            versions: None,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// `self._infos`。
+    pub fn table(&self) -> &UpdateTable {
+        &self.table
+    }
+
+    /// `self._versionsData`（`_downloadApp` / `_downloadPack` 的唯一数据源）。
+    pub fn versions(&self) -> Option<&Value> {
+        self.versions.as_ref()
+    }
+
+    /// 宿主环境。
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// `target_id` 是否正处在下载/校验/解包链路中。
+    pub fn is_pending(&self, target_id: &str) -> bool {
+        self.pending.contains_key(target_id)
+    }
+
+    fn emit(&mut self, target_id: &str, state: UpdateState, fields: EmitFields) -> UpdateEffect {
+        self.table.emit(target_id, state, fields.clone());
+        UpdateEffect::Emit(UpdateStep::new(target_id, state, fields))
+    }
+
+    /// `check()`（`:118-119`）的同步半边：先发 `CHECKING`，再让宿主去抓 `versions.json`。
+    pub fn check(&mut self) -> Vec<UpdateEffect> {
+        let step = self.emit(
+            "app",
+            UpdateState::Checking,
+            EmitFields::new().label(format!("Ghost Downloader {}", self.host.app_version)),
+        );
+        vec![step, UpdateEffect::FetchVersions]
+    }
+
+    /// `_fetchVersions` 的结果回到 `_check` 的后半段（`:139-180`）。
+    ///
+    /// `data` 为 `None` = `fetchJson` 失败：Python 保持 `_versionsData` 不动，
+    /// 只发 `IDLE` + 「无法获取版本信息」。
+    pub fn versions_ready(
+        &mut self,
+        data: Option<Value>,
+        local_packs: &[LocalPack],
+    ) -> Vec<UpdateEffect> {
+        let steps = plan_check(
+            data.as_ref(),
+            local_packs,
+            self.host.is_android,
+            &self.host.app_version,
+        );
+        // `plan_check` 的第一条就是 `check()` 已经发过的 `CHECKING`，跳过它，
+        // 否则宿主会收到两条状态相同的通知（UI 上表现为进度条闪一下）。
+        debug_assert_eq!(
+            steps.first().map(|step| step.state),
+            Some(UpdateState::Checking)
+        );
+        if let Some(data) = data {
+            self.versions = Some(data);
+        }
+        steps
+            .into_iter()
+            .skip(1)
+            .map(|step| {
+                self.table
+                    .emit(&step.target_id, step.state, step.fields.clone());
+                UpdateEffect::Emit(step)
+            })
+            .collect()
+    }
+
+    /// `download(targetId)`（`:121-122` → `_download`，`:189-204`）。
+    ///
+    /// 准入与 Python 相同：记录不存在或状态不是 `AVAILABLE` → 什么都不做。
+    pub fn download(&mut self, target_id: &str) -> Vec<UpdateEffect> {
+        if !self.table.can_download(target_id) {
+            return Vec::new();
+        }
+        let mut effects = vec![
+            self.emit(target_id, UpdateState::Downloading, EmitFields::new()),
+            UpdateEffect::Mkdir(self.host.staging_dir.clone()),
+        ];
+
+        if target_id == "app" {
+            let app_data = self.versions.as_ref().and_then(|value| value.get("app"));
+            let decision = match self.host.platform_key() {
+                Some(key) => plan_app_download(
+                    app_data,
+                    &self.host.app_version,
+                    &key,
+                    self.host.is_darwin(),
+                ),
+                None => {
+                    AppDecision::Failed(platform_key_failure(&self.host.os, &self.host.machine))
+                }
+            };
+            match decision {
+                AppDecision::Failed(error) => effects.push(self.emit(
+                    target_id,
+                    UpdateState::Failed,
+                    EmitFields::new().error(error),
+                )),
+                AppDecision::Download(plan) => {
+                    let dest = self.host.staging_dir.join(&plan.staging_name);
+                    let pending = match plan.kind {
+                        AppKind::Patch => Pending::Patch {
+                            dest: dest.clone(),
+                            sha256: plan.sha256.clone(),
+                        },
+                        AppKind::Full => Pending::Full {
+                            dest: dest.clone(),
+                            sha256: plan.sha256.clone(),
+                            // `plan_app_download` 对完整包恒填 `Some`；补丁才有 `None`。
+                            unpack: plan.unpack.unwrap_or(UnpackKind::Zip),
+                            new_dir: self.host.staging_dir.join(NEW_APP_DIR_NAME),
+                        },
+                    };
+                    self.pending.insert(target_id.to_string(), pending);
+                    effects.push(UpdateEffect::FetchAsset {
+                        tag: plan.tag,
+                        file: plan.file,
+                        dest,
+                    });
+                }
+            }
+            return effects;
+        }
+
+        let packs_data = self.versions.as_ref().and_then(|value| value.get("packs"));
+        let plan = plan_pack_download(packs_data, target_id);
+        let dest = self.host.staging_dir.join(&plan.staging_name);
+        self.pending.insert(
+            target_id.to_string(),
+            Pending::Pack {
+                dest: dest.clone(),
+                sha256: plan.sha256,
+            },
+        );
+        effects.push(UpdateEffect::FetchRaw {
+            path: plan.remote_path,
+            dest,
+        });
+        effects
+    }
+
+    /// `onProgress=lambda p: self._emit(targetId, DOWNLOADING, progress=p)`。
+    pub fn download_progress(&mut self, target_id: &str, progress: f64) -> Vec<UpdateEffect> {
+        vec![self.emit(
+            target_id,
+            UpdateState::Downloading,
+            EmitFields::new().progress(progress),
+        )]
+    }
+
+    /// 下载成功（`fetchReleaseAsset` / `fetchRawFile` 返回）后的一步。
+    pub fn download_finished(&mut self, target_id: &str) -> Vec<UpdateEffect> {
+        let Some(pending) = self.pending.get(target_id) else {
+            return Vec::new();
+        };
+        if pending.sha256().is_empty() {
+            return self.after_checksum(target_id);
+        }
+        vec![UpdateEffect::Checksum {
+            path: pending.dest().to_path_buf(),
+            expected: pending.sha256().to_string(),
+        }]
+    }
+
+    /// `toChecksum(path, …)` 的结果回来：对得上就走后续，对不上删文件 + `FAILED`。
+    pub fn checksum_finished(&mut self, target_id: &str, actual_hex: &str) -> Vec<UpdateEffect> {
+        let Some(pending) = self.pending.get(target_id) else {
+            return Vec::new();
+        };
+        let expected = pending.sha256().to_string();
+        let dest = pending.dest().to_path_buf();
+        if checksum_accepted(&expected, actual_hex) {
+            return self.after_checksum(target_id);
+        }
+        self.pending.remove(target_id);
+        vec![
+            UpdateEffect::RemoveFile(dest),
+            self.emit(
+                target_id,
+                UpdateState::Failed,
+                EmitFields::new().error(checksum_failure()),
+            ),
+        ]
+    }
+
+    /// 校验通过（或本来就没有校验和）之后：补丁/Pack 直接 `READY`，完整包去解包。
+    fn after_checksum(&mut self, target_id: &str) -> Vec<UpdateEffect> {
+        let Some(pending) = self.pending.get(target_id).cloned() else {
+            return Vec::new();
+        };
+        match pending {
+            Pending::Patch { .. } | Pending::Pack { .. } => {
+                self.pending.remove(target_id);
+                vec![self.emit(target_id, UpdateState::Ready, EmitFields::new())]
+            }
+            Pending::Full {
+                dest,
+                unpack,
+                new_dir,
+                ..
+            } => vec![
+                UpdateEffect::RemoveDir(new_dir.clone()),
+                UpdateEffect::Unpack {
+                    kind: unpack,
+                    archive: dest,
+                    target: new_dir,
+                },
+            ],
+        }
+    }
+
+    /// 解包结果：成功才删归档并 `READY`；失败只 `FAILED`（归档留着好排查）。
+    pub fn unpack_finished(
+        &mut self,
+        target_id: &str,
+        error: Option<TaskError>,
+    ) -> Vec<UpdateEffect> {
+        let Some(Pending::Full { dest, .. }) = self.pending.get(target_id).cloned() else {
+            return Vec::new();
+        };
+        self.pending.remove(target_id);
+        match error {
+            Some(error) => vec![self.emit(
+                target_id,
+                UpdateState::Failed,
+                EmitFields::new().error(error),
+            )],
+            None => vec![
+                UpdateEffect::RemoveFile(dest),
+                self.emit(target_id, UpdateState::Ready, EmitFields::new()),
+            ],
+        }
+    }
+
+    /// 下载/校验/解包链路里任何一步抛错（`_download` 的 `except Exception`）。
+    pub fn download_failed(&mut self, target_id: &str, error: TaskError) -> Vec<UpdateEffect> {
+        self.pending.remove(target_id);
+        vec![self.emit(
+            target_id,
+            UpdateState::Failed,
+            EmitFields::new().error(error),
+        )]
+    }
+
+    /// `apply()`（`:129-135`）：所有 `READY` 的 pack 先解到 `*_pending`，
+    /// 最后才拉起 updater（updater 会顶掉当前进程）。
+    ///
+    /// `_applyPack` 的 `if not zipPath.is_file(): return` 归宿主 —— 归档不存在时
+    /// 跳过该条 `Unpack` 即可，状态机不因此改表。
+    pub fn apply(&mut self) -> Vec<UpdateEffect> {
+        let mut effects = Vec::new();
+        for action in plan_apply(&self.table) {
+            match action {
+                ApplyAction::Pack(pack_id) => {
+                    let archive = self.host.staging_dir.join(format!("{pack_id}.zip"));
+                    let target = self
+                        .host
+                        .features_dir
+                        .join(format!("{pack_id}{PACK_PENDING_SUFFIX}"));
+                    effects.push(UpdateEffect::Unpack {
+                        kind: UnpackKind::Zip,
+                        archive,
+                        target,
+                    });
+                }
+                ApplyAction::StartUpdater => {
+                    let command = updater_command(
+                        self.host.is_win32(),
+                        self.host.is_darwin(),
+                        &self.host.executable_dir,
+                        &self.host.staging_dir,
+                        self.host.pid,
+                        &self.host.interpreter,
+                    );
+                    effects.push(match command {
+                        Ok(command) => UpdateEffect::StartUpdater(command),
+                        Err(skip) => UpdateEffect::SkipUpdater(skip),
+                    });
+                }
+            }
+        }
+        effects
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -1487,5 +1947,462 @@ mod tests {
         assert_eq!(command.detach, Detach::Win32);
         assert_eq!(command.args[0], updater.to_string_lossy().into_owned());
         assert!(command.args[0].ends_with("updater.exe"));
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+
+    fn host(tag: &str) -> Host {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gd3-ui-update-runtime-{}-{tag}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        Host {
+            app_version: "4.4.0".to_string(),
+            os: "linux".to_string(),
+            machine: "x86_64".to_string(),
+            is_android: false,
+            staging_dir: dir.join("update_staging"),
+            features_dir: dir.join("features"),
+            executable_dir: dir.join("bin"),
+            pid: 4321,
+            interpreter: dir.join("python"),
+        }
+    }
+
+    /// `versions.json`：app 有 4.5.0 的完整包，pack「youtube」有 1.2.0。
+    fn versions(version: &str) -> Value {
+        json!({
+            "app": {
+                "version": version,
+                "full": {
+                    "Linux-x86_64": {
+                        "file": "Ghost-Downloader-4.5.0-x86_64.zip",
+                        "sha256": "abc123  Ghost-Downloader-4.5.0-x86_64.zip"
+                    }
+                }
+            },
+            "packs": {
+                "youtube": { "version": "1.2.0", "file": "youtube.zip", "sha256": "" }
+            }
+        })
+    }
+
+    fn emit_state(effect: &UpdateEffect) -> UpdateState {
+        match effect {
+            UpdateEffect::Emit(step) => step.state,
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_emits_checking_and_asks_for_the_versions_file() {
+        let mut runtime = UpdateRuntime::new(host("check"));
+        let effects = runtime.check();
+        assert_eq!(effects.len(), 2);
+        match &effects[0] {
+            UpdateEffect::Emit(step) => {
+                assert_eq!(step.target_id, "app");
+                assert_eq!(step.state, UpdateState::Checking);
+                assert_eq!(step.fields.label.as_deref(), Some("Ghost Downloader 4.4.0"));
+            }
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+        assert_eq!(effects[1], UpdateEffect::FetchVersions);
+        assert_eq!(
+            runtime.table().get("app").map(|info| info.state),
+            Some(UpdateState::Checking)
+        );
+    }
+
+    #[test]
+    fn versions_ready_does_not_repeat_the_checking_step() {
+        let mut runtime = UpdateRuntime::new(host("ready"));
+        let effects = runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        assert_eq!(effects.len(), 1, "只剩 AVAILABLE：{:?}", effects);
+        match &effects[0] {
+            UpdateEffect::Emit(step) => {
+                assert_eq!(step.state, UpdateState::Available);
+                assert_eq!(step.fields.label.as_deref(), Some("Ghost Downloader 4.5.0"));
+                assert_eq!(step.fields.latest_version.as_deref(), Some("4.5.0"));
+            }
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+        let info = runtime.table().get("app").expect("app 记录");
+        assert_eq!(info.state, UpdateState::Available);
+        assert_eq!(info.current_version, "4.4.0");
+        assert!(runtime.versions().is_some());
+    }
+
+    #[test]
+    fn versions_ready_reports_a_fetch_failure() {
+        let mut runtime = UpdateRuntime::new(host("fetch-fail"));
+        let effects = runtime.versions_ready(None, &[]);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(emit_state(&effects[0]), UpdateState::Idle);
+        let info = runtime.table().get("app").expect("app 记录");
+        assert_eq!(
+            info.error.as_ref().map(|error| error.message),
+            Some("无法获取版本信息")
+        );
+        assert!(runtime.versions().is_none());
+    }
+
+    #[test]
+    fn a_failed_fetch_keeps_the_previous_versions_data() {
+        let mut runtime = UpdateRuntime::new(host("keep"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        assert!(runtime.versions().is_some());
+        runtime.versions_ready(None, &[]);
+        assert!(
+            runtime.versions().is_some(),
+            "`_fetchVersions` 失败时 Python 不动 `_versionsData`"
+        );
+    }
+
+    #[test]
+    fn download_refuses_a_target_that_is_not_available() {
+        let mut runtime = UpdateRuntime::new(host("refuse"));
+        assert!(runtime.download("app").is_empty());
+        runtime.check();
+        assert!(runtime.download("app").is_empty(), "CHECKING 也不能下载");
+        assert!(!runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn download_asks_for_the_full_package_of_the_platform() {
+        let mut runtime = UpdateRuntime::new(host("full"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        let staging = runtime.host().staging_dir.clone();
+        let effects = runtime.download("app");
+
+        assert_eq!(effects.len(), 3);
+        assert_eq!(emit_state(&effects[0]), UpdateState::Downloading);
+        assert_eq!(effects[1], UpdateEffect::Mkdir(staging.clone()));
+        assert_eq!(
+            effects[2],
+            UpdateEffect::FetchAsset {
+                tag: "v4.5.0".to_string(),
+                file: "Ghost-Downloader-4.5.0-x86_64.zip".to_string(),
+                dest: staging.join("Ghost-Downloader-4.5.0-x86_64.zip"),
+            }
+        );
+        assert!(runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn the_full_package_is_checksummed_unpacked_and_cleaned_up() {
+        let mut runtime = UpdateRuntime::new(host("full-flow"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.download("app");
+        let staging = runtime.host().staging_dir.clone();
+        let archive = staging.join("Ghost-Downloader-4.5.0-x86_64.zip");
+        let new_dir = staging.join("app_new");
+
+        assert_eq!(
+            runtime.download_finished("app"),
+            [UpdateEffect::Checksum {
+                path: archive.clone(),
+                expected: "abc123  Ghost-Downloader-4.5.0-x86_64.zip".to_string(),
+            }]
+        );
+        assert_eq!(
+            runtime.checksum_finished("app", "ABC123"),
+            [
+                UpdateEffect::RemoveDir(new_dir.clone()),
+                UpdateEffect::Unpack {
+                    kind: UnpackKind::Zip,
+                    archive: archive.clone(),
+                    target: new_dir,
+                },
+            ],
+            "校验大小写不敏感，且 parseChecksum 只取第一段"
+        );
+        assert_eq!(
+            runtime.unpack_finished("app", None),
+            [
+                UpdateEffect::RemoveFile(archive),
+                UpdateEffect::Emit(UpdateStep::new(
+                    "app",
+                    UpdateState::Ready,
+                    EmitFields::new()
+                )),
+            ]
+        );
+        assert!(!runtime.is_pending("app"));
+        assert_eq!(
+            runtime.table().get("app").map(|info| info.state),
+            Some(UpdateState::Ready)
+        );
+    }
+
+    #[test]
+    fn a_patch_is_never_unpacked() {
+        let mut runtime = UpdateRuntime::new(host("patch"));
+        let data = json!({
+            "app": {
+                "version": "4.5.0",
+                "patches": {
+                    "Linux-x86_64": { "from": "4.4.0", "file": "app.hdiff", "sha256": "" }
+                },
+                "full": { "Linux-x86_64": { "file": "ignored.zip" } }
+            }
+        });
+        runtime.versions_ready(Some(data), &[]);
+        let staging = runtime.host().staging_dir.clone();
+        let effects = runtime.download("app");
+        assert_eq!(
+            effects[2],
+            UpdateEffect::FetchAsset {
+                tag: "v4.5.0".to_string(),
+                file: "app.hdiff".to_string(),
+                dest: staging.join("patch.hdiff"),
+            }
+        );
+        assert_eq!(
+            runtime.download_finished("app"),
+            [UpdateEffect::Emit(UpdateStep::new(
+                "app",
+                UpdateState::Ready,
+                EmitFields::new()
+            ))],
+            "没有 sha 就跳过校验，补丁不解包"
+        );
+    }
+
+    #[test]
+    fn a_missing_platform_package_fails_the_target() {
+        let mut runtime = UpdateRuntime::new(host("no-platform"));
+        let data = json!({ "app": { "version": "4.5.0", "full": {} } });
+        runtime.versions_ready(Some(data), &[]);
+        let effects = runtime.download("app");
+        assert_eq!(effects.len(), 3, "Mkdir + 一条 FAILED：{:?}", effects);
+        match &effects[2] {
+            UpdateEffect::Emit(step) => {
+                assert_eq!(step.state, UpdateState::Failed);
+                assert_eq!(
+                    step.fields.error.as_ref().map(|error| error.message),
+                    Some("当前平台无可用更新")
+                );
+            }
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+        assert!(!runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn a_pack_downloads_from_the_dist_directory() {
+        let mut runtime = UpdateRuntime::new(host("pack"));
+        let packs = [LocalPack::new("youtube", "YouTube", "1.0.0")];
+        let effects = runtime.versions_ready(Some(versions("4.5.0")), &packs);
+        assert_eq!(
+            effects.len(),
+            2,
+            "app AVAILABLE + pack AVAILABLE：{effects:?}"
+        );
+        assert_eq!(emit_state(&effects[1]), UpdateState::Available);
+
+        let staging = runtime.host().staging_dir.clone();
+        let effects = runtime.download("youtube");
+        assert_eq!(
+            effects[2],
+            UpdateEffect::FetchRaw {
+                path: "dist/packs/youtube.zip".to_string(),
+                dest: staging.join("youtube.zip"),
+            }
+        );
+        assert_eq!(
+            runtime.download_finished("youtube"),
+            [UpdateEffect::Emit(UpdateStep::new(
+                "youtube",
+                UpdateState::Ready,
+                EmitFields::new()
+            ))],
+            "pack 的 sha 为空，下完即 READY"
+        );
+    }
+
+    #[test]
+    fn a_bad_checksum_removes_the_file_and_fails() {
+        let mut runtime = UpdateRuntime::new(host("bad-sha"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.download("app");
+        let archive = runtime
+            .host()
+            .staging_dir
+            .join("Ghost-Downloader-4.5.0-x86_64.zip");
+
+        let effects = runtime.checksum_finished("app", "deadbeef");
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0], UpdateEffect::RemoveFile(archive));
+        match &effects[1] {
+            UpdateEffect::Emit(step) => {
+                assert_eq!(step.state, UpdateState::Failed);
+                assert_eq!(
+                    step.fields.error.as_ref().map(|error| error.message),
+                    Some("校验失败")
+                );
+            }
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+        assert!(!runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn an_unpack_failure_keeps_the_archive() {
+        let mut runtime = UpdateRuntime::new(host("unpack-fail"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.download("app");
+        runtime.checksum_finished("app", "abc123");
+
+        let effects = runtime.unpack_finished("app", Some(TaskError::new("解包炸了", Vec::new())));
+        assert_eq!(effects.len(), 1, "失败时不删归档：{:?}", effects);
+        match &effects[0] {
+            UpdateEffect::Emit(step) => {
+                assert_eq!(step.state, UpdateState::Failed);
+                assert_eq!(
+                    step.fields.error.as_ref().map(|error| error.message),
+                    Some("解包炸了")
+                );
+            }
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+        assert!(!runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn a_download_error_marks_the_target_failed() {
+        let mut runtime = UpdateRuntime::new(host("dl-fail"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.download("app");
+        let effects = runtime.download_failed("app", TaskError::new("网络断了", Vec::new()));
+        assert_eq!(effects.len(), 1);
+        assert_eq!(emit_state(&effects[0]), UpdateState::Failed);
+        assert!(!runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn progress_keeps_the_downloading_state() {
+        let mut runtime = UpdateRuntime::new(host("progress"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.download("app");
+        let effects = runtime.download_progress("app", 0.25);
+        match &effects[0] {
+            UpdateEffect::Emit(step) => {
+                assert_eq!(step.state, UpdateState::Downloading);
+                assert_eq!(step.fields.progress, Some(0.25));
+            }
+            other => panic!("期望 Emit，得到 {other:?}"),
+        }
+        assert_eq!(
+            runtime.table().get("app").map(|info| info.progress),
+            Some(0.25)
+        );
+    }
+
+    /// 把 app 推到 READY（完整包全流程）。
+    fn app_ready(runtime: &mut UpdateRuntime) {
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.download("app");
+        runtime.checksum_finished("app", "abc123");
+        runtime.unpack_finished("app", None);
+    }
+
+    #[test]
+    fn apply_unpacks_the_packs_before_starting_the_updater() {
+        let mut runtime = UpdateRuntime::new(host("apply"));
+        let packs = [LocalPack::new("youtube", "YouTube", "1.0.0")];
+        runtime.versions_ready(Some(versions("4.5.0")), &packs);
+        runtime.download("youtube");
+        runtime.download_finished("youtube");
+        app_ready(&mut runtime);
+
+        let host = runtime.host().clone();
+        std::fs::create_dir_all(&host.staging_dir).expect("staging");
+        std::fs::write(host.staging_dir.join("patch.hdiff"), b"diff").expect("patch");
+        std::fs::create_dir_all(&host.executable_dir).expect("bin");
+        std::fs::write(host.executable_dir.join("updater"), b"#!/bin/sh\n").expect("updater");
+
+        let effects = runtime.apply();
+        assert_eq!(effects.len(), 2, "{effects:?}");
+        assert_eq!(
+            effects[0],
+            UpdateEffect::Unpack {
+                kind: UnpackKind::Zip,
+                archive: host.staging_dir.join("youtube.zip"),
+                target: host.features_dir.join("youtube_pending"),
+            }
+        );
+        let expected = updater_command(
+            false,
+            false,
+            &host.executable_dir,
+            &host.staging_dir,
+            host.pid,
+            &host.interpreter,
+        )
+        .expect("updater 命令");
+        assert_eq!(effects[1], UpdateEffect::StartUpdater(expected));
+    }
+
+    #[test]
+    fn apply_skips_the_updater_when_the_binary_is_missing() {
+        let mut runtime = UpdateRuntime::new(host("apply-missing"));
+        app_ready(&mut runtime);
+        let effects = runtime.apply();
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            UpdateEffect::SkipUpdater(UpdaterSkip::Missing(path)) => {
+                assert_eq!(path, &runtime.host().executable_dir.join("updater"));
+            }
+            other => panic!("期望 SkipUpdater(Missing)，得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_does_nothing_without_ready_targets() {
+        let mut runtime = UpdateRuntime::new(host("apply-empty"));
+        assert!(runtime.apply().is_empty());
+    }
+
+    #[test]
+    fn the_host_reports_the_platform_key() {
+        let host = host("key");
+        assert_eq!(host.platform_key().as_deref(), Some("Linux-x86_64"));
+        assert!(!host.is_win32());
+        assert!(!host.is_darwin());
+
+        let mut unknown = host.clone();
+        unknown.machine = "i686".to_string();
+        assert!(unknown.platform_key().is_none());
+    }
+
+    #[test]
+    fn an_unknown_platform_key_fails_the_app_download() {
+        let mut runtime = UpdateRuntime::new(host("bad-key"));
+        runtime.versions_ready(Some(versions("4.5.0")), &[]);
+        runtime.host.machine = "i686".to_string();
+        let effects = runtime.download("app");
+        assert_eq!(effects.len(), 3, "Mkdir 在失败之前：{effects:?}");
+        assert_eq!(emit_state(&effects[2]), UpdateState::Failed);
+        assert!(!runtime.is_pending("app"));
+    }
+
+    #[test]
+    fn the_staging_path_is_used_for_every_artifact() {
+        let runtime = UpdateRuntime::new(host("paths"));
+        let staging: &PathBuf = &runtime.host().staging_dir;
+        assert!(staging.ends_with("update_staging"));
+        assert_eq!(NEW_APP_DIR_NAME, "app_new");
     }
 }
