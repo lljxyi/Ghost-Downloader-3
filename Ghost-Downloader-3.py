@@ -257,6 +257,14 @@ def startApp(application, isSilent=False):
 
 
 if __name__ == "__main__":
+    from app.platform.ui_backend import dispatchRustUi
+
+    # `GHOST_UI=slint` 时把控制权交给 Rust 前端（缺省 `qt`，保持可回退）。必须排在
+    # `setupEnvironment()` / `SingletonApplication` **之前**：那两步会读
+    # `UserConfig.json` 并抢一把 Qt 的单实例锁，而 Rust 前端自己也要这两样
+    # （单一写者口径见 `app/platform/ui_backend.py` 的模块头）。
+    dispatchRustUi()
+
     from app.config.constants import DESKTOP_ID
     from app.platform.application import SingletonApplication
     from app.platform.url_scheme import isWakeUri

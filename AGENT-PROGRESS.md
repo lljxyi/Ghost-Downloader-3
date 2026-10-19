@@ -9220,3 +9220,32 @@ pump/drain）+ 工作线程里的 `HttpEngine`（Phase 5 的成果）。
 - 下一步：第 128 步 —— `Ghost-Downloader-3.py` 里 `GHOST_UI=slint` 分派（exec `gd3-ui`，
   缺省 qt 不变），然后 `UserConfig.json` 单一写者口径（8c）与 8a/8f/8g 收口。
 - 卡点：无
+
+## 第 128 步：`GHOST_UI` 前端分派（Qt 缺省 / Slint 可切）（2026-10-19 17:48）
+
+Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换。
+
+- 做了什么：
+  - 新增 `app/platform/ui_backend.py`（108 行，不 import Qt）：
+    - `uiBackend()`：`GHOST_UI` 归一化（大小写/空白容错），`slint` → slint，
+      空/`qt` → qt，**未知值按 qt 处理并打警告**；
+    - `findRustUiBinary()`：`GD3_UI_BIN` → 可执行文件同目录 → `rust/target/release`
+      → `rust/target/debug`，找不到返回 `None`；
+    - `dispatchRustUi()`：`os.execv`（不是 subprocess，窗口/信号/退出码都归 Rust），
+      失败或找不到二进制 → 打警告 + **回退 Qt**；
+  - `Ghost-Downloader-3.py`：`__main__` 第一行调 `dispatchRustUi()`，排在
+    `setupEnvironment()` / `SingletonApplication` **之前**。
+- 验证：
+  - 新增 `tests/test_ui_backend.py`：**17 passed**（取值规则 9 条 + 找二进制 3 条 +
+    分派 4 条 + **真入口子进程** 1 条：`GHOST_UI=slint` 跑真入口，假后端收到
+    `sys.argv[1:]` 且 Qt 侧没启动）；
+  - 手工：`GHOST_UI=slint .venv/bin/python Ghost-Downloader-3.py --version` →
+    `Ghost Downloader v4.4.0`（自动发现 `rust/target/debug/gd3-ui`，退出码 0）；
+  - 手工：`GD3_UI_BIN=/nope/gd3-ui` → stderr 打「回退到 Qt」+ 返回 `False`。
+- 单一写者口径（写进 `ui_backend.py` 模块头）：`GHOST_UI=slint` 时
+  `UserConfig.json` / `tasks.jsonl` / 单实例锁的写者是 **Rust**；`GHOST_UI=qt`
+  （缺省）时是 **Python**。两边不能同时跑（锁不一样，会互相覆盖整文件）。
+- 下一步：第 129 步 —— Phase 8c：`UserConfig.json` 的 Rust 侧读→改→写回逐字节一致
+  验收 + Python 侧读回（`SettingsWriter` 已经在第 117 步接过 cfg 回写，这一步补
+  验收与差异记录）。
+- 卡点：无
