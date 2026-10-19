@@ -1,0 +1,140 @@
+// 扩展安装引导框（P3，第 123 步）。
+//
+// 镜像 `app/view/dialogs/extension_install.py` 的 `ExtensionInstallDialog`（133 行）。
+// 这一层只做**形状**：预览区 + 标题 + 五步带序号的引导 + 两个按钮。文案、步骤拆分、
+// 尺寸全部由 Rust 侧 `gd3-ui::extension_install`（`Guide` / `Step` / `Segment`）给出，
+// 这里不判断任何业务语义，也不硬编码一个字。
+//
+// 与 Qt 侧的三处形状差异（语义不变，见 `extension_install.rs` 的「已知差异」）：
+// - 预览是**静态 PNG**（`@image-url` 编译期嵌入），Qt 侧是 720×405 的 webp 动画；
+// - 面板尺寸用 `min(可用空间, 768×790)` 表达 Qt 的「最小宽 / 最大高」；
+// - `MessageBoxBase` 的模态事件循环换成 `opened` 覆盖层 + 两个回调。
+//
+// 按钮顺序照 `MessageBoxBase.__initLayout`（`buttonLayout.addWidget(yesButton)` 在前、
+// `cancelButton` 在后）：**左 yes 右 cancel**，yes 是主按钮。
+
+import { ShellButton } from "app_shell.slint";
+
+// 一步引导。`index` 是显示在圆形徽标里的序号（Python 的 `enumerate(steps, 1)`），
+// `text` 是已经拼好的纯文本（Rust 侧 `Step::plain_text()`）。
+export struct InstallStep {
+    index: int,
+    text: string,
+}
+
+export component ExtensionInstallDialog inherits Rectangle {
+    in property <bool> opened: false;
+    in property <string> title;
+    in property <[InstallStep]> steps;
+    // 预览图缺失时的占位文案（Python：`演示动画即将上线`）。
+    in property <string> preview-text;
+    // 预览图：编译期嵌入的静态 PNG（Qt 侧是 webp 动画，见本文件头）。
+    in property <image> preview: @image-url("../../../../app/assets/install_chrome_extension_guidance.png");
+    in property <string> yes-text;
+    in property <string> cancel-text;
+
+    callback confirmed;
+    callback dismissed;
+
+    visible: root.opened;
+    background: #33000000;
+
+    // 遮罩吞掉点击（模态）。
+    TouchArea {}
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(parent.width - 48px, 768px);
+        height: min(parent.height - 48px, 790px);
+        border-radius: 8px;
+        background: white;
+        border-width: 1px;
+        border-color: #e0e0e0;
+
+        VerticalLayout {
+            padding: 24px;
+            spacing: 12px;
+
+            // 预览区（`PREVIEW_SIZE = 720×405`，16:9；这里让宽度跟随面板）。
+            Rectangle {
+                vertical-stretch: 1;
+                min-height: 160px;
+                border-radius: 8px;
+                background: #f6f6f6;
+
+                Image {
+                    source: root.preview;
+                    image-fit: contain;
+                    width: 100%;
+                    height: 100%;
+                }
+
+                if root.preview.width <= 0 : Text {
+                    text: root.preview-text;
+                    font-size: 13px;
+                    color: #666;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Text {
+                text: root.title;
+                font-size: 16px;
+                font-weight: 700;
+                color: #1a1a1a;
+            }
+
+            VerticalLayout {
+                spacing: 10px;
+                for step in root.steps : HorizontalLayout {
+                    spacing: 12px;
+                    alignment: start;
+
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: 12px;
+                        background: #0067c0;
+
+                        Text {
+                            text: "\{step.index}";
+                            font-size: 12px;
+                            font-weight: 700;
+                            color: white;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Text {
+                        text: step.text;
+                        font-size: 13px;
+                        color: #333;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 12px;
+                ShellButton {
+                    text: root.yes-text;
+                    primary: true;
+                    clicked => {
+                        root.confirmed();
+                    }
+                }
+                ShellButton {
+                    text: root.cancel-text;
+                    clicked => {
+                        root.dismissed();
+                    }
+                }
+            }
+        }
+    }
+}

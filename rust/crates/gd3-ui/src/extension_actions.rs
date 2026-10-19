@@ -44,13 +44,15 @@
 //!   `toLocalizedError(toTaskError(error))`，措辞不同，语义相同。
 
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use gd3_core::desktop::{open_url_command, spawn_detached};
 use gd3_core::filesystem::which;
 use gd3_core::settings;
+
+use slint::ComponentHandle;
 
 use crate::AppWindow;
 use crate::extension_crx;
@@ -166,6 +168,13 @@ impl ExtensionActions {
         })
     }
 
+    /// 解包目标（`BrowserService._extensionFolder`）。引导框要把它显示给用户，
+    /// 第 123 步的 `on_chromiumInstall` 解包成功后用它调
+    /// [`crate::extension_install::show`]。
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
     /// `cfg.browserExtensionPairToken.value`（缺键 / 类型不符 → 空串）。
     pub fn token(&self) -> String {
         settings::read_text(&self.writer.config(), "browserExtensionPairToken").unwrap_or_default()
@@ -262,9 +271,16 @@ pub fn install(window: &AppWindow, actions: Rc<ExtensionActions>) {
     window.on_openStoreUrl(move |url| {
         store.open_store(url.as_str());
     });
+    // `_onChromiumInstallClicked`（`setting_page.py:450-468`）：解包成功才弹引导框，
+    // 失败只留一条 `InfoBar.error`（`install()` 内部已经发过 `Notice::UnpackFailed`）。
     let unpack = Rc::clone(&actions);
+    let win = window.as_weak();
     window.on_chromiumInstall(move || {
-        unpack.install();
+        if unpack.install()
+            && let Some(window) = win.upgrade()
+        {
+            crate::extension_install::show(&window, unpack.folder());
+        }
     });
     window.on_exportCrx(move || {
         actions.export();

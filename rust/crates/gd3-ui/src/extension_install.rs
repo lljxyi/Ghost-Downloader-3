@@ -1,332 +1,770 @@
-//! 浏览器扩展安装引导对话框（P3，第 68 步）：镜像
-//! `app/view/dialogs/extension_install.py`（133 行）的语义层。
+//! 扩展安装引导框（P3，第 123 步）：镜像 `app/view/dialogs/extension_install.py`（133 行）。
 //!
-//! ## 实证口径（2026-10-18 实读源码）
+//! 第 122 步的 `extension_actions::install()` 解包成功后只发一条
+//! [`crate::extension_actions::Notice::ExtensionInstalled`]（`SystemEffects` 里
+//! `eprintln!` 一行）。这一步把 Python 真正弹的那个五步引导框补上：本模块给**文案与
+//! 副作用**，`ui/extension_install.slint` 给形状，`boot.rs` 把两边接起来。
 //!
-//! - `PREVIEW_SIZE = QSize(720, 405)`、`PREVIEW_GIF = ":/res/
-//!   install_chrome_extension_guidance.webp"`（:12-13）。
-//! - `_initWidget`（:34-47）：`widget.setMinimumWidth(PREVIEW_SIZE.width() + 48)`
-//!   （注释写明「+ scrollLayout 左右各 24 边距」）、
-//!   `widget.setMaximumHeight(PREVIEW_SIZE.height() + 385)`（注释拆解
-//!   48+60+28+168+81）；`yesButton` = `打开扩展页面并定位目录`、
-//!   `cancelButton` = `关闭`。
-//! - `_initPreview`（:50-66）：`QMovie` 有效时铺满预览区并 `start()`；
-//!   **无效时**才退化成文字 `演示动画即将上线` + 主题相关的灰底灰字
-//!   （深色 `rgba(255, 255, 255, 0.06)` / `rgba(255, 255, 255, 0.5)`，
-//!   浅色 `rgba(0, 0, 0, 0.04)` / `rgba(0, 0, 0, 0.4)`），圆角 8px。
-//! - `_initSteps`（:68-100）：五步富文本，每步的「命令/名词」用
-//!   [`chip`] 包成灰底 `<span>`（`&nbsp;` 两侧留白）；命令类走等宽字体
-//!   `'Cascadia Code', Consolas, monospace`；步骤徽章是 24×24 圆形、
-//!   底色 `themeColor()`、白字加粗。
-//! - `_onInstall`（:130-133）：先 `revealInFolder(path)`，再
-//!   `openChromiumUrl("chrome://extensions")`；**打开失败**才写剪贴板 +
-//!   弹 5 秒 InfoBar（标题 `请手动打开浏览器`、正文
-//!   `chrome://extensions 已复制到剪贴板，请粘贴到地址栏`）。
+//! ## 实证口径（2026-10-19 实读源码，`translate` = identity）
 //!
-//! ## 与 Qt 的差异
+//! - **标题**：`扩展已解包，按以下步骤安装`（`extension_install.py:24`，`SubtitleLabel`）。
+//! - **预览**：`PREVIEW_SIZE = QSize(720, 405)`（:14）、
+//!   `PREVIEW_GIF = ":/res/install_chrome_extension_guidance.webp"`（:15）；
+//!   `QMovie.isValid()` 为假时正文退成 `演示动画即将上线`（:54）。
+//! - **五步**（:70-76，`enumerate(steps, 1)` 给序号）：
+//!   1. `在浏览器中打开 {chip("chrome://extensions", mono=True)}`
+//!   2. `开启 {chip("开发者模式")}`
+//!   3. `将 {chip("扩展文件夹")} 拖入浏览器窗口`
+//!   4. `启用扩展`
+//!   5. `打开 {chip("扩展弹窗")}，点击 {chip("自动配对")}`
 //!
-//! `QMovie` 的有效性、`themeColor()`、剪贴板与 `openChromiumUrl` 都在外壳侧，
-//! 本模块只把它们当**入参/出参**：`gif_available` 决定预览是动图还是文字，
-//! `accent` 由调用方给（主题色），`install_action(path, opened)` 把
-//! 「打开失败 → 复制 + InfoBar」摊成可断言的 [`InstallOutcome`]。
+//!   `chip()`（:66-68）产出
+//!   `<span style="background-color: {chipBg};{family}">&nbsp;{text}&nbsp;</span>`，
+//!   其中 `family` 只在 `mono=True` 时是 ` font-family: 'Cascadia Code', Consolas, monospace;`，
+//!   `chipBg` 暗色 `rgba(255, 255, 255, 0.1)`、亮色 `rgba(0, 0, 0, 0.06)`。
+//! - **两个按钮**：yes = `打开扩展页面并定位目录`（:38）、cancel = `关闭`（:39）。
+//!   顺序照 `MessageBoxBase.__initLayout`（`buttonLayout.addWidget(yesButton)` 在前），
+//!   即 **左 yes 右 cancel**。
+//! - **尺寸**：`setMinimumWidth(PREVIEW_SIZE.width() + 48)` = **768**（:33，+48 是
+//!   `scrollLayout` 左右各 24 的边距）；`setMaximumHeight(PREVIEW_SIZE.height() + 385)`
+//!   = **790**（:35，385 = 48 边距 + 60 空隙 + 28 标题 + 168 步骤 + 81 按钮组）。
+//! - **yes 不关框**：`_bind`（:120-121）先 `yesButton.clicked.disconnect()` 再连
+//!   `_onInstall` —— 点 yes 只做副作用，框还开着；关框只有 cancel
+//!   （`MessageBoxBase.__onCancelButtonClicked` → `reject()`）。
+//! - **`_onInstall`**（:123-133）：`revealInFolder(str(self._path))` →
+//!   `openChromiumUrl("chrome://extensions")`；**返回假**才
+//!   `clipboard.setText("chrome://extensions")` +
+//!   `InfoBar.info(请手动打开浏览器, chrome://extensions 已复制到剪贴板，请粘贴到地址栏,
+//!   duration=5000, position=TOP)`。
+//!
+//! ## 分工
+//!
+//! | 层 | 负责 |
+//! |---|---|
+//! | [`Guide`] / [`Step`] / [`Segment`] | 全部文案、步骤拆分、尺寸常量、富文本渲染 |
+//! | [`plan_confirm`] / [`confirm`] | 「点 yes 之后发生什么」，副作用经 [`GuideEffects`] 注入 |
+//! | [`show`] / [`hide`] / [`install`] | 往 `AppWindow` 的属性上灌值、装两个回调 |
+//! | `ui/extension_install.slint` | 遮罩 + 面板 + 预览 + 五步 + 两个按钮的形状 |
+//!
+//! ## 与 Qt 侧的已知差异
+//!
+//! - **预览是静态 PNG 而不是 webp 动画**：`.slint` 用 `@image-url` 编译期嵌入
+//!   `app/assets/install_chrome_extension_guidance.png`（1415×670 的静帧）。webp 动画
+//!   要解码器 + 逐帧推进，Slint 侧没有等价物；`image-fit: contain` 保住 16:9 的观感。
+//!   Python 的 `演示动画即将上线` 兜底文案仍保留为 `previewText` 属性（图缺失时显示）。
+//! - **没有模态事件循环**：`MessageBoxBase.exec()` 换成 `extensionInstallVisible`
+//!   覆盖层 + `confirmed` / `dismissed` 两个回调。
+//! - **`revealInFolder` 在 Windows 上返回假**：`gd3_core::desktop::reveal_in_folder`
+//!   走 `open_target_command_on`，那条对 Windows 还没迁移（`ShellExecute` 未接），
+//!   与第 122 步 `open_url` 用 `rundll32` 是两码事。Linux/macOS 正常。
+//! - **`InfoBar` 换成 `eprintln!`**：与 `extension_actions::SystemEffects::notify`
+//!   同一口径，等通知条接线那一步再换。
+
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use slint::{ComponentHandle, ModelRc, VecModel};
+
+use crate::{AppWindow, InstallStep};
 
 // ---------------------------------------------------------------------------
-// 文案与常量（`extension_install.py` 逐字）
+// 文案与尺寸（`extension_install.py` 逐字）
 // ---------------------------------------------------------------------------
 
-/// `PREVIEW_SIZE.width()`（:12）
+/// `PREVIEW_SIZE.width()`（:14）。
 pub const PREVIEW_WIDTH: i32 = 720;
-/// `PREVIEW_SIZE.height()`（:12）
+
+/// `PREVIEW_SIZE.height()`（:14）。
 pub const PREVIEW_HEIGHT: i32 = 405;
-/// `PREVIEW_GIF`（:13）
-pub const PREVIEW_GIF: &str = ":/res/install_chrome_extension_guidance.webp";
-/// `widget.setMinimumWidth(PREVIEW_SIZE.width() + 48)`（:36）
+
+/// `setMinimumWidth(PREVIEW_SIZE.width() + 48)`（:33）。
 pub const MIN_WIDTH: i32 = PREVIEW_WIDTH + 48;
-/// `widget.setMaximumHeight(PREVIEW_SIZE.height() + 385)`（:38）
+
+/// `setMaximumHeight(PREVIEW_SIZE.height() + 385)`（:35）。
 pub const MAX_HEIGHT: i32 = PREVIEW_HEIGHT + 385;
-/// `yesButton.setText(self.tr("打开扩展页面并定位目录"))`（:41）
-pub const BUTTON_OPEN: &str = "打开扩展页面并定位目录";
-/// `cancelButton.setText(self.tr("关闭"))`（:42）
-pub const BUTTON_CLOSE: &str = "关闭";
-/// `self.previewLabel.setText(self.tr("演示动画即将上线"))`（:60）
-pub const FALLBACK_PREVIEW_TEXT: &str = "演示动画即将上线";
-/// `openChromiumUrl("chrome://extensions")`（:132）
+
+/// `PREVIEW_GIF`（:15）—— Qt 资源路径，这里只作为**事实记录**保留。
+///
+/// Slint 侧不用它：`.slint` 直接 `@image-url` 嵌入同名 PNG（见模块头「已知差异」）。
+pub const PREVIEW_RESOURCE: &str = ":/res/install_chrome_extension_guidance.webp";
+
+/// `movie.isValid()` 为假时的占位文案（:54）。
+pub const PREVIEW_FALLBACK: &str = "演示动画即将上线";
+
+/// 标题（:24）。
+pub const TITLE: &str = "扩展已解包，按以下步骤安装";
+
+/// yes 按钮（:38）。
+pub const YES_LABEL: &str = "打开扩展页面并定位目录";
+
+/// cancel 按钮（:39）。
+pub const CANCEL_LABEL: &str = "关闭";
+
+/// `_onInstall` 里 `openChromiumUrl` 的入参（:127）。
 pub const CHROMIUM_EXTENSIONS_URL: &str = "chrome://extensions";
-/// `InfoBar.info(self.tr("请手动打开浏览器"), ...)` 的标题（:138）
+
+/// `InfoBar.info(..., duration=5000, ...)`（:132）。
+pub const INFO_DURATION_MS: i32 = 5000;
+
+/// `InfoBar.info` 的标题（:130）。
 pub const MANUAL_OPEN_TITLE: &str = "请手动打开浏览器";
-/// InfoBar 正文（:139）
-pub const MANUAL_OPEN_CONTENT: &str = "chrome://extensions 已复制到剪贴板，请粘贴到地址栏";
-/// `duration=5000`（:140）
-pub const MANUAL_OPEN_DURATION_MS: u64 = 5000;
-/// `chip()` 里命令类文本追加的字体声明（:72）
-pub const MONO_FAMILY: &str = " font-family: 'Cascadia Code', Consolas, monospace;";
-/// 徽章直径（`badge.setFixedSize(24, 24)`，:92）
-pub const BADGE_SIZE: i32 = 24;
 
-/// `chipBg = "rgba(255, 255, 255, 0.1)" if isDarkTheme() else "rgba(0, 0, 0, 0.06)"`（:69）
-pub fn chip_background(dark: bool) -> &'static str {
-    if dark {
-        "rgba(255, 255, 255, 0.1)"
+/// `InfoBar.info` 的正文（:131）。
+pub const MANUAL_OPEN_BODY: &str = "chrome://extensions 已复制到剪贴板，请粘贴到地址栏";
+
+/// 暗色主题下的 chip 底色（:64）。
+pub const CHIP_BACKGROUND_DARK: &str = "rgba(255, 255, 255, 0.1)";
+
+/// 亮色主题下的 chip 底色（:64）。
+pub const CHIP_BACKGROUND_LIGHT: &str = "rgba(0, 0, 0, 0.06)";
+
+/// `mono=True` 时拼进 style 的字族段（:67，注意开头那个空格是 Python 原文）。
+pub const CHIP_MONO_FAMILY: &str = " font-family: 'Cascadia Code', Consolas, monospace;";
+
+/// 预览占位框的暗色底（:56）。
+pub const PREVIEW_BACKGROUND_DARK: &str = "rgba(255, 255, 255, 0.06)";
+
+/// 预览占位框的暗色字（:56）。
+pub const PREVIEW_COLOR_DARK: &str = "rgba(255, 255, 255, 0.5)";
+
+/// 预览占位框的亮色底（:58）。
+pub const PREVIEW_BACKGROUND_LIGHT: &str = "rgba(0, 0, 0, 0.04)";
+
+/// 预览占位框的亮色字（:58）。
+pub const PREVIEW_COLOR_LIGHT: &str = "rgba(0, 0, 0, 0.4)";
+
+/// 预览占位框的样式表（:59-61，`QLabel { background: …; color: …; border-radius: 8px; }`）。
+pub fn preview_style(dark: bool) -> String {
+    let (background, color) = if dark {
+        (PREVIEW_BACKGROUND_DARK, PREVIEW_COLOR_DARK)
     } else {
-        "rgba(0, 0, 0, 0.06)"
-    }
-}
-
-/// 退化预览的 `(background, color)`（:62-65）。
-pub fn fallback_colors(dark: bool) -> (&'static str, &'static str) {
-    if dark {
-        ("rgba(255, 255, 255, 0.06)", "rgba(255, 255, 255, 0.5)")
-    } else {
-        ("rgba(0, 0, 0, 0.04)", "rgba(0, 0, 0, 0.4)")
-    }
-}
-
-/// 退化预览的样式表（:66-68）：`QLabel { background: {background}; color: {color};
-/// border-radius: 8px; }`。
-pub fn fallback_style(dark: bool) -> String {
-    let (background, color) = fallback_colors(dark);
+        (PREVIEW_BACKGROUND_LIGHT, PREVIEW_COLOR_LIGHT)
+    };
     format!("QLabel {{ background: {background}; color: {color}; border-radius: 8px; }}")
 }
 
-/// 步骤徽章样式（:95-97）：`background: {accent}; color: white; border-radius: 12px;
-/// font-weight: bold;`。
-pub fn badge_style(accent: &str) -> String {
-    format!("background: {accent}; color: white; border-radius: 12px; font-weight: bold;")
+// ---------------------------------------------------------------------------
+// 步骤：片段 → 纯文本 / 富文本
+// ---------------------------------------------------------------------------
+
+/// 一步引导里的一个片段。
+///
+/// Python 的 `chip(text, mono=False)` 把文字包进带底色的 `<span>`；模板里的普通文字
+/// 是片段之外的字面量。这里把两者都摊成片段，[`Step::plain_text`] 与
+/// [`Step::rich_text`] 才能共用同一份数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// 片段文字（chip 内 / 外的原文，不含 `&nbsp;`）。
+    pub text: String,
+    /// 对应 `chip(..., mono=True)`：加等宽字族。
+    pub mono: bool,
+    /// 是否包在 `<span style="background-color: …">` 里。
+    pub chip: bool,
 }
 
-/// `chip(text, mono)`（:71-74）：`<span style="background-color: {chipBg};{family}">
-/// &nbsp;{text}&nbsp;</span>`，`family` 仅等宽时非空。
-pub fn chip(text: &str, mono: bool, dark: bool) -> String {
-    let family = if mono { MONO_FAMILY } else { "" };
-    format!(
-        "<span style=\"background-color: {};{family}\">&nbsp;{text}&nbsp;</span>",
-        chip_background(dark)
-    )
-}
-
-/// `_initSteps` 的五步富文本（:76-82），按声明顺序。
-pub fn steps(dark: bool) -> Vec<String> {
-    vec![
-        format!("在浏览器中打开 {}", chip("chrome://extensions", true, dark)),
-        format!("开启 {}", chip("开发者模式", false, dark)),
-        format!("将 {} 拖入浏览器窗口", chip("扩展文件夹", false, dark)),
-        "启用扩展".to_string(),
-        format!(
-            "打开 {}，点击 {}",
-            chip("扩展弹窗", false, dark),
-            chip("自动配对", false, dark)
-        ),
-    ]
-}
-
-/// 安装动作的产物：外壳据此做副作用（资源管理器定位 / 打开浏览器 / 剪贴板 + InfoBar）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InstallOutcome {
-    /// `revealInFolder(str(self._path))`（:136）
-    pub reveal_path: String,
-    /// `openChromiumUrl(...)` 的目标（:132）
-    pub chromium_url: String,
-    /// `openChromiumUrl` 是否成功；`false` 时外壳要写剪贴板并弹 InfoBar。
-    pub opened: bool,
-    /// 失败时的 InfoBar 文案（成功时为 `None`）。
-    pub fallback: Option<ManualOpenHint>,
-}
-
-/// `InfoBar.info(...)` 的三个可断言字段（:138-141）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ManualOpenHint {
-    pub title: String,
-    pub content: String,
-    pub duration_ms: u64,
-}
-
-impl ManualOpenHint {
-    /// `_onInstall` 的失败分支文案。
-    pub fn new() -> Self {
+impl Segment {
+    /// 模板里的普通文字。
+    pub fn plain(text: &str) -> Self {
         Self {
-            title: MANUAL_OPEN_TITLE.to_string(),
-            content: MANUAL_OPEN_CONTENT.to_string(),
-            duration_ms: MANUAL_OPEN_DURATION_MS,
+            text: text.to_string(),
+            mono: false,
+            chip: false,
         }
+    }
+
+    /// `chip(text)`。
+    pub fn chip(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            mono: false,
+            chip: true,
+        }
+    }
+
+    /// `chip(text, mono=True)`。
+    pub fn mono_chip(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            mono: true,
+            chip: true,
+        }
+    }
+
+    /// 渲染成 Python 的富文本片段（普通片段原样返回）。
+    pub fn render(&self, dark: bool) -> String {
+        if !self.chip {
+            return self.text.clone();
+        }
+        let background = if dark {
+            CHIP_BACKGROUND_DARK
+        } else {
+            CHIP_BACKGROUND_LIGHT
+        };
+        let family = if self.mono { CHIP_MONO_FAMILY } else { "" };
+        let text = &self.text;
+        format!("<span style=\"background-color: {background};{family}\">&nbsp;{text}&nbsp;</span>")
     }
 }
 
-impl Default for ManualOpenHint {
+/// 一步引导：序号（`enumerate(..., 1)`）+ 片段表。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// 显示在圆形徽标里的序号，从 1 开始。
+    pub index: usize,
+    /// 片段表（普通文字与 chip 交替）。
+    pub segments: Vec<Segment>,
+}
+
+impl Step {
+    /// 纯文本（chip 两侧不留 `&nbsp;`）—— 给 Slint 的 `InstallStep.text`。
+    pub fn plain_text(&self) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            text.push_str(&segment.text);
+        }
+        text
+    }
+
+    /// Python 的 `stepLabel.setText(rich_text)` 原样（`Qt.TextFormat.RichText`）。
+    pub fn rich_text(&self, dark: bool) -> String {
+        let mut text = String::new();
+        for segment in &self.segments {
+            text.push_str(&segment.render(dark));
+        }
+        text
+    }
+}
+
+/// 五步引导（`_initSteps` 的 `steps` 列表，:70-76）。
+pub fn steps() -> Vec<Step> {
+    vec![
+        Step {
+            index: 1,
+            segments: vec![
+                Segment::plain("在浏览器中打开 "),
+                Segment::mono_chip(CHROMIUM_EXTENSIONS_URL),
+            ],
+        },
+        Step {
+            index: 2,
+            segments: vec![Segment::plain("开启 "), Segment::chip("开发者模式")],
+        },
+        Step {
+            index: 3,
+            segments: vec![
+                Segment::plain("将 "),
+                Segment::chip("扩展文件夹"),
+                Segment::plain(" 拖入浏览器窗口"),
+            ],
+        },
+        Step {
+            index: 4,
+            segments: vec![Segment::plain("启用扩展")],
+        },
+        Step {
+            index: 5,
+            segments: vec![
+                Segment::plain("打开 "),
+                Segment::chip("扩展弹窗"),
+                Segment::plain("，点击 "),
+                Segment::chip("自动配对"),
+            ],
+        },
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// Guide：一份完整的对话框内容
+// ---------------------------------------------------------------------------
+
+/// 对话框的全部静态内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guide {
+    /// 标题（[`TITLE`]）。
+    pub title: &'static str,
+    /// yes 按钮文案（[`YES_LABEL`]）。
+    pub yes_label: &'static str,
+    /// cancel 按钮文案（[`CANCEL_LABEL`]）。
+    pub cancel_label: &'static str,
+    /// Qt 资源路径（[`PREVIEW_RESOURCE`]，Slint 侧不用）。
+    pub preview_resource: &'static str,
+    /// 预览缺失时的占位文案（[`PREVIEW_FALLBACK`]）。
+    pub preview_fallback: &'static str,
+    /// 最小宽度（[`MIN_WIDTH`]）。
+    pub min_width: i32,
+    /// 最大高度（[`MAX_HEIGHT`]）。
+    pub max_height: i32,
+    /// 五步。
+    pub steps: Vec<Step>,
+}
+
+impl Default for Guide {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// 对话框状态：预览是动图还是退化文字 + 步骤富文本。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExtensionInstallState {
-    dark: bool,
-    gif_available: bool,
-    path: String,
+impl Guide {
+    /// 一份与 Python 逐字一致的引导内容。
+    pub fn new() -> Self {
+        Self {
+            title: TITLE,
+            yes_label: YES_LABEL,
+            cancel_label: CANCEL_LABEL,
+            preview_resource: PREVIEW_RESOURCE,
+            preview_fallback: PREVIEW_FALLBACK,
+            min_width: MIN_WIDTH,
+            max_height: MAX_HEIGHT,
+            steps: steps(),
+        }
+    }
+
+    /// 摊成 Slint 的 `InstallStep` 模型数据（序号 + 纯文本）。
+    pub fn to_slint_steps(&self) -> Vec<InstallStep> {
+        self.steps
+            .iter()
+            .map(|step| InstallStep {
+                index: step.index as i32,
+                text: step.plain_text().into(),
+            })
+            .collect()
+    }
 }
 
-impl ExtensionInstallState {
-    /// `__init__(path)` + `_initPreview()` 的 `movie.isValid()` 分支。
-    pub fn new(path: &str, dark: bool, gif_available: bool) -> Self {
-        Self {
-            dark,
-            gif_available,
-            path: path.to_string(),
+// ---------------------------------------------------------------------------
+// 点 yes 之后：副作用计划
+// ---------------------------------------------------------------------------
+
+/// 一次 `_onInstall` 产生的副作用（顺序即发生顺序）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Effect {
+    /// `revealInFolder(str(self._path))`。
+    RevealInFolder(PathBuf),
+    /// `openChromiumUrl("chrome://extensions")`。
+    OpenChromiumUrl(String),
+    /// `QApplication.clipboard().setText("chrome://extensions")`。
+    CopyText(String),
+    /// `InfoBar.info(请手动打开浏览器, …)`。
+    Notify {
+        /// 标题。
+        title: &'static str,
+        /// 正文。
+        body: &'static str,
+    },
+}
+
+/// `_onInstall` 的计划：先定位目录、再开扩展页；**开不起来**才复制链接 + 提示。
+///
+/// `opened` 是 `openChromiumUrl` 的返回值 —— 计划要能表达两个分支，所以它是入参
+/// 而不是在这里调用。
+pub fn plan_confirm(folder: &Path, opened: bool) -> Vec<Effect> {
+    let mut plan = vec![
+        Effect::RevealInFolder(folder.to_path_buf()),
+        Effect::OpenChromiumUrl(CHROMIUM_EXTENSIONS_URL.to_string()),
+    ];
+    if !opened {
+        plan.push(Effect::CopyText(CHROMIUM_EXTENSIONS_URL.to_string()));
+        plan.push(Effect::Notify {
+            title: MANUAL_OPEN_TITLE,
+            body: MANUAL_OPEN_BODY,
+        });
+    }
+    plan
+}
+
+/// 执行 [`plan_confirm`] 的外设注入点。
+///
+/// 与 `extension_actions::Effects` 分开：这里多一个 `reveal_in_folder`、少一个保存
+/// 对话框，且 `notify` 只要两行文字（`InfoBar.info` 没有按钮、没有复选框）。
+pub trait GuideEffects {
+    /// `revealInFolder(path)`：成功返回 `true`。
+    fn reveal_in_folder(&self, folder: &Path) -> bool;
+    /// `QDesktopServices.openUrl` / `openChromiumUrl`：起得来返回 `true`。
+    fn open_url(&self, url: &str) -> bool;
+    /// `QApplication.clipboard().setText`。
+    fn copy_text(&self, text: &str) -> bool;
+    /// `InfoBar.info`。
+    fn notify(&self, title: &str, body: &str);
+}
+
+/// 跑一遍 `_onInstall`：定位目录 → 开扩展页 → 失败则复制链接 + 提示。
+///
+/// 返回值是「浏览器有没有打开」，与 Python 的 `openChromiumUrl` 返回值同义。
+pub fn confirm(effects: &dyn GuideEffects, folder: &Path) -> bool {
+    effects.reveal_in_folder(folder);
+    let opened = effects.open_url(CHROMIUM_EXTENSIONS_URL);
+    if !opened {
+        effects.copy_text(CHROMIUM_EXTENSIONS_URL);
+        effects.notify(MANUAL_OPEN_TITLE, MANUAL_OPEN_BODY);
+    }
+    opened
+}
+
+/// 生产实现：`gd3_core::desktop` + 第 122 步的剪贴板命令 + `eprintln!`。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemGuide;
+
+impl GuideEffects for SystemGuide {
+    fn reveal_in_folder(&self, folder: &Path) -> bool {
+        gd3_core::desktop::reveal_in_folder(folder)
+            .is_some_and(|command| gd3_core::desktop::spawn_detached(&command).is_ok())
+    }
+
+    fn open_url(&self, url: &str) -> bool {
+        gd3_core::desktop::open_chromium_url(url)
+            .is_some_and(|command| gd3_core::desktop::spawn_detached(&command).is_ok())
+    }
+
+    fn copy_text(&self, text: &str) -> bool {
+        crate::extension_actions::copy_text(text)
+    }
+
+    fn notify(&self, title: &str, body: &str) {
+        eprintln!("{title}：{body}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 窗口接线
+// ---------------------------------------------------------------------------
+
+/// 把引导框的六个属性灌满并显示（Python 的 `ExtensionInstallDialog(path).exec()`）。
+pub fn show(window: &AppWindow, folder: &Path) {
+    let guide = Guide::new();
+    window.set_extensionInstallFolder(folder.display().to_string().into());
+    window.set_extensionInstallTitle(guide.title.into());
+    window.set_extensionInstallSteps(ModelRc::new(VecModel::from(guide.to_slint_steps())));
+    window.set_extensionInstallPreviewText(guide.preview_fallback.into());
+    window.set_extensionInstallYesText(guide.yes_label.into());
+    window.set_extensionInstallCancelText(guide.cancel_label.into());
+    window.set_extensionInstallVisible(true);
+}
+
+/// 关掉引导框（cancel 的语义：`reject()`）。
+pub fn hide(window: &AppWindow) {
+    window.set_extensionInstallVisible(false);
+}
+
+/// 装两个回调。
+///
+/// `confirmed` **不改可见性** —— Python 的 yes 按钮被 `disconnect()` 过，点它只做
+/// 副作用；`dismissed` 才关框。
+pub fn install(window: &AppWindow, effects: Rc<dyn GuideEffects>) {
+    let win = window.as_weak();
+    let confirm_effects = Rc::clone(&effects);
+    window.on_extensionInstallConfirmed(move || {
+        if let Some(window) = win.upgrade() {
+            let folder = PathBuf::from(window.get_extensionInstallFolder().as_str());
+            confirm(confirm_effects.as_ref(), &folder);
         }
-    }
+    });
 
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    pub fn is_dark(&self) -> bool {
-        self.dark
-    }
-
-    /// 动图可用时为 `None`（`previewLabel.setMovie(...)` 分支，:55-58）。
-    pub fn preview_text(&self) -> Option<&'static str> {
-        if self.gif_available {
-            None
-        } else {
-            Some(FALLBACK_PREVIEW_TEXT)
+    let win = window.as_weak();
+    window.on_extensionInstallDismissed(move || {
+        if let Some(window) = win.upgrade() {
+            hide(&window);
         }
-    }
-
-    /// 退化分支的样式；动图可用时为 `None`（Qt 侧根本不会设样式表）。
-    pub fn preview_style(&self) -> Option<String> {
-        if self.gif_available {
-            None
-        } else {
-            Some(fallback_style(self.dark))
-        }
-    }
-
-    pub fn steps(&self) -> Vec<String> {
-        steps(self.dark)
-    }
-
-    /// `_onInstall`（:130-141）：`opened` 由外壳的 `openChromiumUrl` 结果给。
-    pub fn install_action(&self, opened: bool) -> InstallOutcome {
-        InstallOutcome {
-            reveal_path: self.path.clone(),
-            chromium_url: CHROMIUM_EXTENSIONS_URL.to_string(),
-            opened,
-            fallback: if opened {
-                None
-            } else {
-                Some(ManualOpenHint::new())
-            },
-        }
-    }
+    });
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    use slint::Model as _;
+
     use super::*;
 
-    #[test]
-    fn geometry_literals_match_python() {
-        assert_eq!((PREVIEW_WIDTH, PREVIEW_HEIGHT), (720, 405));
-        assert_eq!(MIN_WIDTH, 768);
-        assert_eq!(MAX_HEIGHT, 790);
-        assert_eq!(PREVIEW_GIF, ":/res/install_chrome_extension_guidance.webp");
-        assert_eq!(BADGE_SIZE, 24);
+    /// 记录每次外设调用的假实现（不碰真剪贴板、不真起浏览器）。
+    struct FakeGuide {
+        log: Rc<RefCell<Vec<String>>>,
+        opened: bool,
+        revealed: bool,
     }
 
-    /// `chip()` 的 HTML 逐字节（深色 + 等宽 / 浅色 + 普通各一组）。
+    impl FakeGuide {
+        fn new(opened: bool) -> (Rc<Self>, Rc<RefCell<Vec<String>>>) {
+            let log = Rc::new(RefCell::new(Vec::new()));
+            let guide = Rc::new(Self {
+                log: Rc::clone(&log),
+                opened,
+                revealed: true,
+            });
+            (guide, log)
+        }
+    }
+
+    impl GuideEffects for FakeGuide {
+        fn reveal_in_folder(&self, folder: &Path) -> bool {
+            self.log
+                .borrow_mut()
+                .push(format!("reveal:{}", folder.display()));
+            self.revealed
+        }
+
+        fn open_url(&self, url: &str) -> bool {
+            self.log.borrow_mut().push(format!("open:{url}"));
+            self.opened
+        }
+
+        fn copy_text(&self, text: &str) -> bool {
+            self.log.borrow_mut().push(format!("copy:{text}"));
+            true
+        }
+
+        fn notify(&self, title: &str, body: &str) {
+            self.log.borrow_mut().push(format!("notify:{title}|{body}"));
+        }
+    }
+
     #[test]
-    fn chip_html_is_byte_exact() {
+    fn the_guide_matches_the_python_constants() {
+        let guide = Guide::new();
+        assert_eq!(guide.title, "扩展已解包，按以下步骤安装");
+        assert_eq!(guide.yes_label, "打开扩展页面并定位目录");
+        assert_eq!(guide.cancel_label, "关闭");
+        assert_eq!(guide.preview_fallback, "演示动画即将上线");
         assert_eq!(
-            chip("chrome://extensions", true, true),
-            "<span style=\"background-color: rgba(255, 255, 255, 0.1); \
+            guide.preview_resource,
+            ":/res/install_chrome_extension_guidance.webp"
+        );
+        assert_eq!(guide.min_width, 768, "720 + 48");
+        assert_eq!(guide.max_height, 790, "405 + 385");
+        assert_eq!(Guide::default(), guide);
+    }
+
+    #[test]
+    fn the_five_steps_are_the_python_lines() {
+        let texts: Vec<String> = steps().iter().map(Step::plain_text).collect();
+        assert_eq!(
+            texts,
+            [
+                "在浏览器中打开 chrome://extensions",
+                "开启 开发者模式",
+                "将 扩展文件夹 拖入浏览器窗口",
+                "启用扩展",
+                "打开 扩展弹窗，点击 自动配对",
+            ]
+        );
+        let indices: Vec<usize> = steps().iter().map(|step| step.index).collect();
+        assert_eq!(indices, [1, 2, 3, 4, 5], "enumerate(steps, 1)");
+    }
+
+    #[test]
+    fn the_first_step_wraps_the_url_in_a_mono_chip() {
+        let step = &steps()[0];
+        assert_eq!(
+            step.rich_text(true),
+            "在浏览器中打开 <span style=\"background-color: rgba(255, 255, 255, 0.1); \
              font-family: 'Cascadia Code', Consolas, monospace;\">&nbsp;chrome://extensions&nbsp;</span>"
         );
         assert_eq!(
-            chip("开发者模式", false, false),
-            "<span style=\"background-color: rgba(0, 0, 0, 0.06);\">&nbsp;开发者模式&nbsp;</span>"
+            step.segments[1],
+            Segment::mono_chip("chrome://extensions"),
+            "chip(text, mono=True)"
         );
     }
 
-    /// 五步顺序与文案（浅色主题）。
     #[test]
-    fn steps_match_python_order() {
-        let steps = steps(false);
-        assert_eq!(steps.len(), 5);
-        assert!(steps[0].starts_with("在浏览器中打开 <span"));
-        assert!(steps[0].contains("&nbsp;chrome://extensions&nbsp;"));
+    fn the_chip_background_follows_the_theme() {
+        let step = &steps()[1];
+        assert!(
+            step.rich_text(true)
+                .contains("background-color: rgba(255, 255, 255, 0.1);"),
+            "暗色：{}",
+            step.rich_text(true)
+        );
+        assert!(
+            step.rich_text(false)
+                .contains("background-color: rgba(0, 0, 0, 0.06);"),
+            "亮色：{}",
+            step.rich_text(false)
+        );
+        assert!(
+            !step.rich_text(true).contains("font-family"),
+            "非 mono 的 chip 不带字族段"
+        );
+    }
+
+    #[test]
+    fn a_step_without_chips_renders_as_plain_text() {
+        let step = &steps()[3];
+        assert_eq!(step.segments, [Segment::plain("启用扩展")]);
+        assert_eq!(step.rich_text(true), "启用扩展");
+        assert_eq!(step.rich_text(false), "启用扩展");
+    }
+
+    #[test]
+    fn a_plain_segment_ignores_the_theme() {
+        assert_eq!(Segment::plain("拖入").render(true), "拖入");
+        assert_eq!(Segment::plain("拖入").render(false), "拖入");
         assert_eq!(
-            steps[1],
-            "开启 <span style=\"background-color: rgba(0, 0, 0, 0.06);\">&nbsp;开发者模式&nbsp;</span>"
+            Segment::chip("x").render(false),
+            "<span style=\"background-color: rgba(0, 0, 0, 0.06);\">&nbsp;x&nbsp;</span>"
         );
-        assert!(steps[2].starts_with("将 ") && steps[2].ends_with(" 拖入浏览器窗口"));
-        assert_eq!(steps[3], "启用扩展");
-        assert!(steps[4].starts_with("打开 ") && steps[4].contains("，点击 "));
-        assert!(steps[4].contains("&nbsp;扩展弹窗&nbsp;"));
-        assert!(steps[4].contains("&nbsp;自动配对&nbsp;"));
     }
 
-    /// 动图可用时不给文字也不给样式（`setMovie` 分支提前 return）。
     #[test]
-    fn valid_gif_suppresses_fallback_text_and_style() {
-        let state = ExtensionInstallState::new("/tmp/ext", false, true);
-        assert_eq!(state.preview_text(), None);
-        assert_eq!(state.preview_style(), None);
-        assert_eq!(state.path(), "/tmp/ext");
-    }
-
-    /// 动图不可用时文字 + 主题色样式。
-    #[test]
-    fn missing_gif_falls_back_to_themed_label() {
-        let dark = ExtensionInstallState::new("/tmp/ext", true, false);
-        assert_eq!(dark.preview_text(), Some("演示动画即将上线"));
+    fn the_preview_placeholder_style_follows_the_theme() {
         assert_eq!(
-            dark.preview_style().as_deref(),
-            Some(
-                "QLabel { background: rgba(255, 255, 255, 0.06); color: rgba(255, 255, 255, 0.5); border-radius: 8px; }"
-            )
+            preview_style(true),
+            "QLabel { background: rgba(255, 255, 255, 0.06); color: rgba(255, 255, 255, 0.5); \
+             border-radius: 8px; }"
         );
-        let light = ExtensionInstallState::new("/tmp/ext", false, false);
         assert_eq!(
-            light.preview_style().as_deref(),
-            Some(
-                "QLabel { background: rgba(0, 0, 0, 0.04); color: rgba(0, 0, 0, 0.4); border-radius: 8px; }"
-            )
+            preview_style(false),
+            "QLabel { background: rgba(0, 0, 0, 0.04); color: rgba(0, 0, 0, 0.4); \
+             border-radius: 8px; }"
         );
     }
 
-    /// 打开成功：只定位目录 + 打开浏览器，不碰剪贴板。
     #[test]
-    fn successful_open_has_no_fallback_hint() {
-        let state = ExtensionInstallState::new("/opt/ext", true, true);
-        let outcome = state.install_action(true);
-        assert_eq!(outcome.reveal_path, "/opt/ext");
-        assert_eq!(outcome.chromium_url, "chrome://extensions");
-        assert!(outcome.opened);
-        assert_eq!(outcome.fallback, None);
-    }
-
-    /// 打开失败：剪贴板 + InfoBar 三字段。
-    #[test]
-    fn failed_open_returns_the_manual_hint() {
-        let state = ExtensionInstallState::new("/opt/ext", false, false);
-        let outcome = state.install_action(false);
-        assert!(!outcome.opened);
-        let hint = outcome.fallback.expect("失败必须给 InfoBar 文案");
-        assert_eq!(hint.title, "请手动打开浏览器");
-        assert_eq!(
-            hint.content,
-            "chrome://extensions 已复制到剪贴板，请粘贴到地址栏"
-        );
-        assert_eq!(hint.duration_ms, 5000);
-        // 正文里嵌的 URL 与 `openChromiumUrl` 的目标同源。
-        assert!(hint.content.contains(CHROMIUM_EXTENSIONS_URL));
+    fn slint_steps_carry_the_index_and_the_plain_text() {
+        let model: Vec<InstallStep> = Guide::new().to_slint_steps();
+        assert_eq!(model.len(), 5);
+        assert_eq!(model[0].index, 1);
+        assert_eq!(model[0].text, "在浏览器中打开 chrome://extensions");
+        assert_eq!(model[4].index, 5);
+        assert_eq!(model[4].text, "打开 扩展弹窗，点击 自动配对");
     }
 
     #[test]
-    fn badge_style_embeds_accent() {
+    fn a_failed_browser_open_falls_back_to_the_clipboard() {
+        let plan = plan_confirm(Path::new("/tmp/ext"), false);
         assert_eq!(
-            badge_style("#0067C0"),
-            "background: #0067C0; color: white; border-radius: 12px; font-weight: bold;"
+            plan,
+            [
+                Effect::RevealInFolder(PathBuf::from("/tmp/ext")),
+                Effect::OpenChromiumUrl("chrome://extensions".to_string()),
+                Effect::CopyText("chrome://extensions".to_string()),
+                Effect::Notify {
+                    title: "请手动打开浏览器",
+                    body: "chrome://extensions 已复制到剪贴板，请粘贴到地址栏",
+                },
+            ]
         );
+    }
+
+    #[test]
+    fn a_successful_browser_open_stops_after_the_url() {
+        let plan = plan_confirm(Path::new("/tmp/ext"), true);
+        assert_eq!(plan.len(), 2, "成功时不复制、不提示");
+        assert_eq!(plan[0], Effect::RevealInFolder(PathBuf::from("/tmp/ext")));
+        assert_eq!(
+            plan[1],
+            Effect::OpenChromiumUrl("chrome://extensions".to_string())
+        );
+    }
+
+    #[test]
+    fn confirm_runs_the_fallback_in_order() {
+        let (guide, log) = FakeGuide::new(false);
+        let opened = confirm(guide.as_ref(), Path::new("/tmp/ext"));
+        assert!(!opened);
+        assert_eq!(
+            *log.borrow(),
+            [
+                "reveal:/tmp/ext",
+                "open:chrome://extensions",
+                "copy:chrome://extensions",
+                "notify:请手动打开浏览器|chrome://extensions 已复制到剪贴板，请粘贴到地址栏",
+            ]
+        );
+    }
+
+    #[test]
+    fn confirm_reports_the_browser_result() {
+        let (guide, log) = FakeGuide::new(true);
+        assert!(confirm(guide.as_ref(), Path::new("/tmp/ext")));
+        assert_eq!(
+            *log.borrow(),
+            ["reveal:/tmp/ext", "open:chrome://extensions"]
+        );
+    }
+
+    #[test]
+    fn confirm_ignores_the_reveal_result() {
+        // Python 不检查 `revealInFolder` 的返回值：定位失败也照样开扩展页。
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let guide = Rc::new(FakeGuide {
+            log: Rc::clone(&log),
+            opened: true,
+            revealed: false,
+        });
+        assert!(confirm(guide.as_ref(), Path::new("/tmp/ext")));
+        assert_eq!(
+            *log.borrow(),
+            ["reveal:/tmp/ext", "open:chrome://extensions"]
+        );
+    }
+
+    #[test]
+    fn show_fills_every_property_and_opens_the_overlay() {
+        let window = crate::create_headless();
+        assert!(!window.get_extensionInstallVisible());
+        show(&window, Path::new("/tmp/ext"));
+        assert!(window.get_extensionInstallVisible());
+        assert_eq!(window.get_extensionInstallFolder(), "/tmp/ext");
+        assert_eq!(
+            window.get_extensionInstallTitle(),
+            "扩展已解包，按以下步骤安装"
+        );
+        assert_eq!(window.get_extensionInstallPreviewText(), "演示动画即将上线");
+        assert_eq!(
+            window.get_extensionInstallYesText(),
+            "打开扩展页面并定位目录"
+        );
+        assert_eq!(window.get_extensionInstallCancelText(), "关闭");
+        let model = window.get_extensionInstallSteps();
+        assert_eq!(model.row_count(), 5);
+        assert_eq!(model.row_data(0).unwrap().index, 1);
+        assert_eq!(
+            model.row_data(0).unwrap().text,
+            "在浏览器中打开 chrome://extensions"
+        );
+    }
+
+    #[test]
+    fn hide_only_flips_the_visibility() {
+        let window = crate::create_headless();
+        show(&window, Path::new("/tmp/ext"));
+        hide(&window);
+        assert!(!window.get_extensionInstallVisible());
+        assert_eq!(
+            window.get_extensionInstallFolder(),
+            "/tmp/ext",
+            "属性不清空"
+        );
+    }
+
+    #[test]
+    fn confirmed_runs_the_effects_but_keeps_the_dialog_open() {
+        let window = crate::create_headless();
+        let (guide, log) = FakeGuide::new(true);
+        install(&window, guide);
+        show(&window, Path::new("/tmp/ext"));
+
+        window.invoke_extensionInstallConfirmed();
+        assert_eq!(
+            *log.borrow(),
+            ["reveal:/tmp/ext", "open:chrome://extensions"]
+        );
+        assert!(
+            window.get_extensionInstallVisible(),
+            "yes 按钮被 disconnect 过，点它不关框"
+        );
+    }
+
+    #[test]
+    fn dismissed_closes_the_dialog() {
+        let window = crate::create_headless();
+        let (guide, log) = FakeGuide::new(true);
+        install(&window, guide);
+        show(&window, Path::new("/tmp/ext"));
+
+        window.invoke_extensionInstallDismissed();
+        assert!(!window.get_extensionInstallVisible());
+        assert!(log.borrow().is_empty(), "cancel 不产生副作用");
     }
 }

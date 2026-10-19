@@ -538,6 +538,7 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
                 Rc::new(crate::extension_actions::SystemEffects),
             ),
         );
+        crate::extension_install::install(&window, Rc::new(crate::extension_install::SystemGuide));
         crate::push_settings(&window, &writer.config(), &default_download);
         engine.borrow().tasks().refresh(&window);
         for _ in 0..frames {
@@ -560,6 +561,7 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
                 Rc::new(crate::extension_actions::SystemEffects),
             ),
         );
+        crate::extension_install::install(&window, Rc::new(crate::extension_install::SystemGuide));
         crate::push_settings(&window, &writer.config(), &default_download);
         engine.borrow().tasks().refresh(&window);
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;

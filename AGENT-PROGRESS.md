@@ -8874,3 +8874,100 @@ Windows 的 `_sanitize_windows_name`（保留名 / 冒号 / 尾随点）**没搬
 2. **P3 的 `ExtensionInstallDialog`**（`app/view/dialogs/extension_install.py` 133 行）：
    `install()` 成功后的五步引导框，现在只发 `Notice::ExtensionInstalled(folder)`；
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
+## 第 123 步：扩展安装引导框（`gd3-ui::extension_install`）
+
+时间：2026-10-19 09:45。起点 `a7dd961`（第 122 步），本轮只改 Rust 侧与文档。
+
+### 做了什么
+
+`app/view/dialogs/extension_install.py`（133 行）是 `install()` 成功之后弹的五步引导框。
+第 122 步只发了 `Notice::ExtensionInstalled(folder)`（`SystemEffects` 里 `eprintln!` 一行）。
+这一步补齐：
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `ui/extension_install.slint` | **140**（新） | `InstallStep` 结构 + `ExtensionInstallDialog`：遮罩 + 居中面板 + 16:9 预览 + 五步圆形徽标 + 左 yes（primary）右 cancel |
+| `ui/appwindow.slint` | +9 | import + 7 个属性（`extensionInstallVisible` / `Folder` / `Title` / `Steps` / `PreviewText` / `YesText` / `CancelText`）+ 2 个 callback + 覆盖层实例（插在卡片右键菜单之前，z 序在消息框之后） |
+| `src/extension_install.rs` | **770**（468 实现 + 302 测试） | 常量 / `Segment` / `Step` / `steps()` / `Guide` / `Effect` / `plan_confirm` / `GuideEffects` / `confirm` / `SystemGuide` / `show` / `hide` / `install` |
+| `src/extension_actions.rs` | 830 → **849** | 新增 `folder()` 访问器；`on_chromiumInstall` 解包成功才 `extension_install::show` |
+| `src/boot.rs` | 1025 | 两个分支各加 `crate::extension_install::install(&window, Rc::new(SystemGuide))` |
+| `README.md` | 3146 | 新节「扩展安装引导框」+ 「剩余工作」第 2 条清零 |
+
+### 关键设计
+
+1. **`Segment` 把「模板字面量」和「chip」摊成同一种数据**（`text` + `mono` + `chip`）。
+   Python 的富文本是 `f"…{chip(…)}…"` 拼的，纯文本只能另写一遍；摊平之后
+   `Step::plain_text()` 与 `Step::rich_text(dark)` 共用一份来源，改文案不会漏掉一半。
+   `rich_text` 的输出与 Python **逐字节相同**（含 `&nbsp;`、分号位置、mono 字族前那个
+   空格），单测直接比整串。
+2. **`plan_confirm(folder, opened)` 把「浏览器开没开」当入参**，`confirm()` 才是执行入口。
+   纯函数部分能在单测里逐项比 `Vec<Effect>`（4 项 / 2 项两分支）。
+3. **`revealInFolder` 的返回值被忽略** —— Python 也不检查，定位失败照样开扩展页。
+4. **`confirmed` 不关框**：`_bind` 里 `yesButton.clicked.disconnect()` 之后 yes 只做副作用，
+   关框只有 cancel。`install()` 装的 `extensionInstallDismissed` 才 `hide()`。
+5. **`GuideEffects` 与 `extension_actions::Effects` 分开**：多一个 `reveal_in_folder`、
+   少一个保存对话框、`notify` 只要两行文字。
+6. **预览用静态 PNG 不用 webp 动画**：`@image-url` 编译期嵌入
+   `app/assets/install_chrome_extension_guidance.png`（1415×670 / 76 KB；webp 是
+   720×405 动画 / 1.3 MB）。webp 动画要解码器 + 逐帧推进，Slint 没有等价物。
+   `previewText` 属性保留 Python 的 `演示动画即将上线` 兜底。
+
+### 踩到的坑
+
+1. **旧模块被静默覆盖**：第 68 步已经有一个 332 行的 `src/extension_install.rs`
+   （`ExtensionInstallState` / `InstallOutcome` / `ManualOpenHint` / `chip` / `steps(dark)`），
+   本轮 `Write` 直接盖掉。**事后核查**：`grep -rn 'extension_install' crates/gd3-ui/src`
+   只有 `lib.rs:43` 的 `pub mod` 和 `browser_session.rs` 里同名的 `extension_installed`
+   （无关）—— 旧 API 没有任何外部引用，覆盖是安全的。但流程教训记下：**写新模块前先
+   `grep -n 'pub mod <名字>' lib.rs`**。
+2. **`as_weak` 要 `use slint::ComponentHandle`**：`extension_actions.rs` 之前没有这条
+   import（那个文件里第一次拿 `Weak`）。编译器把 help 写在 `+ use slint::ComponentHandle;`
+   那行，照做即可。
+3. **改文件前必须确认没有 `cargo` 在跑**：第一次 `cargo check` 报了 `as_weak` 的错，
+   `--all-targets` 还在编 `--test` 目标（日志末尾的 `waiting for other jobs`），
+   这时改源码 + 起第二个 `cargo` 会让第二个只打印 `Blocking waiting for file lock`。
+   处理：`kill -9` 整条链（`timeout` / `cargo` / `rustc` 三个 PID），再单起一次。
+4. **`cargo fmt` 会重排长 `assert_eq!`**：测试里的
+   `assert_eq!(guide.preview_resource, ":/res/…webp")` 被折成多行，先 `fmt` 再 `--check`。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**2m 47s，零错零警告**（`/tmp/c123d.log`）；
+- `cargo test -p gd3-ui --lib extension_install`：**17 passed**（`/tmp/t123a.log`）；
+- `cargo test -p gd3-ui --lib`：**1067 passed / 0 failed**（`/tmp/t123b.log`；
+  1058 − 8 旧模块测试 + 17 新）；
+- `cargo test --workspace`：**1623 passed / 0 failed / 28 段**（`/tmp/t123ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，
+  `Finished dev profile in 3m 34s`（`/tmp/c123clip.log`）；
+- Python 侧没改一行。
+
+### 17 条单测
+
+| 测试 | 钉住什么 |
+|---|---|
+| `the_guide_matches_the_python_constants` | 标题 / 两个按钮 / 占位文案 / 资源路径 / 768×790；`Default == new` |
+| `the_five_steps_are_the_python_lines` | 五步纯文本逐字 + 序号 1..5 |
+| `the_first_step_wraps_the_url_in_a_mono_chip` | 富文本整串（mono 字族 + `&nbsp;`） |
+| `the_chip_background_follows_the_theme` | 暗/亮底色；非 mono 不带字族 |
+| `a_step_without_chips_renders_as_plain_text` | 第 4 步没有 chip |
+| `a_plain_segment_ignores_the_theme` | 普通片段原样；非 mono chip 的整串 |
+| `the_preview_placeholder_style_follows_the_theme` | `QLabel { … }` 两套 |
+| `slint_steps_carry_the_index_and_the_plain_text` | `to_slint_steps()` 的 `index` / `text` |
+| `a_failed_browser_open_falls_back_to_the_clipboard` | `plan_confirm(false)` 四项顺序 |
+| `a_successful_browser_open_stops_after_the_url` | `plan_confirm(true)` 两项 |
+| `confirm_runs_the_fallback_in_order` | `confirm` 的四次外设调用顺序 + 返回 `false` |
+| `confirm_reports_the_browser_result` | 成功时只两次调用 + 返回 `true` |
+| `confirm_ignores_the_reveal_result` | `reveal` 返回假也照样开扩展页 |
+| `show_fills_every_property_and_opens_the_overlay` | 七个属性 + 模型 5 行 |
+| `hide_only_flips_the_visibility` | 属性不清空 |
+| `confirmed_runs_the_effects_but_keeps_the_dialog_open` | yes 不关框 |
+| `dismissed_closes_the_dialog` | cancel 关框且无副作用 |
+
+### 下一步
+
+Phase 8 只剩：
+
+1. **更新检查接线**：`update_service` 的 `plan_*` 接 `gd3-net::sources::WreqTransport` +
+   更新卡片。ZIP 读已由 `extension_crx` 提供，剩 tar.xz / dmg 受 `xz2` 离线缺包限制；
+2. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

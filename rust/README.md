@@ -2999,9 +2999,9 @@ Windows 这条值得记一笔：本模块的 `open_target_command_on`（`openFil
   都没有就返回 `Unavailable`（Python 永远有对话框）。宿主能据此提示，而不是静默失败。
 - **剪贴板靠外部命令**：一条都没有时返回 `false`，用户看到的是「没反应」——
   Python 的 `QApplication.clipboard()` 不会失败。
-- **安装引导框还没画**：Python 在 `install()` 成功后 `ExtensionInstallDialog(path).exec()`
-  弹五步引导。这里只发 `Notice::ExtensionInstalled(folder)`；对话框属 P3
-  （`extension_install.py` 133 行）。
+- **安装引导框在第 123 步补上**：Python 在 `install()` 成功后 `ExtensionInstallDialog(path).exec()`
+  弹五步引导。这一步只发 `Notice::ExtensionInstalled(folder)`，`on_chromiumInstall` 的
+  「成功才弹框」由第 123 步的 `crate::extension_install::show` 接（见下节）。
 - **`export()` 不弹 InfoBar**：与 Python 一致（那边静默写盘），但这里多了
   `Exported` / `ExportFailed` 两种 `Notice` 供宿主决定。
 
@@ -3015,6 +3015,111 @@ Windows 这条值得记一笔：本模块的 `open_target_command_on`（`openFil
 - `cargo test --workspace`：**1614 passed / 0 failed / 28 段**（1602 + 13 + 1 − 2）；
 - `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，`Finished dev profile
   in 3m 26s`；
+- Python 侧没改一行。
+
+## 扩展安装引导框（`gd3-ui::extension_install`，第 123 步）
+
+`app/view/dialogs/extension_install.py`（133 行）是 `install()` 成功之后弹的那个五步
+引导框：标题 + 16:9 演示图 + 五条带 chip 的步骤 + 「打开扩展页面并定位目录」/「关闭」。
+第 122 步只发了一条 `Notice::ExtensionInstalled(folder)`，这一步把框补上：
+`ui/extension_install.slint`（139 行）给形状，本模块给文案与副作用，`boot.rs` 把两边接上。
+
+### 逐字口径（实读源码，`translate` = identity）
+
+| 项 | 值 | 源 |
+|---|---|---|
+| 标题 | `扩展已解包，按以下步骤安装` | `:24`（`SubtitleLabel`） |
+| 预览尺寸 | `QSize(720, 405)` | `:14` |
+| 最小宽度 | `720 + 48` = **768** | `:33`（+48 = `scrollLayout` 左右各 24） |
+| 最大高度 | `405 + 385` = **790** | `:35`（385 = 48 边距 + 60 空隙 + 28 标题 + 168 步骤 + 81 按钮组） |
+| 占位文案 | `演示动画即将上线` | `:54`（`QMovie.isValid()` 为假） |
+| yes | `打开扩展页面并定位目录` | `:38` |
+| cancel | `关闭` | `:39` |
+| chip 底色 | 暗 `rgba(255, 255, 255, 0.1)` / 亮 `rgba(0, 0, 0, 0.06)` | `:64` |
+| 占位框样式 | `QLabel { background: …; color: …; border-radius: 8px; }` | `:59-61` |
+
+五步（`:70-76`，序号来自 `enumerate(steps, 1)`）：
+
+1. `在浏览器中打开 {chip("chrome://extensions", mono=True)}`
+2. `开启 {chip("开发者模式")}`
+3. `将 {chip("扩展文件夹")} 拖入浏览器窗口`
+4. `启用扩展`
+5. `打开 {chip("扩展弹窗")}，点击 {chip("自动配对")}`
+
+`chip()`（`:66-68`）产出 `<span style="background-color: {chipBg};{family}">&nbsp;{text}&nbsp;</span>`，
+`family` 只在 `mono=True` 时是 ` font-family: 'Cascadia Code', Consolas, monospace;`
+（**开头那个空格是 Python 原文**，单测钉住）。
+
+### `Segment`：把「模板字面量」和「chip」摊成同一种数据
+
+Python 的富文本是一串 `f"…{chip(…)}…"` 拼出来的，纯文本只能另写一遍。这里把两种东西
+都摊成 [`Segment`]（`text` + `mono` + `chip`），于是：
+
+- `Step::plain_text()` —— 拼 `text`，给 Slint 的 `InstallStep.text`；
+- `Step::rich_text(dark)` —— 拼 `Segment::render`，**与 Python 的 `stepLabel.setText()` 逐字节相同**，
+  单测直接比整串（含 `&nbsp;` 与分号位置）。
+
+这样「显示的文字」只有一份来源，改文案不会漏掉一半。
+
+### 点 yes 之后：`plan_confirm` / `confirm`
+
+`_onInstall`（`:123-133`）的顺序是死的：`revealInFolder(path)` →
+`openChromiumUrl("chrome://extensions")` → **返回假**才 `clipboard.setText` +
+`InfoBar.info(请手动打开浏览器, chrome://extensions 已复制到剪贴板，请粘贴到地址栏, 5000, TOP)`。
+
+把它拆成两半：
+
+- [`plan_confirm(folder, opened)`] —— 纯函数，`opened` 是「浏览器开没开」这个入参，
+  返回 `Vec<Effect>`（`RevealInFolder` / `OpenChromiumUrl` / `CopyText` / `Notify`），
+  两个分支都能在单测里逐项比；
+- [`confirm(effects, folder)`] —— 执行入口，副作用经 [`GuideEffects`] 注入，返回
+  「浏览器有没有打开」。
+
+**`revealInFolder` 的返回值被忽略**，与 Python 一致（定位失败也照样开扩展页）。
+
+[`GuideEffects`] 与 `extension_actions::Effects` 故意分开：这里多一个
+`reveal_in_folder`、少一个保存对话框，`notify` 只要两行文字（`InfoBar.info` 没有按钮、
+没有复选框）。生产实现 `SystemGuide` 用 `gd3_core::desktop::{reveal_in_folder,
+open_chromium_url}` + `extension_actions::copy_text` + `eprintln!`。
+
+### `confirmed` 不关框
+
+`_bind`（`:120-121`）先 `yesButton.clicked.disconnect()` 再连 `_onInstall` ——
+**点 yes 只做副作用，框还开着**；关框只有 cancel（`MessageBoxBase.__onCancelButtonClicked`
+→ `reject()`）。所以 `install()` 装的 `extensionInstallDismissed` 才 `hide()`，
+`extensionInstallConfirmed` 只跑 `confirm()`。单测 `confirmed_runs_the_effects_but_keeps_the_dialog_open`
+钉这一条。
+
+### 接线
+
+- `extension_actions::ExtensionActions::folder()` —— 解包目标（第 122 步是私有字段），
+  `on_chromiumInstall` 里解包成功后 `crate::extension_install::show(&window, unpack.folder())`；
+  解包失败不进这个分支（`install()` 内部已发 `Notice::UnpackFailed`）。
+- `boot.rs` 两个分支（headless / 正常）各加
+  `crate::extension_install::install(&window, Rc::new(SystemGuide))`。
+
+### 与 Qt 侧的已知差异
+
+- **预览是静态 PNG 而不是 webp 动画**：`.slint` 用 `@image-url` 编译期嵌入
+  `app/assets/install_chrome_extension_guidance.png`（1415×670 静帧，76 KB；
+  `.webp` 是 720×405 的动画，1.3 MB）。webp 动画要解码器 + 逐帧推进，Slint 侧没有
+  等价物；`image-fit: contain` 保住 16:9 观感。`previewText` 属性保留 Python 的
+  `演示动画即将上线` 兜底。
+- **没有模态事件循环**：`MessageBoxBase.exec()` 换成 `extensionInstallVisible` 覆盖层 +
+  `confirmed` / `dismissed` 两个回调。
+- **`revealInFolder` 在 Windows 上返回假**：`gd3_core::desktop::reveal_in_folder` 走
+  `open_target_command_on`，那条对 Windows 还没迁移（`ShellExecute` 未接），与第 122 步
+  `open_url` 用 `rundll32` 是两码事。Linux / macOS 正常。
+- **`InfoBar` 换成 `eprintln!`**：与 `SystemEffects::notify` 同一口径，等通知条接线那一步再换。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**2m 47s，零错零警告**（`/tmp/c123d.log`）；
+- `cargo test -p gd3-ui --lib extension_install`：**17 passed**（`/tmp/t123a.log`）；
+- `cargo test -p gd3-ui --lib`：**1067 passed / 0 failed**（`/tmp/t123b.log`；1058 − 8 旧 + 17 新）；
+- `cargo test --workspace`：**1623 passed / 0 failed / 28 段**（`/tmp/t123ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，`Finished dev profile in 3m 34s`（`/tmp/c123clip.log`）；
 - Python 侧没改一行。
 
 ## 剩余工作（Phase 8）
@@ -3036,7 +3141,6 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    与更新卡片；解包要宿主工具或新 crate —— **ZIP 读已由第 121 步的 `extension_crx`
    提供**（CRX 与 zip 载荷同构，`entries` / `read_entry` 可直接复用），剩 tar.xz / dmg
    受 `xz2` 离线缺包限制。
-2. **安装引导框**：`ExtensionInstallDialog`（`app/view/dialogs/extension_install.py` 133 行，
-   P3）—— `extension_actions::install()` 成功后现在只发
-   `Notice::ExtensionInstalled(folder)`，五步引导还没画。
+2. ~~**安装引导框**~~：第 123 步完成（`gd3-ui::extension_install` +
+   `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

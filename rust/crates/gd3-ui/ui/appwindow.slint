@@ -14,6 +14,7 @@ import { TaskPage, TaskRow } from "task_page.slint";
 import { DrawerChecksumRow, DrawerFileRow, DrawerInfoRow, TaskDrawer } from "task_drawer.slint";
 import { BarButtonData, NavButton, NavItemData, ShellInfoBar, ShellMessageDialog } from "app_shell.slint";
 import { CardMenuPopup, CardMenuRowData } from "card_menu.slint";
+import { ExtensionInstallDialog, InstallStep } from "extension_install.slint";
 import {
     CategoryEditDraft,
     HeadersEditDraft,
@@ -262,6 +263,18 @@ export component AppWindow inherits Window {
     in-out property <string> dialogCheckboxLabel: "";
     in-out property <bool> dialogCheckboxChecked: false;
     in property <[BarButtonData]> dialogButtons;
+    // 扩展安装引导框（P3 第 123 步，镜像 `ExtensionInstallDialog`）：标题 / 五步 /
+    // 两个按钮的文案全部来自 `gd3-ui::extension_install::Guide`，这里只留属性。
+    in-out property <bool> extensionInstallVisible: false;
+    // 解包目录：`confirmed` 时 `revealInFolder` 的目标（Python 构造参数 `path`）。
+    in-out property <string> extensionInstallFolder: "";
+    in property <string> extensionInstallTitle: "";
+    in property <[InstallStep]> extensionInstallSteps;
+    in property <string> extensionInstallPreviewText: "";
+    in property <string> extensionInstallYesText: "";
+    in property <string> extensionInstallCancelText: "";
+    callback extensionInstallConfirmed;
+    callback extensionInstallDismissed;
     // 卡片右键菜单（`RoundMenu`）：行列表由 `menu_view::MenuRow` 摊平，
     // 面板高度由 `menu_view::panel_height` 算好（Slint 布局无法回传子项高度和）。
     // 锚点/高度用 int 像素：值全部来自 Rust 侧的像素算术，避免 f32 边界换算。
@@ -603,6 +616,26 @@ export component AppWindow inherits Window {
             }
             checkboxToggled(checked) => {
                 root.dialogCheckboxToggled(checked);
+            }
+        }
+
+        // ---- 扩展安装引导框（P3 第 123 步）----
+        // 与 Qt 的差别：`yesButton.clicked.disconnect()` 之后 yes 只做副作用、**不关框**，
+        // 所以 `confirmed` 不改 `extensionInstallVisible`（见 `extension_install.rs`）。
+        ExtensionInstallDialog {
+            width: 100%;
+            height: 100%;
+            opened: root.extensionInstallVisible;
+            title: root.extensionInstallTitle;
+            steps: root.extensionInstallSteps;
+            preview-text: root.extensionInstallPreviewText;
+            yes-text: root.extensionInstallYesText;
+            cancel-text: root.extensionInstallCancelText;
+            confirmed => {
+                root.extensionInstallConfirmed();
+            }
+            dismissed => {
+                root.extensionInstallDismissed();
             }
         }
 
