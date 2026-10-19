@@ -15,6 +15,7 @@ use slint::platform::{Platform, PlatformError, WindowAdapter};
 use std::rc::Rc;
 
 pub mod actions;
+pub mod aria2_actions;
 pub mod band_selector;
 pub mod banners;
 pub mod batch_url;

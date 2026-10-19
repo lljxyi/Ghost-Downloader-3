@@ -471,7 +471,9 @@ construct:CategoryService → construct:SpeedMeter → construct:TaskService
   ——见「功能包内核」一节的结构性 N/A 表；
 - **桩**：`BrowserService` / `Aria2RpcService` 只保留装配点。两者共用
   `featureService.parse` 这条端口（`browser_service.py:496` 与 `aria2_rpc.py:218`
-  各调一次），所以它们能接上的前提是先有 pack。监听器只保留后端开关
+  各调一次），所以它们能接上的前提是先有 pack；`aria2` 那一半的**应用侧**已在
+  `aria2_actions.rs`（第 109 步，见「aria2 RPC 应用侧」一节），剩下的桩只负责装配。
+  监听器只保留后端开关
   （`GD3_RUST_BROWSER` / `GD3_RUST_ARIA2` == `"1"` → `RustBrowserListener`，否则
   `PortListener`）与配置快照，套接字层在 `gd3-servers`；
 - **配置是快照**：Python 的 `cfg.*` 是活对象（`PortListener` 连 `valueChanged`），
@@ -1292,7 +1294,7 @@ pub trait TaskParser {
     fn priority(&self) -> i64 { 100 }                 // pack.py:42
     fn matches(&self, options: &Map<String, Value>) -> bool;
     fn matches_passive(&self, options: &Map<String, Value>) -> bool { self.matches(options) }
-    fn parse(&mut self, options: &Map<String, Value>) -> Result<TaskRecord, TaskError>;
+    fn parse(&self, options: &Map<String, Value>) -> Result<TaskRecord, TaskError>;
 }
 
 pub struct ParserChain { /* Vec<Box<dyn TaskParser>> */ }
@@ -1332,6 +1334,51 @@ pub struct FeatureService { parsers: ParserChain }
 `Engine::start()` / `Engine::stop()` 仍然调用 `activate()` / `deactivate()`
 （空转，但调用点在 `engine.py:23` / `:44` 的位置上），`Engine::features_mut()` 是宿主
 （扩展安装流程 / 测试）注册解析器的写入口。
+
+## aria2 RPC 应用侧（`gd3-ui::aria2_actions`）
+
+`app/services/aria2_rpc.py`（233 行）把「协议」与「应用」两层混在一个类里。协议层早在
+Phase 5/6 就是 `gd3-servers::aria2`（426 行），所以本模块只搬应用侧的三个方法：
+`applyTaskOptions` / `_onTaskParsed` / `_onTaskParseFailed`。381 行 / 10 单测。
+
+| Python | Rust |
+|---|---|
+| `parseHead` / `buildHttpResponse` / `buildPreflightHeaders` / `toHttpStatus` | `gd3-servers::http`（Phase 5） |
+| `_run` 的 JSON-RPC 方法表、`_addUri` 的参数校验、token、WebSocket 帧 | `gd3-servers::aria2`（`Aria2Action`，Phase 5/6） |
+| `applyTaskOptions` / `_onTaskParsed` / `_onTaskParseFailed` | **本模块** |
+
+```rust
+pub struct Aria2Request {
+    pub url: String, pub output_folder: String,
+    pub headers: Vec<(String, String)>,   // 保留原始大小写与顺序
+    pub client_profile: String, pub name: String,
+}
+pub enum Aria2Effect { DraftRequested(TaskRecord), AddTask(TaskRecord),
+                       ParseFailed { url: String, error: TaskError } }
+pub fn apply_task_options(features: &FeatureService, presets: &[IdentityPreset],
+                          request: Aria2Request, should_draft_taken_download: bool)
+                          -> Vec<Aria2Effect>;
+```
+
+四条口径：
+
+- **`Aria2Request` 是 `Aria2TaskOptions` 的同形物，不跨 crate 引用**：`gd3-ui` 的依赖里
+  没有 `gd3-servers`，也不该有（协议层不该把 tokio 拖进 UI crate）；宿主在两边的同名字段
+  之间搬一次（`Aria2Action::AddTask { gid, options }` → `Aria2Request`）；
+- **结果摊成效果队列**（同 `TaskAction` / `RuntimeEffect` 的口径）：`coroutineRunner.submit(
+  ..., done=, failed=)` 的三条出路 = 三个变体，顺序与 Python 的调用顺序一致（至多一条）；
+- **`out` 走 `Task.setName` 的口径**：`to_safe_filename(name, fallback, 200)`，`fallback`
+  取**当前**名字（`self.name or "download"` 的求值时机），名字为空才退 `"download"`；
+- **`Aria2Effect` 只 `derive(Debug, Clone)`**：`TaskRecord` 没有 `PartialEq`（`extra` /
+  `checksums` 是 `serde_json::Value`），断言用 `matches!`。
+
+### 照抄的 Python 缺陷
+
+`Aria2RpcService.taskDraftRequested`（`aria2_rpc.py:108`）**在整个 Python 应用里没有任何
+`.connect()`**——`grep -rn taskDraftRequested app/` 只命中 `browser_service.py` 里那个同名
+的另一个 Signal。于是 `shouldDraftTakenDownload` 打开时，aria2 加进来的任务被 emit 到一个
+没人听的信号，然后 `return`，**任务直接消失**。Rust 保留 `DraftRequested`：宿主照抄不接 →
+与 Python 同病；接了 → 顺手修好。这条差异写在模块头，免得将来被当成漏了。
 
 ## 剩余工作（Phase 8）
 
