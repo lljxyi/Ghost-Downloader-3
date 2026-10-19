@@ -7803,3 +7803,129 @@ str(PurePosixPath("/a/b/../c"))          # '/a/c'      —— posix_normpath 的
 回 Phase 7 **P0 主线**：`windows/main_window.py`(753) + `cards/task_cards.py`(569) +
 `dialogs/task_drawer.py`(523)，约 1850 行。先读 Python 源确认主窗口的模型装配
 （任务列表 / 分类树 / 排序过滤）与三处 Qt 信号的 Rust 对应物，再决定拆成几个模块。
+## 第 113 步：`gd3-ui::config_store`（`cfg.set` 的等价物）
+
+时间：2026-10-19 04:30（lib 测试）/ 04:43（clippy）
+
+Python 侧**所有**配置写入都走 `qfluentwidgets` 的 `QConfig.set`
+（`.venv/lib/python3.13/site-packages/qfluentwidgets/common/config.py:288`）。`cfg` 是
+`app/config/cfg.py:260` 的 `Config(QConfig)`，`Ghost-Downloader-3.py:38` 的
+`qconfig.load(f"{APP_DATA_DIR}/UserConfig.json", cfg)` 把模块级 `qconfig._cfg` 指向它，
+所以 `cfg.set(item, v)` 与 `qconfig.set(item, v)` 落同一个文件。本步把这条路径搬成
+`crates/gd3-ui/src/config_store.rs`（**552 行 / 15 单测**）+ `lib.rs:33` 一行。
+
+### 分工：不重复实现 validator
+
+`gd3_core::settings::write`（第 78 步）只做「correct → serialize → 写进 `UserConfig`」，
+**不碰磁盘**。`ConfigStore` 在它外面套三件事：比较（`py_eq`）、整文件回写（`save`）、
+变更描述（`ConfigChange`）。`RESTART_ATTRS` / `SPECS` / `Kind::correct` 一行都没重写。
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `ConfigItem` 表（40 app 项 + 3 全局项） | `gd3_core::settings::SPECS` | 第 78 步 |
+| `validator.correct()` / `ConfigItem.value` setter | `settings::Kind::correct` / `Spec::write` | 第 78 步 |
+| `json.dump(toDict(), indent=4, ensure_ascii=False)` | `UserConfig::to_json_text` | 第 78 步 |
+| `qconfig.load(path, cfg)` | `ConfigStore::load` | 本步 |
+| `QConfig.set` + `QConfig.save` | `ConfigStore::set` / `save` | 本步 |
+
+### 四条实证语义（实读 `qfluentwidgets/common/config.py`）
+
+`QConfig.set` 的完整源码：
+
+```python
+def set(self, item, value, save=True, copy=True):
+    if item.value == value:
+        return
+    try:
+        item.value = deepcopy(value) if copy else value   # setter 里跑 validator.correct()
+    except:
+        item.value = value
+    if save:
+        self.save()
+    if item.restart:
+        self._cfg.appRestartSig.emit()
+    if item is self._cfg.themeMode:
+        self.theme = value
+        self._cfg.themeChanged.emit(value)
+    if item is self._cfg.themeColor:
+        self._cfg.themeColorChanged.emit(value)
+```
+
+1. **比较发生在 `correct()` 之前**：当前值是 `3` 时 `cfg.set(cfg.maxTaskNum, 0)` 会继续
+   走完流程、夹成 `1` 再落盘；而 `cfg.set(cfg.maxTaskNum, 3.0)` 直接返回（`3 == 3.0`
+   为真）。所以 `py_eq` 必须按 Python 的 `==` 口径比数字/布尔。
+2. **`set` 里没有 `validate()`**：只经过 setter 里的 `validator.correct()`，越界值被
+   **夹紧**，不是被拒收。
+3. **`correct()` 之后值没变也照样落盘**：`valueChanged` 不发（setter 里 `if ov != v`），
+   但 `save()` 无条件执行。`ConfigChange::emitted` 与「是否落盘」是两件事。
+4. **`save()` 会 `mkdir(parents=True, exist_ok=True)`**，父目录不存在不是错误。
+   `toDict()` 按**属性名字母序**只从类属性重建 → 磁盘上的未知键在 load 时就丢。
+
+`restart=True` 只有三项：`shouldVerifySsl`（`cfg.py:250`）、`dpiScale`（`:296`）、
+`language`（`:303`）。app 里**没有** `cfg.set(cfg.themeColor, ...)`（主题色走
+`setThemeColor(color, save=False)`，不落盘），但 `themeColorChanged` 仍按源码接上。
+
+### 六条结构决策
+
+1. **`load` 归一化成「42 项全量」**（= Python `ConfigItem` 表），顺带丢掉磁盘未知键；
+   `save()` 用 `snapshot()` 重建。两者都用 `SPECS` 的顺序，所以落盘字节序与 Python 一致。
+2. **`set` 的顺序照抄**：`spec.read` → `py_eq` 早退 → `correct` → `serialize` → 改内存 →
+   `save()?`。返回三态：`Ok(None)` = Python 的 `return`；`Ok(Some(_))` = 已整文件回写；
+   `Err(Save)` = 内存已改、磁盘没写成（Python 的 `save()` 同样在 setter 之后才抛）。
+3. **`emitted` 单独算**：`emitted = !py_eq(previous, logical)`，即「correct 之后是否真的
+   变了」；与「无条件落盘」解耦。
+4. **未知属性报错而不是静默**：`ConfigStoreError::UnknownAttribute(String)`。Python 传错
+   `ConfigItem` 是 `AttributeError`，这里同样是「调用方写错」而非「值非法」。
+5. **`py_eq` 公开**：`3 == 3.0`、`true == 1`、`"3" != 3`、dict 不看键序——这是 Python `==`
+   的完整口径，`set` 之外的调用方（如设置页回写）也要用同一套比较。
+6. **先作为纯库模块落地，不接 `boot::run`**：只要 Qt 侧还在写同一个 `UserConfig.json`，
+   两侧就会互相覆盖。接线落点写在 README 的「为什么现在不接 `boot::run`」里（三条）。
+
+### 与 Python 的已知差异
+
+- **`correct()` 抛异常时不中断**：`cfg.set(cfg.maxTaskNum, "7")` 在 Python 里让
+  `RangeValidator.correct` 抛 `TypeError`（`min(max(1, "7"), 10)`），异常穿透 `set`、
+  什么都没写；Rust 的 `Kind::correct` 退回缺省值并继续落盘。这与
+  `gd3-core::settings` 模块头那条「Rust 容错 ≠ Python 中断」一致。
+- **没有信号对象**：`valueChanged` / `appRestartSig` / `themeChanged` /
+  `themeColorChanged` 四个信号摊成 `ConfigChange` 的四个字段（`emitted` / `restart` /
+  `theme_changed()` / `theme_color_changed()`），由宿主决定怎么发。
+- **`save=False` 的调用没搬**：Python 只有主题色走这条路，且它不落盘；Rust 侧
+  `config_mut()` + 不调 `save()` 等价。
+
+### 十五条新单测
+
+`config_store.rs` **552 行 / 15 单测**（`-p gd3-ui --lib` 由 917 变 932）。
+
+| 测试 | 钉住什么 |
+|---|---|
+| `a_missing_file_leaves_the_defaults_and_is_not_created` | 缺文件 → 缺省值且**不建文件** |
+| `a_python_written_file_round_trips_byte_for_byte` | 缺省档 load→save 逐字节不变 |
+| `set_rewrites_the_whole_file` | 一次 `set` 写出全量 42 项，期望值由 `settings::write` 独立算出 |
+| `an_unchanged_value_neither_writes_nor_signals` | 同值 → `Ok(None)`，文件不出现 |
+| `an_int_and_a_float_of_the_same_value_count_as_equal` | `dpiScale` 缺省落盘是 int `0`，SpinBox 发 `0.0` → 提前返回 |
+| `an_unknown_attribute_is_rejected_without_touching_the_file` | 拼写错误 → `UnknownAttribute`，不写盘 |
+| `save_creates_the_missing_parent_directory` | `mkdir(parents=True)` |
+| `a_failed_save_keeps_the_new_value_in_memory` | `Err(Save)` 但内存保留新值（Python 同序） |
+| `an_out_of_range_value_is_clamped_not_rejected` | `99` → `10`，夹紧 |
+| `a_value_that_corrects_back_to_the_current_one_is_saved_without_a_signal` | `emitted == false` 但仍落盘 |
+| `restart_items_are_flagged` | 三项 `restart`，其余 `false` |
+| `theme_items_are_flagged` | `themeMode` / `themeColor` 各发各的信号 |
+| `unknown_keys_on_disk_are_dropped_by_the_load` | 磁盘多出来的组/键在 load 时丢 |
+| `reload_picks_up_an_external_write` | `reload()` 重读外部改动 |
+| `py_eq_mirrors_python_equality` | `3 == 3.0` / `true == 1` / `"3" != 3` / dict 不看键序 |
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib config_store`：**15 passed**（`/tmp/t113.log`）；
+- `cargo test -p gd3-ui --lib`：**932 passed / 0 failed**（917 + 15，`/tmp/t113_full.log`）；
+- `cargo test --workspace`：**1441 passed / 0 failed**（28 段，1426 + 15，`/tmp/t113_ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（1m44s，`/tmp/c113.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 114 步）
+
+`app/sources.py`(295) + `app/services/update_service.py`(335) 是 Phase 8 之外仅剩的两块
+整块未镜像逻辑。先做 `sources.py` 的纯逻辑半边（端点表 / URL 拼接 / 两个聚合口径 /
+六条失败文案），`update_service` 的网络与解包留到接线时。

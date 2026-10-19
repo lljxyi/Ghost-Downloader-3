@@ -150,8 +150,9 @@ Qt 仍是可运行的那一侧，Slint 侧目前是纯库（没有 `main`、没�
 | P6 平台外壳 | `shell/tray.py`、`dock.py`、`mac_status_item.py` | `shell.rs` |
 | P7 补漏 | `shell/clipboard_listener.py`、`cards/draft_cards.py` | `clipboard.rs`、`draft_card.rs` |
 
-规模：**59 个模块**（58 个 `pub` + 私有 `format`）/ **36 838 行 `src/`**（含 `lib.rs` 3 491 行）、
-**6 个 Slint 文件 2 858 行**、**653 个单测**（`cargo test -p gd3-ui --lib`）。
+规模：**69 个模块**（68 个 `pub` + 私有 `format`，加 `lib.rs` / `main.rs` 共 **71 个 `.rs`**）/
+**49 342 行 `src/`**（含 `lib.rs` 3 501 行）、**6 个 Slint 文件 2 858 行**、
+**932 个单测**（`cargo test -p gd3-ui --lib`）。
 
 `app/view` 已逐文件对照：`qfw_patch.py`(75) 是纯 Qt monkeypatch（改 `qfluentwidgets` 内部行为），
 无业务语义可镜像，判定 **N/A**；`clipboard_listener.py` / `draft_cards.py` 由
@@ -164,7 +165,7 @@ Slint 文件在 `crates/gd3-ui/ui/`：`app_shell.slint`（壳）、`appwindow.sl
 
 ```bash
 cargo test -p gd3-ui                       # 库 + 冒烟
-cargo test -p gd3-ui --lib                 # 只跑单测（653）
+cargo test -p gd3-ui --lib                 # 只跑单测（932）
 cargo clippy -p gd3-ui --all-targets -- -D warnings
 ```
 
@@ -178,10 +179,12 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
   非法 IPv6 括号、Markdown 缺片段标记——都在注释里写明与 Python 的差异；
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
-**尚未做**：`BrowserService` / `Aria2RpcService` 两个服务（还是桩，见下一节）；
-托盘；`Ghost-Downloader-3.py` 的入口仍走 Qt。二进制入口见下一节。
+**尚未做**：`config_store` 未接进 `boot::run`（接线条件见「配置落盘」一节末尾）；
+`loadCrx` 的 crx 解包与 `fileWatcher` 归宿主；`Ghost-Downloader-3.py` 的入口仍走 Qt。
+二进制入口见下一节。
 （`RuntimeStatusService` 第 102 步搬完、第 107 步删掉空壳桩；`FeatureService` 的
-解析器链第 108 步搬完，见「功能包内核」一节。）
+解析器链第 108 步搬完；`BrowserService` / `Aria2RpcService` 第 112 步收敛，见「服务装配」
+一节；托盘第 75 步已由 `shell.rs` 覆盖。）
 
 ## Phase 8：启动入口（`gd3-ui` 二进制）
 
@@ -1725,6 +1728,156 @@ fn store_name_conflict_choice(config: &UserConfig) -> gd3_core::NameConflictChoi
 | `an_aria2_request_without_parsers_reports_a_parse_failure` | 空解析器链 → `Aria2Effect::ParseFailed`（不是 `AddTask`） |
 | `refresh_services_reloads_the_aria2_draft_flag` | 快照未刷新时仍是旧值，`refresh_services()` 之后才变 |
 | `the_store_choice_mirrors_the_config_choice` | `gd3_ui` 与 `gd3_core` 两份 `NameConflictChoice` 的转换（含非法值收敛） |
+
+## 配置落盘（`gd3-ui::config_store`）
+
+Python 侧**所有**配置写入都走 `qfluentwidgets` 的 `QConfig.set`
+（`.venv/lib/python3.13/site-packages/qfluentwidgets/common/config.py:288`）。`cfg` 是
+`app/config/cfg.py:260` 的 `Config(QConfig)`，`Ghost-Downloader-3.py:38` 的
+`qconfig.load(f"{APP_DATA_DIR}/UserConfig.json", cfg)` 把模块级 `qconfig._cfg` 指向它，
+所以 `cfg.set(item, v)` 与 `qconfig.set(item, v)` 落同一个文件。第 113 步把这条路径搬成
+`crates/gd3-ui/src/config_store.rs`。
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `ConfigItem` 表（40 个 app 项 + `themeColor` / `fontFamilies` / `themeMode`） | `gd3_core::settings::SPECS` | 第 78 步 |
+| `validator.correct()` / `ConfigItem.value` setter | `settings::Kind::correct` / `Spec::write` | 第 78 步 |
+| `json.dump(toDict(), indent=4, ensure_ascii=False)` | `UserConfig::to_json_text` | 第 78 步 |
+| `qconfig.load(path, cfg)` | `ConfigStore::load` | 第 113 步 |
+| `QConfig.set` + `QConfig.save` | `ConfigStore::set` / `save` | 第 113 步 |
+
+### 结构
+
+```rust
+pub const RESTART_ATTRS: &[&str] = &["dpiScale", "language", "shouldVerifySsl"];
+
+pub struct ConfigChange {
+    pub attr: &'static str,      // cfg.py 的属性名
+    pub group: &'static str,     // 组名
+    pub key: &'static str,       // 键名
+    pub previous: Value,         // 改之前的逻辑值
+    pub value: Value,            // 改之后的逻辑值（已过 correct）
+    pub stored: Value,           // 落盘形态（已过 serialize）
+    pub emitted: bool,           // valueChanged 是否发射
+    pub restart: bool,           // 是否发 appRestartSig
+}
+impl ConfigChange {
+    pub fn theme_changed(&self) -> bool;        // attr == "themeMode"
+    pub fn theme_color_changed(&self) -> bool;  // attr == "themeColor"
+}
+
+pub enum ConfigStoreError { UnknownAttribute(String), Save(io::Error) }
+
+pub struct ConfigStore { path: PathBuf, config: UserConfig }  // derive(Debug, Clone)
+impl ConfigStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self;                 // 不读盘 = cfg 初值
+    pub fn load(path: impl Into<PathBuf>) -> io::Result<Self>;    // qconfig.load
+    pub fn reload(&mut self) -> io::Result<()>;
+    pub fn path(&self) -> &Path;
+    pub fn config(&self) -> &UserConfig;
+    pub fn config_mut(&mut self) -> &mut UserConfig;              // 不落盘
+    pub fn get(&self, attr: &str) -> Option<Value>;
+    pub fn set(&mut self, attr: &str, value: &Value)
+        -> Result<Option<ConfigChange>, ConfigStoreError>;
+    pub fn save(&self) -> io::Result<()>;
+    pub fn snapshot(&self) -> UserConfig;                         // toDict() 口径
+}
+
+pub fn py_eq(left: &Value, right: &Value) -> bool;                // Python `==`
+```
+
+`set` 的返回三态与 Python 一一对应：`Ok(None)` = `if item.value == value: return`
+（没写盘、没信号）；`Ok(Some(_))` = 已整文件回写；`Err(Save)` = 内存已改、磁盘没写成
+（Python 的 `save()` 同样在 setter 之后才抛）。
+
+### 四条实证语义（2026-10-19 实读 `qfluentwidgets/common/config.py`）
+
+`QConfig.set` 的完整源码：
+
+```python
+def set(self, item, value, save=True, copy=True):
+    if item.value == value:
+        return
+    try:
+        item.value = deepcopy(value) if copy else value   # setter 里跑 validator.correct()
+    except:
+        item.value = value
+    if save:
+        self.save()                                       # 无条件整文件回写
+    if item.restart:
+        self._cfg.appRestartSig.emit()
+    if item is self._cfg.themeMode:
+        self.theme = value
+        self._cfg.themeChanged.emit(value)
+    if item is self._cfg.themeColor:
+        self._cfg.themeColorChanged.emit(value)
+```
+
+1. **比较发生在 `correct()` 之前**。当前值 `3` 时 `cfg.set(cfg.maxTaskNum, 0)` 会走完全程、
+   夹成 `1` 再落盘；而 `cfg.set(cfg.maxTaskNum, 3.0)` 直接返回（`3 == 3.0`）。
+   这就是 `py_eq` 存在的原因：`serde_json::Value` 的 `PartialEq` 认为 `3 != 3.0`、
+   `true != 1`，而 `QConfig.set` 第一行恰好就是这个比较。
+2. **`set` 里没有 `validate()`**：只经过 `value` setter 的 `validator.correct()`。
+   越界值被**夹紧**（`maxTaskNum = 99` → `10`），不是被拒收。
+3. **`correct()` 之后值没变也照样落盘**：setter 里 `if ov != v` 挡住 `valueChanged`，
+   但 `save()` 在 setter 之外无条件执行。`ConfigChange::emitted` 与「是否落盘」是两件事。
+4. **`save()` 会 `mkdir(parents=True, exist_ok=True)`**：父目录不存在不是错误。
+
+`restart=True` 只有三项（`shouldVerifySsl` `cfg.py:250`、`dpiScale` `:296`、
+`language` `:303`），`setting_page.py:398` 把它接成「需要重启」的提示条。
+
+### 与 Python 的已知差异
+
+- **`correct()` 抛异常时不中断**：`cfg.set(cfg.maxTaskNum, "7")` 在 Python 里让
+  `RangeValidator.correct` 抛 `TypeError`（`min(max(1, "7"), 10)`），异常穿透 `set`、
+  什么都没写；Rust 的 `Kind::correct` 退回缺省值并继续落盘。同 `gd3-core::settings`
+  模块头那条「Rust 容错 ≠ Python 中断」。
+- **`themeColor` 的比较口径不同**：Python 的 `item.value` 是 `QColor`，
+  `QColor("#ff009faa") == "#ff009faa"` 恒假，所以每次 `cfg.set(cfg.themeColor, ...)`
+  都会落盘；Rust 存 `#aarrggbb` 串，同值提前返回。app 里没有
+  `cfg.set(cfg.themeColor, ...)`（主题色走 `setThemeColor(color, save=False)`，
+  **不落盘**），这条差异不可达。
+- **磁盘上的未知键在 `load` 就丢**：`QConfig.load` 只按 `item.key` 匹配已知项，
+  `toDict()` 又只从类属性重建，多出来的组/键既读不进内存也不会被下次 `save()` 写回。
+  `ConfigStore::load` 直接归一化成「42 项全量」，等价。
+- **没有全局单例**：Python 的 `qconfig` 是模块级实例，靠改 `_cfg` / `file` 把写入目标
+  接到 app 的 `cfg` 上；`ConfigStore` 自己持有 `(config, path)`，不需要那层间接。
+
+### 为什么现在不接 `boot::run`
+
+见下一节：Rust 侧写同一个 `UserConfig.json` 必须与「Slint 成为唯一 UI」同一步落地，
+否则会和仍在运行的 Qt 侧互相覆盖。接线条件与落点：
+
+1. `boot::run` 里把 `Paths::resolve` 之后的 `load_config` 换成
+   `ConfigStore::load(paths.data_dir.join("UserConfig.json"))`，`Engine::new` 收
+   `store.config()` 的克隆；
+2. 设置页的每次提交改成 `store.set(attr, &value)`，按 `ConfigChange` 分发
+   `valueChanged` / `appRestartSig` / `themeChanged` 三个信号，再调
+   `Engine::refresh_services()`；
+3. `BrowserService::new` 里「令牌为空就地生成」要改成「生成 + `store.set("browserExtensionPairToken", …)`」，
+   否则新令牌活不过一次重启。
+
+### 十五条新单测
+
+`config_store.rs` **552 行 / 15 单测**。
+
+| 测试 | 钉住什么 |
+|---|---|
+| `a_missing_file_leaves_the_defaults_and_is_not_created` | 缺文件 → 缺省值且**不建文件** |
+| `a_python_written_file_round_trips_byte_for_byte` | 缺省档 load→save 逐字节不变 |
+| `set_rewrites_the_whole_file` | 一次 `set` 写出全量 42 项，期望值由 `settings::write` 独立算出 |
+| `an_unchanged_value_neither_writes_nor_signals` | 同值 → `Ok(None)`，文件不出现 |
+| `an_int_and_a_float_of_the_same_value_count_as_equal` | `dpiScale` 缺省落盘是 int `0`，SpinBox 发 `0.0` → 提前返回 |
+| `an_unknown_attribute_is_rejected_without_touching_the_file` | 拼写错误 → `UnknownAttribute`，不写盘 |
+| `save_creates_the_missing_parent_directory` | `mkdir(parents=True)` |
+| `a_failed_save_keeps_the_new_value_in_memory` | `Err(Save)` 但内存保留新值（Python 同序） |
+| `an_out_of_range_value_is_clamped_not_rejected` | `99` → `10`，夹紧 |
+| `a_value_that_corrects_back_to_the_current_one_is_saved_without_a_signal` | `emitted == false` 但仍落盘 |
+| `restart_items_are_flagged` | 三项 `restart`，其余 `false` |
+| `theme_items_are_flagged` | `themeMode` / `themeColor` 各发各的信号 |
+| `unknown_keys_on_disk_are_dropped_by_the_load` | 磁盘多出来的组/键在 load 时丢 |
+| `reload_picks_up_an_external_write` | `reload()` 重读外部改动 |
+| `py_eq_mirrors_python_equality` | `3 == 3.0` / `true == 1` / `"3" != 3` / dict 不看键序 |
 
 ## 剩余工作（Phase 8）
 
