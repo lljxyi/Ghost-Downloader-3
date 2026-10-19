@@ -7355,3 +7355,196 @@ Rust 侧保留 `Aria2Effect::DraftRequested` 而不是把任务丢掉：效果�
    `_onCreateTask` → 解析 → 草稿/直加，全摊成效果队列（同本步手法）。
 
 Qt 部分（托盘图标、配对对话框、`extensionUpdated` 的 UI 提示）归 Phase 7 主窗口那条线。
+
+## 第 110 步：`gd3-ui::browser_payload`（浏览器扩展载荷层）
+
+> 时间：2026-10-19 01:18（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 先确认边界（第 104/106/107/109 步都踩过重复搬家）
+
+`app/services/browser_service.py` 共 597 行，按用途切三段：
+
+| 段 | 行号 | 落点 |
+|---|---|---|
+| WebSocket 握手 + 帧（`_send` / `_sendError` 的封包部分） | — | `gd3-servers::websocket`（Phase 5/6，`pub struct WebSocket`） |
+| **五个 `StrEnum` + `toStr` / `toInt` + 三个 `to*` 载荷转换** | :47-168 | **本步** |
+| `BrowserClientSession` / 配对 / hello / create_task 状态机 | :171- 结尾 | 第 111 步（`browser_session`） |
+| 托盘图标、配对对话框、`extensionUpdated` 的 UI 提示 | — | Phase 7 主窗口那条线 |
+
+动手前查过：
+
+```
+grep -rn 'pub struct BrowserService\|pub enum MessageType\|pub enum TaskSource\|pub enum ErrorCode\|pub struct PairRequest' crates/*/src/*.rs
+→ crates/gd3-ui/src/engine.rs:177:pub struct BrowserService;   （零大小桩，第 107 步留的）
+```
+
+五个枚举、三个 `to*` 在 Rust 侧此前都不存在，没有重复搬家。
+
+### 做了什么
+
+新建 `rust/crates/gd3-ui/src/browser_payload.rs`（**812 行 / 18 单测**），`lib.rs` 里按字母序
+插到 `bootstrap_list` 与 `card` 之间：
+
+```rust
+pub const PROTOCOL_VERSION: i64 = 2;
+pub enum MessageType { /* 12 */ }  pub enum ErrorCode { /* 3 */ }
+pub enum BrowserAction { /* 6 */ } public enum TaskSource { /* 4 */ }
+pub enum CreateTaskStatus { /* 3 */ }
+
+pub struct PayloadDefaults { download_folder, pre_block_num, current_headers }
+pub struct BaseOptions { url, output_folder, headers, client_profile, user_agent,
+                         source_user_agent, subworker_count }
+pub struct ResourceOptions { base, name, size, can_use_range_requests }
+pub struct PageOptions { base, page_url, page_title }
+pub struct MergeOptions { base, video: Option<ResourceOptions>, audio: Option<ResourceOptions> }
+pub enum TaskOptionsPayload { Resource(..), Page(..), Merge(..) }   // base() 取公共字段
+
+pub fn to_resource_task_options(&Map<String, Value>, &PayloadDefaults) -> ResourceOptions;
+pub fn to_task_options(TaskSource, &Map<String, Value>, &PayloadDefaults) -> TaskOptionsPayload;
+pub fn to_task_summary(&TaskRecord) -> Map<String, Value>;
+```
+
+私有：`to_str` / `to_int` / `header_map` / `header_text` / `base_options` / `round2` /
+`status_name` / `file_ext`；五个枚举共用 `macro_rules! str_enum`（生成 `as_str()` +
+`parse() -> Option<Self>`）。
+
+### 逐条对照
+
+| Python | Rust |
+|---|---|
+| `toStr(data, key, default="")`（:93-96） | `to_str`：只认字符串 |
+| `toInt(data, key, default)`（:98-101） | `to_int`：只认「正」整数（含 `True`） |
+| `toResourceTaskOptions(resource)`（:103-114） | `to_resource_task_options` |
+| `toTaskOptions(source, payload)`（:116-149） | `to_task_options`（三条出路 = 三个枚举变体） |
+| `toTaskSummary(task)`（:151-168） | `to_task_summary`（13 键同序） |
+| `TaskStatus.XXX.name.lower()` | `status_name` |
+| `round(progress, 2)` | `round2`（`format!("{value:.2}")` 再 parse） |
+| `outputPath.parent` / `outputPath.suffix` | `gd3-core::path::posix_parent` / `posix_suffix`（本步新增） |
+| `task.canPause` | `facts::can_pause`（第 100 步已有） |
+| `isExisting(...)` | `gd3-core::filesystem::is_existing` |
+| `raise ValueError(f"unsupported task source: …")` | 不存在（`TaskSource` 是枚举） |
+
+### 顺带补的 `gd3-core::path`（`posix_parent` / `posix_suffix`）
+
+`toTaskSummary` 要 `outputPath.parent` 与 `outputPath.suffix`，`gd3-core::path` 只有
+`posix_normpath`——而**两者不能互相顶替**：CPython 实测
+
+```python
+str(PurePosixPath("/a/b/../c").parent)   # '/a/b/..'   —— 不消解 '..'
+str(PurePosixPath("/a/b/../c"))          # '/a/c'      —— posix_normpath 的口径
+```
+
+所以照 `pathlib` 另写两个函数，实现都走已有的私有 `split_root`（返回 `("/" | "//" | "", parts)`，
+已滤掉空段与 `.`）：
+
+- `posix_parent`：组件多于 1 个就去掉最后一段；否则「有根返回根、无根返回 `.`」；
+- `posix_suffix`：最后一段里最后一个 `.` 起的部分（含点），**点开头整段没有后缀**
+  （`.bashrc` → `""`）、**结尾是点也没有**（`b.` → `""`、`...` → `""`）、中间的点只认最后一个
+  （`a..b` → `.b`、`.a.b` → `.b`）。
+
+两条表驱动单测的期望值全部 CPython 3.13 实取：`parent` 18 例（含 `//a/b`、`/a/b/../c`、
+`./a/./b`）、`suffix` 14 例（含 `x.TAR.GZ` → `.GZ`，大小写不折）。
+
+### 关键决策
+
+- **`PayloadDefaults` 把三项配置打包成参数**：`downloadFolder` / `preBlockNum` /
+  `currentHeaders()`（`cfg.py:351`）。Rust 侧没有响应式配置层，调用方每轮现读再传，同
+  `identity::parse_presets` 的口径。`MergeTaskOptions` 不传 `headers` 时用的正是
+  `currentHeaders()` 那套，所以 `base_options` 的 `headers` 参数由调用方决定：
+  `RESOURCE_MERGE` 传 `defaults.current_headers`，`PAGE_MEDIA` / `RESOURCE` 传
+  `payload["headers"] or {}`。
+- **嵌套的 `ResourceTaskOptions` 走 dataclass 缺省**：`toResourceTaskOptions` 根本不传
+  `outputFolder` / `headers` / `subworkerCount`，所以 merge 里的 video/audio 拿到的是
+  `cfg.downloadFolder` / `currentHeaders()` / `cfg.preBlockNum`，**不是外层 `path` 覆写后的
+  值**。单测钉住（`video.base.output_folder == "/downloads"` 而 `options.base.output_folder
+  == "/media"`）。
+- **`TaskOptionsPayload` 用枚举，且 `source` 是枚举**：Python 的 `match source` 带一条
+  `case _: raise ValueError(...)`，Rust 构造不出第四种 `TaskSource`，所以这条分支不存在，
+  不是「漏了」。
+- **枚举名 `BrowserAction`**：`gd3-ui` 已有 `actions::TaskAction`（第 100 步），同名会让 `use`
+  撞车。模块头写了理由。
+- **`toInt` 照抄 `isinstance(True, int)`**：JSON `true` → `1`；`false` 不满足 `> 0` 落回缺省；
+  `3.0` 是浮点不算 `int`，也落回缺省（`as_i64()` 对 `Number::from_f64(3.0)` 返回 `None`）。
+- **`round2` 不能用「乘 100 再 `round_ties_even`」**（本轮实测踩到，见「验证」）。
+- **`to_task_summary` 用 `Map::insert` 逐键写**：`preserve_order` 下 `Map` 是 `IndexMap`，
+  插入序即序列化序，与 Python 字面量同序；单测直接断言 `keys()` 的完整序列。
+- **`Merge` 变体装箱**：`MergeOptions` 含两个 `Option<ResourceOptions>`，比另外两个变体大
+  400 字节以上，`clippy::large_enum_variant` 直接红。载荷寿命很短，`Box` 一次分配不影响语义
+  （解构处照旧 `options.video`，`Box` 自动解引用）。
+- **`is_truthy` 从 `feature_service` 借**：第 108 步写的 `pub(crate)` 真值判定正好覆盖
+  `bool(resource.get("supportsRange"))`（`0` / `""` / `[]` / `{}` / `null` 全为假）。
+
+### 三处容错差异（写进模块头与 README）
+
+| 坏包 | Python | Rust |
+|---|---|---|
+| `headers` 不是对象 | `hdrs.get(...)` → `AttributeError`，整条会话崩 | 空 map |
+| `resources[i]` 不是对象 | `resource.get(...)` → `AttributeError` | 当作没有该资源 |
+| `path` 不是字符串 | `Path(1)` → `TypeError` | 用 `cfg.downloadFolder` |
+
+另外 `headers.get("user-agent")` 是**大小写敏感的精确匹配**（Python 原样），扩展发
+`User-Agent` 时 `sourceUserAgent` 是空串——这条照抄，有单测钉住
+（`the_user_agent_header_lookup_is_case_sensitive`）。
+
+### 18 条新单测
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `every_str_enum_round_trips` | 12 个 `MessageType` 全量 + 其余四个枚举各一例，`as_str`/`parse` 互逆 |
+| `unknown_enum_text_is_rejected` | 空串 / 大写 / 尾随空格 / 近义词都 `None` |
+| `to_str_only_accepts_strings` | 数字、`null`、数组、缺键都落 `""` |
+| `to_int_treats_true_as_one_and_rejects_floats` | 正数认、0/负数/浮点/字符串/`false` 落缺省、`true` → 1 |
+| `round2_matches_python_round` | 5 组 CPython 实取值（`42.675→42.67`、`0.125→0.12`、`1.005→1.0`…） |
+| `a_resource_payload_carries_name_size_and_range_support` | `url`/`filename`/`size`/`supportsRange`/`user-agent` 全链路 |
+| `the_user_agent_header_lookup_is_case_sensitive` | `User-Agent` 取不到 `sourceUserAgent` |
+| `a_broken_headers_field_degrades_to_an_empty_map` | 非对象与空对象都退化成空 map |
+| `a_download_payload_overrides_the_output_folder_and_subworkers` | `path` / `preBlockNum` 覆写 |
+| `an_empty_path_falls_back_to_the_download_folder` | 空 `path` → `cfg.downloadFolder`，`preBlockNum` 缺键 → `cfg.preBlockNum` |
+| `a_page_payload_carries_page_url_and_title` | `pageUrl` / `pageTitle` / `user-agent` |
+| `a_merge_payload_maps_two_resources_to_video_and_audio` | 两个资源分别落 video/audio，嵌套 base 走缺省 |
+| `a_merge_payload_without_resources_has_an_empty_url` | 0 个 / 1 个资源的边界 |
+| `a_summary_rounds_the_progress_and_names_the_status` | 13 键顺序 + 逐键取值 + `progress` 取整 |
+| `every_task_status_lowers_to_its_enum_name` | 5 个状态 → 小写名 |
+| `a_summary_reports_existing_paths_as_openable` | 真实临时目录：`canOpenFile`/`canOpenFolder` 均 true、`fileExt == "mkv"` |
+| `a_summary_reports_missing_paths_as_not_openable` | 不存在的目录：两者 false |
+| `a_summary_without_an_extension_has_an_empty_file_ext` | `.bashrc` / `b.` → `""`，`a.tar.GZ` → `gz` |
+
+### 验证
+
+首轮两处编译错、一处断言错，都记在这里：
+
+1. **`path.rs` 的新测试落错了模块**：`cat >>` 追加到了文件末尾，而末尾是第 108 步的
+   `mod normpath_tests`（只 `use super::posix_normpath`）→ `E0425: cannot find function
+   posix_parent`。修法：模块改名 `posix_path_tests` + import 补全；顺手删掉 `mod tests`
+   里那三个多出来的 import（`unused_imports` 警告）。
+2. **`round2` 的口径错了**：`(42.675 * 100.0).round_ties_even() / 100.0 == 42.68`——
+   `42.675 * 100.0` 恰好舍入成 `4267.5`，五成双进位。CPython 的 `round(42.675, 2)` 是
+   `42.67`（对**精确十进制展开**做五成双）。改用 `format!("{value:.2}")` 再 parse：Rust 的
+   定精度格式化同样是对精确展开做五成双。11 组输入逐一比对 CPython（含 `-0.125`、`1e300`、
+   `inf`、tie 的 `0.375`）全一致。
+3. **`unused_doc_comment`**：`///` 挂在 `str_enum!(BrowserAction { … })` 宏调用上，
+   rustdoc 不为宏展开生成文档 → 改成 `//`。clippy `-D warnings` 会红，先改掉。
+4. **`clippy::large_enum_variant`**：`TaskOptionsPayload` 最大变体 680 字节、次大 248 字节
+   （`MergeOptions` 里两个 `Option<ResourceOptions>`）→ `Merge(Box<MergeOptions>)`。
+
+最终：
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-core --lib`：**313 passed / 0 failed**（第 108 步 311 + 2 条 path 单测）；
+- `cargo test -p gd3-ui --lib`：**867 passed / 0 failed**（849 + 18）；
+- `cargo test --workspace`：**1376 passed / 0 failed**（28 段）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（3m13s）；
+- Python 侧没改一行。
+
+编译耗时：`gd3-ui` 单 crate lib+test **约 12 分钟**（02:06→02:18），`--workspace` 约 19 分钟
+（02:12→02:31），clippy 3m13s（依赖已热）。机器仍是 939 MB 内存 + swap 抖动。
+
+### 下一步（第 111 步）
+
+`browser_session`：`BrowserClientSession` 的 `paired` / `pairRequest` 生命周期、
+`approvePair` / `rejectPair` / `regenerateToken`、`_onHello` 的协议版本判定、
+`_onCreateTask` → `feature_service.parse` → 草稿/直加，全摊成效果队列（同第 109 步手法）。
+本步的五个枚举与三个 `to*` 就是它的输入输出类型。
+
+之后还有两件收尾：`Engine` 里 `BrowserService` / `Aria2RpcService` 两个零大小桩的收敛；
+以及回 Phase 7 P0 主线（`main_window.py`(753) + `task_cards.py`(569) + `task_drawer.py`(523)）。

@@ -1383,7 +1383,7 @@ pub fn apply_task_options(features: &FeatureService, presets: &[IdentityPreset],
 ## 浏览器扩展载荷层（`gd3-ui::browser_payload`）
 
 `app/services/browser_service.py`（597 行）混了三层，本模块只搬中间那层
-（`browser_service.py:47-168`，808 行 / 18 单测）：
+（`browser_service.py:47-168`，812 行 / 18 单测）：
 
 | Python | Rust |
 |---|---|
