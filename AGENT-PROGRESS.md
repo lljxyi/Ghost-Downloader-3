@@ -7101,3 +7101,132 @@ ABI。这条边界值得写下来，否则后续每轮都会有人（包括我�
 
 它是 `browser_service.py:496` 与 `aria2_rpc.py:218` 的共同依赖，也是 Phase 8 剩下最大
 两块（浏览器扩展服务 / aria2 RPC）的前置。
+
+## 第 108 步：`gd3-core::url` 抽取 + `gd3-ui::feature_service` 内核
+
+> 时间：2026-10-18 23:50（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 做了什么
+
+两件互为前提的事：把「从 URL 抠 host」抽成公共模块；用它把 `FeatureService.parse` 的
+可移植部分搬过来（第 107 步笔记里许的那笔债）。
+
+1. **新建 `gd3-core/src/url.rs`（179 行 / 4 单测）**：`pub fn host_of(url) -> String`
+   是唯一 `pub` 项（`urlparse(url).hostname or ""` 的口径）；`ParsedUrl` /
+   `parse_url` 保持 `pub(crate)`。`github.rs`（246 → 157 行）与 `http_pack.rs` 改成
+   `use crate::url::parse_url;`，删掉各自那份 92 行私有实现。
+2. **`hostname()` 按 CPython `_hostinfo` 重写**：旧实现用 `rfind(':')` + `is_ascii_digit`
+   判断端口，`https://host:notaport/x` 会得到 `host:notaport`；CPython 是**第一个** `:`
+   处切、**不校验**端口是不是数字。这是一处真 bug，不是风格差异。
+3. **新建 `gd3-ui/src/feature_service.rs`（597 行 / 15 单测）**：`TaskParser` trait、
+   `ParserChain`（稳定序 `register` + `parse` / `matches` / `matches_passive`）、
+   `apply_identity_preset`、`FeatureService`。
+4. **`engine.rs` 的 `FeatureService` 空壳桩删掉**（第 83 步产物），改
+   `pub use crate::feature_service::FeatureService;`；`Engine::start()` / `stop()` 在
+   原来的轨迹标签之后**真调** `activate()` / `deactivate()`（无 pack 时空转，但调用点
+   落在 `engine.py:23` / `:44` 的位置上）；补 `features_mut()` 作注册解析器的写入口。
+
+### 逐条对照
+
+| Python | Rust |
+|---|---|
+| `urlparse(url).hostname or ""`（`feature_service.py:79`、`client.py:83`） | `gd3_core::url::host_of(url)` |
+| `TaskParser.priority = 100`（`pack.py:42`） | `TaskParser::priority()` 默认返回 `100` |
+| `matchPassive` 默认转 `match`（`pack.py:49-50`） | `matches_passive` 默认 `self.matches(options)` |
+| `self._parsers.sort(key=lambda p: p.priority)`（`feature_service.py:61`） | `ParserChain::register` 插到第一个更大 priority 之前 |
+| `parse` 的预设前置（:77-89） | `apply_identity_preset(options, presets)` |
+| `raise ValueError(f"No parser matched: {options.url}")`（:88） | `ParseError::NoParserMatched { url }` → `TaskError::io(...)` |
+| `match(url)` / `matchPassive(url)`（:91-99） | `FeatureService::matches` / `matches_passive` |
+| `activate()` / `deactivate()`（:43-48 / :225-234） | 空转（没有 pack 就没有协程） |
+
+### 关键决策
+
+- **`host_of` 是唯一 `pub` 项**，`ParsedUrl` / `parse_url` 保持 `pub(crate)`：它们带着
+  「path 被 lowercase」这个降级（Python 只 lowercase scheme 与 host），不该升级成公共契约。
+  两个消费者（`http_pack` / `github`）都只做小写比较，降级写在文档注释里。
+- **`hostname` 照 CPython 抄，不「修正」**：`https://host:notaport/x` → `host`；
+  `ed2k://|file|x|1|h|/` → `|file|x|1|h|`（`_hostinfo` 不挑食）；IPv6 去 `[]`；
+  userinfo 在**最后一个** `@` 切。`host_of_mirrors_urlparse_hostname` 的 20 组期望值是
+  CPython 实取，不是手推。
+- **`ParserChain::register` 用「插到第一个更大 priority 之前」**而不是 `sort_by_key`：
+  语义与 Python 稳定 `list.sort` 一致，但每次 register 是 O(n) 而不是 O(n log n)。
+- **`TaskParser::parse` 同步返回 `Result<TaskRecord, TaskError>`**（Python 是 `async`）：
+  需要异步的实现在内部阻塞，同 `gd3-core::checksum` 的口径。
+- **`ParseError::NoParserMatched` 经 `to_task_error()` 落成 `TaskError::io(...)`**：
+  `TaskError::io(impl Display)` 会包成 `发生了意外错误：{detail}`，正是 Python
+  `toTaskError(ValueError(...))` 的落点。
+- **`apply_identity_preset` 就地改 `&mut Map`**：Python 的 `replace(options, **kwargs)`
+  造新对象、原对象不变；Rust 侧调用方（`DraftEffect::Parse`）交出来的本来就是可变副本，
+  语义等价，差异写进文档注释。
+- **`matches` / `matches_passive` 只塞 `{"url": url}`**：现有八个解析器的 `match` 只读
+  `options.url`（`features/*/pack.py` 实测），读配置留给调用方。
+- **`is_truthy` 完整镜像 Python 真值判定**：预设里的 `clientProfile` 既可能是 `""` 也可能
+  缺键，`0` / `false` / 空容器同样为假。
+- **`activate()` 也补上空转方法**（不只是 `deactivate()`）：`Engine::start()` 里那个调用点
+  在 Python 里是真实调用（:23），补一个空实现比留「只有轨迹标签」更接近原型；将来若有
+  Rust 侧插件 ABI，落点已经在。
+
+### 15 条新单测（`feature_service.rs`）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `register_sorts_by_priority_and_keeps_registration_order` | 稳定序：同 priority 保持注册先后 |
+| `parse_picks_the_lowest_priority_match` | 排序之后第一个 `matches` 的胜出 |
+| `parse_skips_parsers_that_do_not_match` | 不匹配的解析器不参与 |
+| `parse_without_a_match_reports_no_parser_matched` | 错误带 URL |
+| `parser_errors_pass_through_untouched` | 解析器自己的 `TaskError` 不被包一层 |
+| `matches_passive_falls_back_to_matches` | 默认实现转发 |
+| `matches_and_matches_passive_are_independent` | 覆写后两者互不影响 |
+| `match_only_gets_the_url_key` | options 里只有 `url` |
+| `identity_preset_fills_an_empty_client_profile` | 空 `clientProfile` 被预设填上 |
+| `identity_preset_leaves_an_explicit_profile_alone` | 已有值不覆盖 |
+| `identity_preset_treats_null_as_empty` | `null` 与缺键同义 |
+| `identity_preset_skips_unknown_hosts` | 未命中不动 options |
+| `identity_preset_fills_nothing_when_the_preset_is_empty` | 预设两字段都空时不改动、返回 false |
+| `parse_applies_the_preset_before_matching` | 前置真的发生在匹配之前（解析器看到的是补过的 options） |
+| `a_feature_service_without_packs_has_an_empty_chain` | 没有 pack → 空链、`parse` 报 NoParserMatched |
+
+### 4 条新单测（`url.rs`）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `host_of_mirrors_urlparse_hostname` | 20 组 CPython 实取期望（含 `host:notaport`、IPv6、userinfo、`ed2k`） |
+| `parse_url_splits_scheme_host_path` | scheme / host / path 三段，query 与 fragment 不进 path |
+| `parse_url_lowercases_path_as_documented` | 文档化的降级 |
+| `parse_url_rejects_illegal_schemes` | 非法 scheme → 整条当 path，host 为空 |
+
+### 搬不了的部分（结构性 N/A）
+
+`load()` / `loadPacks()`（要 `importlib` 加载 `features/` 下的 Python 子类）、
+- `cargo fmt --all` + `--check`：通过（写完后先 fmt 再 check；`github.rs` 少了一行
+  空行被 fmt 补掉）；
+- `cargo test -p gd3-core --lib`：**311 passed / 0 failed**（第 107 步 307 + 4；
+  `github` / `http_pack` 原有单测在 `hostname` 语义改动后仍全绿）；
+- `cargo test -p gd3-ui --lib`：**839 passed / 0 failed**（824 + 15）；
+- `cargo test --workspace`：**1346 passed / 0 failed**（28 段；1327 + 19）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（6m15s）。
+  这一次同时覆盖第 107 步的改动（第 107 步那次 clippy 没跑完，见其笔记的「验证」）；
+- Python 侧没改一行。
+
+编译耗时记录：本轮 `gd3-ui` 单 crate 编译 **约 13 分钟**（比前几轮慢 50%），
+clippy 6m15s。机器 939 MB 内存 + swap 抖动是主因，不是代码规模问题。
+卡片）、`register` 里的属性注入、`_registerAssociations`（Qt 信号）。
+理由与第 107 步那条一样：**结构性不可移植，不是「还没做」**。`browserService` /
+`aria2RpcService` 仍共用 `featureService.parse` 这条端口，它们能接上的前提是先有 pack。
+
+### 验证
+
+VERIFY_PLACEHOLDER
+
+### 下一步（第 109 步）
+
+`browser_service.py`（597 行）与 `aria2_rpc.py`（约 400 行）都卡在「需要 pack 才能
+`parse`」上，但两者**协议层**（配对握手 / WebSocket 帧 / JSON-RPC 方法表）并不依赖 pack：
+
+1. **`aria2_rpc.py`**：JSON-RPC 2.0 方法表（`addUri` / `pause` / `unpause` /
+   `remove` / `tellStatus` / `getGlobalOption` / `changeGlobalOption`）+ 任务草稿请求，
+   纯请求/响应，`gd3-net` 侧已有 HTTP 客户端；`parse` 端口可以注入成闭包，测试里给假的；
+2. **`browser_service.py`**：配对码、token、帧格式（`PortListener` 那侧已在
+   `gd3-servers`），但 597 行里有相当一部分是 Qt 托盘/对话框，得先分清哪半是协议。
+
+倾向 1：接口面清楚、可测性高，且 `aria2` 开关（`GD3_RUST_ARIA2`）已经在引擎里留好了。
