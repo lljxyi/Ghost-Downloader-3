@@ -9,7 +9,6 @@
 //!                              SettingsBridge::drain → push_settings（重推）
 //!                                                   → restart_attrs（提示重启）
 //!                                                   → failures（提示失败）
-//!                                                   → deferred（还没接的动作）
 //! ```
 //!
 //! ## 为什么是轮询
@@ -28,7 +27,7 @@
 //!    （Python 每处现读全局 `cfg`，这里引擎持克隆，必须显式同步）；
 //! 2. 把 `refresh_services()` 可能换掉的 `browserExtensionPairToken` 用
 //!    [`SettingsWriter::adopt`] 吞回文件（Python 的 `cfg.set` 自己落盘）；
-//! 3. 失败 / 待办 / 需重启的属性名打到 stderr。
+//! 3. 失败 / 需重启的属性名打到 stderr。
 //!
 //! 处理器在**重推之前**调用，所以它改出来的值也能进同一帧的 `push_settings`。
 //!
@@ -44,9 +43,6 @@
 //! - **重推是整页**：Python 的 `setting_cards.py:71` 只让**那一张卡**回读自己的值；
 //!   这里统一调 [`crate::push_settings`] 推全量 42 项。同一个值再写一次不会触发 Slint
 //!   的属性通知，所以正在编辑的输入框不会被重置；真正会变的是 `correct()` 夹紧过的项。
-//! - **`deferred` 只记录不执行**：用户点了还没接的按钮（列表写 / 平台副作用）时，
-//!   这里把名字交出去，宿主决定 `eprintln!` 还是弹提示。见
-//!   [`crate::settings_writer`] 模块头的边界表。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -70,8 +66,6 @@ pub struct SettingsDrain {
     pub changes: Vec<ConfigChange>,
     /// 写盘失败（Python 会在这里抛 `OSError`）。
     pub failures: Vec<ConfigStoreError>,
-    /// 还没接的动作名（待办清单）。
-    pub deferred: Vec<&'static str>,
     /// 是否重推过 UI。
     pub repushed: bool,
 }
@@ -79,10 +73,7 @@ pub struct SettingsDrain {
 impl SettingsDrain {
     /// 什么都没发生。
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
-            && self.failures.is_empty()
-            && self.deferred.is_empty()
-            && !self.repushed
+        self.changes.is_empty() && self.failures.is_empty() && !self.repushed
     }
 
     /// 需要提示「重启后生效」的属性名（`restart=True` 的三项）。
@@ -150,19 +141,17 @@ impl SettingsBridge {
         *self.on_drain.borrow_mut() = Some(Box::new(handler));
     }
 
-    /// 取走改动/失败/待办，交给宿主钩子，再把当前配置重推到窗口。
+    /// 取走改动/失败，交给宿主钩子，再把当前配置重推到窗口。
     ///
     /// 幂等：没有待处理的东西时什么都不做（`repushed == false`、不调钩子）。
     pub fn drain(&self, window: &AppWindow) -> SettingsDrain {
         let failures = self.writer.take_failures();
         let changes = self.writer.take_changes();
-        let deferred = self.writer.take_deferred();
         // 失败也要重推：`ConfigStore::set` 是先改内存再 `save()`，值已经变了。
         let repushed = !changes.is_empty() || !failures.is_empty();
         let drained = SettingsDrain {
             changes,
             failures,
-            deferred,
             repushed,
         };
         if !drained.is_empty()
@@ -316,24 +305,6 @@ mod tests {
         assert!(drained.changes.is_empty());
         assert!(drained.repushed, "内存里的值已经改了，界面要跟上");
         assert_eq!(window.get_maxTaskNum(), 9);
-        bridge.stop();
-    }
-
-    #[test]
-    fn deferred_actions_are_reported_not_executed() {
-        let (path, bridge) = bridge("deferred");
-        let window = crate::create_headless();
-        bridge.install(&window);
-
-        window.invoke_copyPairToken();
-        // 第 119 步之后 `categoryResetRequested` 会真写盘；第 120 步之后对话框
-        // 开合也不在动作集里了 —— 这里用两个平台副作用钉「待办不进改动列表」。
-        window.invoke_chromiumInstall();
-        let drained = bridge.drain(&window);
-        assert_eq!(drained.deferred, ["copyPairToken", "chromiumInstall"]);
-        assert!(drained.changes.is_empty());
-        assert!(!drained.repushed);
-        assert!(!path.exists());
         bridge.stop();
     }
 

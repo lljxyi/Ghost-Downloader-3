@@ -8790,3 +8790,87 @@ Windows 的 `_sanitize_windows_name`（保留名 / 冒号 / 尾随点）**没搬
 4. `exportCrx` → 保存对话框 + `extension_crx::export`（离线无 `rfd`，走宿主钩子）。
 
 顺带：`pair_token_regenerate` 之后也要把新令牌复制到剪贴板（`setting_page.py:443-448`）。
+## 第 122 步：五个扩展卡动作接线（`gd3-ui::extension_actions`）+ 删除 `defer` 机制
+
+开工时 `extension_actions.rs` 已经写完但没进 `lib.rs`、没删 `defer`、没编译。这一步把它
+接上并收口。新建 `rust/crates/gd3-ui/src/extension_actions.rs`（**830 行 / 13 单测**），
+`SettingsActions` **40 → 35 字段**，`SettingsWriter::defer` 整条链路删除。
+
+### 做了什么
+
+| # | 改动 | 文件 |
+|---|---|---|
+| 1 | 新模块：五个回调 + `Effects` 注入点 + 剪贴板/浏览器/保存对话框的生产实现 | `gd3-ui/src/extension_actions.rs`（新，830 行） |
+| 2 | `open_url_command_on(os, url)` / `open_url_command(url)` + 1 单测 | `gd3-core/src/desktop.rs`（627 → 699 行） |
+| 3 | 删 5 个字段 + 5 行安装；测试构造与 invoke 断言同步删 | `gd3-ui/src/lib.rs` |
+| 4 | 删 `deferred` 字段 / `take_deferred()` / `defer()` / 4 个闭包 / 模块头一段 / 3 条测试 | `gd3-ui/src/settings_writer.rs`（1477 → 1252 行） |
+| 5 | 删 `SettingsDrain::deferred` + `is_empty()` 一项 + `drain()` 一行 + 1 条测试 + 模块头两处 | `gd3-ui/src/settings_bridge.rs`（434 → 404 行） |
+| 6 | 删 drain 钩子里的 `for action in &drained.deferred`；两个分支各装 `extension_actions::install` | `gd3-ui/src/boot.rs` |
+| 7 | README 新段 + 「剩余工作」第 2 条清零 | `rust/README.md` |
+
+### 关键设计
+
+- **`Effects` 是四个方法的 trait**（`copy_text` / `open_url` / `choose_save_path` / `notify`）：
+  单测注入 `FakeEffects` 就能跑通整条链路，不需要 X11 / Wayland / 真对话框。生产实现
+  `SystemEffects` 用外部命令 + `eprintln!`。
+- **`SaveChoice` 比 Qt 多一档**：`Path` / `Cancelled` / `Unavailable`。Python 的
+  `QFileDialog.getSaveFileName` 永远可用，所以那边没有「没有对话框」这个分支；这里必须有，
+  否则「用户取消」和「环境不支持」混成一件事，宿主没法提示。
+- **`regenerate_token` 必须和复制捆在一起**：Python 是一次点击做两件事（`cfg.set` +
+  `clipboard.setText`）。所以这个动作从 `SettingsActions` 搬到本模块，cfg 写仍走
+  `SettingsWriter::regenerate_pair_token`。
+- **Windows 的 `open_url` 用 `rundll32.exe url.dll,FileProtocolHandler`**：与
+  `open_target_command_on`（`openFile` / `openFolder`）对 Windows 返回 `None` 不矛盾 ——
+  那里传文件路径、要「在文件夹里选中」的语义；这里传 URL，`FileProtocolHandler` 就是
+  `ShellExecuteW(.., "open", url, ..)`，不需要 `windows` crate。
+- **剪贴板不用 `arboard`**：`clipboard.rs` 只是监听器，没有写入端；`arboard` 会拖
+  `x11rb` / `wl-clipboard-rs` 一串依赖。改用系统工具：Linux `wl-copy` → `xclip` → `xsel`
+  （按 `which` 过滤、逐条试、第一条成功即停），macOS `pbcopy`、Windows `clip.exe`
+  （这两个是系统自带，**不查 `PATH`**）。
+- **删掉 `defer` 而不是留着**：它是第 119 步的临时脚手架（「记一笔就算接过了」）。
+  这一步之后动作集里没有未接项，留着只会让「动作集 = cfg 写」这条边界继续含混。
+
+### 编译 / 静态检查期修正（5 个，都是自己写出来的）
+
+1. `use std::path::{Path, PathBuf}` → `Path` 只在测试里用，挪进 `mod tests`（`unused_imports`）；
+2. `#[derive(Default)] struct FakeEffects` —— 字段含 `RefCell<SaveChoice>`，而 `SaveChoice`
+   没有 `Default`。`FakeEffects` 本来就有 `new()`，把 derive 删掉即可（不用给
+   `SaveChoice` 编一个「默认值」）；
+3. `clipboard_commands_follow_the_platform` 失败：实现里对 macOS / Windows 也走 `which`
+   过滤，而测试的意图是「系统自带工具不看 `PATH`」。**改实现不改断言** —— 从桌面环境
+   拉起的进程 `PATH` 常被精简，`pbcopy` / `clip.exe` 查 `PATH` 会假阴性；
+4. `clippy::cloned_ref_to_slice_refs`：`assert_eq!(slice, [token.clone()])` →
+   `std::slice::from_ref(&token)`；
+5. `pub fn extension_folder(paths)` 是 `Paths::extension_folder()` 的薄封装，没人调 ——
+   直接删掉，少一层无用 API。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**2m 56s，零错零警告**（`/tmp/c122c.log`）；
+- `cargo test -p gd3-ui --lib extension_actions`：**13 passed**（`/tmp/t122b.log`）；
+- `cargo test -p gd3-core --lib`：**334 passed / 0 failed**（`/tmp/t122core.log`）；
+- `cargo test -p gd3-ui --lib`：**1058 passed / 0 failed**（`/tmp/t122ui.log`；
+  1047 + 13 新增 − 2 删除）；
+- `cargo test --workspace`：**1614 passed / 0 failed / 28 段**（`/tmp/t122ws2.log`；
+  1602 + 13 + 1 − 2）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，
+  `Finished dev profile in 3m 26s`（`/tmp/c122clip2.log`）；
+- Python 侧没改一行。
+
+### 踩到的坑：两个 `cargo` 并发
+
+第一次 `cargo check` 还在跑就编辑了源码并起了第二个 `cargo check`，第二个只打印
+`Blocking waiting for file lock`，日志看着像卡死。而且**第一个进程读的是编辑到一半的
+源码**，结果不可信。处理：按 PID 把 `timeout` / `cargo` / `rustc` 整条链 `kill -9`，
+再单起一次。以后改文件前先确认没有 `cargo` 在跑。
+
+### 下一步
+
+`defer` 清单清零之后，Phase 8 剩：
+
+1. **更新检查接线**：`update_service` 的 `plan_*` 接 `gd3-net::sources::WreqTransport` +
+   更新卡片；ZIP 读已由 `extension_crx` 提供，tar.xz / dmg 受 `xz2` 离线缺包限制；
+2. **P3 的 `ExtensionInstallDialog`**（`app/view/dialogs/extension_install.py` 133 行）：
+   `install()` 成功后的五步引导框，现在只发 `Notice::ExtensionInstalled(folder)`；
+3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

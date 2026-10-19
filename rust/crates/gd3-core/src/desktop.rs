@@ -152,6 +152,28 @@ fn open_target_command_on(os: &str, path: &Path) -> Option<Vec<String>> {
     Some(vec![opener.to_string(), path.display().to_string()])
 }
 
+/// `QDesktopServices.openUrl` 的命令表：拉起**默认**浏览器。
+///
+/// Python 走的是 Qt 的 `QDesktopServices.openUrl(QUrl(url))`（`setting_page.py:657` 等），
+/// 语义是「交给桌面环境的默认处理程序」，与 [`open_chromium_url_on`] 那种「挑一个
+/// 已安装的 Chromium 系浏览器并改写 `chrome://` 前缀」是两件事，不能互相顶替。
+///
+/// Windows 这里给的是 `rundll32.exe url.dll,FileProtocolHandler <url>`：等价于
+/// `ShellExecuteW(.., "open", url, ..)`，且不需要 `windows` crate（与本模块
+/// [`open_target_command_on`] 的「ShellExecute 未迁移」是两码事——那里要传文件路径，
+/// 走 `rundll32` 会丢掉「在文件夹里选中」的语义，这里传的是 URL，没有额外语义）。
+pub fn open_url_command_on(os: &str, url: &str) -> Vec<String> {
+    match os {
+        "windows" => vec![
+            "rundll32.exe".to_string(),
+            "url.dll,FileProtocolHandler".to_string(),
+            url.to_string(),
+        ],
+        "macos" => vec!["open".to_string(), url.to_string()],
+        _ => vec!["xdg-open".to_string(), url.to_string()],
+    }
+}
+
 /// 镜像 `str(Path(path).parent)`。
 ///
 /// Rust 的 `Path::new("foo").parent()` 是**空路径**（`display()` 出来是空串），
@@ -258,6 +280,11 @@ pub fn open_file_command(path: &Path) -> Option<Vec<String>> {
 /// `openFolder`（当前平台）。
 pub fn open_folder_command(path: &Path) -> Option<Vec<String>> {
     open_folder_command_on(std::env::consts::OS, path)
+}
+
+/// `openUrl`（当前平台）。
+pub fn open_url_command(url: &str) -> Vec<String> {
+    open_url_command_on(std::env::consts::OS, url)
 }
 
 /// `revealInFolder`（当前平台）。
@@ -489,6 +516,36 @@ mod tests {
     }
 
     #[test]
+    fn open_url_commands_match_python() {
+        assert_eq!(
+            open_url_command_on("linux", "https://example.com"),
+            strings(&["xdg-open", "https://example.com"])
+        );
+        assert_eq!(
+            open_url_command_on("macos", "https://example.com"),
+            strings(&["open", "https://example.com"])
+        );
+        assert_eq!(
+            open_url_command_on("windows", "https://example.com"),
+            strings(&[
+                "rundll32.exe",
+                "url.dll,FileProtocolHandler",
+                "https://example.com"
+            ])
+        );
+        // 未知平台与 `open_target_command_on` 一样落进 POSIX 分支
+        assert_eq!(
+            open_url_command_on("freebsd", "https://example.com"),
+            strings(&["xdg-open", "https://example.com"])
+        );
+        // URL 原样传递：不在这里做任何编码或校验
+        assert_eq!(
+            open_url_command_on("linux", "chrome://extensions/?a=1&b=2"),
+            strings(&["xdg-open", "chrome://extensions/?a=1&b=2"])
+        );
+    }
+
+    #[test]
     fn parent_display_mirrors_python_path_parent() {
         // Python: str(Path("foo").parent) == "."
         assert_eq!(parent_display(Path::new("foo")), ".");
@@ -619,6 +676,10 @@ mod tests {
         let path = Path::new("/tmp/x");
         assert_eq!(open_file_command(path), open_file_command_on(os, path));
         assert_eq!(open_folder_command(path), open_folder_command_on(os, path));
+        assert_eq!(
+            open_url_command("https://x"),
+            open_url_command_on(os, "https://x")
+        );
     }
 
     #[test]

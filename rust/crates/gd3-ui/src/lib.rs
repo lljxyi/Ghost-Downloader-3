@@ -38,6 +38,7 @@ pub mod drawer;
 pub mod edit_task;
 pub mod editors;
 pub mod engine;
+pub mod extension_actions;
 pub mod extension_crx;
 pub mod extension_install;
 pub mod facts;
@@ -650,15 +651,6 @@ pub struct SettingsActions {
     pub browser_enabled: Box<dyn Fn(bool)>,
     pub browser_draft_taken: Box<dyn Fn(bool)>,
     pub browser_port: Box<dyn Fn(i64)>,
-    // 第 40 步：浏览器扩展动作卡（复制令牌/重新生成/一键安装/导出
-    // CRX 收 ()，商店链接收 URL 原样串）。剪贴板写入、扩展解包、
-    // 拉起浏览器归平台/引擎桥接步；重新生成的 cfg 写口径由
-    // gd3-core pair_token::generate 兜（token_urlsafe(16) 等价）。
-    pub pair_token_copy: Box<dyn Fn()>,
-    pub pair_token_regenerate: Box<dyn Fn()>,
-    pub store_url_open: Box<dyn Fn(String)>,
-    pub chromium_install: Box<dyn Fn()>,
-    pub chromium_crx_export: Box<dyn Fn()>,
     // 第 41 步：模拟身份动作收 profile 字面量（auto/raw/家族），索引
     // →字面量换算在 install 层 profile.rs；引擎 resolve 在 gd3-net。
     pub client_profile: Box<dyn Fn(&str)>,
@@ -792,17 +784,6 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_browserDraftTakenChanged(move |v| (browser_draft.browser_draft_taken)(v));
     let browser_port = actions.clone();
     window.on_browserPortChanged(move |v| (browser_port.browser_port)(v as i64));
-    // 第 40 步：浏览器扩展动作卡注册（对齐留调用方/引擎桥接步）。
-    let pair_token_copy = actions.clone();
-    window.on_copyPairToken(move || (pair_token_copy.pair_token_copy)());
-    let pair_token_regen = actions.clone();
-    window.on_regeneratePairToken(move || (pair_token_regen.pair_token_regenerate)());
-    let store_url = actions.clone();
-    window.on_openStoreUrl(move |url| (store_url.store_url_open)(url.to_string()));
-    let chromium_install = actions.clone();
-    window.on_chromiumInstall(move || (chromium_install.chromium_install)());
-    let chromium_crx = actions.clone();
-    window.on_exportCrx(move || (chromium_crx.chromium_crx_export)());
     // 第 41 步：模拟身份注册（索引 → 字面量，镜像 _onPick）。
     let client_profile = actions.clone();
     window.on_clientProfileChanged(move |i| {
@@ -2261,10 +2242,6 @@ mod smoke {
         let close_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let dpi_hits: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
         // 第 40 步：动作卡命中记录。
-        let token_copy_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
-        let token_regen_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
-        let store_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let chromium_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let profile_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         // 第 42 步：标头预设动作命中记录。
         let headers_pick_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
@@ -2330,24 +2307,6 @@ mod smoke {
                 move |v| h.borrow_mut().push(v)
             }),
             browser_port: Box::new(|_| {}),
-            // 第 40 步：动作卡 invoke 通路验证。
-            pair_token_copy: Box::new({
-                let h = token_copy_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
-            pair_token_regenerate: Box::new({
-                let h = token_regen_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
-            store_url_open: Box::new({
-                let h = store_hits.clone();
-                move |u| h.borrow_mut().push(u)
-            }),
-            chromium_install: Box::new({
-                let h = chromium_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
-            chromium_crx_export: Box::new(|| {}),
             // 第 41 步：模拟身份（索引→字面量通路验证）。
             client_profile: Box::new({
                 let h = profile_hits.clone();
@@ -2466,21 +2425,6 @@ mod smoke {
             Some(0.75),
             "显示 % 应换算回配置 0-5 浮点"
         );
-        // 第 40 步：动作卡 invoke 通路（复制/重新生成各 1 次、商店
-        // URL 原样串、一键安装 1 次）。
-        window.invoke_copyPairToken();
-        assert_eq!(token_copy_hits.borrow().len(), 1);
-        window.invoke_regeneratePairToken();
-        assert_eq!(token_regen_hits.borrow().len(), 1);
-        window.invoke_openStoreUrl(
-            "https://addons.mozilla.org/firefox/addon/ghost-downloader/".into(),
-        );
-        assert_eq!(
-            store_hits.borrow().last().map(|s| s.as_str()),
-            Some("https://addons.mozilla.org/firefox/addon/ghost-downloader/")
-        );
-        window.invoke_chromiumInstall();
-        assert_eq!(chromium_hits.borrow().len(), 1);
         // 第 41 步：模拟身份 invoke 通路（索引 3 → "edge"，镜像
         // buildProfileMenu 家族字面量选项）。
         window.invoke_clientProfileChanged(3);

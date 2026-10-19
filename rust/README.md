@@ -2841,6 +2841,182 @@ arcname = os.sep.join(x for x in arcname.split(os.sep) if x not in invalid)
 `openStoreUrl`（拉起浏览器）、`chromiumInstall`（`extension_crx::unpack` + 安装引导框）、
 `exportCrx`（保存对话框 + `extension_crx::export`）。
 
+## 浏览器扩展卡的动作（`gd3-ui::extension_actions`，第 122 步）
+
+设置页的「浏览器扩展」组有五张按钮卡，它们的回调**都不写 cfg**（除重新生成令牌），
+要碰的是外设：剪贴板、默认浏览器、扩展目录、保存对话框。第 40 步把它们塞进
+`SettingsActions` 当五个空壳，第 119–120 步用 `SettingsWriter::defer` 记下「点了但没接」。
+这一步把五个动作真正接上，并把 `defer` 机制整体删掉。
+
+### 五个 Python 回调逐行对照
+
+| Python | 行号 | 这里 |
+|---|---|---|
+| `_onCopyTokenClicked` | `setting_page.py:437-441` | `ExtensionActions::copy_token` |
+| `_onRegenerateTokenClicked` | `:443-448` | `ExtensionActions::regenerate_token` |
+| 商店链接（`HyperlinkButton.setUrl`） | `:642/646/650` → `openStoreUrl` | `ExtensionActions::open_store` |
+| `_onChromiumInstallClicked` | `:450-468` | `ExtensionActions::install` / `install_from` |
+| `_onExportExtensionClicked` | `:487-495` | `ExtensionActions::export` |
+
+三处细节按 Python 原样照抄：
+
+- **重新生成令牌也要复制**：Python 是「先 `cfg.set(cfg.browserExtensionPairToken, …)`，
+  再 `QApplication.clipboard().setText(token)`」，两个 InfoBar 的标题/正文分别是
+  「已重新生成配对令牌」+「新令牌已复制到剪贴板」。所以这个动作的**入口必须和复制捆在
+  同一个闭包里** —— 它从 `SettingsActions` 搬到了本模块，cfg 写仍走
+  [`SettingsWriter::regenerate_pair_token`]。
+- **复制失败不弹提示**：`copy_token` 只在 `copy_text` 返回 `true` 时才 `notify`。Python
+  的 `QApplication.clipboard()` 永远可用，所以那边没有这条分支；这里必须有。
+- **导出成功不弹 InfoBar**：Python 的 `_onExportExtensionClicked` 静默写盘。这里只把
+  `Notice::Exported` 交给宿主（`SystemEffects` 打 stderr），不假设有 InfoBar。
+
+### 为什么要单独一个模块
+
+`SettingsActions` 的 40 个字段是「一个属性名 + 一个值」的清一色闭包，由
+`settings_writer::actions()` 一次性装出来；这五个动作没有属性名，还要拿路径、拿
+`Rc<SettingsWriter>`、拿平台副作用，塞在同一个结构里会让「动作集 = cfg 写」这条边界失效。
+于是 `SettingsActions` **40 → 35 字段**，`extension_actions::install` 独占这五个回调。
+
+Slint 的 `on_<callback>` 二次安装是**替换而非叠加**，所以「谁装谁负责」在这里是硬约束：
+`install_settings_actions` 里已经删掉了这五行，两个 `install` 各管各的。
+
+### `Effects`：四类外设的注入点
+
+```rust
+pub trait Effects {
+    fn copy_text(&self, text: &str) -> bool;                 // QApplication.clipboard().setText
+    fn open_url(&self, url: &str) -> bool;                   // QDesktopServices.openUrl
+    fn choose_save_path(&self, suggested: &str) -> SaveChoice; // QFileDialog.getSaveFileName
+    fn notify(&self, notice: Notice);                        // InfoBar / ExtensionInstallDialog
+}
+```
+
+单测实现这四个方法就能把整条链路跑通，不需要 X11 / Wayland / 真对话框；
+生产实现 `SystemEffects` 用外部命令 + `eprintln!`。
+
+`SaveChoice` 三分支（`Path` / `Cancelled` / `Unavailable`）比 Qt 的
+`(path, filter)` 多一档：**没有可用的对话框**要能和「用户点了取消」区分开，否则宿主
+没法提示。`Notice` 八变体的 `text()` 给出 `InfoBar` 的两行文案。
+
+### 剪贴板：外部命令，不是 `arboard`
+
+`clipboard.rs` 是**监听器**状态机（读剪贴板、判断是不是下载链接），没有写入端。
+`arboard 3.7.0` 在离线缓存里，但会拖 `x11rb` / `wl-clipboard-rs` 一串依赖 ——
+为「把一段 22 字符的令牌写进剪贴板」付这个代价不值。改用系统工具：
+
+| 平台 | 候选命令 | `which` 过滤 |
+|---|---|---|
+| Linux | `wl-copy` → `xclip -selection clipboard` → `xsel --clipboard --input` | 是（按顺序试，第一条成功即停） |
+| macOS | `pbcopy` | **否** |
+| Windows | `clip.exe` | **否** |
+
+`pbcopy` / `clip.exe` 是系统自带工具，从桌面环境拉起时 `PATH` 可能被精简，
+所以不查 `PATH` 直接试；Linux 的三条是可选安装，必须查。`copy_text_with` 把
+「逐条试 + 第一条成功即停」写成 `any`，命令表与执行分离后可以注入假命令测试。
+
+`run_with_stdin` 是「stdin 管道 + `write_all` + `wait`」：写失败就把子进程 `kill` 掉，
+避免 `wl-copy` 这种「读 stdin 读到 EOF 才写剪贴板」的工具挂住。
+
+### 默认浏览器：`gd3-core::desktop::open_url_command_on`
+
+Python 的 `QDesktopServices.openUrl(QUrl(url))` 是「交给桌面环境的默认处理程序」，
+与 `open_chromium_url`（挑一个已装的 Chromium 系浏览器 + 改写 `chrome://` 前缀）
+是两件事，不能互相顶替。新增：
+
+| 平台 | 命令 |
+|---|---|
+| Linux / 其它 | `xdg-open <url>` |
+| macOS | `open <url>` |
+| Windows | `rundll32.exe url.dll,FileProtocolHandler <url>` |
+
+Windows 这条值得记一笔：本模块的 `open_target_command_on`（`openFile` / `openFolder`）
+对 Windows 返回 `None`，注释写的是「`ShellExecute` 未迁移」。但那里传的是**文件路径**，
+用 `rundll32` 会丢掉「在文件夹里选中」的语义；这里传的是 **URL**，`FileProtocolHandler`
+就是 `ShellExecuteW(.., "open", url, ..)` 的等价物，不需要 `windows` crate。
+
+### 保存对话框：`zenity` / `kdialog` / `osascript`
+
+| 平台 | 候选 | 说明 |
+|---|---|---|
+| Linux | `zenity --file-selection --save --confirm-overwrite --filename=… --file-filter=…` → `kdialog --getsavefilename …` | 装了哪个用哪个 |
+| macOS | `osascript -e 'POSIX path of (choose file name with prompt … default name …)'` | 需要「自动化」权限 |
+| Windows | 无 | 返回 `SaveChoice::Unavailable` |
+
+过滤器字面量 `Chromium Extension(*.crx)` 与默认文件名 `Extension.crx` 都是 Python 的
+原样串（`setting_page.py:490`），单测钉住。`run_capture` 读 stdout、trim、**非零退出当
+取消**（`zenity` 取消返回 1，`kdialog` 也是）。
+
+### 解包与导出：复用 `extension_crx`
+
+`install()` = `extension_crx::unpack(crx_bytes(), &folder)`，`folder` 来自
+`Paths::extension_folder()`（`app_data_dir/browser_extension`，镜像 `startup.py:49`
+传给 `Engine` 的 `extensionFolder`）。解包成功发 `Notice::ExtensionInstalled(folder)`，
+失败发 `Notice::UnpackFailed(error.to_string())`（标题「解包失败」，镜像 Python 的
+`InfoBar.error("解包失败", toLocalizedError(toTaskError(error)))`）。
+
+`install_from(&[u8])` 让坏包分支可测 —— 单测喂一个 `Cr24` 但载荷是垃圾的容器，
+断言 `false` + `UnpackFailed`。
+
+`export()` = `choose_save_path("Extension.crx")` → `extension_crx::export(crx, path)`。
+
+### 删掉的 `defer` 机制
+
+`defer()` 是第 119 步的临时脚手架：动作集里没接的动作记个名字，`take_deferred()` 把
+名单交给宿主打日志。这一步之后动作集里不再有「记一笔就算」的洞，于是整条链路删除：
+
+| 位置 | 删掉的东西 |
+|---|---|
+| `settings_writer.rs` | `deferred` 字段、`take_deferred()`、`defer()`、模块头的「还没接的部分」段、4 个 `defer(...)` 闭包 |
+| `settings_bridge.rs` | `SettingsDrain::deferred` 字段、`is_empty()` 里的一项、`drain()` 里的 `take_deferred()`、模块头两条说明 |
+| `boot.rs` | drain 钩子里 `for action in &drained.deferred` 那个循环 |
+| 测试 | `the_deferred_actions_name_what_is_still_missing`、`deferred_actions_are_reported_not_executed`、两处 `assert!(writer.take_deferred().is_empty())` |
+
+`SettingsActions` 的 `pair_token_regenerate` 字段一起删了 —— 它的 cfg 写半边仍在
+`SettingsWriter::regenerate_pair_token`，`all_scalar_actions_write_their_attribute`
+改成直接调方法验落盘（27 个属性名的顺序不变）。
+
+### 十三条单测
+
+| 覆盖面 | 断言 |
+|---|---|
+| 复制令牌 | 写进剪贴板的正是配置里的令牌 + `Notice::TokenCopied` |
+| 复制失败 | 剪贴板写失败 → 不 `notify`、返回 `false` |
+| 重新生成 | cfg 里的令牌换了、写盘一次、剪贴板里是新令牌 |
+| 商店链接 | URL 原样转给 `open_url` |
+| 安装 | 341 464 字节的自家 crx 解出 31 个文件到 `<tmp>/ext`、`Notice::ExtensionInstalled` |
+| 安装失败 | 坏载荷 → `false` + `UnpackFailed`（含错误文案） |
+| 导出 | 选定路径后字节与 `crx_bytes()` 逐字节相同 |
+| 导出取消 / 无对话框 | `ExportCancelled` / `SaveDialogUnavailable` 两个 `Notice` |
+| 导出写失败 | 目标是已存在的目录 → `ExportFailed` |
+| 剪贴板命令表 | 三平台 + `which` 过滤 + Wayland 优先 |
+| 逐条重试 | `a` 失败 → `b` 成功即停；全失败返回 `false`；空表返回 `false` |
+| 保存对话框命令 | `zenity` 优先、`kdialog` 次之、都没有 → `None`、Windows → `None` |
+| `Notice::text()` | 八变体的标题/正文（含 Python 的两条原样文案） |
+
+### 与 Python 的已知差异
+
+- **没有 Qt 就没有 `QFileDialog`**：Linux 用 `zenity` / `kdialog`，macOS 用 `osascript`，
+  都没有就返回 `Unavailable`（Python 永远有对话框）。宿主能据此提示，而不是静默失败。
+- **剪贴板靠外部命令**：一条都没有时返回 `false`，用户看到的是「没反应」——
+  Python 的 `QApplication.clipboard()` 不会失败。
+- **安装引导框还没画**：Python 在 `install()` 成功后 `ExtensionInstallDialog(path).exec()`
+  弹五步引导。这里只发 `Notice::ExtensionInstalled(folder)`；对话框属 P3
+  （`extension_install.py` 133 行）。
+- **`export()` 不弹 InfoBar**：与 Python 一致（那边静默写盘），但这里多了
+  `Exported` / `ExportFailed` 两种 `Notice` 供宿主决定。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**2m 56s，零错零警告**；
+- `cargo test -p gd3-ui --lib extension_actions`：**13 passed**；
+- `cargo test -p gd3-core --lib`：**334 passed / 0 failed**（新增 `open_url_commands_match_python`）；
+- `cargo test -p gd3-ui --lib`：**1058 passed / 0 failed**（1047 + 13 新增 − 2 删除）；
+- `cargo test --workspace`：**1614 passed / 0 failed / 28 段**（1602 + 13 + 1 − 2）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**，`Finished dev profile
+  in 3m 26s`；
+- Python 侧没改一行。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
@@ -2852,14 +3028,15 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
 
 这条已经落地：第 113 步 `config_store`（读写语义）→ 第 117 步 `settings_writer`
 （动作 → cfg 键）→ 第 118 步 `settings_bridge`（装到窗口上 + 宿主钩子）→ 第 119 步
-`settings_writer` 的列表写回 → 第 120 步 `settings_dialogs`（九个覆盖层开合）。
-剩下的是：
+`settings_writer` 的列表写回 → 第 120 步 `settings_dialogs`（九个覆盖层开合）→
+第 122 步 `extension_actions`（五个平台副作用，`defer` 机制随之删除）。
+**设置页的动作集已经全部接线**，剩下的是：
 
 1. **更新检查接线**：`update_service` 的 `plan_*` 接到 `gd3-net::sources::WreqTransport`
    与更新卡片；解包要宿主工具或新 crate —— **ZIP 读已由第 121 步的 `extension_crx`
    提供**（CRX 与 zip 载荷同构，`entries` / `read_entry` 可直接复用），剩 tar.xz / dmg
    受 `xz2` 离线缺包限制。
-2. **4 个 `defer` 项**（`take_deferred()`）：剪贴板 / 商店 URL / CRX 解包 / 导出 crx。
-   CRX 解包与导出所需的容器层已就位（`extension_crx::unpack` / `export`），
-   第 122 步只做接线与宿主钩子。
+2. **安装引导框**：`ExtensionInstallDialog`（`app/view/dialogs/extension_install.py` 133 行，
+   P3）—— `extension_actions::install()` 成功后现在只发
+   `Notice::ExtensionInstalled(folder)`，五步引导还没画。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

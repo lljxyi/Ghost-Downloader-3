@@ -63,20 +63,17 @@
 //! `CategoryService._save()` 写的是 `[asdict(c) ...]`（`category_service.py:144-146`），
 //! 未知键在 `_load`（`:136-143`）就丢了，所以这里与 Python 同样「过一遍 dataclass」。
 //!
-//! ## 还没接的部分
+//! ## 不在动作集里的动作
 //!
-//! 四个平台副作用仍走 [`SettingsWriter::defer`]：
+//! 两类动作不走 [`SettingsActions`]，因为它们**不写 cfg**：
 //!
-//! | 动作 | 为什么留后 |
+//! | 动作 | 归属 |
 //! |---|---|
-//! | `pair_token_copy` / `store_url_open` / `chromium_install` / `chromium_crx_export` | 剪贴板、浏览器、扩展解包归平台层 |
+//! | 九个对话框开合（`*AddRequested` / `*EditRequested` / `*EditClosed`） | [`crate::settings_dialogs`]（第 120 步） |
+//! | 五个扩展卡动作（复制/重生成令牌、商店链接、一键安装、导出 CRX） | [`crate::extension_actions`]（第 122 步） |
 //!
-//! `take_deferred()` 能列出被记下的动作名，测试里钉住了这份名单 —— 它是一张**待办清单**，
-//! 不是「悄悄丢掉用户的编辑」。
-//!
-//! 九个「对话框开合」动作（`*AddRequested` / `*EditRequested` / `*EditClosed`）第 120 步
-//! 起**不在动作集里**：它们不写 cfg，只改 `AppWindow` 的 `*EditVisible` / `*EditIndex`，
-//! 由 [`crate::settings_dialogs`] 直接装到窗口上。
+//! 第 119–120 步用 `defer()` 记「还没接」的名字；第 122 步接完最后四个平台副作用后
+//! `defer` 机制整体删除 —— 动作集里不再有「记一笔就算」的洞。
 //!
 //! ## 与 Python 的已知差异
 //!
@@ -144,7 +141,6 @@ pub struct SettingsWriter {
     store: RefCell<ConfigStore>,
     changes: RefCell<Vec<ConfigChange>>,
     failures: RefCell<Vec<ConfigStoreError>>,
-    deferred: RefCell<Vec<&'static str>>,
 }
 
 impl SettingsWriter {
@@ -154,7 +150,6 @@ impl SettingsWriter {
             store: RefCell::new(store),
             changes: RefCell::new(Vec::new()),
             failures: RefCell::new(Vec::new()),
-            deferred: RefCell::new(Vec::new()),
         }
     }
 
@@ -191,11 +186,6 @@ impl SettingsWriter {
         std::mem::take(&mut *self.failures.borrow_mut())
     }
 
-    /// 取走并清空「留给后续接线步的动作名」。
-    pub fn take_deferred(&self) -> Vec<&'static str> {
-        std::mem::take(&mut *self.deferred.borrow_mut())
-    }
-
     /// 把外部写回的 `browserExtensionPairToken` 吞回文件。
     ///
     /// Python 的 `cfg` 是全局单例：`browser_service.py:190` 生成新令牌时
@@ -221,11 +211,6 @@ impl SettingsWriter {
             Ok(None) => {}
             Err(error) => self.failures.borrow_mut().push(error),
         }
-    }
-
-    /// 记一笔「这一步不管」的动作（见模块头的边界表）。
-    fn defer(&self, action: &'static str) {
-        self.deferred.borrow_mut().push(action);
     }
 
     // -----------------------------------------------------------------------
@@ -557,14 +542,14 @@ impl SettingsWriter {
     // 动作集
     // -----------------------------------------------------------------------
 
-    /// 把 27 个标量方法 + 9 个列表方法装成 [`SettingsActions`]（40 个字段全覆盖）。
+    /// 把 27 个标量方法 + 9 个列表方法装成 [`SettingsActions`]（35 个字段全覆盖）。
     ///
     /// 每个闭包只做「一个属性名 + 一个值」；单位换算、索引→字面量、URL 拼装
     /// 都在 `install_settings_actions` 那一层（见 `lib.rs` 的同名注释）。
     ///
-    /// 剩 4 个平台副作用调 [`SettingsWriter::defer`]（剪贴板 / 商店 URL / CRX 解包 /
-    /// 拉起浏览器），归平台层。这不是静默丢弃 —— [`SettingsWriter::take_deferred`]
-    /// 会把名字交出去。
+    /// 第 122 步起动作集里**没有平台副作用**：扩展卡那五个动作（含唯一的 cfg 写
+    /// `regenerate_pair_token`）归 [`crate::extension_actions`]，它直接持 [`SettingsWriter`]
+    /// 调方法，不经过 [`SettingsActions`]。
     pub fn actions(self: &Rc<Self>) -> SettingsActions {
         let folder = Rc::clone(self);
         let max_task_num = Rc::clone(self);
@@ -585,7 +570,6 @@ impl SettingsWriter {
         let browser_enabled = Rc::clone(self);
         let browser_draft_taken = Rc::clone(self);
         let browser_port = Rc::clone(self);
-        let pair_token_regenerate = Rc::clone(self);
         let client_profile = Rc::clone(self);
         let url_scheme_enabled = Rc::clone(self);
         let check_update_at_startup = Rc::clone(self);
@@ -594,10 +578,6 @@ impl SettingsWriter {
         let clipboard_listener = Rc::clone(self);
         let dpi_scale = Rc::clone(self);
 
-        let pair_token_copy = Rc::clone(self);
-        let store_url_open = Rc::clone(self);
-        let chromium_install = Rc::clone(self);
-        let chromium_crx_export = Rc::clone(self);
         let headers_preset_pick = Rc::clone(self);
         let headers_preset_remove = Rc::clone(self);
         let headers_preset_edit_submit = Rc::clone(self);
@@ -634,11 +614,6 @@ impl SettingsWriter {
                 browser_draft_taken.browser_draft_taken(value)
             }),
             browser_port: Box::new(move |value| browser_port.browser_port(value)),
-            // 新令牌通过 `take_changes()` 交给宿主（`ConfigChange::value`），
-            // 由它重推 `browserExtensionPairToken` 属性。
-            pair_token_regenerate: Box::new(move || {
-                let _ = pair_token_regenerate.regenerate_pair_token();
-            }),
             client_profile: Box::new(move |value| client_profile.client_profile(value)),
             url_scheme_enabled: Box::new(move |value| url_scheme_enabled.url_scheme_enabled(value)),
             check_update_at_startup: Box::new(move |value| {
@@ -648,11 +623,6 @@ impl SettingsWriter {
             close_mode: Box::new(move |value| close_mode.close_mode(value)),
             clipboard_listener: Box::new(move |value| clipboard_listener.clipboard_listener(value)),
             dpi_scale: Box::new(move |value| dpi_scale.dpi_scale(value)),
-
-            pair_token_copy: Box::new(move || pair_token_copy.defer("copyPairToken")),
-            store_url_open: Box::new(move |_| store_url_open.defer("openStoreUrl")),
-            chromium_install: Box::new(move || chromium_install.defer("chromiumInstall")),
-            chromium_crx_export: Box::new(move || chromium_crx_export.defer("exportCrx")),
             headers_preset_pick: Box::new(move |index| {
                 headers_preset_pick.headers_preset_pick(index)
             }),
@@ -901,7 +871,9 @@ mod tests {
         (actions.browser_enabled)(false);
         (actions.browser_draft_taken)(true);
         (actions.browser_port)(14371);
-        (actions.pair_token_regenerate)();
+        // 第 122 步起 `pair_token_regenerate` 不在动作集里：入口在
+        // `extension_actions`（它要顺带复制剪贴板），这里直接调方法验落盘。
+        writer.regenerate_pair_token();
         (actions.client_profile)("chrome");
         (actions.url_scheme_enabled)(false);
         (actions.check_update_at_startup)(false);
@@ -946,7 +918,6 @@ mod tests {
             writer.take_failures().is_empty(),
             "27 个属性名都要能查到 spec"
         );
-        assert!(writer.take_deferred().is_empty(), "标量动作不进待办清单");
     }
 
     fn header_preset(name: &str, pairs: &[(&str, &str)]) -> headers::HeaderPreset {
@@ -985,31 +956,6 @@ mod tests {
             Some(Value::Array(items)) => items,
             other => panic!("{attr} 应当是数组：{other:?}"),
         }
-    }
-
-    #[test]
-    fn the_deferred_actions_name_what_is_still_missing() {
-        let (path, writer) = writer("deferred");
-        let actions = writer.actions();
-        (actions.pair_token_copy)();
-        (actions.store_url_open)("https://microsoftedge.microsoft.com/addons".into());
-        (actions.chromium_install)();
-        (actions.chromium_crx_export)();
-
-        // 第 120 步起只剩四个平台副作用：对话框开合不在动作集里
-        // （见 `settings_dialogs`）。
-        assert_eq!(
-            writer.take_deferred(),
-            [
-                "copyPairToken",
-                "openStoreUrl",
-                "chromiumInstall",
-                "exportCrx",
-            ]
-        );
-        // 待办清单里的动作一个都不碰文件，也不进改动列表。
-        assert!(writer.take_changes().is_empty());
-        assert!(!path.exists());
     }
 
     #[test]
@@ -1277,7 +1223,6 @@ mod tests {
         assert_eq!(writer.take_changes().len(), 1);
         assert!(writer.take_changes().is_empty());
         assert!(writer.take_failures().is_empty());
-        assert!(writer.take_deferred().is_empty());
     }
 
     #[test]

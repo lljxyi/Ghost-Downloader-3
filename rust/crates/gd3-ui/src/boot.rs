@@ -508,9 +508,6 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
             for failure in &drained.failures {
                 eprintln!("配置保存失败：{failure}");
             }
-            for action in &drained.deferred {
-                eprintln!("设置页动作尚未接线：{action}");
-            }
             let restart = drained.restart_attrs();
             if !restart.is_empty() {
                 eprintln!("以下设置重启后生效：{}", restart.join(" / "));
@@ -533,6 +530,14 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         let window = crate::create_headless();
         bridge.install(&window);
         crate::settings_dialogs::install(&window, Rc::clone(&writer));
+        crate::extension_actions::install(
+            &window,
+            crate::extension_actions::ExtensionActions::new(
+                Rc::clone(&writer),
+                paths.extension_folder(),
+                Rc::new(crate::extension_actions::SystemEffects),
+            ),
+        );
         crate::push_settings(&window, &writer.config(), &default_download);
         engine.borrow().tasks().refresh(&window);
         for _ in 0..frames {
@@ -547,6 +552,14 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         let window = crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?;
         bridge.install(&window);
         crate::settings_dialogs::install(&window, Rc::clone(&writer));
+        crate::extension_actions::install(
+            &window,
+            crate::extension_actions::ExtensionActions::new(
+                Rc::clone(&writer),
+                paths.extension_folder(),
+                Rc::new(crate::extension_actions::SystemEffects),
+            ),
+        );
         crate::push_settings(&window, &writer.config(), &default_download);
         engine.borrow().tasks().refresh(&window);
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;
