@@ -181,7 +181,8 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 
 **尚未做**：`config_store` 未接进 `boot::run`（接线条件见「配置落盘」一节末尾）；
 `loadCrx` 的 crx 解包与 `fileWatcher` 归宿主；`update_service` 未接（网络半边见
-「更新源纯逻辑层」一节）；`Ghost-Downloader-3.py` 的入口仍走 Qt。
+「更新源纯逻辑层」一节）；`Ghost-Downloader-3.py` 的入口用 `GHOST_UI` 切换
+（缺省 `qt`，`slint` 时 `exec` 本二进制，见「前端分派」一节）。
 二进制入口见下一节。
 （`RuntimeStatusService` 第 102 步搬完、第 107 步删掉空壳桩；`FeatureService` 的
 解析器链第 108 步搬完；`BrowserService` / `Aria2RpcService` 第 112 步收敛，见「服务装配」
@@ -211,18 +212,25 @@ Paths（paths.py）→ load_config（qconfig.load）→ 单实例锁（instance.
 - **事件循环**：有 `DISPLAY`/`WAYLAND_DISPLAY` 走 winit 后端（`window.run()`），
   否则走 `MinimalSoftwareWindow`，跑 `--frames` 帧后退出；
 - **任务**：`Engine::start()` 读 `<APP_DATA_DIR>/tasks.jsonl`（坏行只计数），
-  `resume_saved()` 把 `WAITING`/`RUNNING` 重新入队并把 `RUNNING` 回落到 `WAITING`；
-  **只入队不派发**（Python 的 `_schedule` 会顺带 `_pump`，派发要真的起协程，等下载引擎迁过来）。
+  `resume_saved()` 把 `WAITING`/`RUNNING` 重新入队并把 `RUNNING` 回落到 `WAITING`。
   启动**不回写** `tasks.jsonl`；退出时 `Engine::stop()` 把 `RUNNING`/`WAITING` 落成 `PAUSED`
   ——与 Python 一致（一次「启动完立刻退出」也会留下 `PAUSED`）。
+- **下载运行期**（第 126/127 步，见「下载运行期」一节）：`Runtime` 每 100ms tick 一次
+  （`pump` → `drain` → 速度表 → 有改动才落盘 → 刷列表），工作线程里是真 `gd3-net`。
+  有头由窗口事件循环驱动；无头只有 `--until-idle` 才真的推运行期。
 - **CLI**：`--silence`（对应 Python 的 `--silence`）、`--version`、`--help` 之外，
-  另有四个 Rust 侧可测性开关 `--headless` / `--frames` / `--data-dir` / `--tasks-file`
-  （Python 没有）。
+  另有 Rust 侧可测性开关 `--headless` / `--frames` / `--data-dir` / `--tasks-file` /
+  `--until-idle` / `--idle-timeout` / `--set ATTR=VALUE`（Python 都没有）。
 
 ```bash
 cargo run -p gd3-ui --bin gd3-ui -- --headless --frames 3 --data-dir /tmp/gd3-data
-# Ghost Downloader v4.4.0 launched (headless, 3 frame(s), config=default, data=/tmp/gd3-data, tasks=0, resumed=0)
+# Ghost Downloader v4.4.0 launched (headless, 3 frame(s), config=default, data=/tmp/gd3-data,
+#   tasks=0, resumed=0, completed=0, ticks=0)
 cargo run -p gd3-ui --bin gd3-ui -- --version   # v4.4.0（app/config/constants.py）
+# 真下载（`tasks.jsonl` 里已有 WAITING 任务时）：
+cargo run -p gd3-ui --bin gd3-ui -- --data-dir /tmp/gd3-data --until-idle --idle-timeout 120
+# 改一项配置（走 settings_writer，与设置页同一条路）：
+cargo run -p gd3-ui --bin gd3-ui -- --headless --frames 0 --data-dir /tmp/gd3-data --set maxTaskNum=5
 ```
 
 ### 分类匹配与输出目录（`category.rs`）
@@ -3281,3 +3289,89 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
 2. ~~**安装引导框**~~：第 123 步完成（`gd3-ui::extension_install` +
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
+
+## Phase 8 进展（第 126–130 步）
+
+### 下载运行期（`task_runner.rs` + `runtime.rs`）
+
+`task_runner.rs`（第 126 步）是「谁去下载」：计划层（`pending_positions` /
+`step_output_path` / `plan_job`，对应 `Task.pendingSteps` / `Task.toFilePath` /
+`HttpTask.run` 的参数摊平）、`RunnerEvent`（每条都带 `workId`，暂停后重派发的旧事件
+整条丢掉）、`Spawner` trait（生产是 `ThreadSpawner` = 一个多线程 tokio runtime，
+测试是 `FakeSpawner`）、`TaskRunner`（`pump` / `dispatch` / `drain` / `pause` /
+`cancel_all` / `shutdown`）。**一个任务一个 job，步骤按 `stepIndex` 顺序跑**（同
+Python 的 `Task.run`）。
+
+`runtime.rs`（第 127 步）是「谁按 tick 推它」：
+
+```text
+tick = 现读 cfg（maxTaskNum 改了下一 tick 就生效）
+     → pump（派发等待队列）
+     → drain（收工作线程事件：进度 / 步骤完成 / 任务完成 / 失败 / 取消）
+     → 每秒一次 tick_speed_meter → Engine::drain_speed_effects
+     → report.changed 才 flush(tasks.jsonl)
+     → report.changed 或 有进度 才 refresh（重画任务列表）
+```
+
+口径（与 Python 的差异都写在模块头里）：
+
+- **只有收尾才落盘**：进度不改盘（Python 的 `_flushSoon` 也只在
+  `_onRunDone` / `_onRunFailed` / `pause` 里）；
+- **`.ghd` 只在整任务 `COMPLETED` 时删**（暂停 / 失败都保留，续传靠它）；
+- **`Cancelled` 不做队列记账**：`TaskService::pause` / `cancel_work` 已经做过，
+  再做一次就是双重 `queue.done`；
+- **速度表按 tick 判 1 秒**（Python 是每个任务一个协程定时器），数字进
+  `RunnerTick::speed`；
+- `dispatch` 里 **先置 `RUNNING` 再算 job**（`pending_positions()` 在任务不是
+  `RUNNING` 时返回空表 —— 顺序反了会变成「每个任务零步骤」）。
+
+无头没有窗口事件循环（`slint::Timer` 不会自己走），所以 `Runtime::run_until_idle`
+手动按同一间隔调 `tick()`；**不带 `--until-idle` 的 `--frames` 冒烟不推运行期**
+（保持「只启动不派发」的语义）。停机顺序是 `runtime.shutdown(5s)`（取消工作线程、
+保住 `.ghd`）**先于** `Engine::stop()`（落盘）——反过来的话 `TaskService` 已经收工，
+晚到的运行期事件没人收。
+
+端到端验收：`tests/runner_e2e.rs`（2 条，`TaskRunner` 直驱）、
+`tests/runtime_e2e.rs`（2 条，`boot::run(--until-idle)` 与 `Runtime::pause`/`start`）、
+`tests/test_config_roundtrip.py`（4 条 cfg 往返）。
+
+### 前端分派（`GHOST_UI`）
+
+**不删 Qt 入口**。`app/platform/ui_backend.py`（不 import Qt）在
+`Ghost-Downloader-3.py` 的 `__main__` **第一行**分派：
+
+| `GHOST_UI` | 行为 |
+|---|---|
+| 未设 / `qt` | 原 PySide6 入口（缺省，可回退） |
+| `slint` | `os.execv` 换成 `gd3-ui`（二进制找法：`GD3_UI_BIN` → 可执行文件同目录 → `rust/target/{release,debug}`） |
+| 其它 | 当作 `qt`，stderr 一条警告 |
+
+必须在 `setupEnvironment()` / `SingletonApplication` **之前**：那两步会 `qconfig.load`
+同一个 `UserConfig.json` 并抢一把 Qt 的单实例锁。
+
+**单一写者**：`GHOST_UI=slint` 时 `UserConfig.json` / `tasks.jsonl` / 单实例锁的写者是
+**Rust**；`GHOST_UI=qt`（缺省）时是 **Python**。两边不能同时跑（锁不一样，整文件回写
+会互相覆盖）。
+
+### 平台外壳（托盘 / Dock / 状态项）：**降级**
+
+`shell.rs`（第 75 步）已经有全套**语义**（`tray_menu()` 五项顺序、`toTraySpeed` /
+`toDockSpeed` 的两套小数口径、`dock.onSpeedChanged` 的 `shouldShowDockSpeed and
+shouldShowDockIcon` 条件、Windows 菜单定位钳制、激活原因到信号的映射），但
+**Slint 1.18 没有原生托盘 / Dock / 状态项能力**，所以这一步不硬造。方案：
+
+| 平台 | 要用的 API | 现状 |
+|---|---|---|
+| Linux | `libappindicator` / `ksni`（StatusNotifierItem over D-Bus），菜单走 `com.canonical.dbusmenu` | TODO，未接 |
+| Windows | Win32 `Shell_NotifyIcon` + `TrackPopupMenu`（`tray.py` 的 `AcrylicMenu` 定位钳制对应 `TrackPopupMenuEx` 的屏幕工作区） | TODO，未接 |
+| macOS | AppKit `NSStatusItem` + `NSMenu`（`mac_status_item.py`） | TODO，未接 |
+
+接线方式（**不改现有契约**）：加一个 `TrayHost` trait（`show_menu(entries)` /
+`set_tooltip(text)` / `set_icon(bytes)` / `set_dock_speed(text)`），宿主按平台选实现，
+`NullTray`（默认）只把 `shell.rs` 算好的东西丢掉。`shell.rs` 的返回类型已经是
+平台无关的，所以接的时候**不需要动它**。
+
+尚未接的还有：`shouldPreserveLastModified` 的 `os.utime`、限速钩子
+（`SpeedMeter::waitForSpeedLimit`）、建任务链路（解析器仍在 Python 侧，Rust 只跑
+已经在 `tasks.jsonl` 里的任务）、窗口无显示服务时的 winit 分支（本机没有
+`DISPLAY`，只验了无头分支）。
