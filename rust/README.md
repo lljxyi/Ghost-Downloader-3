@@ -1452,6 +1452,160 @@ pub fn to_task_summary(record: &TaskRecord) -> Map<String, Value>;
 `headers.get("user-agent")` 是**大小写敏感的精确匹配**（Python 原样），扩展发 `User-Agent`
 时 `sourceUserAgent` 是空串——这条照抄，有单测钉住。
 
+## 浏览器扩展会话状态机（`gd3-ui::browser_session`）
+
+`browser_service.py:29-597` 的最后一层：配对请求的生命周期、`hello` 的协议版本门禁、
+`createTask` 的「直加 / 草稿」分叉、`taskAction` 的六种动作、快照广播的去重与合并
+（2123 行 / 41 单测）。
+
+```rust
+pub type SessionId = u64;
+
+pub struct ClientSession { peer_address, is_authenticated, is_subscribed_to_tasks,
+                           last_snapshot: Option<String>, extension_version, install_type }
+pub struct PairRequest   { request_id, peer_address, extension_version, client_kind }
+
+pub enum SessionEffect {
+    Send { session, text }, Close { session }, PairRequestChanged(Option<PairRequest>),
+    ConnectionChanged, ProtocolMismatched, TaskDraftRequested(Vec<TaskRecord>),
+    ExtensionUpdated(String), InstallExtension { session },
+    Task(TaskAction),                    // 复用 task_actions 的词汇表
+    Dispatch { task_ids: Vec<String> },  // _pump() 派发出来的 id
+    OpenFile { path }, RevealInFolder { path },
+}
+
+pub struct SessionContext<'a> {          // handle_message 需要的外部世界
+    parsers: &'a ParserChain, presets: &'a [IdentityPreset],
+    tasks: &'a mut TaskService, conflict_choice: NameConflictChoice,
+    delete_recoverably: &'a mut dyn FnMut(&Path) -> bool,
+}
+
+impl BrowserHub {
+    pub fn new(token: impl Into<String>, defaults: PayloadDefaults) -> Self;
+    pub fn token(&self) -> &str;   pub fn set_token(..);   pub fn set_defaults(..);
+    pub fn set_should_draft(..);   pub fn set_max_task_num(..);
+    pub fn session(&self, SessionId) -> Option<&ClientSession>;   pub fn sessions(&self) -> &[(SessionId, ClientSession)];
+    pub fn pair_request(&self) -> Option<&PairRequest>;
+    pub fn connection_summary(&self) -> (String, String);
+    pub fn is_updating_extension(&self) -> bool;
+
+    pub fn on_connected(&mut self, SessionId, peer_address: impl Into<String>);
+    pub fn on_disconnected(&mut self, SessionId) -> Vec<SessionEffect>;
+    pub fn regenerate_token(&mut self) -> (String, Vec<SessionEffect>);
+    pub fn approve_pair(&mut self, request_id: &str) -> Vec<SessionEffect>;
+    pub fn reject_pair(&mut self, request_id: &str) -> Vec<SessionEffect>;
+    pub fn note_tasks_changed(&mut self) -> bool;
+    pub fn send_snapshots(&mut self, &TaskService) -> Vec<SessionEffect>;
+    pub fn tasks_changed(&mut self, &TaskService) -> Vec<SessionEffect>;
+    pub fn extension_installed(&mut self, SessionId, ok: bool) -> Vec<SessionEffect>;
+    pub fn handle_message(&mut self, SessionId, raw: &[u8], &mut SessionContext<'_>)
+        -> Vec<SessionEffect>;
+}
+```
+
+七条结构决策：
+
+- **会话键是 `SessionId = u64`，不是连接对象**：Python 拿 `WebSocketStream` 的对象身份当
+  `dict` 键，本 crate 不依赖网络层，宿主给每条连接发号。会话表用
+  `Vec<(SessionId, ClientSession)>` 保插入序——Python 的 `dict` 也是插入序，快照广播的
+  会话顺序因此一致。
+- **副作用全摊成 `SessionEffect`**：`_send` / `stream.close()` / 四个 Qt 信号 /
+  `openFile` / `revealInFolder` 都只产出效果，宿主执行。单测因此不需要网络、不需要桌面，
+  也不会真的打开文件。
+- **`TaskService` 报告的「宿主半边」复用 `task_actions::TaskAction`**：`delete` /
+  `redownload` / `pause` 在 Rust 只做记账（第 99 步），`Task.deleteFiles`、
+  `fileDeleteDenied`、`_unwatchFile`、`checksumStopped`、`_cancelWork`、`taskRemoved`
+  都得由宿主做。这里不另造词汇表——浏览器动作与卡片动作调的是同一批服务方法，摊出来的
+  效果自然同形。四个「报告 → 效果」映射（`cancel_effects` / `pause_effects` /
+  `delete_effects` / `redownload_effects`）抽成 `task_actions` 的 `pub fn`，两条线共用
+  一份实现，发射顺序只有一处定义。
+- **`_pump()` 派发的 id 单独走 `Dispatch { task_ids }`**：`TaskAction::Started` 需要
+  `workId`，发号与提交协程归宿主，`browser_session` 不该造号。
+- **`install()` 的 crx 解包留给宿主**：`_onHello` 发现扩展是 `development` 且**旧于**
+  `LATEST_EXTENSION_VERSION` 时产出 `InstallExtension`，宿主解包完回调
+  `extension_installed(session, ok)`。
+- **`_parse` 是同步的**：`featureService.parse` 在 Python 是 `async`，本仓
+  `TaskParser::parse` 同步返回（第 108 步），所以「提交 → 回调 `_onTaskParsed`」两步合成
+  一次调用。
+- **`_sendSnapshots` 的延迟合并显式化**：`note_tasks_changed()`（判重）+
+  `send_snapshots()`（真发），`tasks_changed()` 是两者的同步合成。宿主若要合并突发信号，
+  只用前两个即可。
+
+照抄的四个 Python 缺陷：
+
+| 缺陷 | 位置 | 后果 |
+|---|---|---|
+| `_isUpdatingExtension` 成功后不复位 | `_onHello` → `install()` | 同一进程内不会二次热更 |
+| `_onTaskParsed` 里 `taskService.add` 出错什么都不回 | `done=` 回调 | 扩展收不到 `REJECTED` |
+| `decryptionKeys` 是空操作 | `Task.setOptions` 只认 `outputFolder` / `category` | 字段被丢弃 |
+| `regenerateToken` 不踢会话出表 | 只 `_close` + 置 `isAuthenticated = False` | 断开时才 `pop` |
+
+两处「Python 抛异常、Rust 里不存在」的路径：
+
+| 路径 | Python | Rust |
+|---|---|---|
+| `toTaskOptions` 抛 `AttributeError` / `TypeError` | `except Exception` → `REJECTED` + `repr(e)` | 不会发生（第 110 步的容错转换） |
+| `_onTaskAction` 内部异常 | `except Exception` → `repr(e)` | 不会发生（`TaskService` 返回 `Option` / `bool`） |
+
+这两条不是「还没做」：Rust 侧把异常折成了返回值，对应的拒绝分支没有输入可喂。
+
+### 测试（41 条，按状态机分段）
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `a_stale_protocol_version_is_refused_and_reported` | 协议版本不符 → `REJECTED` + `ProtocolMismatched` + `Close` |
+| `a_wrong_token_is_refused_without_the_protocol_signal` | 令牌错只 `REJECTED` + `Close`，不报协议信号 |
+| `an_error_without_a_request_id_omits_the_key` | `requestId` 空串时错误帧不带该键 |
+| `hello_authenticates_and_acks_the_capabilities` | `hello` → `is_authenticated` + `helloAck` 的 6 个动作 + 配置回显 |
+| `a_store_build_never_triggers_a_hot_update` | `store` 版扩展永不热更 |
+| `a_newer_development_build_is_installed_once` | `development` 且旧于 `LATEST` → 一次 `InstallExtension` |
+| `a_finished_install_reloads_the_extension_and_keeps_the_flag` | 成功 → `ExtensionUpdated`，标志**保持置位** |
+| `a_failed_install_only_clears_the_flag` | 失败 → 只清标志，不发 `ExtensionUpdated` |
+| `anything_but_hello_before_authentication_is_rejected` | 未认证的 `taskAction` / `subscribeTasks` 都被拒 |
+| `a_broken_frame_gets_a_bad_request` | 非 JSON / 非对象 / 无 `type` → `BAD_REQUEST` |
+| `a_frame_from_an_unknown_session_is_ignored` | 未知 `SessionId` 不产出任何效果 |
+| `a_second_session_cannot_claim_the_pending_pair_request` | 配对请求被别的会话占着时不覆盖 |
+| `the_same_session_can_replace_its_own_pair_request` | 同一会话可刷新自己的请求 |
+| `approving_a_pair_request_sends_the_token` | `approvePair` → `paired` 帧带令牌 + 置认证 |
+| `rejecting_a_pair_request_sends_no_token` | `rejectPair` → `pairRejected` 帧，不带令牌 |
+| `an_unknown_pair_request_id_does_nothing` | 过期的 `requestId` 静默 |
+| `regenerating_the_token_closes_every_session` | 新令牌 + 每个已认证会话一条 `Close` |
+| `regenerating_the_token_is_silent_when_nobody_was_authenticated` | 无人认证时不发 `ConnectionChanged` |
+| `disconnecting_the_pairing_session_clears_the_request` | 配对中会话断开 → `PairRequestChanged(None)` |
+| `subscribing_sends_a_snapshot_newest_first` | 快照按 `createdAt` 降序，13 键/项 |
+| `an_unchanged_snapshot_is_not_resent` | 同一快照文本不重发（`last_snapshot` 去重） |
+| `only_subscribed_authenticated_sessions_get_snapshots` | 未订阅 / 未认证都不发 |
+| `a_pending_snapshot_swallows_the_burst` | `note_tasks_changed` 返回 `true` 只一次 |
+| `create_task_adds_the_task_and_reports_the_id` | `createTask` → `CREATED` + 任务 id + `add_with_conflict` |
+| `a_draft_request_never_touches_the_task_list` | `draft` → `TaskDraftRequested`，任务表不变 |
+| `the_configured_default_decides_when_the_frame_says_nothing` | 帧里没有 `draft` 时取 `cfg.shouldDraftTakenDownload` |
+| `a_title_keeps_the_existing_suffix` | 标题已带 `existingSuffix` 时不重复拼 |
+| `an_unknown_source_is_rejected` | `source: ""` / 未知值 → 「未知的任务来源」 |
+| `a_create_task_without_a_payload_is_rejected` | 缺 `payload` → `error` 帧「无效的请求」 |
+| `a_create_task_without_a_parser_match_is_rejected` | 解析器不认 → `rejected` + `No parser matched: <url>` |
+| `toggling_a_completed_task_reports_a_failure` | `Completed` 上 `togglePause` → 「任务已完成」 |
+| `toggling_a_running_task_pauses_it` | 运行中 → `Paused`，成功帧不带 `message` |
+| `toggling_a_paused_task_queues_it` | 暂停 → `start` + `pump`，任务离开等待队列、`running_count() == 1` |
+| `cancel_asks_the_host_to_delete_files_and_remove_does_not` | `cancel` → `DeleteFiles`；`remove` 不删文件 |
+| `redownloading_resets_the_task` | `redownload` → 状态回 `Waiting` |
+| `opening_a_missing_file_reports_that_it_is_not_ready` | 文件不存在 → 「任务尚未完成」 |
+| `opening_an_existing_file_produces_the_effect` | 存在 → `OpenFile` |
+| `opening_the_folder_reveals_the_file` | `openFolder` → `RevealInFolder` |
+| `opening_the_folder_of_a_missing_directory_fails` | 目录不存在 → 拒绝 |
+| `an_unknown_task_or_action_is_reported` | 未知 `taskId` → 「任务不存在」；未知 `action` → 「不支持的操作」 |
+| `a_task_action_without_a_request_id_is_a_bad_request` | 缺 `requestId` → `bad_request`「缺少 requestId」，任务不动 |
+
+### 本轮修掉的两个真缺陷
+
+1. **`togglePause` 的「恢复」分支只 `start` 不 `pump`**：Python 的 `TaskService.start`
+   就是 `_schedule`（`queue.wait` + `_pump()`，`task_service.py:392-395`）。Rust 侧
+   `TaskService::start` 只 `queue.wait`，所以必须再 `pump(max_task_num)`——否则空出来的
+   槽永远不派发，扩展点「恢复」后任务卡在 `Paused`。
+2. **`cancel` / `remove` 的删文件没人做**：`TaskService::delete` 只做记账（第 99 步），
+   原本 `Some(report)` 直接丢掉 `delete_files` / `delete_denied` → 扩展点「取消」后
+   文件留在盘上、`fileDeleteDenied` 也发不出去。现在摊成
+   `TaskAction::DeleteFiles` / `DeleteDenied` 交给宿主。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

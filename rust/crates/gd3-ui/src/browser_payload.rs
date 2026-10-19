@@ -123,7 +123,7 @@ str_enum!(CreateTaskStatus {
 });
 
 /// `toStr(data, key, default="")`：只认字符串，其余一律缺省。
-fn to_str(data: &Map<String, Value>, key: &str) -> String {
+pub(crate) fn to_str(data: &Map<String, Value>, key: &str) -> String {
     data.get(key)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -134,7 +134,7 @@ fn to_str(data: &Map<String, Value>, key: &str) -> String {
 ///
 /// Python 的 `isinstance(value, int) and value > 0` 里 `True` 也算 `int`，所以 `true` → `1`；
 /// 浮点（`3.0`）不算 `int`，落回缺省。
-fn to_int(data: &Map<String, Value>, key: &str, default: i64) -> i64 {
+pub(crate) fn to_int(data: &Map<String, Value>, key: &str, default: i64) -> i64 {
     match data.get(key) {
         Some(Value::Bool(true)) => 1,
         Some(value) => match value.as_i64() {
@@ -228,6 +228,90 @@ impl TaskOptionsPayload {
             TaskOptionsPayload::Resource(options) => &options.base,
             TaskOptionsPayload::Page(options) => &options.base,
             TaskOptionsPayload::Merge(options) => &options.base,
+        }
+    }
+
+    /// `toTaskOptions` 的结果摊成 [`ParserChain::parse`](crate::feature_service::ParserChain)
+    /// 吃的那张 map。
+    ///
+    /// 键名 = Python dataclass 的**字段名**（`url` / `outputFolder` / `subworkerCount` / …），
+    /// 与 `feature_service::apply_identity_preset` 读的 `clientProfile` / `userAgent` 同一套口径
+    /// ——Python 的解析器就是按属性名读的（`options.outputFolder`），属性名即字段名。
+    ///
+    /// `outputFolder` 在这里是字符串：Python 那份是 `Path`，但它只在解析器内部被
+    /// `/` 拼接或 `str()`，Rust 侧的解析器拿字符串自己拼，语义相同。
+    pub fn to_map(&self) -> Map<String, Value> {
+        match self {
+            TaskOptionsPayload::Resource(options) => {
+                let mut map = base_map(&options.base);
+                insert_resource_fields(&mut map, options);
+                map
+            }
+            TaskOptionsPayload::Page(options) => {
+                let mut map = base_map(&options.base);
+                map.insert("pageUrl".to_string(), Value::from(options.page_url.clone()));
+                map.insert(
+                    "pageTitle".to_string(),
+                    Value::from(options.page_title.clone()),
+                );
+                map
+            }
+            TaskOptionsPayload::Merge(options) => {
+                let mut map = base_map(&options.base);
+                map.insert("video".to_string(), resource_value(options.video.as_ref()));
+                map.insert("audio".to_string(), resource_value(options.audio.as_ref()));
+                map
+            }
+        }
+    }
+}
+
+/// `TaskOptions` 基类的七个字段（`task.py:60-67` 的声明序）。
+fn base_map(base: &BaseOptions) -> Map<String, Value> {
+    let mut map = Map::new();
+    map.insert("url".to_string(), Value::from(base.url.clone()));
+    map.insert(
+        "outputFolder".to_string(),
+        Value::from(base.output_folder.clone()),
+    );
+    map.insert("headers".to_string(), Value::Object(base.headers.clone()));
+    map.insert(
+        "clientProfile".to_string(),
+        Value::from(base.client_profile.clone()),
+    );
+    map.insert(
+        "userAgent".to_string(),
+        Value::from(base.user_agent.clone()),
+    );
+    map.insert(
+        "sourceUserAgent".to_string(),
+        Value::from(base.source_user_agent.clone()),
+    );
+    map.insert(
+        "subworkerCount".to_string(),
+        Value::from(base.subworker_count),
+    );
+    map
+}
+
+/// `ResourceTaskOptions` 多出来的三个字段（`task.py:76-79`）。
+fn insert_resource_fields(map: &mut Map<String, Value>, options: &ResourceOptions) {
+    map.insert("name".to_string(), Value::from(options.name.clone()));
+    map.insert("size".to_string(), Value::from(options.size));
+    map.insert(
+        "canUseRangeRequests".to_string(),
+        Value::Bool(options.can_use_range_requests),
+    );
+}
+
+/// `MergeTaskOptions.video` / `.audio`：`None` 落 `null`（Python 侧就是 `None`）。
+fn resource_value(options: Option<&ResourceOptions>) -> Value {
+    match options {
+        None => Value::Null,
+        Some(options) => {
+            let mut map = base_map(&options.base);
+            insert_resource_fields(&mut map, options);
+            Value::Object(map)
         }
     }
 }

@@ -22,6 +22,7 @@ pub mod batch_url;
 pub mod boot;
 pub mod bootstrap_list;
 pub mod browser_payload;
+pub mod browser_session;
 pub mod card;
 pub mod card_groups;
 pub mod card_menu;

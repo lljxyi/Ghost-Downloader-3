@@ -63,7 +63,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::actions;
-use crate::task_service::{CancelWork, EditReport, SelectionReport, TaskService};
+use crate::task_service::{
+    CancelWork, DeleteReport, EditReport, PauseReport, RedownloadReport, SelectionReport,
+    TaskService,
+};
 use gd3_core::placeholder::CreateError;
 use gd3_core::task::{TaskOptions, TaskRecord, TaskStatus};
 
@@ -216,16 +219,8 @@ impl<S: TaskStore> TaskActions<S> {
 
     /// `_cancelWork(task)` 的两个信号：`seedingStopped` 先、`cancel(workId)` 后。
     fn emit_cancel(&self, task_id: &str, work: &CancelWork) {
-        if work.stopped_seeding {
-            self.emit(TaskAction::SeedingStopped {
-                task_id: task_id.to_string(),
-            });
-        }
-        if let Some(work_id) = &work.work_id {
-            self.emit(TaskAction::CancelWork {
-                task_id: task_id.to_string(),
-                work_id: work_id.clone(),
-            });
+        for effect in cancel_effects(task_id, work) {
+            self.emit(effect);
         }
     }
 
@@ -409,6 +404,92 @@ impl<S: TaskStore> TaskActions<S> {
     }
 }
 
+// ── 报告 → 效果的纯映射 ──────────────────────────────────────────────────────
+//
+// `TaskActions` 与 [`crate::browser_session`] 调的是同一批 `TaskService` 方法，
+// 所以「报告里宿主还没做的部分」也该摊成同一批 [`TaskAction`]。这一层是纯函数：
+// 只读报告、不改服务状态，两个调用方各取所需（`report.started` 的派发留给调用方，
+// 因为发号 `workId` 与提交协程都归宿主）。
+
+/// `_cancelWork(task)` 的两个信号：`seedingStopped` 先、`cancel(workId)` 后。
+pub fn cancel_effects(task_id: &str, work: &CancelWork) -> Vec<TaskAction> {
+    let mut effects = Vec::new();
+    if work.stopped_seeding {
+        effects.push(TaskAction::SeedingStopped {
+            task_id: task_id.to_string(),
+        });
+    }
+    if let Some(work_id) = &work.work_id {
+        effects.push(TaskAction::CancelWork {
+            task_id: task_id.to_string(),
+            work_id: work_id.clone(),
+        });
+    }
+    effects
+}
+
+/// `pause(task)` 的报告 → 效果（`Paused` 在 `_cancelWork` 之后）。
+pub fn pause_effects(task_id: &str, report: &PauseReport) -> Vec<TaskAction> {
+    let mut effects = cancel_effects(task_id, &report.cancel);
+    effects.push(TaskAction::Paused {
+        task_id: task_id.to_string(),
+    });
+    effects
+}
+
+/// `delete(task, shouldDeleteFiles)` 的报告 → 效果。
+///
+/// 顺序即 Python 的发射顺序：`checksumStopped` → `_unwatchFile` →
+/// `fileDeleteDenied`（只一次）→ `_cancelWork` → `onStopped{deleteFiles}` →
+/// `taskRemoved`。**不含**尾部 `_pump()` 的派发（见 `report.started`）。
+pub fn delete_effects(task_id: &str, report: &DeleteReport) -> Vec<TaskAction> {
+    let mut effects = Vec::new();
+    if let Some(work_id) = &report.checksum_work {
+        effects.push(TaskAction::ChecksumStopped {
+            task_id: task_id.to_string(),
+            work_id: work_id.clone(),
+        });
+    }
+    effects.push(TaskAction::UnwatchFile {
+        task_id: task_id.to_string(),
+    });
+    if report.delete_denied {
+        effects.push(TaskAction::DeleteDenied);
+    }
+    effects.extend(cancel_effects(task_id, &report.cancel));
+    // `onStopped`: `if canDelete: task.deleteFiles()`（占位符已就地删过）
+    if report.delete_files {
+        effects.push(TaskAction::DeleteFiles {
+            task_id: task_id.to_string(),
+        });
+    }
+    effects.push(TaskAction::Removed {
+        task_id: task_id.to_string(),
+    });
+    effects
+}
+
+/// `redownload(task)` 的报告 → 效果。
+///
+/// `onStopped` 的第一句是 `task.deleteFiles()`——**不判 canDelete**，照抄。
+pub fn redownload_effects(task_id: &str, report: &RedownloadReport) -> Vec<TaskAction> {
+    let mut effects = Vec::new();
+    if let Some(work_id) = &report.checksum_work {
+        effects.push(TaskAction::ChecksumStopped {
+            task_id: task_id.to_string(),
+            work_id: work_id.clone(),
+        });
+    }
+    effects.push(TaskAction::UnwatchFile {
+        task_id: task_id.to_string(),
+    });
+    effects.extend(cancel_effects(task_id, &report.cancel));
+    effects.push(TaskAction::DeleteFiles {
+        task_id: task_id.to_string(),
+    });
+    effects
+}
+
 impl<S: TaskStore> actions::TaskService for TaskActions<S> {
     fn pause(&self, task_id: &str) {
         let max = self.max_task_num();
@@ -416,10 +497,9 @@ impl<S: TaskStore> actions::TaskService for TaskActions<S> {
         let Some(report) = report else {
             return;
         };
-        self.emit_cancel(task_id, &report.cancel);
-        self.emit(TaskAction::Paused {
-            task_id: task_id.to_string(),
-        });
+        for effect in pause_effects(task_id, &report) {
+            self.emit(effect);
+        }
         self.dispatch(&report.started);
     }
 
@@ -464,33 +544,11 @@ impl<S: TaskStore> actions::TaskService for TaskActions<S> {
         let Some(report) = report else {
             return;
         };
-        // `cancelChecksum(task)`：`checksumStopped.emit(task, None)`
-        if let Some(work_id) = report.checksum_work {
-            self.emit(TaskAction::ChecksumStopped {
-                task_id: task_id.to_string(),
-                work_id,
-            });
+        // 报告的固定半边（`checksumStopped` / `_unwatchFile` / `fileDeleteDenied` /
+        // `_cancelWork` / `Task.deleteFiles` / `taskRemoved`）见 [`delete_effects`]。
+        for effect in delete_effects(task_id, &report) {
+            self.emit(effect);
         }
-        // `_unwatchFile(task)`
-        self.emit(TaskAction::UnwatchFile {
-            task_id: task_id.to_string(),
-        });
-        // `fileDeleteDenied.emit()`（只提示一次）
-        if report.delete_denied {
-            self.emit(TaskAction::DeleteDenied);
-        }
-        // `_cancelWork(task, finished=onStopped)`
-        self.emit_cancel(task_id, &report.cancel);
-        // `onStopped`: `if canDelete: task.deleteFiles()`（占位符已就地删过）
-        if report.delete_files {
-            self.emit(TaskAction::DeleteFiles {
-                task_id: task_id.to_string(),
-            });
-        }
-        // `taskRemoved.emit(task.taskId)`
-        self.emit(TaskAction::Removed {
-            task_id: task_id.to_string(),
-        });
         // 尾部 `_pump()`
         self.dispatch(&report.started);
     }
@@ -503,21 +561,11 @@ impl<S: TaskStore> actions::TaskService for TaskActions<S> {
         let Some(report) = report else {
             return;
         };
-        if let Some(work_id) = report.checksum_work {
-            self.emit(TaskAction::ChecksumStopped {
-                task_id: task_id.to_string(),
-                work_id,
-            });
+        // `reset()` + `_flushSoon()` + `_schedule()` 已在 `TaskService` 里做完；
+        // 剩下的固定半边见 [`redownload_effects`]。
+        for effect in redownload_effects(task_id, &report) {
+            self.emit(effect);
         }
-        self.emit(TaskAction::UnwatchFile {
-            task_id: task_id.to_string(),
-        });
-        self.emit_cancel(task_id, &report.cancel);
-        // `onStopped` 的第一句是 `task.deleteFiles()`——**不判 canDelete**。
-        self.emit(TaskAction::DeleteFiles {
-            task_id: task_id.to_string(),
-        });
-        // `reset()` + `_flushSoon()` + `_schedule()` 已在 `TaskService` 里做完。
         self.dispatch(&report.started);
     }
 
