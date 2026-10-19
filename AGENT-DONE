@@ -1,0 +1,158 @@
+# AGENT-DONE — Phase 8（把 Slint 接成可运行应用）
+
+时间：2026-10-19 21:45
+仓库：`/root/Ghost-Downloader-3`　最后提交：本文件所在提交（`git log -1 --format=%h -- AGENT-DONE`；Phase 8 的最后一个代码提交是 `c0a581f`）
+
+一句话：**`gd3-ui` 现在是一个能真下载的 Slint 应用**（起窗口 / 干净退出 / 读 `UserConfig.json` /
+跑 `tasks.jsonl` 里的任务 / 结果回写且 Python 读得回），`GHOST_UI` 可在 Qt 与 Slint 之间切换，
+Qt 入口一字未动；质量门全绿。
+
+---
+
+## 1. 完工判定（Phase 8 的 7 条）
+
+| # | 判定 | 证据 |
+|---|---|---|
+| 1 | `cargo run -p gd3-ui` 能起窗口并干净退出；`--headless` 冒烟通过 | `--version` → `Ghost Downloader v4.4.0`（exit 0）；`--headless --frames 3 --data-dir /tmp/e2e-smoke` → exit 0，摘要行 `config=default … tasks=0`。**本机无 `DISPLAY`**，窗口分支只做了代码级/单测验证（见 §5） |
+| 2 | `UserConfig.json` 读→改→写回逐字节一致 | `tests/test_config_roundtrip.py` **6 passed**：真 Python `qconfig.save()` 写出的 **18 组真配置**被 Rust 读→整文件回写后**逐字节相同**；`--set maxTaskNum=7` 只改那一行 |
+| 3 | 本地 HTTP 服务 → 加任务 → 真下载 → 逐字节校验 | `tests/runtime_e2e.rs` **2 passed**（`--until-idle` 全链路 + 暂停/恢复）。本轮又手工跑了一遍：`python3 -m http.server 18743` + 300 KB 随机载荷，`tasks=1, resumed=1, completed=1, ticks=2`，`cmp` → `BYTES_IDENTICAL`，`.ghd` 已删 |
+| 4 | 状态写回 `tasks.jsonl`，Python 侧能读 | 同一轮：Python `app.models.task.Task.fromDict` 读回 → `taskId=e2e-cli`、`status=COMPLETED`、`completedAt=1792446083`、`step0 progress=100`、`outputPath` 存在 |
+| 5 | 无头冒烟覆盖 启动/加任务/进度/暂停恢复/完成 | `tests/runtime_e2e.rs`（启动 + 完成 + byte 校验；`Mode::Slow` → pause（保 `.ghd`、状态 PAUSED）→ start → 续传完成）+ `tests/runner_e2e.rs` 2 条 |
+| 6 | `GHOST_UI=qt` 仍可用（可回退） | Qt 入口未改一行；`dispatchRustUi()` 只在 `GHOST_UI=slint` 时 `os.execv`，未设/`qt`/未知值都走原路径（`tests/test_ui_backend.py` **17 passed**，含真入口子进程测试）；`GHOST_UI=slint python Ghost-Downloader-3.py --version` → exit 0 |
+| 7 | 质量门全绿 | 见 §2 |
+
+## 2. 质量门（本轮实测，全部在本机、单独跑）
+
+| 门 | 命令 | 结果 |
+|---|---|---|
+| fmt | `cargo fmt --all --check` | OK |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | exit 0，`Finished dev profile in 25m 12s` |
+| Rust 测试 | `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` | 全绿（含 `gd3-ui --lib` **1165 passed**） |
+| Python 全量 | `.venv/bin/python -m pytest -q --continue-on-collection-errors` | `3 failed, 1370 passed, 8 skipped, 35 errors`；与 `/root/baseline-failures.txt` 逐行 `comm` → **新增 0、消失 0** |
+
+失败集合与基线**完全相同**（`comm` 两个方向都为空）：36 条 android 收集错误 + 本机 `::1`、
+aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯。
+
+## 3. Phase 8 做完什么
+
+### 8a 可运行骨架
+`gd3-ui` 有 `main` / `boot::run`：CLI（`--headless` / `--frames` / `--data-dir` /
+`--tasks-file` / `--until-idle` / `--idle-timeout` / `--set ATTR=VALUE` / `--silent` /
+`--help` / `--version` / 位置参数 URL）、单实例、引擎装载、窗口装配、干净退出码
+（`RunOutcome::{Ran, AlreadyRunning}`）。
+
+### 8b 任务数据接线
+`Engine`（`gd3-ui/src/engine.rs`）+ `TaskService` 直接跑 `tasks.jsonl`：装载 →
+`resumeSaved` → 队列/调度 → 进度 → 收尾落盘。任务列表来自真实记录。
+
+### 8c cfg 读写接管
+`ConfigStore`（读写语义、`ConfigChange` 描述该发哪些信号）→ `SettingsWriter`
+（动作 → cfg 键）→ `SettingsBridge`（装到窗口上）→ `SettingsDialogs`（九个覆盖层）。
+双向：`--set` / 设置页动作写盘，进程启动读盘。
+
+### 8d 页面接线
+设置页各卡片动作、任务卡片、任务抽屉、队列、对话框、更新检查（计划层 + 执行层
+`UpdateRuntime`）、扩展安装（真 CRX 解包 + 五步引导）、草稿创建——都有「改前/改后」
+断言。
+
+### 8e 下载引擎接线（本阶段的核心）
+- `task_runner.rs`：计划层（`pending_positions` / `step_output_path` / `plan_job`）、
+  `RunnerEvent`（每条带 `workId`，暂停后重派发的旧事件整条丢弃）、`Spawner` trait
+  （生产 `ThreadSpawner` = 一个多线程 tokio runtime；测试 `FakeSpawner`）、
+  `TaskRunner`（`pump` / `dispatch` / `drain` / `pause` / `cancel_all` / `shutdown`）。
+- `runtime.rs`：宿主 tick —— 现读 cfg → `pump` → `drain` → 每秒一次速度表 →
+  有改动才 `flush(tasks.jsonl)` → 有改动/有进度才 `refresh`。无头用
+  `run_until_idle()` 按同一间隔手动 tick（`slint::Timer` 在无事件循环时不走）。
+- 停机顺序：`runtime.shutdown(5s)`（取消工作线程、保住 `.ghd`）**先于** `Engine::stop()`（落盘）。
+
+### 8f 平台外壳（降级，按任务书允许）
+`shell.rs` 的托盘/Dock **语义**早在第 75 步就齐了（五项菜单、两套速度小数口径、
+`shouldShowDockSpeed and shouldShowDockIcon` 条件、Windows 菜单钳制、激活原因映射）。
+Slint 1.18 无原生托盘/Dock/状态项能力，**没有硬造**：README 记了平台 API 方案
+（Linux `libappindicator`/`ksni` + `com.canonical.dbusmenu`；Windows `Shell_NotifyIcon` +
+`TrackPopupMenuEx`；macOS `NSStatusItem` + `NSMenu`）与接线方式（`TrayHost` trait +
+`NullTray` 缺省；`shell.rs` 契约不动）。
+
+### 8g 端到端验收
+见 §1 / §2。
+
+## 4. 本阶段改了什么滑点：一个真 bug（第 130 步）
+
+跑收口质量门时，Python 全量里冒出一条**新增**失败（单跑绿、全量红）。追下去是**真数据丢失**：
+
+- `ConfigStore::rebuild` 照 `settings::SPECS`（42 项 / 9 组）重建整份 `UserConfig.json`，
+  不认识的组/键全丢。
+- 真机上还有 feature pack 的组：`features/*/config.py` 的 `PackConfig.__init_subclass__`
+  （`app/models/pack.py:62-71`）把每个 `ConfigItem` `setattr` 到**全局 `cfg.__class__`**，
+  所以 `toDict()` 会把 `Bilibili` / `BitTorrent` / `ED2k` / `FFmpeg` / `FTP` / `GitHub` /
+  `HuggingFace` / `M3U8` / `YtDlp` 一起写盘。
+- 实测：`--set maxTaskNum=7` 之后文件 **163 行 → 66 行**。也就是说
+  `GHOST_UI=slint` 下用户改任何一项设置，**BT / ED2K / 网盘 / GitHub 配置会被静默删除**。
+- 修法：`rebuild` 改成**保序合并**（源里的组按原位置输出，已知组用归一化值 + 源里多出来的键
+  原样附在组尾，不认识的组整体原样带上；源里没有的已知组按 `SPECS` 顺序补末尾）。
+- 顺带把那条编码了错行为的旧单测改名反转，并让 Python 验收测试的 fixture 显式导入全部
+  `features/*/config.py`，从而**不再依赖测试执行顺序**（原来只有别的测试先导入过 pack 才会红）。
+
+## 5. 还剩什么（**未完成项，按重要性排序**）
+
+1. **窗口分支在本机无法验证**：本机没有 `DISPLAY`/Wayland，`winit` 窗口路线只过了编译、
+   单测与 `has_display()` 判定；窗口下的 `slint::Timer` 驱动 `Runtime::tick` 属于
+   「代码已接、缺少真机运行证据」。请在**有显示服务**的机器上跑一次
+   `cargo run -p gd3-ui`（关窗 → 退出码 0 → `tasks.jsonl` 落盘）后再算最终验收。
+2. **托盘 / Dock / 状态项**：按 §3.8f 降级（`NullTray` 缺省，语义层已就绪但没人消费）。
+3. **`update_service` 的宿主适配**：`FetchAsset` / `FetchRaw` / `Checksum` / `Unpack`
+   的执行层（`UpdateRuntime` 十个 `UpdateEffect`）已就位，缺的是 tokio 侧的 I/O 接线；
+   tar.xz / dmg 还受离线 `xz2` 缺包限制。
+4. **建任务链路（解析器）仍在 Python 侧**：Rust 只跑**已经在 `tasks.jsonl` 里**的任务，
+   不解析 URL、不生成草稿落盘。
+5. **`shouldPreserveLastModified` 的 `os.utime`** 与**限速门**（`SpeedMeter` 里
+   `waitForSpeedLimit` 的落点）尚未接进下载循环。
+6. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI。
+
+## 6. 已知差异与风险
+
+- **磁盘/协议格式未动**：`tasks.jsonl`（一行一 JSON、状态存枚举名如 `"COMPLETED"`）、
+  `.ghd`（只在整任务 COMPLETED 时删）、`UserConfig.json`（`indent=4`、无尾随换行、键序
+  按 Python `dir(class)` 口径）、aria2 JSON-RPC、浏览器扩展 WS v2 —— 全部保持。
+- **`UserConfig.json` 单一写者**：`GHOST_UI=slint` → Rust；未设/`qt` → Python。
+  **两边不能同时跑**（单实例锁不一样，整文件回写会互相覆盖）。这一点写在
+  `app/platform/ui_backend.py` 模块头与 `rust/README.md`。
+- **未知配置组/键一律保留**（第 130 步的口径）：比 Python 略保守 —— Python 下次 `save()`
+  会把「谁都没注册过的野键」丢掉，Rust 会带回去。单一写者场景下宁可留残留，不删用户数据。
+- **容错差异（继承自 Phase 1–4 口径）**：Python 在首个非法值处中断整个 `load`；Rust 逐键跳过。
+- **`--frames` 无头冒烟不推运行期**（保持「只启动不派发」语义），要真跑任务得加
+  `--until-idle`。
+- **跑 Python 全量必须带 `--continue-on-collection-errors`**：本机没有 `android/`
+  （`.gitignore` + `9c17647 refactor: remove Qt Android`），
+  `tests/test_android_pack_import.py` 模块级读 `android/app/build.gradle.kts` 导致收集期报错，
+  默认参数下 pytest 会**整轮中断、一个测试都不跑**。基线文件第 25 行就是这个错。
+- **本机资源**：939 MB / 2 核。全量 Python 套件**不能**与 Rust 编译同时跑
+  （曾触发 `Fatal Python error: Aborted`）。冷 clippy 约 25 分钟。
+- **`wreq` 是预发布版本**：TLS 指纹相关代码未在本阶段改动；改动需格外小心（ja4 +
+  HTTP/2 Akamai + UA 已实测对齐）。
+
+## 7. 怎么跑
+
+```bash
+source /root/gd3-env.sh
+cd /root/Ghost-Downloader-3
+
+# Slint 前端（无头冒烟）
+cargo build -p gd3-ui
+./rust/target/debug/gd3-ui --version
+./rust/target/debug/gd3-ui --headless --frames 3 --data-dir /tmp/gd3-smoke
+
+# 真下载（tasks.jsonl 里已有的任务）
+./rust/target/debug/gd3-ui --headless --until-idle --idle-timeout 60 --data-dir /tmp/e2e-dl
+
+# 走 Python 入口、切到 Slint；不带 GHOST_UI（或 =qt）仍是原 Qt
+GHOST_UI=slint .venv/bin/python Ghost-Downloader-3.py --version
+
+# 质量门
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui
+.venv/bin/python -m pytest -q --continue-on-collection-errors   # 与基线只比新增失败
+```
+
+**停止推进，等待人工验收。** 最先需要人工确认的是 §5.1（有显示服务的机器上跑一次窗口）。

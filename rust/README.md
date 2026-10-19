@@ -3333,7 +3333,7 @@ tick = 现读 cfg（maxTaskNum 改了下一 tick 就生效）
 
 端到端验收：`tests/runner_e2e.rs`（2 条，`TaskRunner` 直驱）、
 `tests/runtime_e2e.rs`（2 条，`boot::run(--until-idle)` 与 `Runtime::pause`/`start`）、
-`tests/test_config_roundtrip.py`（4 条 cfg 往返）。
+`tests/test_config_roundtrip.py`（6 条 cfg 往返）。
 
 ### 前端分派（`GHOST_UI`）
 
@@ -3353,6 +3353,27 @@ tick = 现读 cfg（maxTaskNum 改了下一 tick 就生效）
 **Rust**；`GHOST_UI=qt`（缺省）时是 **Python**。两边不能同时跑（锁不一样，整文件回写
 会互相覆盖）。
 
+### 配置整文件回写：不认识的组必须原样保留（第 130 步）
+
+`ConfigStore::save` 是**整文件回写**（Python 的 `cfg.set` 也是）。第 130 步之前它照
+`settings::SPECS`（42 项 / 9 个组）重建整份文件，于是磁盘上它不认识的组全被删掉。
+真机上那些组是**合法配置**：`features/*/config.py` 的 `PackConfig` 子类在
+`__init_subclass__`（`app/models/pack.py:62-71`）里把每个 `ConfigItem` `setattr` 到
+**全局 `cfg.__class__`**，所以 `toDict()` 会连 `Bilibili` / `BitTorrent` / `ED2k` /
+`FFmpeg` / `FTP` / `GitHub` / `HuggingFace` / `M3U8` / `YtDlp` 一起写盘。
+实测（真 Python 写的档）：`--set maxTaskNum=7` 之后文件 **163 行 → 66 行**，
+等于用户改任何一项设置就把 BT / ED2K / 网盘配置整段删掉。
+
+现在的口径（[`rebuild`]）：源里的组按**原位置**输出，已知组用归一化值 + 源里多出来的
+键原样附在组尾，Rust 不认识的组整体原样带上；源里没有的已知组按 `SPECS` 顺序补在末尾。
+代价写进了模块头「与 Python 的已知差异」：连「谁都没注册过的野键」也会被带回去
+（Python 下次 `save()` 会丢掉）—— 单一写者场景下宁可留着，也不要静默删用户数据。
+
+验收：`gd3-ui/src/config_store.rs` 的 `unknown_pack_groups_are_preserved_verbatim` /
+`unknown_keys_on_disk_survive_the_round_trip`，以及 `tests/test_config_roundtrip.py`
+（fixture 显式导入全部 `features/*/config.py`，所以写出的档是 18 组的真形态，
+且**与测试执行顺序无关**）。
+
 ### 平台外壳（托盘 / Dock / 状态项）：**降级**
 
 `shell.rs`（第 75 步）已经有全套**语义**（`tray_menu()` 五项顺序、`toTraySpeed` /
@@ -3370,6 +3391,24 @@ shouldShowDockIcon` 条件、Windows 菜单定位钳制、激活原因到信号�
 `set_tooltip(text)` / `set_icon(bytes)` / `set_dock_speed(text)`），宿主按平台选实现，
 `NullTray`（默认）只把 `shell.rs` 算好的东西丢掉。`shell.rs` 的返回类型已经是
 平台无关的，所以接的时候**不需要动它**。
+
+### 跑 Python 全量必须带 `--continue-on-collection-errors`
+
+本机没有 `android/`（`.gitignore` 里，且 `9c17647 refactor: remove Qt Android` 已删），
+而 `tests/test_android_pack_import.py` 在模块级读 `android/app/build.gradle.kts` →
+收集期报错，默认参数下 pytest 直接 `Interrupted: 1 error during collection`、
+**一个测试都不跑**。所以对比基线要用：
+
+```bash
+cd /root/Ghost-Downloader-3
+.venv/bin/python -m pytest -q --continue-on-collection-errors 2>&1 \
+  | grep -E '^(FAILED|ERROR) ' | sort > /root/run-failures.txt
+comm -13 /root/baseline-failures.txt /root/run-failures.txt   # 只看新增
+```
+
+（`/root/baseline-failures.txt` 第 25 行就是这个收集错误，说明基线也是这么跑的。）
+
+### 尚未接的
 
 尚未接的还有：`shouldPreserveLastModified` 的 `os.utime`、限速钩子
 （`SpeedMeter::waitForSpeedLimit`）、建任务链路（解析器仍在 Python 侧，Rust 只跑

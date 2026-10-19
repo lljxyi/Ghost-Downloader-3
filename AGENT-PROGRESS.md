@@ -9321,3 +9321,31 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
   `--continue-on-collection-errors`（基线文件里第 25 行就是这个错，说明基线也是这么跑的）。
 - 下一步：第 131 步 —— Phase 8 收口：质量门汇总 + `AGENT-DONE`。
 - 卡点：无
+
+## 第 131 步：Phase 8 收口 —— 质量门全绿 + `rust/README.md` 更新 + `AGENT-DONE`（2026-10-19 21:44）
+
+- 做了什么：
+  - 质量门四道**单独、顺序**跑完（本机 2 核 / 939 MB，Python 全量与 Rust 编译不同时跑）：
+    `cargo fmt --all --check` → OK；`cargo clippy --workspace --all-targets -- -D warnings`
+    → exit 0（`Finished dev profile in 25m 12s`）；
+    `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` → 全绿（`gd3-ui --lib`
+    **1165 passed**）；Python 全量 → `3 failed, 1370 passed, 8 skipped, 35 errors`，
+    与 `/root/baseline-failures.txt` 逐行 `comm` **新增 0 / 消失 0**；
+  - 用当前二进制重跑完工判定 1/3/4/6 的**真机证据**（不是回忆）：
+    `--version` exit 0、`--headless --frames 3` exit 0；
+    本地 `http.server 18743` + 300 KB 随机载荷 → `--headless --until-idle` → 摘要
+    `tasks=1, resumed=1, completed=1, ticks=2`、`cmp` → `BYTES_IDENTICAL`、`.ghd` 已删；
+    Python `Task.fromDict` 读回 `status=COMPLETED` / `completedAt=1792446083` /
+    `step0 progress=100`；`GHOST_UI=slint .venv/bin/python Ghost-Downloader-3.py --version`
+    → exit 0；`tests/test_ui_backend.py` 17 passed；
+  - `rust/README.md`：新增「配置整文件回写：不认识的组必须原样保留（第 130 步）」与
+    「跑 Python 全量必须带 `--continue-on-collection-errors`」两节，
+    `test_config_roundtrip.py` 条数 4 → 6；
+  - 新建 `/root/Ghost-Downloader-3/AGENT-DONE`：7 条完工判定逐条给证据、质量门数字、
+    8a–8g 各做了什么、第 130 步那个数据丢失 bug 的来龙去脉、**未完成项 6 条**（最重要的一条：
+    本机无 `DISPLAY`，窗口分支只有代码级/单测验证，需要人工在有显示服务的机器上跑一次
+    `cargo run -p gd3-ui`）、已知差异与风险、怎么跑。
+- 验证：见上（全部命令与数字都来自本轮实跑）。
+- 下一步：**停止推进，等人工验收**。验收建议按 `AGENT-DONE` §5 顺序：
+  ① 有显示服务的机器跑窗口分支；② 托盘/Dock；③ 更新检查宿主适配。Phase 8 的代码工作到此为止。
+- 卡点：无（唯一「非绿」的是基线里那些既有红灯，与本次工作无关）。
