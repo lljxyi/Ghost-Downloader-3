@@ -1606,6 +1606,126 @@ impl BrowserHub {
    文件留在盘上、`fileDeleteDenied` 也发不出去。现在摊成
    `TaskAction::DeleteFiles` / `DeleteDenied` 交给宿主。
 
+## 服务装配（`Engine` 的 `BrowserService` / `Aria2RpcService`）
+
+第 109–111 步把 `browser_service.py` 与 `aria2_rpc.py` 的逻辑搬完了，但 `engine.rs` 里
+`BrowserService` / `Aria2RpcService` 还是两个零大小桩。第 112 步把它们收敛成「只剩接线」的
+薄结构——**一行逻辑都不复制**，全部转调已有的三个模块。
+
+| Python | Rust | 状态 |
+|---|---|---|
+| `browser_service.py` 的帧层 | `gd3-servers::websocket` | Phase 5/6 |
+| `browser_service.py` 的载荷层 | `gd3-ui::browser_payload` | 第 110 步 |
+| `browser_service.py` 的会话状态机 | `gd3-ui::browser_session`（`BrowserHub`） | 第 111 步 |
+| `aria2_rpc.py` 的协议层 | `gd3-servers::aria2` | 第 109 步 |
+| `aria2_rpc.py` 的应用层 | `gd3-ui::aria2_actions` | 第 109 步 |
+| **两个服务的装配 + 配置快照** | **`gd3-ui::engine`（本节）** | **第 112 步** |
+
+### 结构
+
+```rust
+pub struct BrowserService { hub: BrowserHub }        // derive(Debug, Clone)
+
+impl BrowserService {
+    pub fn new(config: &mut UserConfig, settings: &EngineConfig) -> BrowserService;
+    pub fn hub(&self) -> &BrowserHub;
+    pub fn hub_mut(&mut self) -> &mut BrowserHub;
+    pub fn token(&self) -> &str;
+    pub fn apply_config(&mut self, config: &mut UserConfig, settings: &EngineConfig);
+}
+
+pub struct Aria2RpcService { should_draft_taken_download: bool }
+// derive(Clone, Copy, Debug, Default, PartialEq, Eq)
+
+impl Aria2RpcService {
+    pub fn new(should_draft_taken_download: bool) -> Self;
+    pub fn should_draft_taken_download(&self) -> bool;
+    pub fn set_should_draft_taken_download(&mut self, flag: bool);
+    pub fn apply_task_options(
+        &self,
+        features: &FeatureService,
+        presets: &[IdentityPreset],
+        request: Aria2Request,
+    ) -> Vec<Aria2Effect>;
+}
+```
+
+`Engine` 新增八个方法：
+
+```rust
+pub fn browser_mut(&mut self) -> &mut BrowserService;
+pub fn handle_browser_message(&mut self, session: SessionId, raw: &[u8]) -> Vec<SessionEffect>;
+pub fn browser_connected(&mut self, session: SessionId, peer_address: impl Into<String>);
+pub fn browser_disconnected(&mut self, session: SessionId) -> Vec<SessionEffect>;
+pub fn browser_tasks_changed(&mut self) -> Vec<SessionEffect>;
+pub fn regenerate_browser_token(&mut self) -> (String, Vec<SessionEffect>);
+pub fn apply_aria2_request(&self, request: Aria2Request) -> Vec<Aria2Effect>;
+pub fn refresh_services(&mut self);
+```
+
+模块级助手（都不导出，`Engine` 与测试共用一份）：
+
+```rust
+fn browser_token(config: &mut UserConfig) -> String;
+fn payload_defaults(config: &UserConfig) -> PayloadDefaults;
+fn should_draft_taken_download(config: &UserConfig) -> bool;
+fn presets_of(config: &UserConfig) -> Vec<IdentityPreset>;
+fn store_name_conflict_choice(config: &UserConfig) -> gd3_core::NameConflictChoice;
+```
+
+### 六条结构决策
+
+1. **构造期副作用照搬**：`browser_service.py:189-190` 的
+   `if not cfg.browserExtensionPairToken.value: cfg.set(..., token_urlsafe(16))` 是
+   `__init__` 里唯一的写操作，**不在任何消息路径上**。所以 `BrowserService::new` 收
+   `&mut UserConfig`，令牌为空时就地生成并写回。`token_urlsafe(16)` 是 16 字节 →
+   22 个 URL-safe base64 字符，`gd3_core::pair_token::generate()` 同口径（第 111 步已核）。
+   **落盘归 Phase 8**：Rust 侧只改内存里这份克隆，传进来的 `UserConfig` 不动。
+2. **`Aria2RpcService` 只留一项状态**：`_onTaskParsed` 里除了
+   `cfg.shouldDraftTakenDownload.value` 之外没有别的服务状态（`_coroutineRunner` /
+   `_parse` / `_addTask` 都换成了效果队列与 [`FeatureService`] 参数）。
+3. **`Engine` 提供两个「借用合成」入口**：`handle_browser_message` 一次调用内同时借
+   `features` / `tasks` / `browser` 三个**不同字段**，装好 `SessionContext` 交给
+   `BrowserHub::handle_message`，效果队列交出去后借用结束——形态与
+   `Engine::task_actions`（`RefCell<&mut TaskService>`）一致。
+4. **`delete_recoverably` 接真实现**：`xdg_data_home` 取
+   `crate::boot::generic_data_location()`（`$XDG_DATA_HOME` 或 `~/.local/share`），
+   uid 取 `gd3_core::trash::current_uid()`。Python 的 `deleteRecoverably` 走
+   `QFile.moveToTrash`，第 87 步已对齐；这里不再退化成 `|_| false`。
+5. **`apply_aria2_request` 现读 `shouldDraftTakenDownload`**：Python 在
+   `_onTaskParsed`（`aria2_rpc.py:220`）里每次现读 `cfg`，所以设置页改完立刻生效。
+   `Aria2RpcService` 自己那份快照是给「没有 `Engine` 的宿主」用的，靠
+   `refresh_services()` 同步——两条路径都在测试里钉住了。
+6. **配置变更靠显式 `refresh_services()`**：Python 每处现读 `cfg`，Rust 侧
+   `BrowserHub` 持的是快照（`token` / `defaults` / `should_draft` / `max_task_num`）。
+   `refresh_services()` 重取这四项 + `Aria2RpcService` 的开关，**不动监听器**——
+   监听器的启停是 `Engine::start` / `stop` 的事。
+
+### 与 Python 的已知差异
+
+- **11 个信号连线不存在**：`taskAdded` / `taskRemoved` / … / `speedChanged` 在
+  Python 里接 `_onTasksChanged`，Rust 侧由宿主在任务变化时直接调
+  `Engine::browser_tasks_changed()`（`QTimer.singleShot(0, ...)` 的延迟合并已在
+  第 111 步拆成 `note_tasks_changed` / `send_snapshots` 两步）。
+- **`cfg.set` 的落盘**：见决策 1。
+- **`loadCrx`（crx 解包）与 `fileWatcher` 仍归宿主**：`zip` crate 不在离线缓存里，
+  `install()` 只产出 `SessionEffect::InstallExtension`，宿主解包完回调
+  `BrowserHub::extension_installed`。
+
+### 九条新单测
+
+| 测试 | 钉住什么 |
+|---|---|
+| `browser_service_generates_a_pair_token_on_construction` | 空令牌 → 22 字符 + 写回引擎那份 cfg + 不动入参克隆 |
+| `an_existing_pair_token_is_kept` | 非空令牌不重生成 |
+| `payload_defaults_read_the_three_config_items` | `downloadFolder` / `preBlockNum` / `currentHeaders()` 三项 |
+| `a_browser_hello_reaches_the_hub_with_the_engine_token` | `browser_connected` + `handle_browser_message` 端到端：`ConnectionChanged` + `Send` + 认证置位 + `store` 不触发热更 |
+| `a_browser_hello_with_a_stale_token_is_closed` | 令牌不符 → 末尾 `Close`，`is_authenticated` 仍 `false` |
+| `regenerating_the_browser_token_writes_back_to_the_config` | 新令牌 ≠ 旧令牌、22 字符、hub 与 cfg 同步 |
+| `an_aria2_request_without_parsers_reports_a_parse_failure` | 空解析器链 → `Aria2Effect::ParseFailed`（不是 `AddTask`） |
+| `refresh_services_reloads_the_aria2_draft_flag` | 快照未刷新时仍是旧值，`refresh_services()` 之后才变 |
+| `the_store_choice_mirrors_the_config_choice` | `gd3_ui` 与 `gd3_core` 两份 `NameConflictChoice` 的转换（含非法值收敛） |
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

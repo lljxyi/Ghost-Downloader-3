@@ -67,10 +67,13 @@
 //!   `pack.pages()` / `pack.config` / `taskCardClass` 全是 Python 对象。
 //!   `gd3-core::loader`（第 87 步）只搬了「按依赖排序 manifest 列表」。
 //!   所以 `activate()` / `deactivate()` 在无 pack 时是空转（Python 同）；
-//! - `browserService` / `aria2RpcService` 仍是桩：装配点保留，行为没有。
-//!   两者共用 `featureService.parse` 这条端口（`browser_service.py:496` 与
-//!   `aria2_rpc.py:218` 各调一次），所以它们能接上的前提是先有 pack；
-//!   `loadCrx` / `deleteRecoverably` / `fileWatcher` 同理；
+//! - `browserService` / `aria2RpcService` 不再是桩（第 112 步）：逻辑分别在
+//!   [`crate::browser_payload`] / [`BrowserHub`] / [`crate::aria2_actions`]，
+//!   这里只剩装配、配置快照与两个端到端入口（[`Engine::handle_browser_message`] /
+//!   [`Engine::apply_aria2_request`]）。**解析器链仍然是空的**——`loadPacks` 要
+//!   `importlib` 加载 `features/` 下的 Python 子类（见上一条），所以两条入口在
+//!   没有 pack 时都只会得到 `ParseFailed`；`loadCrx`（crx 解包）/
+//!   `fileWatcher` 仍归宿主；
 //! - `probeConflict` 已接线（第 96 步）：`TaskConflictActions::probe` 转调
 //!   [`TaskService::probe_conflict_by_id`]，即 `TaskStore.probeConflict` +
 //!   `categoryService.outputFolderOf`；Python 里队列拿到的是 `Task` 对象，Rust 侧
@@ -88,9 +91,14 @@ use std::path::{Path, PathBuf};
 
 use gd3_core::config::UserConfig;
 use gd3_core::settings;
+use serde_json::Value;
 
+use crate::aria2_actions::{Aria2Effect, Aria2Request};
+use crate::browser_payload::PayloadDefaults;
+use crate::browser_session::{BrowserHub, SessionContext, SessionEffect, SessionId};
 pub use crate::category::CategoryService;
 pub use crate::feature_service::FeatureService;
+use crate::identity::IdentityPreset;
 use crate::name_conflict::{
     ConflictActions, ConflictEvent, ConflictTask, DialogOutcome, NameConflictChoice,
     NameConflictQueue, ProbeTarget,
@@ -165,32 +173,160 @@ fn max_task_num(config: &UserConfig) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// 桩服务
+// 服务装配
 // ---------------------------------------------------------------------------
 
 // `FeatureService` 不再是桩：真实现见 `crate::feature_service`（上面 `pub use`）。
 // `Engine::new` 的装配点、`Engine::start` / `Engine::stop` 的调用点都保留。
 
-/// `app/services/browser_service.py`（约 500 行）的桩：配对、WebSocket 帧、
-/// 建任务动作都未迁移。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BrowserService;
+/// `app/services/browser_service.py:171` 的 `BrowserService`。
+///
+/// 逻辑分三层搬完了：帧层 `gd3-servers::websocket`（Phase 5/6）、载荷层
+/// [`crate::browser_payload`]（第 110 步）、会话状态机 [`BrowserHub`]（第 111 步）。
+/// 本结构只剩 Python `__init__` 的**构造期副作用**与四项配置的快照：
+///
+/// - `if not cfg.browserExtensionPairToken.value: cfg.set(..., token_urlsafe(16))`
+///   ——空令牌就地生成并写回配置（`browser_service.py:189-190`）；
+/// - `BrowserHub` 的 `token` / `defaults` / `should_draft` / `max_task_num`。
+///
+/// 11 个信号接到 `_onTasksChanged` 这条连线在 Rust 侧不存在：宿主在任务变化时
+/// 直接调 [`Engine::browser_tasks_changed`]（延迟合并见第 111 步）。
+#[derive(Debug, Clone)]
+pub struct BrowserService {
+    hub: BrowserHub,
+}
 
 impl BrowserService {
-    pub fn new() -> Self {
-        BrowserService
+    /// `BrowserService.__init__`：令牌、载荷缺省、两个开关。
+    ///
+    /// `config` 是可变借用——令牌为空时要写回（Python 的 `cfg.set`）。Rust 侧
+    /// `UserConfig` 的落盘归 Phase 8，这里只改内存里这份克隆。
+    pub fn new(config: &mut UserConfig, settings: &EngineConfig) -> BrowserService {
+        let token = browser_token(config);
+        let mut hub = BrowserHub::new(token, payload_defaults(config));
+        hub.set_should_draft(should_draft_taken_download(config));
+        hub.set_max_task_num(settings.max_task_num);
+        BrowserService { hub }
+    }
+
+    pub fn hub(&self) -> &BrowserHub {
+        &self.hub
+    }
+
+    pub fn hub_mut(&mut self) -> &mut BrowserHub {
+        &mut self.hub
+    }
+
+    /// `cfg.browserExtensionPairToken.value` 的当前值（构造期生成后的那个）。
+    pub fn token(&self) -> &str {
+        self.hub.token()
+    }
+
+    /// 配置变更后重新取快照（Python 每处现读 `cfg`，Rust 侧是快照）。
+    ///
+    /// 令牌为空会重新生成——与 `__init__` 同一条路径，重复调用等价。
+    pub fn apply_config(&mut self, config: &mut UserConfig, settings: &EngineConfig) {
+        let token = browser_token(config);
+        self.hub.set_token(token);
+        self.hub.set_defaults(payload_defaults(config));
+        self.hub
+            .set_should_draft(should_draft_taken_download(config));
+        self.hub.set_max_task_num(settings.max_task_num);
     }
 }
 
-/// `app/services/aria2_rpc.py`（约 400 行）的桩：JSON-RPC 方法表与任务草稿
-/// 请求都未迁移。
+/// `app/services/aria2_rpc.py` 的 `Aria2RpcService`。
+///
+/// JSON-RPC 方法表 / HTTP 与 WebSocket 外壳在 `gd3-servers::aria2`（第 109 步），
+/// 解析与入队分流在 [`crate::aria2_actions`]。本结构只剩 `_onTaskParsed` 里
+/// 现读的那一项配置。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Aria2RpcService;
+pub struct Aria2RpcService {
+    /// `cfg.shouldDraftTakenDownload.value`（`aria2_rpc.py:220`）。
+    should_draft_taken_download: bool,
+}
 
 impl Aria2RpcService {
-    pub fn new() -> Self {
-        Aria2RpcService
+    pub fn new(should_draft_taken_download: bool) -> Self {
+        Aria2RpcService {
+            should_draft_taken_download,
+        }
     }
+
+    pub fn should_draft_taken_download(&self) -> bool {
+        self.should_draft_taken_download
+    }
+
+    pub fn set_should_draft_taken_download(&mut self, flag: bool) {
+        self.should_draft_taken_download = flag;
+    }
+
+    /// `applyTaskOptions(options, name)` + `_onTaskParsed`：转调
+    /// [`crate::aria2_actions::apply_task_options`]，不复制逻辑。
+    pub fn apply_task_options(
+        &self,
+        features: &FeatureService,
+        presets: &[IdentityPreset],
+        request: Aria2Request,
+    ) -> Vec<Aria2Effect> {
+        crate::aria2_actions::apply_task_options(
+            features,
+            presets,
+            request,
+            self.should_draft_taken_download,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 配置快照助手
+// ---------------------------------------------------------------------------
+
+/// `if not cfg.browserExtensionPairToken.value: cfg.set(..., token_urlsafe(16))`。
+///
+/// `token_urlsafe(16)` = 16 字节 → 22 个 URL-safe base64 字符，
+/// [`gd3_core::pair_token::generate`] 同口径（第 111 步）。
+fn browser_token(config: &mut UserConfig) -> String {
+    let existing = settings::read_text(config, "browserExtensionPairToken").unwrap_or_default();
+    if !existing.is_empty() {
+        return existing;
+    }
+    let token = gd3_core::pair_token::generate();
+    settings::write(
+        config,
+        "browserExtensionPairToken",
+        &Value::String(token.clone()),
+    );
+    token
+}
+
+/// `toTaskOptions` 读的三项配置（[`crate::browser_payload::PayloadDefaults`]）。
+fn payload_defaults(config: &UserConfig) -> PayloadDefaults {
+    PayloadDefaults {
+        download_folder: settings::read_text(config, "downloadFolder").unwrap_or_default(),
+        pre_block_num: int_attr(config, "preBlockNum"),
+        current_headers: settings::current_headers(config).unwrap_or_default(),
+    }
+}
+
+/// `cfg.shouldDraftTakenDownload.value`（`browser_service.py:483` /
+/// `aria2_rpc.py:220`）。
+fn should_draft_taken_download(config: &UserConfig) -> bool {
+    settings::read_bool(config, "shouldDraftTakenDownload").unwrap_or(false)
+}
+
+/// `identity.parsePresets(cfg.identityPresets.value)` 的落点。
+fn presets_of(config: &UserConfig) -> Vec<IdentityPreset> {
+    let raw = settings::read(config, "identityPresets").map(|value| value.to_string());
+    crate::identity::parse_presets(raw.as_deref())
+}
+
+/// [`TaskService::add`] 吃的 `gd3_core::NameConflictChoice`。
+///
+/// `crate::name_conflict::NameConflictChoice` 是配置/对话框那条线的镜像，两者靠
+/// `as_str()` + `parse()` 转（第 111 步的结论）。
+fn store_name_conflict_choice(config: &UserConfig) -> gd3_core::NameConflictChoice {
+    gd3_core::NameConflictChoice::parse(name_conflict_choice(config).as_str()).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +473,8 @@ impl Engine {
     /// `config` 是 `UserConfig` 的克隆（Python 里是全局 `cfg`）；
     /// `tasks_path` 是 `APP_DATA_DIR / "tasks.jsonl"`（`TaskStore._path`）。
     pub fn new(config: &UserConfig, tasks_path: impl Into<PathBuf>) -> Engine {
-        let config = config.clone();
+        // `mut`：`BrowserService.__init__` 在令牌为空时会写回 `browserExtensionPairToken`。
+        let mut config = config.clone();
         let tasks_path = tasks_path.into();
         let settings = EngineConfig::from_config(&config);
         let mut trace: Trace = Vec::new();
@@ -386,7 +523,7 @@ impl Engine {
                 .to_string(),
         );
         trace.push("construct:BrowserService".to_string());
-        let browser = BrowserService::new();
+        let browser = BrowserService::new(&mut config, &settings);
 
         trace.push("construct:browserListener".to_string());
         let browser_listener = create_browser_listener(
@@ -399,7 +536,7 @@ impl Engine {
 
         trace.push("connect:aria2RpcService <- featureService.parse, taskService.add".to_string());
         trace.push("construct:Aria2RpcService".to_string());
-        let aria2 = Aria2RpcService::new();
+        let aria2 = Aria2RpcService::new(should_draft_taken_download(&config));
 
         trace.push("construct:aria2Listener".to_string());
         let aria2_listener = create_aria2_listener(
@@ -526,6 +663,95 @@ impl Engine {
 
     pub fn aria2(&self) -> &Aria2RpcService {
         &self.aria2
+    }
+
+    /// `browserService` 的写入口（令牌重生成、配置刷新）。
+    pub fn browser_mut(&mut self) -> &mut BrowserService {
+        &mut self.browser
+    }
+
+    /// `_onMessageReceived(stream, message)` 的端到端入口。
+    ///
+    /// 一次调用内同时借 `features` / `tasks` / `browser`（三个不同字段）：
+    /// [`SessionContext`] 装好后交给 [`BrowserHub::handle_message`]，效果队列
+    /// 交出去后借用结束。`delete_recoverably` 接真实现——`xdg_data_home` 取
+    /// [`crate::boot::generic_data_location`]，uid 取
+    /// [`gd3_core::trash::current_uid`]（Python 的 `deleteRecoverably` 走
+    /// `QFile.moveToTrash`，第 87 步已对齐）。
+    pub fn handle_browser_message(&mut self, session: SessionId, raw: &[u8]) -> Vec<SessionEffect> {
+        let presets = presets_of(&self.config);
+        let conflict_choice = store_name_conflict_choice(&self.config);
+        let xdg_data_home = crate::boot::generic_data_location();
+        let uid = gd3_core::trash::current_uid();
+        let mut trash =
+            |path: &Path| gd3_core::trash::delete_recoverably(path, &xdg_data_home, uid);
+        let mut context = SessionContext {
+            parsers: self.features.parsers(),
+            presets: &presets,
+            tasks: &mut self.tasks,
+            conflict_choice,
+            delete_recoverably: &mut trash,
+        };
+        self.browser
+            .hub_mut()
+            .handle_message(session, raw, &mut context)
+    }
+
+    /// `BrowserService.onConnected(stream, peerAddress)`。
+    pub fn browser_connected(&mut self, session: SessionId, peer_address: impl Into<String>) {
+        self.browser.hub_mut().on_connected(session, peer_address);
+    }
+
+    /// `BrowserService.onDisconnected(stream)`。
+    pub fn browser_disconnected(&mut self, session: SessionId) -> Vec<SessionEffect> {
+        self.browser.hub_mut().on_disconnected(session)
+    }
+
+    /// `_onTasksChanged()`：11 个任务/速度信号共用的槽。
+    ///
+    /// Python 用 `QTimer.singleShot(0, ...)` 合并同一轮里的多次触发；Rust 侧是
+    /// [`BrowserHub::note_tasks_changed`]（判重）+ [`BrowserHub::send_snapshots`]
+    /// 两步显式化（第 111 步），这里合成一次调用。
+    pub fn browser_tasks_changed(&mut self) -> Vec<SessionEffect> {
+        self.browser.hub_mut().tasks_changed(&self.tasks)
+    }
+
+    /// `regenerateToken()` + `cfg.set(cfg.browserExtensionPairToken, ...)`。
+    pub fn regenerate_browser_token(&mut self) -> (String, Vec<SessionEffect>) {
+        let (token, effects) = self.browser.hub_mut().regenerate_token();
+        settings::write(
+            &mut self.config,
+            "browserExtensionPairToken",
+            &Value::String(token.clone()),
+        );
+        (token, effects)
+    }
+
+    /// `aria2RpcService.applyTaskOptions(options, name)` 的端到端入口。
+    ///
+    /// `shouldDraftTakenDownload` **现读配置**：Python 在 `_onTaskParsed` 里每次
+    /// `cfg.shouldDraftTakenDownload.value`，所以设置页改完立刻生效，不需要
+    /// [`Engine::refresh_services`]。
+    pub fn apply_aria2_request(&self, request: Aria2Request) -> Vec<Aria2Effect> {
+        let presets = presets_of(&self.config);
+        crate::aria2_actions::apply_task_options(
+            &self.features,
+            &presets,
+            request,
+            should_draft_taken_download(&self.config),
+        )
+    }
+
+    /// 配置变更后刷新两个服务的快照（Python 没有这一步，它每处现读 `cfg`）。
+    ///
+    /// 令牌为空会重新生成；`shouldDraftTakenDownload` / 载荷三项 /
+    /// `maxTaskNum` 一并重取。**监听器的启停不在这里**——那是
+    /// [`Engine::start`] / [`Engine::stop`] 的事。
+    pub fn refresh_services(&mut self) {
+        let settings = EngineConfig::from_config(&self.config);
+        self.browser.apply_config(&mut self.config, &settings);
+        self.aria2
+            .set_should_draft_taken_download(should_draft_taken_download(&self.config));
     }
 
     pub fn browser_listener(&self) -> &Listener {
@@ -1170,5 +1396,186 @@ mod tests {
         let engine = Engine::new(&config, "/nonexistent/tasks.jsonl");
         assert_eq!(engine.category().rules().len(), 1);
         assert_eq!(engine.category().rules()[0].name, "X");
+    }
+
+    // ── 服务装配（第 112 步）──────────────────────────────────────────────
+
+    #[test]
+    fn browser_service_generates_a_pair_token_on_construction() {
+        let config = settings::default_config();
+        assert_eq!(
+            settings::read_text(&config, "browserExtensionPairToken").as_deref(),
+            Some("")
+        );
+
+        let engine = Engine::new(&config, "/nonexistent/tasks.jsonl");
+        let token = engine.browser().token();
+        // `token_urlsafe(16)`：16 字节 → 22 个 URL-safe base64 字符。
+        assert_eq!(token.len(), 22);
+        // 写回了引擎自己那份配置（Python 的 `cfg.set`）。
+        assert_eq!(
+            settings::read_text(engine.config(), "browserExtensionPairToken").as_deref(),
+            Some(token)
+        );
+        // 传进来的那份是克隆，没有被改。
+        assert_eq!(
+            settings::read_text(&config, "browserExtensionPairToken").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_existing_pair_token_is_kept() {
+        let config = config_with(&[("browserExtensionPairToken", json!("fixed-token"))]);
+        let engine = Engine::new(&config, "/nonexistent/tasks.jsonl");
+        assert_eq!(engine.browser().token(), "fixed-token");
+    }
+
+    #[test]
+    fn payload_defaults_read_the_three_config_items() {
+        let config = config_with(&[
+            ("downloadFolder", json!("/tmp/gd3-dl")),
+            ("preBlockNum", json!(8)),
+        ]);
+        let defaults = payload_defaults(&config);
+        assert_eq!(defaults.download_folder, "/tmp/gd3-dl");
+        assert_eq!(defaults.pre_block_num, 8);
+        // `currentHeaders()` 缺省是第一个预设（`cfg.py:351`）。
+        assert_eq!(defaults.current_headers, settings::base_headers());
+    }
+
+    #[test]
+    fn a_browser_hello_reaches_the_hub_with_the_engine_token() {
+        let mut engine = Engine::new(&settings::default_config(), "/nonexistent/tasks.jsonl");
+        let token = engine.browser().token().to_string();
+        engine.browser_connected(7, "127.0.0.1:50000");
+        assert_eq!(engine.browser().hub().session_count(), 1);
+
+        let frame = serde_json::to_vec(&json!({
+            "type": "hello",
+            "requestId": "r1",
+            "protocolVersion": crate::browser_payload::PROTOCOL_VERSION,
+            "token": token,
+            "extensionVersion": "2.2.0",
+            "installType": "store",
+        }))
+        .expect("序列化 hello");
+        let effects = engine.handle_browser_message(7, &frame);
+
+        assert!(matches!(effects[0], SessionEffect::ConnectionChanged));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, SessionEffect::Send { .. }))
+        );
+        assert!(
+            engine
+                .browser()
+                .hub()
+                .session(7)
+                .expect("会话")
+                .is_authenticated
+        );
+        // 没有装扩展的副作用：`store` 安装不会触发热更。
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, SessionEffect::InstallExtension { .. }))
+        );
+    }
+
+    #[test]
+    fn a_browser_hello_with_a_stale_token_is_closed() {
+        let mut engine = Engine::new(&settings::default_config(), "/nonexistent/tasks.jsonl");
+        engine.browser_connected(1, "127.0.0.1:1");
+        let frame = serde_json::to_vec(&json!({
+            "type": "hello",
+            "protocolVersion": crate::browser_payload::PROTOCOL_VERSION,
+            "token": "nope",
+        }))
+        .expect("序列化 hello");
+
+        let effects = engine.handle_browser_message(1, &frame);
+        assert!(matches!(
+            effects.last(),
+            Some(SessionEffect::Close { session: 1 })
+        ));
+        assert!(
+            !engine
+                .browser()
+                .hub()
+                .session(1)
+                .expect("会话")
+                .is_authenticated
+        );
+    }
+
+    #[test]
+    fn regenerating_the_browser_token_writes_back_to_the_config() {
+        let mut engine = Engine::new(&settings::default_config(), "/nonexistent/tasks.jsonl");
+        let before = engine.browser().token().to_string();
+
+        let (token, _effects) = engine.regenerate_browser_token();
+        assert_ne!(token, before);
+        assert_eq!(token.len(), 22);
+        assert_eq!(engine.browser().token(), token);
+        assert_eq!(
+            settings::read_text(engine.config(), "browserExtensionPairToken").as_deref(),
+            Some(token.as_str())
+        );
+    }
+
+    #[test]
+    fn an_aria2_request_without_parsers_reports_a_parse_failure() {
+        let engine = Engine::new(&settings::default_config(), "/nonexistent/tasks.jsonl");
+        let effects = engine.apply_aria2_request(Aria2Request {
+            url: "https://example.com/a.bin".to_string(),
+            output_folder: "/tmp".to_string(),
+            headers: Vec::new(),
+            client_profile: String::new(),
+            name: String::new(),
+        });
+        assert_eq!(effects.len(), 1);
+        match &effects[0] {
+            Aria2Effect::ParseFailed { url, .. } => {
+                assert_eq!(url, "https://example.com/a.bin");
+            }
+            other => panic!("期望 ParseFailed，实得 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_services_reloads_the_aria2_draft_flag() {
+        let mut engine = Engine::new(&settings::default_config(), "/nonexistent/tasks.jsonl");
+        assert!(!engine.aria2().should_draft_taken_download());
+
+        settings::write(
+            engine.config_mut(),
+            "shouldDraftTakenDownload",
+            &json!(true),
+        );
+        // 快照没刷新之前还是旧值（Python 现读，这里要显式同步）。
+        assert!(!engine.aria2().should_draft_taken_download());
+        engine.refresh_services();
+        assert!(engine.aria2().should_draft_taken_download());
+    }
+
+    #[test]
+    fn the_store_choice_mirrors_the_config_choice() {
+        assert_eq!(
+            store_name_conflict_choice(&settings::default_config()),
+            gd3_core::NameConflictChoice::KeepBoth
+        );
+        let config = config_with(&[("nameConflict", json!("overwrite"))]);
+        assert_eq!(
+            store_name_conflict_choice(&config),
+            gd3_core::NameConflictChoice::Overwrite
+        );
+        // 非法值由 `correct()` 收敛成第一项，转一次仍是 `KeepBoth`。
+        let config = config_with(&[("nameConflict", json!("bogus"))]);
+        assert_eq!(
+            store_name_conflict_choice(&config),
+            gd3_core::NameConflictChoice::KeepBoth
+        );
     }
 }
