@@ -524,6 +524,7 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     if headless {
         let window = crate::create_headless();
         bridge.install(&window);
+        crate::settings_dialogs::install(&window, Rc::clone(&writer));
         crate::push_settings(&window, &writer.config(), &default_download);
         engine.borrow().tasks().refresh(&window);
         for _ in 0..frames {
@@ -537,6 +538,7 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     } else {
         let window = crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?;
         bridge.install(&window);
+        crate::settings_dialogs::install(&window, Rc::clone(&writer));
         crate::push_settings(&window, &writer.config(), &default_download);
         engine.borrow().tasks().refresh(&window);
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;

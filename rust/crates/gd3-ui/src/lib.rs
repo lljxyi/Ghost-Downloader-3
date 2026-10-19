@@ -69,6 +69,7 @@ pub mod sequence_matcher;
 pub mod setting_card_group;
 pub mod setting_cards;
 pub mod settings_bridge;
+pub mod settings_dialogs;
 pub mod settings_group;
 pub mod settings_spec;
 pub mod settings_writer;
@@ -664,36 +665,26 @@ pub struct SettingsActions {
     // 索引调整、删除确认框归调用方，镜像 _onPick/_onRemoveClicked）。
     pub headers_preset_pick: Box<dyn Fn(i64)>,
     pub headers_preset_remove: Box<dyn Fn(i64)>,
-    // 第 46 步：标头预设添加/编辑动作（添加收 ()；编辑收 int 索引
-    // 原样——越界守卫/缺失回退归调用方；「取消」收 ()；「确定」回发
-    // (索引, draft_to_header_preset 归一化预设)，cfg 写与重推归调用方）。
-    pub headers_preset_add_requested: Box<dyn Fn()>,
-    pub headers_preset_edit_requested: Box<dyn Fn(i64)>,
-    pub headers_preset_edit_closed: Box<dyn Fn()>,
+    // 第 46 步：标头预设「确定」回发 (索引, draft_to_header_preset 归一化
+    // 预设)，cfg 写与重推归调用方。入口与「取消」只改窗口属性、不写 cfg，
+    // 因此不进动作集 —— 见 `settings_dialogs`（第 120 步）。
     pub headers_preset_edit_submit: Box<dyn Fn((i64, headers::HeaderPreset))>,
     // 第 43 步：身份预设动作——开关收 (索引, bool)、删除收当前索引
     // （cfg 写、索引边界检查、删除确认框归调用方，镜像
     // _onToggled/_onRemoveClicked；编辑/添加对话框留欠账步）。
     pub identity_preset_toggle: Box<dyn Fn(i64, bool)>,
     pub identity_preset_remove: Box<dyn Fn(i64)>,
-    // 第 47 步：身份预设添加/编辑动作（添加收 ()；编辑收 int 索引原样；
-    // 「取消」收 ()；「确定」回发 (索引, draft_to_identity_preset 归一化
+    // 第 47 步：身份预设「确定」回发 (索引, draft_to_identity_preset 归一化
     // 预设)——编辑态 isEnabled 由调用方经 apply_identity_preset_draft
-    // 继承，cfg 写与 categoriesChanged 式重推归调用方）。
-    pub identity_preset_add_requested: Box<dyn Fn()>,
-    pub identity_preset_edit_requested: Box<dyn Fn(i64)>,
-    pub identity_preset_edit_closed: Box<dyn Fn()>,
+    // 继承，cfg 写与 categoriesChanged 式重推归调用方。入口与「取消」见
+    // `settings_dialogs`。
     pub identity_preset_edit_submit: Box<dyn Fn((i64, identity::IdentityPreset))>,
     // 第 44 步：库分类动作（恢复默认收 ()、删除收 categoryId 原样；
     // cfg 写与重推归调用方）。
     pub category_reset: Box<dyn Fn()>,
     pub category_remove: Box<dyn Fn(String)>,
-    // 第 45 步：分类添加/编辑动作（添加/取消收 ()；编辑入口收
-    // categoryId 原样——查行与开框归调用方；确定收归一化后的
-    // 规则，cfg 写与 categoriesChanged 重推归调用方）。
-    pub category_add_requested: Box<dyn Fn()>,
-    pub category_edit_requested: Box<dyn Fn(String)>,
-    pub category_edit_closed: Box<dyn Fn()>,
+    // 第 45 步：分类「确定」收归一化后的规则，cfg 写与
+    // categoriesChanged 重推归调用方。入口与「取消」见 `settings_dialogs`。
     pub category_edit_submit: Box<dyn Fn(category::CategoryRule)>,
     // 第 38 步：关联 + 软件组动作（CloseMode 收字面量，索引→字面量
     // 换算在 install 层 close_mode.rs）。
@@ -824,18 +815,16 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     let headers_remove = actions.clone();
     window
         .on_headersPresetRemoveRequested(move |i| (headers_remove.headers_preset_remove)(i as i64));
-    // 第 46 步：标头预设添加/编辑入口与确定草稿（确定回发
-    // draft_to_header_preset 归一化预设；cfg 写与重推归调用方）。
-    let headers_add = actions.clone();
-    window.on_headersPresetAddRequested(move || (headers_add.headers_preset_add_requested)());
-    let headers_edit = actions.clone();
-    window.on_headersPresetEditRequested(move |i| {
-        (headers_edit.headers_preset_edit_requested)(i as i64)
-    });
-    let headers_closed = actions.clone();
-    window.on_headersPresetEditClosed(move || (headers_closed.headers_preset_edit_closed)());
+    // 第 46 步：标头预设「确定」（回发 draft_to_header_preset 归一化预设；
+    // cfg 写与重推归调用方）。入口与「取消」由 `settings_dialogs::install`
+    // 装 —— 它们只改窗口属性，不进动作集。
+    //
+    // 第 120 步补：确定后收起覆盖层。Python 的 `dialog.exec()` 返回真值即关框，
+    // Slint 的覆盖层不会自己收（identity 分支第 47 步已在做）。
     let headers_submit = actions.clone();
+    let headers_win = window.clone_strong();
     window.on_headersPresetEditAccepted(move |d| {
+        headers_win.set_headersEditVisible(false);
         (headers_submit.headers_preset_edit_submit)((
             d.index as i64,
             headers::draft_to_header_preset(&d.name, &d.pairs),
@@ -859,18 +848,11 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_identityPresetRemoveRequested(move |i| {
         (identity_remove.identity_preset_remove)(i as i64)
     });
-    // 第 47 步：身份预设添加/编辑注册（「确定」先过 `validate()` 口径：
-    // 至少一个 Host，否则只置 hostsError 不收起、不发事件——精确镜像
-    // 需 parse_hosts 归一化后判空，故收起责任落在 Rust 侧；通过后清错、
-    // 收起覆盖层并回发 draft_to_identity_preset 归一化预设）。
-    let identity_add = actions.clone();
-    window.on_identityPresetAddRequested(move || (identity_add.identity_preset_add_requested)());
-    let identity_edit = actions.clone();
-    window.on_identityPresetEditRequested(move |i| {
-        (identity_edit.identity_preset_edit_requested)(i as i64)
-    });
-    let identity_closed = actions.clone();
-    window.on_identityPresetEditClosed(move || (identity_closed.identity_preset_edit_closed)());
+    // 第 47 步：身份预设「确定」注册（先过 `validate()` 口径：至少一个
+    // Host，否则只置 hostsError 不收起、不发事件——精确镜像需 parse_hosts
+    // 归一化后判空，故收起责任落在 Rust 侧；通过后清错、收起覆盖层并回发
+    // draft_to_identity_preset 归一化预设）。入口与「取消」见
+    // `settings_dialogs`。
     let identity_submit = actions.clone();
     let identity_win = window.clone_strong();
     window.on_identityPresetEditAccepted(move |d| {
@@ -890,19 +872,15 @@ pub fn install_settings_actions(window: &AppWindow, actions: std::rc::Rc<Setting
     window.on_categoryResetRequested(move || (category_reset.category_reset)());
     let category_remove = actions.clone();
     window.on_categoryRemoveRequested(move |id| (category_remove.category_remove)(id.to_string()));
-    // 第 45 步：分类添加/编辑动作注册（确定草稿经五字段构造即
-    // category::draft_to_rule 归一化后转发——对话框端只回发原样
-    // 字段，容错口径在镜像层）。
-    let category_add = actions.clone();
-    window.on_categoryAddRequested(move || (category_add.category_add_requested)());
-    let category_edit = actions.clone();
-    window.on_categoryEditRequested(move |id| {
-        (category_edit.category_edit_requested)(id.to_string())
-    });
-    let category_close = actions.clone();
-    window.on_categoryEditClosed(move || (category_close.category_edit_closed)());
+    // 第 45 步：分类「确定」注册（草稿经五字段构造即
+    // category::draft_to_rule 归一化后转发——对话框端只回发原样字段，
+    // 容错口径在镜像层）。入口与「取消」见 `settings_dialogs`。
+    //
+    // 第 120 步补：确定后收起覆盖层（同 headers 分支）。
     let category_submit = actions.clone();
+    let category_win = window.clone_strong();
     window.on_categoryEditAccepted(move |draft| {
+        category_win.set_categoryEditVisible(false);
         (category_submit.category_edit_submit)(category::draft_to_rule(
             &draft.id,
             &draft.name,
@@ -2290,27 +2268,19 @@ mod smoke {
         // 第 42 步：标头预设动作命中记录。
         let headers_pick_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
         let headers_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
-        // 第 46 步：标头预设添加/编辑动作命中记录。
-        let headers_add_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
-        let headers_edit_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
-        let headers_close_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 46 步：标头预设「确定」命中记录（第 120 步起入口/取消归
+        // `settings_dialogs`，不再进动作集）。
         let headers_submit_hits: Rc<RefCell<Vec<(i64, crate::headers::HeaderPreset)>>> =
             Rc::new(RefCell::new(Vec::new()));
         // 第 43 步：身份预设动作命中记录。
         let identity_toggle_hits: Rc<RefCell<Vec<(i64, bool)>>> = Rc::new(RefCell::new(Vec::new()));
         let identity_remove_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
-        let identity_add_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
-        let identity_edit_hits: Rc<RefCell<Vec<i64>>> = Rc::new(RefCell::new(Vec::new()));
-        let identity_close_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let identity_submit_hits: Rc<RefCell<Vec<(i64, crate::identity::IdentityPreset)>>> =
             Rc::new(RefCell::new(Vec::new()));
         // 第 44 步：库分类动作命中记录。
         let category_reset_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
         let category_remove_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        // 第 45 步：分类添加/编辑动作命中记录（提交收归一化规则）。
-        let category_add_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
-        let category_edit_hits: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let category_close_hits: Rc<RefCell<Vec<()>>> = Rc::new(RefCell::new(Vec::new()));
+        // 第 45 步：分类「确定」命中记录（提交收归一化规则）。
         let category_submit_hits: Rc<RefCell<Vec<crate::category::CategoryRule>>> =
             Rc::new(RefCell::new(Vec::new()));
         let actions = Rc::new(crate::SettingsActions {
@@ -2391,19 +2361,7 @@ mod smoke {
                 let h = headers_remove_hits.clone();
                 move |i| h.borrow_mut().push(i)
             }),
-            // 第 46 步：添加/编辑入口与确定草稿（采集调用发生即可）。
-            headers_preset_add_requested: Box::new({
-                let h = headers_add_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
-            headers_preset_edit_requested: Box::new({
-                let h = headers_edit_hits.clone();
-                move |i| h.borrow_mut().push(i)
-            }),
-            headers_preset_edit_closed: Box::new({
-                let h = headers_close_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
+            // 第 46 步：确定草稿（采集调用发生即可）。
             headers_preset_edit_submit: Box::new({
                 let h = headers_submit_hits.clone();
                 move |pair| h.borrow_mut().push(pair)
@@ -2417,19 +2375,7 @@ mod smoke {
                 let h = identity_remove_hits.clone();
                 move |i| h.borrow_mut().push(i)
             }),
-            // 第 47 步：身份预设添加/编辑入口与确定草稿。
-            identity_preset_add_requested: Box::new({
-                let h = identity_add_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
-            identity_preset_edit_requested: Box::new({
-                let h = identity_edit_hits.clone();
-                move |i| h.borrow_mut().push(i)
-            }),
-            identity_preset_edit_closed: Box::new({
-                let h = identity_close_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
+            // 第 47 步：确定草稿。
             identity_preset_edit_submit: Box::new({
                 let h = identity_submit_hits.clone();
                 move |pair| h.borrow_mut().push(pair)
@@ -2443,19 +2389,7 @@ mod smoke {
                 let h = category_remove_hits.clone();
                 move |s| h.borrow_mut().push(s)
             }),
-            // 第 45 步：添加/编辑动作（提交收 draft_to_rule 归一化产物）。
-            category_add_requested: Box::new({
-                let h = category_add_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
-            category_edit_requested: Box::new({
-                let h = category_edit_hits.clone();
-                move |s| h.borrow_mut().push(s)
-            }),
-            category_edit_closed: Box::new({
-                let h = category_close_hits.clone();
-                move || h.borrow_mut().push(())
-            }),
+            // 第 45 步：确定动作（提交收 draft_to_rule 归一化产物）。
             category_edit_submit: Box::new({
                 let h = category_submit_hits.clone();
                 move |rule| h.borrow_mut().push(rule)
@@ -2562,10 +2496,6 @@ mod smoke {
         // 第 46 步：添加/编辑 invoke 通路；确定草稿 → draft_to_header_
         // preset 归一化预设（名称 strip + 逐行 parseHeaderLine 拆对，
         // 无冒号/名称含空白行镜像丢弃）。
-        window.invoke_headersPresetAddRequested();
-        assert_eq!(headers_add_hits.borrow().len(), 1);
-        window.invoke_headersPresetEditRequested(0);
-        assert_eq!(headers_edit_hits.borrow().last().copied(), Some(0));
         window.invoke_headersPresetEditAccepted(crate::HeadersEditDraft {
             index: 0,
             name: "  A2  ".into(),
@@ -2593,8 +2523,6 @@ mod smoke {
         );
         window.invoke_headersPresetPairsEdited("x-a: 1".into());
         assert_eq!(window.get_headersEditDuplicateWarning(), "");
-        window.invoke_headersPresetEditClosed();
-        assert_eq!(headers_close_hits.borrow().len(), 1);
         // 第 43 步：身份预设 invoke 通路（开关 (索引, bool)、删除索引）。
         window.invoke_identityPresetToggled(1, false);
         assert_eq!(
@@ -2606,10 +2534,6 @@ mod smoke {
         // 第 47 步：身份预设添加/编辑 invoke 通路——「确定」先过
         // validate() 口径（hosts 归一化后判空）：拒绝时只置 hostsError、
         // 不收起、不发事件；通过后清错、收起覆盖层并回发归一化预设。
-        window.invoke_identityPresetAddRequested();
-        assert_eq!(identity_add_hits.borrow().len(), 1);
-        window.invoke_identityPresetEditRequested(2);
-        assert_eq!(identity_edit_hits.borrow().last().copied(), Some(2));
         window.set_identityEditVisible(true);
         window.invoke_identityPresetEditAccepted(crate::IdentityEditDraft {
             index: 1,
@@ -2637,8 +2561,6 @@ mod smoke {
         assert!(submitted_p.is_enabled, "草稿态恒 True，编辑态由调用方继承");
         assert!(!window.get_identityEditHostsError(), "通过后清错");
         assert!(!window.get_identityEditVisible(), "通过后收起覆盖层");
-        window.invoke_identityPresetEditClosed();
-        assert_eq!(identity_close_hits.borrow().len(), 1);
         // 第 44 步：库分类 invoke 通路（恢复默认 ()、删除收 id 原样）。
         window.invoke_categoryResetRequested();
         assert_eq!(category_reset_hits.borrow().len(), 1);
@@ -2650,13 +2572,6 @@ mod smoke {
         // 第 45 步：添加/编辑 invoke 通路；draft_to_rule 归一化产物
         // 断言（名称空兜/扩展名去点去空/不存在项）。图标 choices
         // 25 项先落在有值推送段（push 断言见缺省段）。
-        window.invoke_categoryAddRequested();
-        assert_eq!(category_add_hits.borrow().len(), 1);
-        window.invoke_categoryEditRequested("x".into());
-        assert_eq!(
-            category_edit_hits.borrow().last().map(|s| s.as_str()),
-            Some("x")
-        );
         window.invoke_categoryEditAccepted(crate::CategoryEditDraft {
             id: "x".into(),
             name: "自定义".into(),
@@ -2673,8 +2588,6 @@ mod smoke {
         );
         assert_eq!(got.folder.as_deref(), Some("{default}/X"));
         assert_eq!(got.category_id, "x");
-        window.invoke_categoryEditClosed();
-        assert_eq!(category_close_hits.borrow().len(), 1);
         window.set_downloadFolder("/edited/path".into());
         assert_eq!(window.get_downloadFolder(), "/edited/path");
     }

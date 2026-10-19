@@ -8527,3 +8527,121 @@ if self._preset is not None:
 2. 4 个平台副作用：剪贴板（`clipboard.rs` 已有）、商店 URL（`open_url`）、CRX 解包、拉起浏览器。
 3. `update_service` 接线（受 `zip` / `xz2` 离线缺包限制）。
 4. P2–P6 剩余 UI。
+
+## 第 120 步：`gd3-ui::settings_dialogs`（九个覆盖层开合）
+
+**2026-10-19 07:55**
+
+第 117–119 步把设置页的「写回」半边接完，但 `SettingsActions` 里还挂着九个
+`*AddRequested` / `*EditRequested` / `*EditClosed`，每次点击都进 `take_deferred()` 的待办名单。
+它们**不写 cfg**：只改窗口上的 `headersEditVisible` / `headersEditIndex` 之类属性。
+`SettingsWriter` 不持窗口，硬塞进去只会让「cfg 半边」和「窗口半边」搅在一起。这一步把它们
+摘出来，装到单独一层：`crates/gd3-ui/src/settings_dialogs.rs`（**373 行 / 12 单测**）。
+
+### 覆盖面
+
+```text
+Slint 回调 ─┬→ *AddRequested / *EditRequested ──→ settings_dialogs::open_*
+            │                                          ↓ 读 writer.get(attr) 的逻辑值
+            │                                     lib.rs::open_*_edit（第 108 步就有的回显）
+            └→ *EditClosed ────────────────────→ settings_dialogs::close_*（只 set_*Visible(false)）
+```
+
+| Slint 回调 | Python 源 | 这里 |
+|---|---|---|
+| `headersPresetAddRequested` | `setting_cards.py:719-727` | `open_headers` + `None` |
+| `headersPresetEditRequested` | `setting_cards.py:729-736` | `open_headers` + `Some(i)` |
+| `headersPresetEditClosed` | 覆盖层「取消」 | `close_headers` |
+| `identityPresetAddRequested` | `setting_cards.py:565-574` | `open_identity` + `None` |
+| `identityPresetEditRequested` | `setting_cards.py:576-586` | `open_identity` + `Some(i)` |
+| `identityPresetEditClosed` | 覆盖层「取消」 | `close_identity` |
+| `categoryAddRequested` | `category_settings.py:129-133` | `open_category_new` |
+| `categoryEditRequested` | `category_settings.py:135-142` | `open_category` |
+| `categoryEditClosed` | 覆盖层「取消」 | `close_category` |
+
+### 关键决定：分工按**回调**切，不按主题切
+
+`window.on_<callbackName>(closure)` 对同一个回调**二次安装是替换不是叠加**。所以不能把
+「设置页的全部回调」交给一个模块装：`install_settings_actions`（`lib.rs`）留
+`*EditAccepted`（提交草稿要 `SettingsActions`），`settings_dialogs` 装 `*Requested` /
+`*Closed`。两边的回调名互不相交，谁装谁生效。
+
+### `SettingsActions` 49 → 40 字段
+
+删掉的九个字段（`lib.rs:621` 起）：
+
+```text
+headers_preset_add / headers_preset_edit / headers_preset_close
+identity_preset_add / identity_preset_edit / identity_preset_close
+category_add / category_edit / category_close
+```
+
+`settings_writer.rs` 里对应的九个 `Rc::clone` 与字段一并删掉，`defer()` 名单
+**13 → 4**：`copyPairToken` / `openStoreUrl` / `chromiumInstall` / `exportCrx`
+（四个平台副作用，留给下一步）。单测
+`the_deferred_actions_name_what_is_still_missing` 断言收到 4 项。
+
+### 顺手补的既有缺陷：headers / category 的 accept 之后不收框
+
+`headersPresetEditAccepted` 与 `categoryEditAccepted` 的闭包原来只调动作、不
+`set_*EditVisible(false)`。Python 那边是模态 `dialog.exec()`，用户点「确定」后
+`accept()` 关框、`_save()` 写盘在同一栈帧里；这里不关框 = 覆盖层留在屏幕上。
+两个 accept 闭包各补 `window.clone_strong()` + `set_*EditVisible(false)`，
+**先收框再调动作**（差一帧以内，语义等价）。identity 的 accept 本来就关了。
+
+### 三条越界守卫，三档不同
+
+| 覆盖层 | Python 行为 | 这里 |
+|---|---|---|
+| 身份预设 | `if index < 0 or index >= len(presets): return`（`:578-579`） | 照抄 |
+| 标头预设 | **无守卫**，直接 `presets[index]`（`:732`）→ `IndexError` | 静默返回 |
+| 库分类 | `categoryById` 查不到就 `return`（`:137-138`） | 照抄（`category_by_id`） |
+
+标头那条写成静默返回而不是 `panic!`：`headersEditIndex` 是普通整数属性，越界索引
+只可能来自手改过的模型，UI 不该因此崩。
+
+### `SettingsWriter::categories` 改 `pub`
+
+`open_category` 要「按 id 查分类」，而「空表 → 八预设」是 `CategoryService._load`
+的口径（`category_service.py:136-143`），已经落在 `SettingsWriter::categories` 里。
+改 `pub` 复用，不在 `settings_dialogs` 重写一遍 —— 两处各写一份必然漂移。
+
+`open_category` 每次从 cfg 重读分类表，不持内存副本：Python 的 `_onEditClicked`
+也是现读 `categoryService.categories`。语义等价（都是「查不到就不开」）。
+
+### 一条实测纠错（测试错、实现对）
+
+`editing_an_identity_preset_echoes_it` 第一版按「`identityPresets` 缺省是空表」写：
+先 `identity_preset_submit` 追加一项，再取 `index = 0` 回显。挂在
+`left: 2, right: 1` —— 因为**缺省的 `identityPresets` 有 1 项**（「百度网盘客户端」，
+`settings.rs` 的 `Kind::JsonList` 缺省值，第 119 步已实测过）。改成「追加后按实际条数取
+`count - 1`」，实现未改。
+
+### 与 Python 的已知差异
+
+- **不是模态**：Python 用 `dialog.exec()` 阻塞，Slint 覆盖层是异步属性；
+  `*EditClosed` 与 `*EditAccepted` 都只是回调。
+- **草稿状态留在窗口上**：Python 的对话框对象持有草稿，`exec()` 返回即销毁；
+  这里靠 `headersEdit*` / `identityEdit*` / `categoryEdit*` 一组属性，取消后不清空
+  （下次打开会覆盖，无害）。
+- **`close_*` 只置 `Visible = false`**：不重置 `*EditIndex` / `*EditId`，
+  与 Python「对话框销毁即丢弃」不等价，但 Slint 侧下次打开会先写这些属性。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：零错零警告（`/tmp/ck120b.log`，5m11s —— 期间一次
+  `identity` unused import 修复后重跑）；
+- `cargo test -p gd3-ui --lib settings_dialogs`：**12 passed**（`/tmp/t120b.log`）；
+- `cargo test -p gd3-ui --lib`：**1034 passed / 0 failed**（1022 + 12，`/tmp/t120lib.log`）；
+- `cargo test --workspace`：**1589 passed / 0 failed / 28 段**（`/tmp/t120ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c120.log`，3m28s）；
+- Python 侧没改一行。
+
+### 下一步（第 121 步）
+
+1. **四个平台副作用**（`take_deferred()` 里剩的全部）：剪贴板（`clipboard.rs` 已有实现）/
+   商店 URL（`open_url`）/ CRX 解包 / 拉起浏览器。
+2. `update_service` 接线：`plan_*` 接到 `gd3-net::sources::WreqTransport` 与更新卡片；
+   解包受 `zip` / `xz2` 离线缺包限制。
+3. P2–P6 剩余 UI：建任务链路、其它对话框、组件库、OOBE、平台外壳。

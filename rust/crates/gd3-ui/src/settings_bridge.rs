@@ -326,11 +326,11 @@ mod tests {
         bridge.install(&window);
 
         window.invoke_copyPairToken();
-        // 第 119 步之后 `categoryResetRequested` 会真写盘，这里换一个仍待办的
-        // 对话框动作（开合类）来钉「待办不进改动列表」。
-        window.invoke_categoryAddRequested();
+        // 第 119 步之后 `categoryResetRequested` 会真写盘；第 120 步之后对话框
+        // 开合也不在动作集里了 —— 这里用两个平台副作用钉「待办不进改动列表」。
+        window.invoke_chromiumInstall();
         let drained = bridge.drain(&window);
-        assert_eq!(drained.deferred, ["copyPairToken", "categoryAddRequested"]);
+        assert_eq!(drained.deferred, ["copyPairToken", "chromiumInstall"]);
         assert!(drained.changes.is_empty());
         assert!(!drained.repushed);
         assert!(!path.exists());

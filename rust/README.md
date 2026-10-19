@@ -2615,6 +2615,110 @@ pub fn merge_pypi_releases<E>(
 | `pending_pack_id_strips_the_suffix` | 后缀剥离、空 id 拒绝、重复后缀 |
 | `updater_name_*` / `app_dir_*` / `updater_command_*`（5 条） | `updater.exe` 与 `updater`、macOS 上溯两级、argv 五项、补丁优先于 `app_new`、`Detach` 分平台、两个 skip 分支 |
 
+## 设置页覆盖层的开合（`gd3-ui::settings_dialogs`，第 120 步）
+
+第 119 步之后还剩 13 个 `defer` 项。这一步接掉 9 个「开对话框 / 关对话框」动作，剩 4 个
+平台副作用（剪贴板 / 商店 URL / CRX 解包 / 拉起浏览器）。
+
+### 为什么另起一层，而不是塞进 `SettingsWriter`
+
+这九个动作一个都不写 cfg：它们只改 `AppWindow` 上的 `headersEditVisible` /
+`headersEditIndex` / `identityEditVisible` / `categoryEditId` 之类属性。第 117 步把它们
+放进 `SettingsActions` 并 `defer`，是因为动作集当时是「Slint 回调 → Rust 闭包」的唯一
+通路；但 `SettingsWriter` 只持 `ConfigStore`，拿不到 `&AppWindow`。
+
+这一步的选择是**把这九个字段从 `SettingsActions` 删掉**（49 → 40 字段），新建
+`settings_dialogs::install(&window, Rc<SettingsWriter>)` 直接装这九个回调：
+
+```rust
+pub fn install(window: &AppWindow, writer: Rc<SettingsWriter>);
+pub fn open_headers(window: &AppWindow, writer: &SettingsWriter, index: Option<i64>);
+pub fn open_identity(window: &AppWindow, writer: &SettingsWriter, index: Option<i64>);
+pub fn open_category_new(window: &AppWindow);
+pub fn open_category(window: &AppWindow, writer: &SettingsWriter, category_id: &str);
+pub fn close_headers / close_identity / close_category(window: &AppWindow);
+```
+
+`install_settings_actions` 继续装 `*EditAccepted`（提交草稿要 `SettingsActions`）。分工
+必须按**回调**切而不是按「主题」切：`window.on_<callback>` 对同一个回调二次安装是
+**替换**而不是叠加，同一个回调装两处会静默丢掉前一处。
+
+| Slint 回调 | Python 源 | 这里 |
+|---|---|---|
+| `headersPresetAddRequested` | `setting_cards.py:719-727` | `open_headers(.., None)` |
+| `headersPresetEditRequested` | `setting_cards.py:729-736` | `open_headers(.., Some(i))` |
+| `headersPresetEditClosed` | 覆盖层「取消」 | `close_headers` |
+| `identityPresetAddRequested` | `setting_cards.py:565-574` | `open_identity(.., None)` |
+| `identityPresetEditRequested` | `setting_cards.py:576-586` | `open_identity(.., Some(i))` |
+| `identityPresetEditClosed` | 覆盖层「取消」 | `close_identity` |
+| `categoryAddRequested` | `category_settings.py:129-133` | `open_category_new` |
+| `categoryEditRequested` | `category_settings.py:135-142` | `open_category` |
+| `categoryEditClosed` | 覆盖层「取消」 | `close_category` |
+
+每个闭包各持一份 `Weak<AppWindow>` 与 `Rc<SettingsWriter>`：`window.run()` 期间回调活到
+窗口销毁之后，持强引用会成环。
+
+### 三条越界守卫
+
+- **身份预设照抄 Python 的守卫**：`_onEditClicked` 自己写着 `if index < 0 or
+  index >= len(presets): return`（`setting_cards.py:578-579`）。
+- **标头预设没有可照抄的守卫**：Python 那边直接 `presets[index]`（`:732`），越界会抛
+  `IndexError`。这里静默返回 —— Slint 的 `headersEditIndex` 是普通整数属性，越界索引
+  只可能来自手改过的模型。
+- **库分类查不到就不开**：`categoryById` 返回 `None` 时 `return`
+  （`category_settings.py:137-138`）。
+
+列表长度一律从 `SettingsWriter::get` 的**逻辑值**取（也就是 `correct()` 之后的那份），
+与 `open_*_edit` 里重新 `parse_*` 的输入同源。为此把
+`SettingsWriter::categories`（`settings_writer.rs:536`）从私有改成 `pub` ——
+`CategoryService._load` 口径的「空表 → 八预设」在这一层，重复实现会漂。
+
+### 顺手补的既有缺陷：确定之后不收起覆盖层
+
+Slint 的覆盖层不会因为 `*EditAccepted` 自己收起来。第 47 步的 identity 分支已经显式
+`set_identityEditVisible(false)`，但第 45 步的 category 与第 46 步的 headers 一直漏着 ——
+点「确定」写完 cfg，框还杵在那儿。这一步在 `install_settings_actions` 的两个 accept
+闭包里各补一行：
+
+```rust
+let headers_win = window.clone_strong();
+window.on_headersPresetEditAccepted(move |d| {
+    headers_win.set_headersEditVisible(false);   // ← Python 的 dialog.exec() 返回真值即关框
+    ...
+});
+```
+
+### 十二条新单测
+
+`settings_dialogs.rs` 的 12 条测试走「headless 窗口 + 临时目录 writer」：
+
+| 覆盖面 | 断言 |
+|---|---|
+| 标头添加态 | `visible`、`index == -1`、名称空、标头回显 `currentHeaders()` |
+| 标头编辑态 | `index == 0`、名称「默认」、标头非空 |
+| 标头越界 | 索引 9 → 不开框、`headersEditIndex` 一个都没动 |
+| 标头取消 | 开→关，`visible == false` |
+| 身份添加态 | 名称/hosts/UA 空、TLS 指纹落「跟随全局默认」（索引 0） |
+| 身份编辑态 | 经公开动作 `identity_preset_edit_submit(-1, ..)` 追加一项后回显 |
+| 身份越界 | 索引 5 → 不开框 |
+| 身份取消 | 开→关 |
+| 分类添加态 | `categoryEditId == ""`、字段全空、icon 索引 0 |
+| 分类编辑态 | `cat_video` → id/名称/扩展名逗号连接/`{default}/Video` |
+| 分类查不到 | `cat_nope` → 不开框 |
+| 分类取消 | 开→关 |
+
+一条实测纠错：`identityPresets` 的缺省**不是空表**，`Network/IdentityPresets` 缺省就带
+一项「百度网盘客户端」（`tests/fixtures/user_config_default_linux.json`）。第一版测试
+按「空表」写，`list_len == 1` 的断言挂在 2 上 —— 改测试（按实际条数追加），不改实现。
+
+### 与 Python 的已知差异
+
+- **`headers_preset_edit_requested` 的越界**：Python 抛 `IndexError`，这里静默忽略。
+- **`category_edit_requested` 的陈旧 id**：Python 的 `CategoryService` 持内存表，删掉的
+  分类立刻查不到；这里每次都从 cfg 重读，语义相同（都是「查不到就不开」）。
+- **收框时机**：Python 是模态 `dialog.exec()`，收框与写 cfg 在同一栈帧；这里 `*EditAccepted`
+  先收框再调动作，宿主看到改动时框已经关了（差一帧以内）。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是
@@ -2626,11 +2730,11 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
 
 这条已经落地：第 113 步 `config_store`（读写语义）→ 第 117 步 `settings_writer`
 （动作 → cfg 键）→ 第 118 步 `settings_bridge`（装到窗口上 + 宿主钩子）→ 第 119 步
-`settings_writer` 的列表写回。剩下的是：
+`settings_writer` 的列表写回 → 第 120 步 `settings_dialogs`（九个覆盖层开合）。
+剩下的是：
 
 1. **更新检查接线**：`update_service` 的 `plan_*` 接到 `gd3-net::sources::WreqTransport`
    与更新卡片；解包（zip / tar.xz / dmg）要宿主工具或新 crate（`zip` / `xz2` 不在离线缓存里）。
-2. **13 个 `defer` 项**：剪贴板 / 商店 / CRX 解包 / 拉起浏览器四个平台副作用，以及
-   `headersPreset*` / `identityPreset*` / `category*` 的九个「开对话框 / 关对话框」动作
-   （要 `&AppWindow` 改 `headersEditIndex` / `*EditVisible`）。
+2. **4 个 `defer` 项**：剪贴板（`clipboard.rs` 已有实现）/ 商店 URL / CRX 解包 /
+   拉起浏览器四个平台副作用。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

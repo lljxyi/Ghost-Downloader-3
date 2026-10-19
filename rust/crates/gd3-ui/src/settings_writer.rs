@@ -65,15 +65,18 @@
 //!
 //! ## 还没接的部分
 //!
-//! 十三个动作仍走 [`SettingsWriter::defer`]：
+//! 四个平台副作用仍走 [`SettingsWriter::defer`]：
 //!
-//! | 类别 | 动作 | 为什么留后 |
-//! |---|---|---|
-//! | 平台副作用 | `pair_token_copy` / `store_url_open` / `chromium_install` / `chromium_crx_export` | 剪贴板、浏览器、扩展解包归平台层 |
-//! | 对话框开合 | `headers_preset_*` / `identity_preset_*` / `category_*` 的 `*_requested` 与 `*_edit_closed` | 要 `&AppWindow` 改 `headersEditIndex` / `*EditVisible`，而 [`SettingsWriter`] 不持窗口 |
+//! | 动作 | 为什么留后 |
+//! |---|---|
+//! | `pair_token_copy` / `store_url_open` / `chromium_install` / `chromium_crx_export` | 剪贴板、浏览器、扩展解包归平台层 |
 //!
 //! `take_deferred()` 能列出被记下的动作名，测试里钉住了这份名单 —— 它是一张**待办清单**，
 //! 不是「悄悄丢掉用户的编辑」。
+//!
+//! 九个「对话框开合」动作（`*AddRequested` / `*EditRequested` / `*EditClosed`）第 120 步
+//! 起**不在动作集里**：它们不写 cfg，只改 `AppWindow` 的 `*EditVisible` / `*EditIndex`，
+//! 由 [`crate::settings_dialogs`] 直接装到窗口上。
 //!
 //! ## 与 Python 的已知差异
 //!
@@ -533,7 +536,7 @@ impl SettingsWriter {
 
     /// 当前分类表：`CategoryService._load`（`category_service.py:136-143`）口径 ——
     /// `categoryRules` 为空 → 八预设。
-    fn categories(&self) -> Vec<category::CategoryRule> {
+    pub fn categories(&self) -> Vec<category::CategoryRule> {
         let raw = self.get("categoryRules").map(|value| value.to_string());
         category::parse_rules(raw.as_deref())
     }
@@ -554,14 +557,14 @@ impl SettingsWriter {
     // 动作集
     // -----------------------------------------------------------------------
 
-    /// 把 27 个标量方法装成 [`SettingsActions`]（49 个字段全覆盖）。
+    /// 把 27 个标量方法 + 9 个列表方法装成 [`SettingsActions`]（40 个字段全覆盖）。
     ///
     /// 每个闭包只做「一个属性名 + 一个值」；单位换算、索引→字面量、URL 拼装
     /// 都在 `install_settings_actions` 那一层（见 `lib.rs` 的同名注释）。
     ///
-    /// 其余 13 个动作（平台副作用 4 个 + 对话框开合 9 个）调 [`SettingsWriter::defer`]：
-    /// 前者归平台层，后者要 `&AppWindow` 改编辑态属性。
-    /// 这不是静默丢弃 —— [`SettingsWriter::take_deferred`] 会把名字交出去。
+    /// 剩 4 个平台副作用调 [`SettingsWriter::defer`]（剪贴板 / 商店 URL / CRX 解包 /
+    /// 拉起浏览器），归平台层。这不是静默丢弃 —— [`SettingsWriter::take_deferred`]
+    /// 会把名字交出去。
     pub fn actions(self: &Rc<Self>) -> SettingsActions {
         let folder = Rc::clone(self);
         let max_task_num = Rc::clone(self);
@@ -597,21 +600,12 @@ impl SettingsWriter {
         let chromium_crx_export = Rc::clone(self);
         let headers_preset_pick = Rc::clone(self);
         let headers_preset_remove = Rc::clone(self);
-        let headers_preset_add_requested = Rc::clone(self);
-        let headers_preset_edit_requested = Rc::clone(self);
-        let headers_preset_edit_closed = Rc::clone(self);
         let headers_preset_edit_submit = Rc::clone(self);
         let identity_preset_toggle = Rc::clone(self);
         let identity_preset_remove = Rc::clone(self);
-        let identity_preset_add_requested = Rc::clone(self);
-        let identity_preset_edit_requested = Rc::clone(self);
-        let identity_preset_edit_closed = Rc::clone(self);
         let identity_preset_edit_submit = Rc::clone(self);
         let category_reset = Rc::clone(self);
         let category_remove = Rc::clone(self);
-        let category_add_requested = Rc::clone(self);
-        let category_edit_requested = Rc::clone(self);
-        let category_edit_closed = Rc::clone(self);
         let category_edit_submit = Rc::clone(self);
 
         SettingsActions {
@@ -665,15 +659,6 @@ impl SettingsWriter {
             headers_preset_remove: Box::new(move |index| {
                 headers_preset_remove.headers_preset_remove(index)
             }),
-            headers_preset_add_requested: Box::new(move || {
-                headers_preset_add_requested.defer("headersPresetAddRequested")
-            }),
-            headers_preset_edit_requested: Box::new(move |_| {
-                headers_preset_edit_requested.defer("headersPresetEditRequested")
-            }),
-            headers_preset_edit_closed: Box::new(move || {
-                headers_preset_edit_closed.defer("headersPresetEditClosed")
-            }),
             headers_preset_edit_submit: Box::new(move |(index, preset)| {
                 headers_preset_edit_submit.headers_preset_submit(index, &preset)
             }),
@@ -683,29 +668,11 @@ impl SettingsWriter {
             identity_preset_remove: Box::new(move |index| {
                 identity_preset_remove.identity_preset_remove(index)
             }),
-            identity_preset_add_requested: Box::new(move || {
-                identity_preset_add_requested.defer("identityPresetAddRequested")
-            }),
-            identity_preset_edit_requested: Box::new(move |_| {
-                identity_preset_edit_requested.defer("identityPresetEditRequested")
-            }),
-            identity_preset_edit_closed: Box::new(move || {
-                identity_preset_edit_closed.defer("identityPresetEditClosed")
-            }),
             identity_preset_edit_submit: Box::new(move |(index, preset)| {
                 identity_preset_edit_submit.identity_preset_submit(index, &preset)
             }),
             category_reset: Box::new(move || category_reset.category_reset()),
             category_remove: Box::new(move |id| category_remove.category_remove(&id)),
-            category_add_requested: Box::new(move || {
-                category_add_requested.defer("categoryAddRequested")
-            }),
-            category_edit_requested: Box::new(move |_| {
-                category_edit_requested.defer("categoryEditRequested")
-            }),
-            category_edit_closed: Box::new(move || {
-                category_edit_closed.defer("categoryEditClosed")
-            }),
             category_edit_submit: Box::new(move |rule| category_edit_submit.category_submit(&rule)),
         }
     }
@@ -1028,16 +995,9 @@ mod tests {
         (actions.store_url_open)("https://microsoftedge.microsoft.com/addons".into());
         (actions.chromium_install)();
         (actions.chromium_crx_export)();
-        (actions.headers_preset_add_requested)();
-        (actions.headers_preset_edit_requested)(0);
-        (actions.headers_preset_edit_closed)();
-        (actions.identity_preset_add_requested)();
-        (actions.identity_preset_edit_requested)(0);
-        (actions.identity_preset_edit_closed)();
-        (actions.category_add_requested)();
-        (actions.category_edit_requested)("cat_video".into());
-        (actions.category_edit_closed)();
 
+        // 第 120 步起只剩四个平台副作用：对话框开合不在动作集里
+        // （见 `settings_dialogs`）。
         assert_eq!(
             writer.take_deferred(),
             [
@@ -1045,15 +1005,6 @@ mod tests {
                 "openStoreUrl",
                 "chromiumInstall",
                 "exportCrx",
-                "headersPresetAddRequested",
-                "headersPresetEditRequested",
-                "headersPresetEditClosed",
-                "identityPresetAddRequested",
-                "identityPresetEditRequested",
-                "identityPresetEditClosed",
-                "categoryAddRequested",
-                "categoryEditRequested",
-                "categoryEditClosed",
             ]
         );
         // 待办清单里的动作一个都不碰文件，也不进改动列表。
