@@ -9082,3 +9082,36 @@ Phase 8 只剩：
 2. **更新卡片 / 进度条 UI**：`UpdateTable` → `progress_toast::ProgressToastState`
    （第 71 步已有数据模型）+ 设置页更新卡片。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
+
+## 第 125 步：任务草稿对话框接线（`gd3-ui::task_draft_ui`）（2026-10-19 13:12）
+
+第 63/100 步把 `app/view/dialogs/task_draft.py`（349 行）的**状态机**搬完了
+（`task_draft.rs` / `draft.rs` / `draft_card.rs` / `card_groups.rs` / `option_cards.rs`），
+但没有窗口承载。这一步补「状态机 → Slint 属性」的那一层，并把对话框挂进 `AppWindow`。
+
+- 做了什么：
+  - 新增 `rust/crates/gd3-ui/src/task_draft_ui.rs`（1604 行）：`Texts`（全部文案）/
+    `TaskDraftUi`（状态机 + URL 文本 + 两个设置卡 + 1 秒防抖）/ `DraftView`（一次性
+    快照：属性 + 行模型 + 统计标签）/ `DraftHost`（宿主钩子：解析、冲突探测、
+    `canEdit`、子对话框、任务落库）/ `apply` / `refresh` / `install`；
+    `mod tests` 28 条单测。
+  - 新增 `rust/crates/gd3-ui/ui/task_draft.slint`（470 行）：遮罩 + 面板 + 编辑器 +
+    结果列表 + 两个设置卡 + 三个按钮。
+  - `ui/appwindow.slint`：加 27 个 `taskDraft*` 属性 + 11 个回调 + 覆盖层实例化
+    （`url-text` / `folder-text` / `subworker-value` 用双向绑定，关框清空依赖这条）。
+  - `ui/app_shell.slint`：`ShellButton` 加 `enabled`（对应
+    `QPushButton.setEnabled(False)` —— 草稿的「下载」在 `canConfirm()` 为假时禁用）。
+  - `src/lib.rs`：加 `pub mod task_draft_ui;`。
+- 验证：
+  - `cargo test -p gd3-ui --lib`：**1115 passed / 0 failed**（第 124 步 1087 + 28，
+    `/tmp/t125a.log`，含 `cargo test` 冷编译 ~11 分钟）；
+  - `cargo fmt --all && cargo fmt --all --check`：通过。
+- 已知差异（写进模块头）：没有模态事件循环（`exec()` → `taskDraftVisible` 覆盖层，
+  关框发 `UiEffect::Closed`）；剪贴板**读**未迁移（`open()` 接受调用方给的文本，
+  `boot.rs` 传空串）；`featureService.draftCard(task)` 的图标层（`QFileIconProvider`
+  是平台位图）不迁移，只保留 `editable` / `conflict` / `category` 三个语义位；
+  `PrimarySplitPushButton` 拆成「下载」/「稍后下载」两个按钮；批量 URL / 导入文件 /
+  编辑任务 / 选目录四个子对话框只发效果（宿主默认空操作）；解析同步调用
+  `DraftHost::parse` 而不是 `coroutineRunner.submit`。
+- 下一步：Phase 8e —— 把 `gd3-net` 的 `HttpEngine` 接进运行期（任务真的能下载）。
+- 卡点：无

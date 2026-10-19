@@ -390,33 +390,43 @@ timeout 1200 cargo test -p gd3-core -p gd3-net -p gd3-servers
   ```
   确认是自己这轮起的再杀，不要动别人的。
 
-### 12. Phase 7 剩余工作的优先级（当前主线）
+### 12. Phase 8 目标：把 Slint 接成可运行应用（当前主线）
 
-Phase 5–6 已收官（26 个影子开关为终态）。现在只剩 UI。按**能跑起来的顺序**推进，
-不要按文件大小顺序：
+Phase 1–7 已完成。Phase 7 产出的是**纯库**：没有 `main`、没有事件循环、没接
+`TaskService`、没读写 `UserConfig.json`，`Ghost-Downloader-3.py` 入口仍走 Qt。
+Phase 8 就是把这些接上。按顺序推进，每步可独立验证：
 
-| 优先级 | 目标 | Python 源 | 规模 |
-|---|---|---|---|
-| **P0 主链路** | 主窗口 + 任务卡片 + 任务抽屉 | `windows/main_window.py`(753)、`cards/task_cards.py`(569)、`dialogs/task_drawer.py`(523) | ~1850 行 |
-| **P1 设置页收尾** | 剩余设置卡片 + 卡片分组容器 | `components/setting_cards.py`(949)、`setting_card_group.py`(290)、`card_groups.py`(191) | ~1430 行 |
-| **P2 建任务链路** | 任务草稿 + 计划 + 批量 URL + 选文件 + 重名 | `dialogs/task_draft.py`(349)、`plan_task.py`(100)、`batch_url.py`(184)、`file_select.py`(252)、`name_conflict.py`(82) | ~970 行 |
-| **P3 其它对话框** | 编辑任务 / 包信息 / 字幕 / 扩展安装 / 发行说明 | `dialogs/edit_task.py`(127)、`pack_info.py`(106)、`subtitle_select.py`(88)、`extension_install.py`(133)、`release_info.py`(123) | ~580 行 |
-| **P4 组件库** | 范围滑块 / 选项卡 / 引导列表 / Markdown / token 输入等 | `components/` 下 12 个文件 | ~1900 行 |
-| **P5 首次启动** | OOBE 向导 | `windows/oobe_window.py`(971) | ~970 行 |
-| **P6 平台外壳** | 托盘 / Dock / macOS 状态项 | `shell/tray.py`(205)、`dock.py`(141)、`mac_status_item.py`(112) | ~460 行 |
+| 子阶段 | 目标 | 验收方式 |
+|---|---|---|
+| **8a 可运行骨架** | `gd3-ui` 有 `main`：起窗口、事件循环、干净退出 | `cargo run -p gd3-ui` 能起窗口；无头环境用 `--headless` 冒烟 |
+| **8b 任务数据接线** | 接 `gd3-core` 的 TaskService，列表显示 `tasks.jsonl` 里的真实任务 | 造几条任务记录 -> 启动 -> 列表内容正确 |
+| **8c cfg 读写接管** | `UserConfig.json` 由 Rust 双向读写 | 读->改->写回逐字节一致（时间戳类除外）；Python 侧能读回 |
+| **8d 页面接线** | 设置页回写、对话框开合、任务抽屉动作、草稿创建接真实数据 | 每个动作有断言：改前/改后 cfg 或 tasks 的差异 |
+| **8e 下载引擎接线** | 把 `gd3-net` 接上，任务能真实下载 | 起本地 HTTP 服务 -> 加任务 -> 下载完成 -> 文件逐字节校验 |
+| **8f 平台外壳** | 托盘 / Dock | Slint 1.18 无原生能力。**允许降级**：留 TODO + 记录平台 API 方案，不要硬造 |
+| **8g 端到端验收** | 完整链路跑通 | 见「完工判定」 |
 
-**为什么 P0 优先**：没有主窗口 + 任务卡片 + 抽屉，前面所有数据层都无法验证「真的能跑」。
-先把主链路打通，后面的页面才有承载点。OOBE 只在首次启动出现，可以最后做。
+**已自行推进的部分**（第 79–124 步）：`settings_writer` / `settings_bridge` /
+`settings_dialogs` / `extension_crx` / `extension_actions` / `extension_install` /
+`update_service` / `gd3-net::sources` / `task_draft_ui`。
 
-**Phase 7 的判定标准**（与 Phase 5/6 不同）：
+#### 与 Qt 的共存（硬要求）
 
-- UI 没有「两侧逐字节一致」这个概念，改为**语义镜像**：先实证 Python 的原始行为
-  （`cfg.py` 默认值、`set_*` 边界、字符串格式化的精确口径），再在 Rust 逐条复刻，
-  实证结论写进进度笔记；
-- **不追求像素一致**，但**配置键名、默认值、取值范围、格式化输出必须一致**
-  （`UserConfig.json` 两侧要能互相读写）；
-- 每个 Slint 页面都要有**无头冒烟测试**（`MinimalSoftwareWindow`），
-  至少覆盖模型装配与属性绑定。
+**不要删 Qt 入口。** 用环境变量切换：`GHOST_UI=slint` 走 Rust/Slint，
+`GHOST_UI=qt` 走原 Qt（默认，保持可回退）。
 
-**完工判定**：P0–P6 全部完成、主窗口能无头启动并通过冒烟测试 -> 更新 `rust/README.md`
--> 创建 `AGENT-DONE`（写清做完什么、还剩什么、已知差异与风险）-> 停止推进等人工验收。
+`cfg` 回写必须遵守**单一写者**：同一时刻只能有一侧写 `UserConfig.json`，
+否则整文件回写会互相覆盖。接线时在文档里写清「谁是当前写者」。
+
+#### 完工判定（Phase 8）
+
+1. `cargo run -p gd3-ui` 能起窗口并干净退出；`--headless` 冒烟通过
+2. 用 `UserConfig.json` 启动，读->改->写回逐字节一致（时间戳类字段除外）
+3. 起本地 HTTP 服务 -> 添加任务 -> 真实下载完成 -> 文件逐字节校验通过
+4. 任务状态写回 `tasks.jsonl`，**Python 侧能读**
+5. 无头冒烟覆盖：启动 / 加任务 / 进度更新 / 暂停恢复 / 完成
+6. `GHOST_UI=qt` 仍可用（可回退）
+7. 质量门全绿
+
+满足后：更新 `rust/README.md` -> 覆盖 `AGENT-DONE`（写清 Phase 8 做完什么、
+还剩什么、已知差异与风险）-> 停止推进等人工验收。

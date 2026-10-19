@@ -15,6 +15,7 @@ import { DrawerChecksumRow, DrawerFileRow, DrawerInfoRow, TaskDrawer } from "tas
 import { BarButtonData, NavButton, NavItemData, ShellInfoBar, ShellMessageDialog } from "app_shell.slint";
 import { CardMenuPopup, CardMenuRowData } from "card_menu.slint";
 import { ExtensionInstallDialog, InstallStep } from "extension_install.slint";
+import { DraftRowData, TaskDraftDialog } from "task_draft.slint";
 import {
     CategoryEditDraft,
     HeadersEditDraft,
@@ -275,6 +276,34 @@ export component AppWindow inherits Window {
     in property <string> extensionInstallCancelText: "";
     callback extensionInstallConfirmed;
     callback extensionInstallDismissed;
+    // 任务草稿对话框（P2 第 125 步，镜像 `TaskDraftDialog`）：文案 / 行模型 /
+    // 统计标签的可见性全部来自 `gd3-ui::task_draft_ui::DraftView`。
+    in-out property <bool> taskDraftVisible: false;
+    in property <string> taskDraftTitle: "添加任务";
+    in property <string> taskDraftPlaceholder: "";
+    in property <string> taskDraftBatchText: "批量添加";
+    in property <string> taskDraftImportText: "导入文件";
+    in property <bool> taskDraftImportVisible: false;
+    in-out property <string> taskDraftUrlText: "";
+    in property <bool> taskDraftParsing: false;
+    in property <string> taskDraftDraftTitle: "解析结果";
+    in property <[DraftRowData]> taskDraftRows;
+    in property <string> taskDraftRatioText: "";
+    in property <bool> taskDraftRatioVisible: false;
+    in property <string> taskDraftSizeText: "";
+    in property <bool> taskDraftSizeVisible: false;
+    in property <string> taskDraftOptionsTitle: "下载设置";
+    in property <string> taskDraftFolderTitle: "选择下载路径";
+    in property <string> taskDraftFolderBrowseText: "浏览";
+    in-out property <string> taskDraftFolderText: "";
+    in property <string> taskDraftSubworkerTitle: "预分配线程数";
+    in-out property <float> taskDraftSubworkerValue: 8;
+    in property <int> taskDraftSubworkerMin: 1;
+    in property <int> taskDraftSubworkerMax: 256;
+    in property <string> taskDraftDownloadText: "下载";
+    in property <string> taskDraftLaterText: "稍后下载";
+    in property <string> taskDraftCancelText: "取消";
+    in property <bool> taskDraftCanConfirm: false;
     // 卡片右键菜单（`RoundMenu`）：行列表由 `menu_view::MenuRow` 摊平，
     // 面板高度由 `menu_view::panel_height` 算好（Slint 布局无法回传子项高度和）。
     // 锚点/高度用 int 像素：值全部来自 Rust 侧的像素算术，避免 f32 边界换算。
@@ -289,6 +318,18 @@ export component AppWindow inherits Window {
     callback infoBarClosed();
     callback dialogButtonClicked(int);
     callback dialogCheckboxToggled(bool);
+    // 任务草稿的 11 个回调（`TaskDraftDialog` 的同名 callback）。
+    callback taskDraftUrlEdited(string);
+    callback taskDraftBatchClicked();
+    callback taskDraftImportClicked();
+    callback taskDraftFolderEdited(string);
+    callback taskDraftFolderPickRequested();
+    callback taskDraftSubworkerEdited(int);
+    callback taskDraftDownloadClicked();
+    callback taskDraftLaterClicked();
+    callback taskDraftCancelClicked();
+    callback taskDraftRowEditRequested(string);
+    callback taskDraftRowCategoryRequested(string);
     // 摊平后的行号：子菜单行由 Rust 侧切换展开，其余解析成 `CardClick`。
     callback cardMenuActivated(int);
     callback cardMenuDismissed();
@@ -636,6 +677,73 @@ export component AppWindow inherits Window {
             }
             dismissed => {
                 root.extensionInstallDismissed();
+            }
+        }
+
+        // ---- 任务草稿对话框（P2 第 125 步）----
+        // `url-text` / `folder-text` / `subworker-value` 用双向绑定：Slint 侧逐键
+        // 回写，Rust 侧 `apply()` 也能整块覆盖（关框清空时依赖这条）。
+        TaskDraftDialog {
+            width: 100%;
+            height: 100%;
+            opened: root.taskDraftVisible;
+            title: root.taskDraftTitle;
+            placeholder: root.taskDraftPlaceholder;
+            batch-text: root.taskDraftBatchText;
+            import-text: root.taskDraftImportText;
+            import-visible: root.taskDraftImportVisible;
+            url-text <=> root.taskDraftUrlText;
+            parsing: root.taskDraftParsing;
+            draft-title: root.taskDraftDraftTitle;
+            rows: root.taskDraftRows;
+            ratio-text: root.taskDraftRatioText;
+            ratio-visible: root.taskDraftRatioVisible;
+            size-text: root.taskDraftSizeText;
+            size-visible: root.taskDraftSizeVisible;
+            options-title: root.taskDraftOptionsTitle;
+            folder-title: root.taskDraftFolderTitle;
+            folder-browse-text: root.taskDraftFolderBrowseText;
+            folder-text <=> root.taskDraftFolderText;
+            subworker-title: root.taskDraftSubworkerTitle;
+            subworker-value <=> root.taskDraftSubworkerValue;
+            subworker-min: root.taskDraftSubworkerMin;
+            subworker-max: root.taskDraftSubworkerMax;
+            download-text: root.taskDraftDownloadText;
+            later-text: root.taskDraftLaterText;
+            cancel-text: root.taskDraftCancelText;
+            can-confirm: root.taskDraftCanConfirm;
+            url-edited(text) => {
+                root.taskDraftUrlEdited(text);
+            }
+            batch-clicked => {
+                root.taskDraftBatchClicked();
+            }
+            import-clicked => {
+                root.taskDraftImportClicked();
+            }
+            folder-edited(text) => {
+                root.taskDraftFolderEdited(text);
+            }
+            folder-pick-requested => {
+                root.taskDraftFolderPickRequested();
+            }
+            subworker-edited(value) => {
+                root.taskDraftSubworkerEdited(value);
+            }
+            download-clicked => {
+                root.taskDraftDownloadClicked();
+            }
+            later-clicked => {
+                root.taskDraftLaterClicked();
+            }
+            cancel-clicked => {
+                root.taskDraftCancelClicked();
+            }
+            row-edit-requested(url) => {
+                root.taskDraftRowEditRequested(url);
+            }
+            row-category-requested(url) => {
+                root.taskDraftRowCategoryRequested(url);
             }
         }
 

@@ -35,13 +35,17 @@ export struct BarButtonData {
 export component ShellButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
+    // `QPushButton.setEnabled(false)`：任务草稿的「下载」在 `canConfirm()` 为假时禁用。
+    in property <bool> enabled: true;
     callback clicked;
 
     height: 30px;
     border-radius: 5px;
-    background: touch.has-hover
-        ? (root.primary ? #1a5fb4 : #e4e4e4)
-        : (root.primary ? #0067c0 : #f3f3f3);
+    background: !root.enabled
+        ? (root.primary ? #8fb9e0 : #ededed)
+        : (touch.has-hover
+            ? (root.primary ? #1a5fb4 : #e4e4e4)
+            : (root.primary ? #0067c0 : #f3f3f3));
 
     HorizontalLayout {
         padding-left: 14px;
@@ -49,7 +53,9 @@ export component ShellButton inherits Rectangle {
         Text {
             text: root.text;
             font-size: 13px;
-            color: root.primary ? white : #1a1a1a;
+            color: root.primary
+                ? (root.enabled ? white : #f0f0f0)
+                : (root.enabled ? #1a1a1a : #a0a0a0);
             horizontal-alignment: center;
             vertical-alignment: center;
         }
@@ -57,7 +63,9 @@ export component ShellButton inherits Rectangle {
 
     touch := TouchArea {
         clicked => {
-            root.clicked();
+            if (root.enabled) {
+                root.clicked();
+            }
         }
     }
 }
