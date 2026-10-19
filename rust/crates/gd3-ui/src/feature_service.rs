@@ -252,7 +252,10 @@ fn url_of(options: &Map<String, Value>) -> String {
 }
 
 /// Python 的真值判定（`not options.clientProfile`）。
-fn is_truthy(value: Option<&Value>) -> bool {
+///
+/// `pub(crate)`：`browser_payload` 里 `payload.get("headers") or {}` /
+/// `bool(resource.get("supportsRange"))` 用的是同一套判定。
+pub(crate) fn is_truthy(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
         Some(Value::Bool(flag)) => *flag,

@@ -1380,6 +1380,78 @@ pub fn apply_task_options(features: &FeatureService, presets: &[IdentityPreset],
 没人听的信号，然后 `return`，**任务直接消失**。Rust 保留 `DraftRequested`：宿主照抄不接 →
 与 Python 同病；接了 → 顺手修好。这条差异写在模块头，免得将来被当成漏了。
 
+## 浏览器扩展载荷层（`gd3-ui::browser_payload`）
+
+`app/services/browser_service.py`（597 行）混了三层，本模块只搬中间那层
+（`browser_service.py:47-168`，808 行 / 18 单测）：
+
+| Python | Rust |
+|---|---|
+| WebSocket 握手 + 帧（`_send` / `_sendError` 的封包部分） | `gd3-servers::websocket`（Phase 5/6） |
+| **五个 `StrEnum` + `toStr` / `toInt` + 三个 `to*`** | **本模块** |
+| `BrowserClientSession` / 配对 / hello / create_task 状态机 | 第 111 步（`browser_session`） |
+| 托盘图标、配对对话框、`extensionUpdated` 的 UI 提示 | Phase 7 主窗口那条线 |
+
+```rust
+pub const PROTOCOL_VERSION: i64 = 2;
+
+pub enum MessageType { /* 12 变体 */ }   pub enum ErrorCode { /* 3 */ }
+pub enum BrowserAction { /* 6 */ }       pub enum TaskSource { /* 4 */ }
+pub enum CreateTaskStatus { /* 3 */ }
+
+pub struct PayloadDefaults {
+    pub download_folder: String,
+    pub pre_block_num: i64,
+    pub current_headers: Map<String, Value>,
+}
+pub enum TaskOptionsPayload {   // Merge 装箱，见下
+    Resource(ResourceOptions), Page(PageOptions), Merge(Box<MergeOptions>) }
+
+pub fn to_resource_task_options(resource: &Map<String, Value>, defaults: &PayloadDefaults)
+                                -> ResourceOptions;
+pub fn to_task_options(source: TaskSource, payload: &Map<String, Value>,
+                       defaults: &PayloadDefaults) -> TaskOptionsPayload;
+pub fn to_task_summary(record: &TaskRecord) -> Map<String, Value>;
+```
+
+`to_task_summary` 的 13 个键与 Python 字面量同序：`taskId` / `name` / `status` / `progress` /
+`receivedBytes` / `fileSize` / `speed` / `createdAt` / `canPause` / `canOpenFile` /
+`canOpenFolder` / `fileExt` / `packName`。
+
+六条口径：
+
+- **`PayloadDefaults` 把三项配置打包成参数**：`downloadFolder` / `preBlockNum` /
+  `currentHeaders()`。Rust 侧没有响应式配置层，调用方每轮现读再传（同
+  `identity::parse_presets` 的口径）；`MergeTaskOptions` 不传 `headers` 时用的正是
+  `currentHeaders()` 那套。嵌套在 merge 里的 `ResourceTaskOptions` 也走 dataclass 缺省
+  （`downloadFolder` / `currentHeaders()` / `preBlockNum`），不是外层覆写后的值；
+- **`TaskOptionsPayload` 用枚举对应三个 dataclass 子类**：Python `match source` 里那条
+  `raise ValueError(f"unsupported task source: …")` 在 Rust 里不存在——`TaskSource` 是枚举，
+  构造不出第四种；
+- **`Merge` 变体装箱**：`MergeOptions` 比另外两个变体大 400 字节以上
+  （`clippy::large_enum_variant`），载荷寿命很短，`Box` 一次分配不影响语义；
+- **枚举叫 `BrowserAction` 而不是 `TaskAction`**：`gd3-ui` 已有 `actions::TaskAction`
+  （第 100 步的任务动作效果），同名会让 `use` 撞车；
+- **`toInt` 照抄 `isinstance(True, int)`**：JSON `true` → `1`；`false` 不满足 `> 0`，
+  落回缺省；`3.0` 是浮点不算 `int`，也落回缺省；
+- **`round(progress, 2)` 走 `format!("{value:.2}")` 再 parse 回 `f64`**：Python 是对二进制值的
+  精确十进制展开做五成双。先乘 100 再 `round_ties_even` 会在 `round(42.675, 2)` 上给出
+  `42.68`（`42.675 * 100.0` 恰好舍入成 `4267.5`），与 CPython 的 `42.67` 不符；
+- **`parent` / `suffix` 用本步新增的 `gd3-core::path::posix_parent` / `posix_suffix`**：
+  `pathlib` 的 `parent` **不消解 `..`**（`Path("/a/b/../c").parent == "/a/b/.."`），与
+  `posix_normpath` 混用会算错；`suffix` 对 `.bashrc` / `b.` / `...` 都是 `""`。
+
+三处容错差异（Python 会抛异常炸掉整条会话，Rust 退化成空）：
+
+| 坏包 | Python | Rust |
+|---|---|---|
+| `headers` 不是对象 | `AttributeError` | 空 map |
+| `resources[i]` 不是对象 | `AttributeError` | 当作没有该资源 |
+| `path` 不是字符串 | `TypeError` | 用 `cfg.downloadFolder` |
+
+`headers.get("user-agent")` 是**大小写敏感的精确匹配**（Python 原样），扩展发 `User-Agent`
+时 `sourceUserAgent` 是空串——这条照抄，有单测钉住。
+
 ## 剩余工作（Phase 8）
 
 **配置（`UserConfig.json`）和 Slint 入口要一起搬**。`app/config/cfg.py` 是

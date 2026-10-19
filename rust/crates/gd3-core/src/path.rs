@@ -140,6 +140,43 @@ pub fn posix_relative_to(path: &str, base: &str) -> Option<String> {
     Some(rest.join("/"))
 }
 
+/// 镜像 `str(PurePosixPath(p).parent)`：去掉最后一段组件，**不消解 `..`**。
+///
+/// 与 [`posix_normpath`] 的差别就在 `..`：`Path("/a/b/../c").parent` 是 `/a/b/..`，
+/// 而 `posix_normpath` 会先压成 `/a/c`。期望值来自 CPython 3.13：
+///
+/// ```text
+/// "a/b.tar.gz" -> "a"     "b"    -> "."    "/"  -> "/"   "//a"   -> "//"
+/// "a//b"       -> "a"     ""     -> "."    "/a" -> "/"   "//a/b" -> "//a"
+/// "a/b/"       -> "a"     "a..b" -> "."    "/a/b/../c" -> "/a/b/.."
+/// ```
+pub fn posix_parent(path: &str) -> String {
+    let (root, parts) = split_root(path);
+    if parts.len() > 1 {
+        return format!("{root}{}", parts[..parts.len() - 1].join("/"));
+    }
+    if root.is_empty() {
+        return String::from(".");
+    }
+    root.to_string()
+}
+
+/// 镜像 `PurePosixPath(p).suffix`：最后一段组件里最后一个 `.` 起的部分（含点）。
+///
+/// 三条口径（CPython 3.13 实测）：点开头的整段没有后缀（`.bashrc` → `""`）、
+/// 结尾是点也没有（`b.` → `""`、`...` → `""`）、中间的点只认最后一个
+/// （`a..b` → `.b`、`.a.b` → `.b`）。
+pub fn posix_suffix(path: &str) -> String {
+    let (_, parts) = split_root(path);
+    let Some(name) = parts.last() else {
+        return String::new();
+    };
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot < name.len() - 1 => name[dot..].to_string(),
+        _ => String::new(),
+    }
+}
+
 /// `(根, 组件)`：根是 `"/"` / `"//"` / `""`，组件已去掉空段与 `.`。
 fn split_root(path: &str) -> (&str, Vec<&str>) {
     let leading = path.bytes().take_while(|byte| *byte == b'/').count();
@@ -253,8 +290,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod normpath_tests {
-    use super::posix_normpath;
+mod posix_path_tests {
+    use super::{posix_normpath, posix_parent, posix_suffix};
 
     #[test]
     fn matches_str_of_pure_posix_path() {
@@ -280,6 +317,58 @@ mod normpath_tests {
         ];
         for (raw, expected) in cases {
             assert_eq!(posix_normpath(raw), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn parent_matches_pure_posix_path_parent() {
+        // 期望值全部来自 CPython 3.13：`str(PurePosixPath(p).parent)`
+        let cases = [
+            ("a/b.tar.gz", "a"),
+            ("a/.bashrc", "a"),
+            ("a/b.", "a"),
+            ("a/b", "a"),
+            ("b", "."),
+            ("/", "/"),
+            ("/a", "/"),
+            ("a//b", "a"),
+            ("", "."),
+            ("//a", "//"),
+            ("//a/b", "//a"),
+            ("a..b", "."),
+            ("...", "."),
+            (".a.b", "."),
+            ("a/b/", "a"),
+            ("/a/b/../c", "/a/b/.."),
+            ("a/..", "a"),
+            ("./a/./b", "a"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(posix_parent(raw), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn suffix_matches_pure_posix_path_suffix() {
+        // 期望值全部来自 CPython 3.13：`PurePosixPath(p).suffix`
+        let cases = [
+            ("a/b.tar.gz", ".gz"),
+            ("a/.bashrc", ""),
+            ("a/b.", ""),
+            ("a/b", ""),
+            ("b", ""),
+            ("/", ""),
+            ("a//b", ""),
+            ("", ""),
+            ("a..b", ".b"),
+            ("...", ""),
+            (".a.b", ".b"),
+            ("a/b/", ""),
+            ("/a/b/../c", ""),
+            ("x.TAR.GZ", ".GZ"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(posix_suffix(raw), expected, "raw={raw:?}");
         }
     }
 }
