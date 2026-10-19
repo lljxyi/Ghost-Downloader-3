@@ -8336,3 +8336,87 @@ writer.actions())`，然后每帧（或每个动作之后）做三件事：
 3. 有改动就 `push_settings(window, &writer.config(), ...)` 重推（`correct()` 可能夹紧过值）。
 
 `take_deferred()` 非空说明用户点了还没接的按钮 —— 接线期先 `eprintln!` 记一笔，别静默。
+## 第 118 步：`gd3-ui::settings_bridge`（设置页接线）
+
+**2026-10-19 07:05**
+
+第 117 步让「动作 → cfg 键」能落盘，但 `install_settings_actions` 在生产路径上仍然没人调，
+写盘之后的「重推 UI / 刷新服务 / 提示重启」也没有归属。这一步把两端装到窗口上，并接进
+`boot::run`。`crates/gd3-ui/src/settings_bridge.rs`（**434 行 / 11 单测**）。
+
+### 覆盖面
+
+```text
+Slint 回调 → SettingsActions → SettingsWriter::set → 落盘
+                                      ↓ take_changes()
+                          SettingsBridge::drain ─┬→ 宿主钩子（刷新服务 / 提示）
+                                                 └→ push_settings（重推整页）
+```
+
+- `POLL_INTERVAL = 50ms`，`slint::Timer` 轮询。**不给 49 个闭包各包一层**：Python 的
+  `ConfigItem.valueChanged` 是同步信号（`setting_cards.py:71` 让卡片回读 `correct()`
+  之后的值），Slint 没有「属性变化信号」，所以一处收口最省。
+- `SettingsDrain { changes, failures, deferred, repushed }` + `is_empty()` + `restart_attrs()`。
+- 定时器回调只持 `Weak<SettingsBridge>` + `Weak<AppWindow>` → 不构成引用环；`stop()` drop
+  timer 即彻底停。
+- `drain` 幂等：空的时候 `repushed == false`、不调钩子、不重推。
+
+### 宿主钩子（`set_drain_handler`）
+
+`boot::run` 装的处理器做四件事：失败 → `eprintln!`；`deferred` → `eprintln!` 待办名；
+`restart_attrs()` 非空 → 提示重启；有改动或失败 → `*engine.config_mut() = writer.config()`
+→ `refresh_services()` → `writer.adopt(engine.config())`。
+
+**钩子在重推之前调用**，所以 `adopt` 换掉的令牌也能进同一帧的 `push_settings`。
+
+### `boot::run` 的三处改动
+
+| 改动 | 为什么 |
+|---|---|
+| 新增 `ConfigStore::from_config(path, &loaded.config)` | 复用 `load_config` 已读好的配置；再 `load` 一次会丢掉「文件不存在 → 缺省 `DownloadFolder` 取 `DOWNLOAD_DIR`」与「文件损坏 → 退回缺省」的区分 |
+| `Engine` 放进 `Rc<RefCell<Engine>>` | 轮询回调要 `&mut engine` 做 `refresh_services()`，而 `window.run()` 阻塞在同一栈帧里 |
+| 新增 `SettingsWriter::adopt(&UserConfig)`，`Engine::new` 之后调一次 | Python 的 `BrowserService.__init__`（`browser_service.py:189-190`）在令牌为空时 `cfg.set(..., token_urlsafe(16))` 并落盘；引擎持的是克隆 |
+
+无头分支在帧循环之后补一次 `bridge.drain(&window)`（帧数很少时 50ms 定时器可能还没到点）。
+
+### 一条实测纠错（测试错、实现对）
+
+`boot::tests::headless_run_smoke` 原来断言「跑完 `run()` 之后 `UserConfig.json` 仍然不存在」。
+接上启动期 `adopt` 之后这条挂了 —— 而**挂得对**：Python 在 `Engine.__init__` 里就构造
+`BrowserService`（`app/engine.py:30`），它的 `__init__` 生成令牌并 `cfg.set(..., save=True)`，
+所以**首次启动写出配置文件是 Python 的既有行为**。按「以 Python 源码为准改断言」改：
+
+```rust
+let written = UserConfig::load(&dir.join(USER_CONFIG_FILE)).expect("启动后应当写出配置");
+assert_eq!(written.get_str("Browser", "BrowserExtensionPairToken").unwrap().chars().count(), 22);
+assert_eq!(settings::read_i64(&written, "maxTaskNum"), Some(3));
+```
+
+改完 21 条 boot 测试全过（`/tmp/t118d.log`），等于**实测确认**令牌确实生成并落盘。
+
+### 与 Python 的已知差异
+
+- **重推是整页**：Python 只让那一张卡回读；这里推全量 42 项。同值再写不触发 Slint 属性通知，
+  所以正在编辑的输入框不会被重置；真正会变的是 `correct()` 夹紧过的项。
+- **`deferred` 只记录不执行**：22 个待办动作的名字交给宿主 `eprintln!`。
+- **服务刷新时机**：Python 每处现读全局 `cfg`；这里引擎持克隆，只能在 drain 之后同步一次
+  （最多晚 50ms）。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo check -p gd3-ui --all-targets`：**1m04s**，零错零警告（`/tmp/ck118e.log`）；
+- `cargo test -p gd3-ui --lib settings`：**64 passed**（含 11 条 bridge + 16 条 writer，`/tmp/t118b.log`）；
+- `cargo test -p gd3-ui --lib boot::`：**21 passed**（`/tmp/t118d.log`）；
+- `cargo test -p gd3-ui --lib`：**1008 passed / 0 failed**（996 + 11 + 1，`/tmp/t118lib.log`）；
+- `cargo test --workspace`：**1563 passed / 0 failed / 28 段**（1551 + 12，`/tmp/t118ws.log`）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（`/tmp/c118.log`）；
+- Python 侧没改一行。
+
+### 下一步（第 119 步）
+
+1. `update_service` 接线：`UpdateTable` / `plan_check` / `plan_app_download` / `plan_pack_download`
+   / `plan_apply` / `updater_command` 接到 `WreqTransport` 与更新卡片；解包要宿主工具
+   （`zip` / `xz2` 不在离线缓存里）。
+2. P1 剩余：22 个 `defer` 项（`headersPreset*` / `identityPreset*` / `category*` 的列表写回，
+   以及剪贴板 / 商店 / CRX 解包 / 拉起浏览器四个平台副作用）。

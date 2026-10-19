@@ -68,6 +68,7 @@ pub mod scroll_area;
 pub mod sequence_matcher;
 pub mod setting_card_group;
 pub mod setting_cards;
+pub mod settings_bridge;
 pub mod settings_group;
 pub mod settings_spec;
 pub mod settings_writer;

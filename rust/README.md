@@ -1885,7 +1885,7 @@ def set(self, item, value, save=True, copy=True):
 设置页的每个控件在第 32–39 步就接成了 `SettingsActions` 的一个闭包，但闭包体一直是空的
 （`install_settings_actions` 只在测试里被调用）。第 113 步把 `QConfig.set` 的语义落成
 `ConfigStore`，这一步把两端接起来：**动作 → 属性名 → `ConfigStore::set`**，于是设置页的
-编辑终于能落盘。`crates/gd3-ui/src/settings_writer.rs` **852 行 / 15 单测**。
+编辑终于能落盘。`crates/gd3-ui/src/settings_writer.rs` **892 行 / 16 单测**（第 118 步接线时补了 `adopt` 与它的一条单测）。
 
 | Python | Rust | 状态 |
 |---|---|---|
@@ -1988,9 +1988,9 @@ pub struct SettingsWriter {
 - **`pair_token_regenerate` 是 `Fn()`**：Python 里重新生成后要 `setText` 到只读框上；
   这里新令牌从 `take_changes()[0].value` 取，闭包返回值被丢弃。
 
-### 十五条新单测
+### 十六条新单测
 
-`settings_writer.rs` **852 行 / 15 单测**。全部只碰临时目录里的 `UserConfig.json`，
+`settings_writer.rs` **892 行 / 16 单测**。全部只碰临时目录里的 `UserConfig.json`，
 **不创建 Slint 窗口**（直接调 `(actions.max_task_num)(7)` 这种装箱闭包）。
 
 | 测试 | 钉住什么 |
@@ -2010,6 +2010,107 @@ pub struct SettingsWriter {
 | `changes_are_taken_once` | 取走即清空 |
 | `open_leaves_a_missing_file_alone` | `open` 不建文件（`qconfig.load` 同序） |
 | `an_unknown_attribute_never_comes_out_of_the_actions` | 拼错属性名 → `UnknownAttribute` 进 failures，不 panic |
+| `adopt_takes_a_token_that_the_engine_generated` | `Engine::refresh_services` 换掉的令牌被吞回文件；第二次无变化 |
+
+## 设置页接线（`gd3-ui::settings_bridge`）
+
+第 117 步让「动作 → cfg 键」能落盘，但生产路径上 `install_settings_actions` 仍然没人调，
+写盘之后的「重推 UI / 刷新服务 / 提示重启」也没有归属。这一步把两端装到窗口上：
+`crates/gd3-ui/src/settings_bridge.rs` **434 行 / 11 单测**。
+
+```text
+Slint 回调 → SettingsActions → SettingsWriter::set → 落盘
+                                      ↓ take_changes()
+                          SettingsBridge::drain ─┬→ 宿主钩子（刷新服务 / 提示）
+                                                 └→ push_settings（重推整页）
+```
+
+### 为什么是轮询，不是给 49 个闭包各包一层
+
+Python 的 `ConfigItem.valueChanged` 是**同步信号**：`cfg.set` 里改完值立刻回调，
+卡片自己回读 `correct()` 之后的值（`setting_cards.py:71`）。Slint 的 callback 只连到
+我们自己的闭包，没有「属性变化信号」这一层，所以用 `slint::Timer` 按
+`POLL_INTERVAL`（50ms）轮询一次。
+
+| 方案 | 代价 |
+|---|---|
+| 49 个闭包各包一层「写盘 + 重推」 | 49 处重复，漏一个就静默不刷新 |
+| 一个 50ms 定时器（本步） | 最多一帧延迟；好处是**一处**收口 |
+
+`drain` 幂等：没有待处理的东西时 `repushed == false`、不调钩子、不重推。
+
+### 定时器不持 `Rc<Self>`
+
+回调里只拿 `Weak<SettingsBridge>` + `Weak<AppWindow>`，所以
+「bridge → timer → 回调 → bridge」不构成引用环。`stop()` 把 `timer` drop 掉即彻底停；
+宿主只要保证 `Rc<SettingsBridge>` 活到事件循环结束。
+
+### 宿主的钩子（`set_drain_handler`）
+
+轮询只负责「取走 + 重推」，**刷新服务 / 提示重启 / 提示失败**由宿主决定。
+`boot::run` 装的处理器做四件事：
+
+1. `failures` 非空 → `eprintln!("配置保存失败：…")`（Python 在这里抛 `OSError`）；
+2. `deferred` 非空 → `eprintln!("设置页动作尚未接线：…")`（22 个待办动作，见
+   [`settings_writer`] 的边界表）；
+3. `restart_attrs()` 非空 → `eprintln!("以下设置重启后生效：…")`（`dpiScale` /
+   `language` / `shouldVerifySsl`）；
+4. 有改动或失败 → `*engine.config_mut() = writer.config()` → `refresh_services()`
+   → `writer.adopt(engine.config())`。
+
+**钩子在重推之前调用**，所以它改出来的值（`adopt` 换掉令牌）也能进同一帧的
+`push_settings`。钩子内不要再调 `drain`（`RefCell` 已经可变借用）。
+
+### `boot::run` 的三处改动
+
+| 改动 | 为什么 |
+|---|---|
+| `ConfigStore::from_config(path, &loaded.config)` | 复用 `load_config` 已经读好的配置。再 `load` 一次会丢掉「文件不存在 → 缺省 `DownloadFolder` 取 `DOWNLOAD_DIR`」与「文件损坏 → 退回缺省」的区分 |
+| `Engine` 放进 `Rc<RefCell<Engine>>` | 轮询回调要 `&mut engine` 做 `refresh_services()`，而 `window.run()` 阻塞在同一栈帧里 |
+| `writer.adopt(engine.config())`（`Engine::new` 之后） | Python 的 `BrowserService.__init__`（`browser_service.py:189-190`）在令牌为空时 `cfg.set(..., token_urlsafe(16))` 并落盘；引擎持的是克隆，要同步回来 |
+
+无头分支在帧循环之后补一次 `bridge.drain(&window)`（帧数很少时 50ms 定时器可能还没到点）。
+
+### 一条实测纠错：首次启动会写出 `UserConfig.json`
+
+`boot::tests::headless_run_smoke` 原来断言「跑完 `run()` 之后 `UserConfig.json` 仍然不存在」。
+接上 `adopt` 之后这条挂了 —— 而**挂得对**：Python 在 `Engine.__init__` 里就构造
+`BrowserService`（`app/engine.py:30`），它的 `__init__` 生成令牌并 `cfg.set(..., save=True)`。
+所以首次启动写出配置文件是 Python 的既有行为。**改断言不改实现**：
+
+```rust
+let written = UserConfig::load(&dir.join(USER_CONFIG_FILE)).expect("启动后应当写出配置");
+assert_eq!(written.get_str("Browser", "BrowserExtensionPairToken").unwrap().chars().count(), 22);
+assert_eq!(settings::read_i64(&written, "maxTaskNum"), Some(3));
+```
+
+### 与 Python 的已知差异
+
+- **重推是整页**：Python 只让**那一张卡**回读自己的值；这里统一 `push_settings` 推全量 42 项。
+  同一个值再写一次不触发 Slint 的属性通知，所以正在编辑的输入框不会被重置；真正会变的
+  是 `correct()` 夹紧过的项。
+- **`deferred` 只记录不执行**：用户点了还没接的按钮时，这里把名字交出去，宿主 `eprintln!`。
+- **服务刷新的时机**：Python 的服务每次现读全局 `cfg`，没有「刷新」这一步；这里引擎持克隆，
+  只能在 drain 之后显式同步一次（最多晚 50ms）。
+
+### 十一条新单测
+
+| 测试 | 钉住什么 |
+|---|---|
+| `install_wires_the_actions_to_the_writer` | 窗口回调 → writer → 落盘 → drain 重推 |
+| `drain_pushes_the_value_that_correction_produced` | 端口 `80` 被夹到 `1024`，界面跟着变 |
+| `a_second_drain_does_nothing` | 幂等（`is_empty` / `!repushed` / 无重启项） |
+| `an_unchanged_value_is_not_pushed_again` | 缺省值早退：不落盘、不重推 |
+| `a_failed_save_is_reported_and_still_repushes` | 父目录被文件占住 → failures 一条 + 仍然重推 |
+| `deferred_actions_are_reported_not_executed` | 两个待办名按点击顺序列出，不碰文件 |
+| `restart_items_are_listed_for_the_host` | `shouldVerifySsl` 进重启清单，`maxTaskNum` 不进 |
+| `the_drain_handler_sees_the_change_before_the_repush` | 钩子拿到 `changes` 且能读到 writer 的最新值 |
+| `the_drain_handler_is_not_called_for_an_empty_drain` | 空 drain 不调钩子 |
+| `the_poll_timer_drains_on_its_own` | 1ms 间隔的定时器自己把改动推上窗口 |
+| `stop_stops_the_polling` | `stop()` 之后改动留在 writer 里等宿主，UI 不动 |
+
+定时器测试用 `slint::platform::update_timers_and_animations()` + 2ms sleep 手动泵帧
+（`HeadlessPlatform` 没覆写 `now()`，定时器走真实单调时钟）。
 
 ## 更新源纯逻辑层（`gd3-core::sources`）
 
@@ -2386,3 +2487,12 @@ pub fn merge_pypi_releases<E>(
 Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读写必须与「Slint 成为唯一 UI」
 同一步落地，不能提前。同理，凡是「持久化进 cfg」的服务（`category_service` 的
 `categoryRules` 等）都要排在它后面。
+
+这条已经落地：第 113 步 `config_store`（读写语义）→ 第 117 步 `settings_writer`
+（动作 → cfg 键）→ 第 118 步 `settings_bridge`（装到窗口上 + 宿主钩子）。剩下的是：
+
+1. **更新检查接线**：`update_service` 的 `plan_*` 接到 `gd3-net::sources::WreqTransport`
+   与更新卡片；解包（zip / tar.xz / dmg）要宿主工具或新 crate（`zip` / `xz2` 不在离线缓存里）。
+2. **22 个 `defer` 项**：`headersPreset*` / `identityPreset*` / `category*` 的列表写回，
+   以及剪贴板 / 商店 / CRX 解包 / 拉起浏览器四个平台副作用。
+3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。

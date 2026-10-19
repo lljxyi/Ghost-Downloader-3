@@ -60,7 +60,9 @@
 //!   `PAUSED`，与真实退出行为一致；
 //! - `--tasks-file` 是 Rust 侧的可测性开关（Python 侧固定用 `APP_DATA_DIR`）。
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gd3_core::config::UserConfig;
 use gd3_core::settings;
@@ -462,25 +464,83 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     let headless = cli.headless || !has_display();
     let frames = cli.frames.unwrap_or(1);
     let tasks_path = cli.tasks_file.clone().unwrap_or_else(|| paths.tasks_path());
-    let mut engine = crate::engine::Engine::new(&loaded.config, &tasks_path);
+
+    // 设置页回写：复用 `load_config` 已经读好的配置，不再读第二次盘 —— 否则
+    // 「文件不存在 → 缺省 DownloadFolder 取 DOWNLOAD_DIR」与「文件损坏 → 退回缺省」
+    // 这两种情形的区分会丢。
+    let writer = Rc::new(crate::settings_writer::SettingsWriter::new(
+        crate::config_store::ConfigStore::from_config(paths.user_config_path(), &loaded.config),
+    ));
+    let bridge =
+        crate::settings_bridge::SettingsBridge::new(Rc::clone(&writer), default_download.clone());
+
+    // 引擎放进 `Rc<RefCell<_>>`：设置页的轮询回调要 `&mut engine` 做
+    // `refresh_services()`，而 `window.run()` 阻塞在同一栈帧里。
+    let engine = Rc::new(RefCell::new(crate::engine::Engine::new(
+        &loaded.config,
+        &tasks_path,
+    )));
+    // Python 的 `BrowserService.__init__`（`browser_service.py:189-190`）在令牌为空时
+    // `cfg.set(cfg.browserExtensionPairToken, token_urlsafe(16))`，那一步立刻整文件落盘
+    // ——所以**首次启动就会写出 `UserConfig.json`**。引擎持的是配置克隆，这里同步回
+    // writer（`adopt` 只在真的变了时才写盘）。
+    writer.adopt(engine.borrow().config());
+
     let started = engine
+        .borrow_mut()
         .start()
         .map_err(|err| format!("任务列表读取失败：{err}"))?;
 
+    // 写盘之后的落地（`settings_writer.rs` 模块头的第 2 条）：Python 的 `cfg` 是全局
+    // 单例、服务每次现读；这里引擎持克隆，所以要把新值推进去再刷新服务。
+    bridge.set_drain_handler({
+        let engine = Rc::clone(&engine);
+        let writer = Rc::downgrade(&writer);
+        move |drained| {
+            for failure in &drained.failures {
+                eprintln!("配置保存失败：{failure}");
+            }
+            for action in &drained.deferred {
+                eprintln!("设置页动作尚未接线：{action}");
+            }
+            let restart = drained.restart_attrs();
+            if !restart.is_empty() {
+                eprintln!("以下设置重启后生效：{}", restart.join(" / "));
+            }
+            if drained.changes.is_empty() && drained.failures.is_empty() {
+                return;
+            }
+            let Some(writer) = writer.upgrade() else {
+                return;
+            };
+            let mut engine = engine.borrow_mut();
+            *engine.config_mut() = writer.config();
+            engine.refresh_services();
+            // `refresh_services` 在令牌为空时会换掉它（`browser_service.py:190`）。
+            writer.adopt(engine.config());
+        }
+    });
+
     if headless {
         let window = crate::create_headless();
-        crate::push_settings(&window, &loaded.config, &default_download);
-        engine.tasks().refresh(&window);
+        bridge.install(&window);
+        crate::push_settings(&window, &writer.config(), &default_download);
+        engine.borrow().tasks().refresh(&window);
         for _ in 0..frames {
             slint::platform::update_timers_and_animations();
             window.window().request_redraw();
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        // 帧数很少时 50ms 的轮询定时器可能还没到点，这里补一次（幂等）。
+        bridge.drain(&window);
+        bridge.stop();
     } else {
         let window = crate::AppWindow::new().map_err(|err| format!("窗口创建失败：{err}"))?;
-        crate::push_settings(&window, &loaded.config, &default_download);
-        engine.tasks().refresh(&window);
+        bridge.install(&window);
+        crate::push_settings(&window, &writer.config(), &default_download);
+        engine.borrow().tasks().refresh(&window);
         window.run().map_err(|err| format!("事件循环失败：{err}"))?;
+        bridge.stop();
     }
 
     // 交接消息（第二个实例送来的 URI / 唤醒）只能在这里取：消费方（打开链接 / 激活
@@ -492,6 +552,7 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     // 停机序列（`engine.py:41-49`）：`taskService.stop` → flush → 速度表/监听器/功能包
     // 收尾 → 再 flush。窗口一关就走，与 Qt 的 `aboutToQuit` 同位置。
     engine
+        .borrow_mut()
         .stop()
         .map_err(|err| format!("任务列表落盘失败：{err}"))?;
 
@@ -504,7 +565,7 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         download_dir: paths.download_dir,
         urls: cli.urls.clone(),
         silent: cli.silent,
-        tasks: engine.tasks().len(),
+        tasks: engine.borrow().tasks().len(),
         task_load_failures: started.load_failures.len(),
         resumed: started.resumed.len(),
         handoffs,
@@ -779,7 +840,14 @@ mod tests {
         assert_eq!(summary.app_data_dir, dir);
         assert_eq!(summary.urls, vec!["https://example.com/a".to_string()]);
         assert!(!summary.silent);
-        assert!(!dir.join(USER_CONFIG_FILE).exists());
+        // Python 的 `BrowserService.__init__` 在令牌为空时生成一个并 `cfg.set` 落盘，
+        // 所以首次启动会写出 `UserConfig.json`（第 118 步接线后才与 Python 对齐）。
+        let written = UserConfig::load(&dir.join(USER_CONFIG_FILE)).expect("启动后应当写出配置");
+        let token = written
+            .get_str("Browser", "BrowserExtensionPairToken")
+            .expect("令牌应当落盘");
+        assert_eq!(token.chars().count(), 22, "token_urlsafe(16) 是 22 个字符");
+        assert_eq!(settings::read_i64(&written, "maxTaskNum"), Some(3));
     }
 
     #[test]

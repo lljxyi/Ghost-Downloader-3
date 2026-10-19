@@ -58,6 +58,7 @@ use std::rc::Rc;
 
 use gd3_core::config::UserConfig;
 use gd3_core::pair_token;
+use gd3_core::settings;
 use serde_json::{Value, json};
 
 use crate::SettingsActions;
@@ -121,6 +122,23 @@ impl SettingsWriter {
     /// 取走并清空「留给后续接线步的动作名」。
     pub fn take_deferred(&self) -> Vec<&'static str> {
         std::mem::take(&mut *self.deferred.borrow_mut())
+    }
+
+    /// 把外部写回的 `browserExtensionPairToken` 吞回文件。
+    ///
+    /// Python 的 `cfg` 是全局单例：`browser_service.py:190` 生成新令牌时
+    /// `cfg.set(cfg.browserExtensionPairToken, token_urlsafe(16))` 立刻落盘。这里
+    /// [`crate::engine::Engine`] 持有自己的一份克隆，[`crate::engine::Engine::refresh_services`]
+    /// 可能在里面换掉令牌（首次启动令牌为空时会重新生成），所以要同步回来。
+    ///
+    /// 返回 `Some(change)` 表示确实写了一次盘（同一次改动也会进 [`Self::take_changes`]）。
+    pub fn adopt(&self, config: &UserConfig) -> Option<ConfigChange> {
+        let token = settings::read(config, "browserExtensionPairToken")?;
+        if self.get("browserExtensionPairToken").as_ref() == Some(&token) {
+            return None;
+        }
+        self.set("browserExtensionPairToken", token);
+        self.changes.borrow().last().cloned()
     }
 
     /// `qconfig.set(item, value)`：相等早退 → `correct()` → 整文件回写。
@@ -812,6 +830,28 @@ mod tests {
             settings::read(&writer.config(), "closeMode"),
             Some(json!("Background"))
         );
+    }
+
+    #[test]
+    fn adopt_takes_a_token_that_the_engine_generated() {
+        let (_path, writer) = writer("adopt");
+        // `Engine::refresh_services` → `BrowserService::apply_config` 在令牌为空时
+        // 会重新生成一个（`browser_service.py:190` 的 `cfg.set` 自己落盘）。
+        let mut config = writer.config();
+        config.set(
+            "Browser",
+            "BrowserExtensionPairToken",
+            json!("token-from-the-engine"),
+        );
+
+        let change = writer.adopt(&config).expect("应当吞回文件");
+        assert_eq!(change.attr, "browserExtensionPairToken");
+        assert_eq!(
+            writer.get("browserExtensionPairToken"),
+            Some(json!("token-from-the-engine"))
+        );
+        assert!(writer.adopt(&config).is_none(), "第二次没有变化");
+        assert_eq!(attrs(&writer.take_changes()), ["browserExtensionPairToken"]);
     }
 
     #[test]

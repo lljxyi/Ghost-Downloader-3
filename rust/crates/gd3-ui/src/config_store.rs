@@ -173,6 +173,19 @@ impl ConfigStore {
         }
     }
 
+    /// 不读盘：收下调用方已经加载好的配置。
+    ///
+    /// `boot::load_config` 已经读过一次盘，并且区分了「文件不存在 → 缺省
+    /// `DownloadFolder` 取 `DOWNLOAD_DIR`」与「文件损坏 → 退回缺省」两种情形。
+    /// 这里再 [`Self::load`] 一次会把这两种情形的区分丢掉，所以给一个直接收下配置的入口；
+    /// 内容同样归一化成 [`settings::SPECS`] 的 42 项全量。
+    pub fn from_config(path: impl Into<PathBuf>, config: &UserConfig) -> Self {
+        Self {
+            path: path.into(),
+            config: rebuild(config),
+        }
+    }
+
     /// 镜像 `qconfig.load(f"{APP_DATA_DIR}/UserConfig.json", cfg)`
     /// （`Ghost-Downloader-3.py:38`）：
     ///
