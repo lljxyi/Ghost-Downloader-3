@@ -7548,3 +7548,151 @@ str(PurePosixPath("/a/b/../c"))          # '/a/c'      —— posix_normpath 的
 
 之后还有两件收尾：`Engine` 里 `BrowserService` / `Aria2RpcService` 两个零大小桩的收敛；
 以及回 Phase 7 P0 主线（`main_window.py`(753) + `task_cards.py`(569) + `task_drawer.py`(523)）。
+
+## 第 111 步：`gd3-ui::browser_session`（浏览器扩展会话状态机）
+
+时间：2026-10-19 03:02（测试首轮）/ 03:44（收尾）
+
+`browser_service.py:29-597` 的最后一层。第 110 步搬了载荷层（五个 `StrEnum` + 三个
+`to*`），本步搬状态机：`BrowserClientSession` 的配对 / 认证 / 订阅生命周期、`hello` 的
+协议版本门禁、`createTask` 的「直加 / 草稿」分叉、`taskAction` 的六种动作、快照广播的
+去重与合并。**2123 行 / 41 单测**。
+
+### 先确认边界（沿用第 110 步的三分表）
+
+| Python | Rust | 状态 |
+|---|---|---|
+| WebSocket 握手 + 帧 | `gd3-servers::websocket` | Phase 5/6 已收 |
+| 五个 `StrEnum` + `toStr`/`toInt` + 三个 `to*` | `gd3-ui::browser_payload` | 第 110 步 |
+| **会话状态机** | **`gd3-ui::browser_session`** | **本步** |
+| 托盘图标 / 配对对话框 / `extensionUpdated` 提示 | Phase 7 主窗口线 | 未做 |
+
+### 做了什么
+
+- `browser_session.rs`（新文件）：
+  - `SessionId = u64`、`ClientSession`（6 字段，少 `stream`）、`PairRequest`（4 字段）；
+  - `SessionEffect`（12 变体）：`Send` / `Close` / `PairRequestChanged` / `ConnectionChanged` /
+    `ProtocolMismatched` / `TaskDraftRequested` / `ExtensionUpdated` / `InstallExtension` /
+    `Task(TaskAction)` / `Dispatch { task_ids }` / `OpenFile` / `RevealInFolder`；
+  - `SessionContext<'a>`（5 字段）：`parsers` / `presets` / `tasks` / `conflict_choice` /
+    `delete_recoverably`；
+  - `BrowserHub`（9 字段）+ 20 个 `pub fn`，核心是 `handle_message(session, text, &mut ctx)`；
+  - `push_task_effects` / `push_dispatch` 两个私有助手 + `dumps`（`serde_json::to_string`）。
+- `browser_payload.rs`：`to_str` / `to_int` 升 `pub(crate)`；新增
+  `TaskOptionsPayload::to_map()` + `base_map()` / `insert_resource_fields()` /
+  `resource_value()`（`_onCreateTask` 要把枚举摊回 `Map` 再喂 `TaskService`）。**893 行**。
+- `task_actions.rs` 重构：抽出四个**纯映射函数** `cancel_effects`(:415) /
+  `pause_effects`(:432) / `delete_effects`(:445) / `redownload_effects`(:475)，
+  `TaskActions::{emit_cancel, pause, delete, redownload}` 改为调它们。行为不变，原 10 条
+  测试仍绿。**~1235 行**。
+- `lib.rs`：`pub mod browser_session;`。
+
+### 七条结构决策
+
+1. **会话键是 `SessionId = u64`**：Python 拿 `WebSocketStream` 的对象身份当 `dict` 键；
+   本 crate 不依赖网络层，宿主给每条连接发号。会话表 `Vec<(SessionId, ClientSession)>`
+   保插入序（Python `dict` 也是插入序），快照广播的会话顺序因此一致。
+2. **所有副作用摊成 `SessionEffect`**：`_send` / `stream.close()` / 四个 Qt 信号 /
+   `openFile` / `revealInFolder` 都只产出效果。单测不需要网络、不需要桌面、不会真打开文件。
+3. **`TaskService` 报告的「宿主半边」复用 `task_actions::TaskAction`**（本轮补的缺口）：
+   `delete` / `redownload` / `pause` 在 Rust 只做记账（第 99 步），`Task.deleteFiles`、
+   `fileDeleteDenied`、`_unwatchFile`、`checksumStopped`、`_cancelWork`、`taskRemoved`
+   都得由宿主做。浏览器动作与卡片动作调的是同一批服务方法，摊出来的效果自然同形，
+   所以不另造词汇表。四个「报告 → 效果」映射抽成 `task_actions` 的 `pub fn`，两条线共用
+   一份实现，发射顺序只有一处定义。
+4. **`_pump()` 派发的 id 单独走 `Dispatch { task_ids }`**：`TaskAction::Started` 需要
+   `workId`，发号与提交协程归宿主，`browser_session` 不该造号。
+5. **`install()` 的 crx 解包留给宿主**：`_onHello` 发现扩展是 `development` 且**旧于**
+   `LATEST_EXTENSION_VERSION` 时产出 `InstallExtension`，宿主解包完回调
+   `extension_installed(session, ok)`（`zip` crate 不在离线缓存里）。
+6. **`_parse` 是同步的**：`featureService.parse` 在 Python 是 `async`，本仓
+   `TaskParser::parse` 同步返回（第 108 步），所以「提交 → 回调 `_onTaskParsed`」合成一次调用。
+7. **`_sendSnapshots` 的延迟合并显式化**：`note_tasks_changed()`（判重）+
+   `send_snapshots()`（真发），`tasks_changed()` 是两者的同步合成。
+
+### 逐条对照（易错处）
+
+- **`hello` 的三个门禁顺序**：协议版本不符 → `REJECTED` + `ProtocolMismatched` + `Close`；
+  令牌不符 → `REJECTED` + `Close`（**不报**协议信号）；都过 → 置认证 + `helloAck`。
+- **`helloAck` 的 6 个动作按声明序**：`[a.value for a in TaskAction]` →
+  `TogglePause` / `Cancel` / `Remove` / `Redownload` / `OpenFile` / `OpenFolder`，
+  用 `const TASK_ACTIONS: [BrowserAction; 6]` 钉住。
+- **配对请求只允许一个未决**：已有请求且不是本会话时拒绝；同一会话可刷新自己的请求。
+  请求先于认证门（未认证也要能发 `pairRequest`）。
+- **`regenerateToken` 不踢会话出表**：只 `_close` + 置 `isAuthenticated = False`；
+  没人认证过时不发 `ConnectionChanged`。
+- **快照 13 键与 `sort_by(|l, r| r.created_at.cmp(&l.created_at))`**；去重比较的是
+  自己序列化出来的串（`last_snapshot`）。
+- **`createTask` 的 `source`**：缺键 → `"resource"`，但 `source: ""` 必须报
+  「未知的任务来源」（`to_str` 只在「值不是字符串」时落缺省）。
+- **`draft` 取原值判真值**（`is_truthy`），不是「非 bool 落缺省」；帧里没有 `draft` 时
+  才用 `cfg.shouldDraftTakenDownload`。
+- **改名逻辑**：`existingSuffix = posix_suffix(record.name)`；`title` 不以该后缀结尾才拼上，
+  `to_safe_filename(title, .., 200)`。
+- **`onCreate` 走 `add_with_conflict`**：`Ok(AddReport { outcome: None })` 就是 Python 的
+  `nameConflicted` 分支（返回 `False`，扩展侧收到 `REJECTED`）。
+- **`decryptionKeys` 是空操作**：`Task.setOptions` 只认 `outputFolder` / `category`。
+- **`_isUpdatingExtension` 成功后不复位**：同一进程内不会二次热更（Python 只在
+  `_onExtensionExtractFailed` 里清标志）。
+
+### 本轮修掉的两个真缺陷
+
+1. **`togglePause` 的「恢复」分支只 `start` 不 `pump`**：Python 的 `TaskService.start`
+   就是 `_schedule`（`queue.wait` + `_pump()`，`task_service.py:392-395`）。Rust 的
+   `TaskService::start` 只 `queue.wait`，必须再 `pump(max_task_num)`——否则空出来的槽
+   永远不派发，扩展点「恢复」后任务卡在 `Paused`。
+2. **`cancel` / `remove` 的删文件没人做**：`TaskService::delete` 只做记账（第 99 步），
+   原本 `Some(report)` 直接丢掉 `delete_files` / `delete_denied` → 扩展点「取消」后文件
+   留在盘上、`fileDeleteDenied` 也发不出去。现在摊成 `TaskAction::DeleteFiles` /
+   `TaskAction::DeleteDenied` 交给宿主。
+
+### 41 条新单测
+
+按状态机分段（完整表格见 `rust/README.md`）：hello / 热更 7 条、配对 9 条、快照 4 条、
+`createTask` 8 条、`taskAction` 10 条、错误路径 3 条。
+
+测试助手：`TempDir` / `UrlParser` / `task_record` / `record_in` / `payload_defaults` /
+`frame` / `hello_frame` / `World`（`{ dir, hub, parsers, tasks }`，`send()` 内部构造
+`SessionContext`，`trash = |_: &Path| false`）/ `sends` / `close_count` / `has_effect` /
+`pair_request_ids` / `action_frame` / `action_world`。
+
+### 验证
+
+首轮 **905 passed / 3 failed**，三个失败与两处编译错都记在这里：
+
+1. **`a_newer_development_build_is_installed_once` 期望 `[1]` 实得 `[]`**：`is_newer` 的
+   方向反了。`is_newer(current, latest) = parse_version(latest) > parse_version(current)`
+   （`gd3-core::version.rs:52`，同 `app/update.py:30`）→ 热更触发条件是扩展**旧于**
+   `LATEST`，测试里该给 `"1.0.0"` 而不是 `"9.9.9"`。模块头也写反了，一并改正。
+2. **`a_finished_install_reloads_the_extension_and_keeps_the_flag`**：同一个方向错，
+   hello 版本改 `"1.0.0"`。
+3. **`toggling_a_paused_task_queues_it` 的 `waiting_order()` 是空的**：`pump` 之后任务
+   **已离开等待队列**、进 `running_count()`，状态仍是 `Paused`（第 99 步的口径）。
+   改断言 `running_count() == 1` + 存在 `Dispatch` 效果。
+4. 编译错两处：`gd3_core::task::TaskError` → `gd3_core::task_error::TaskError`；
+   `an_unknown_task_or_action_is_reported` 里局部变量 `sends` 遮蔽了同名助手函数
+   （改 `unknown_task` / `unknown_action`）。
+5. **clippy `unnecessary_sort_by`**：`records.sort_by(|l, r| r.created_at.cmp(&l.created_at))`
+   → `sort_by_key(|record| std::cmp::Reverse(record.created_at))`。`created_at` 是 `i64`，
+   `Reverse` 可用；`sort_by_key` 同样稳定，`reverse=True` 的「相等元素不反转」语义不变。
+
+最终：
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**908 passed / 0 failed**（867 + 41）；
+- `cargo test --workspace`：**1417 passed / 0 failed**（28 段）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（2m25s，修掉一条 `unnecessary_sort_by`）；
+- Python 侧没改一行。
+
+编译耗时：`gd3-ui` lib+test **约 8 分钟**（02:54→03:02，比第 110 步的 3 分 07 秒慢一倍多——
+机器 939 MB 内存 + 1.2 GB swap 抖动）；`--workspace` 12m26s（03:08→03:21），修掉 clippy
+那条后复跑 10m43s（03:32→03:43）；clippy `--all-targets` 2m25s（03:27→03:31）。
+
+### 下一步（第 112 步）
+
+两件收尾，然后回 Phase 7 P0 主线：
+
+1. `Engine` 里 `BrowserService`(:177) / `Aria2RpcService` 两个零大小桩的收敛——
+   第 109/110/111 步的三个模块已经把它们的逻辑全搬完，桩本身只剩接线；
+2. Phase 7 P0：`main_window.py`(753) + `cards/task_cards.py`(569) +
+   `dialogs/task_drawer.py`(523)。
