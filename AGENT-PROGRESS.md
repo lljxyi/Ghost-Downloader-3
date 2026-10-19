@@ -7198,6 +7198,13 @@ ABI。这条边界值得写下来，否则后续每轮都会有人（包括我�
 ### 搬不了的部分（结构性 N/A）
 
 `load()` / `loadPacks()`（要 `importlib` 加载 `features/` 下的 Python 子类）、
+`pack.pages()` / `taskCardClass`（Qt 卡片）、`register` 里的属性注入、
+`_registerAssociations`（Qt 信号）。理由与第 107 步那条一样：**结构性不可移植，不是「还没做」**。
+`browserService` / `aria2RpcService` 仍共用 `featureService.parse` 这条端口，
+它们能接上的前提是先有 pack。
+
+### 验证
+
 - `cargo fmt --all` + `--check`：通过（写完后先 fmt 再 check；`github.rs` 少了一行
   空行被 fmt 补掉）；
 - `cargo test -p gd3-core --lib`：**311 passed / 0 failed**（第 107 步 307 + 4；
@@ -7210,13 +7217,6 @@ ABI。这条边界值得写下来，否则后续每轮都会有人（包括我�
 
 编译耗时记录：本轮 `gd3-ui` 单 crate 编译 **约 13 分钟**（比前几轮慢 50%），
 clippy 6m15s。机器 939 MB 内存 + swap 抖动是主因，不是代码规模问题。
-卡片）、`register` 里的属性注入、`_registerAssociations`（Qt 信号）。
-理由与第 107 步那条一样：**结构性不可移植，不是「还没做」**。`browserService` /
-`aria2RpcService` 仍共用 `featureService.parse` 这条端口，它们能接上的前提是先有 pack。
-
-### 验证
-
-VERIFY_PLACEHOLDER
 
 ### 下一步（第 109 步）
 
@@ -7230,3 +7230,128 @@ VERIFY_PLACEHOLDER
    `gd3-servers`），但 597 行里有相当一部分是 Qt 托盘/对话框，得先分清哪半是协议。
 
 倾向 1：接口面清楚、可测性高，且 `aria2` 开关（`GD3_RUST_ARIA2`）已经在引擎里留好了。
+
+## 第 109 步：`gd3-ui::aria2_actions`（aria2 RPC 应用侧）
+
+> 时间：2026-10-19 00:23（`date '+%Y-%m-%d %H:%M'` 实取）
+
+### 先纠正上一轮笔记里的两个数
+
+第 108 步的「下一步」写「`aria2_rpc.py`（约 400 行）」，实测 **233 行**。更要紧的是：
+它的**协议半边根本不用搬**——`parseHead` / `buildHttpResponse` / `buildPreflightHeaders` /
+`toHttpStatus` / `toText` / `toHeaders`、`_run` 的 JSON-RPC 方法表、`addUri` 的参数校验、
+token、WebSocket 帧，早在 Phase 5/6 就是 `gd3-servers::aria2`（426 行）+
+`gd3-servers::http`。差点重搬一遍（第 104 步 `name_conflict_queue`、第 106 步 `SpeedMeter`、
+第 107 步 `RuntimeStatusService` 都是同一个坑）。
+
+**留给本步的只有三个方法**：`applyTaskOptions`（:215-221）/ `_onTaskParsed`（:223-229）/
+`_onTaskParseFailed`（:231-233）。它们之所以在 `gd3-ui` 而不在 `gd3-servers`：需要
+`FeatureService.parse`（第 108 步）与 `cfg.shouldDraftTakenDownload` 策略。
+
+### 做了什么
+
+新建 `rust/crates/gd3-ui/src/aria2_actions.rs`（**381 行 / 10 单测**），`lib.rs` 里按字母序
+插到 `actions` 与 `band_selector` 之间：
+
+```rust
+pub struct Aria2Request { url, output_folder, headers: Vec<(String, String)>, client_profile, name }
+pub enum Aria2Effect { DraftRequested(TaskRecord), AddTask(TaskRecord), ParseFailed { url, error: TaskError } }
+pub fn apply_task_options(features: &FeatureService, presets: &[IdentityPreset],
+                          request: Aria2Request, should_draft_taken_download: bool) -> Vec<Aria2Effect>
+```
+
+私有：`request_options(&Aria2Request) -> Map<String, Value>`（`url` / `outputFolder` /
+`clientProfile` / `headers` 四键）、`safe_name(name, current)`。
+
+### 逐条对照
+
+| Python | Rust |
+|---|---|
+| `coroutineRunner.submit(self._parse(options), done=…, failed=…)`（:217-221） | 同步 `features.parsers().parse(&mut options, presets)`，结果摊成 `Aria2Effect` |
+| `if name: task.setName(name)`（:224-225） | `task.name = to_safe_filename(name, fallback, 200)` |
+| `cfg.shouldDraftTakenDownload.value` → `taskDraftRequested.emit([task])`（:226-228） | `Aria2Effect::DraftRequested(task)` |
+| `self._addTask(task)`（:229） | `Aria2Effect::AddTask(task)` |
+| `logger.warning(...)` + `parseFailed.emit(url, toTaskError(error))`（:232-233） | `Aria2Effect::ParseFailed { url, error }`（日志归宿主） |
+| `TaskOptions(url=…, headers=…, outputFolder=…, clientProfile=…)`（:206-211） | `request_options()` 的同名四键 |
+| `toSafeFilename(name, fallback=self.name or "download")`（`task.py:284-285`） | `safe_name(name, current)` |
+
+### 关键决策
+
+- **不跨 crate 引用 `Aria2TaskOptions`**：`gd3-ui` 的依赖里没有 `gd3-servers`，也不该有
+  （协议层会把它背后的 tokio 拖进 UI crate）。定义同形的 `Aria2Request`，由宿主在
+  `Aria2Action::AddTask { gid, options }` 与它之间搬一次字段——两边字段名一一对应，搬运是
+  机械的。
+- **结果摊成效果队列而不是回调**：`coroutineRunner.submit(done=, failed=)` 的三条出路 =
+  三个变体，顺序与 Python 的调用顺序一致（至多一条）。同第 100 步 `TaskAction`、第 102 步
+  `RuntimeEffect` 的口径；宿主没有协程运行时也照样能驱动。
+- **`Aria2Effect` 只 `derive(Debug, Clone)`**：`TaskRecord` 没有 `PartialEq`（`extra` /
+  `checksums` 是 `serde_json::Value`，`files` 是 `Option<Vec<TaskFile>>` 且 `TaskFile`
+  也没 `PartialEq`）。断言一律用 `matches!`，不为了断言去给领域模型加 derive。
+- **`safe_name` 的 `fallback` 取「当前名字」**：`self.name or "download"` 在 `setName` 调用
+  **前**求值，所以是「解析出来的名字为空 → `download`，否则 → 解析出来的名字」。不是常量
+  `"download"`，也不是 aria2 的 `out`（`out` 正是被清洗的那个）。
+- **`headers` 落成 JSON 对象**：Python 传 `dict[str, str]`，解析器按 `options["headers"][…]`
+  读；`Vec<(String, String)>` 保序保大小写（`toHeaders` 的结果就是原样大小写）。
+- **不建 `Aria2Request::from_options`**：那需要 `Aria2TaskOptions`，也就需要依赖
+  `gd3-servers`。搬运交给宿主，本模块保持零协议依赖。
+
+### 10 条新单测
+
+| 测试 | 钉住的行为 |
+|---|---|
+| `add_uri_reports_an_add_task` | 默认直加，`url` / `name` 来自解析结果 |
+| `the_out_option_renames_the_task` | `out` 非空 → 改名（含中文） |
+| `a_sanitized_out_option_keeps_the_extension` | `a/b:c.txt` → `a_b_c.txt`，扩展名不丢 |
+| `an_empty_out_option_keeps_the_parsed_name` | `out` 为空不动名字 |
+| `an_unusable_out_option_falls_back_to_the_parsed_name` | `"..."` 被剥空 → 退到当前名字 |
+| `an_empty_parsed_name_falls_back_to_download` | 当前名字也空 → `"download"` |
+| `the_draft_setting_routes_to_draft_requested` | 开关打开 → `DraftRequested`，不 `AddTask` |
+| `no_parser_matched_becomes_a_parse_failed_effect` | 空链 → `ParseFailed`，错误文本 `发生了意外错误：No parser matched: <url>` |
+| `the_request_options_carry_headers_folder_and_profile` | 四键齐全，`headers` 是对象且保大小写 |
+| `an_identity_preset_fills_the_profile_before_matching` | 空 `clientProfile` 被预设补成 `raw`（缺省预设只认 `*.pcs.baidu.com`） |
+
+### 照抄的 Python 缺陷（写进模块头）
+
+`Aria2RpcService.taskDraftRequested`（`aria2_rpc.py:108`）**在整个 Python 应用里没有任何
+`.connect()`**——`grep -rn taskDraftRequested app/` 只命中 `browser_service.py` 里那个同名
+的另一个 Signal。于是 `shouldDraftTakenDownload` 打开时，aria2 加进来的任务被 emit 到一个
+没人听的信号，然后 `return`，**任务直接消失**。
+
+Rust 侧保留 `Aria2Effect::DraftRequested` 而不是把任务丢掉：效果队列的意义就是「谁来消费由
+宿主决定」。宿主照抄 Python 不接这条 → 行为与 Python 一致（同病）；接了 → 顺手修好。这条
+差异写在模块头与 README，免得将来被当成漏了。
+
+### 验证
+
+- `cargo fmt --all` + `--check`：通过；
+- `cargo test -p gd3-ui --lib`：**849 passed / 0 failed**（第 108 步 839 + 10；首跑即绿）；
+- `cargo test --workspace`：**1356 passed / 0 failed**（28 段；1346 + 10）；
+- `cargo clippy --workspace --all-targets -- -D warnings`：**0 warning**（6m00s）。
+  首跑红了一次：`clippy::type_complexity`（测试助手 `service_with` 的返回类型
+  `(FeatureService, Rc<RefCell<Vec<Map<String, Value>>>>)`），抽成
+  `type SeenOptions = Rc<RefCell<Vec<Map<String, Value>>>>` 后复跑绿；
+- Python 侧没改一行。
+
+顺带清了两处文档债：第 108 步笔记里「搬不了的部分」与「验证」两节的内容串了位置、
+`验证` 里留着一个 `VERIFY_PLACEHOLDER`（已按当时实取的数字补回）；README 里
+`TaskParser::parse` 的签名笔误（`&mut self` → `&self`）。
+
+编译耗时：`gd3-ui` 单 crate 首轮 **约 13 分钟**（含 test target），clippy 6m00s。
+
+### 下一步（第 110 步）
+
+`browser_service.py`（597 行）同样是「协议 + 应用」混装，但这次**协议半边还没搬**：
+`gd3-servers` 只有 `websocket.rs`（握手 + 帧），`MessageType` / `ErrorCode` /
+`TaskAction` / `TaskSource` / `CreateTaskStatus` 五个枚举与 `toTaskOptions` /
+`toResourceTaskOptions` / `toTaskSummary` 三个载荷转换都在 Python 侧。
+
+建议拆两步：
+
+1. **第 110 步：载荷层**（纯函数，可全测）——五个枚举、`toStr` / `toInt` 的容错读法、
+   `toTaskOptions(source, payload)`、`toResourceTaskOptions(resource)`、
+   `toTaskSummary(task)`（含 `speedChanged` 的取整口径）；
+2. **第 111 步：会话状态机**——`BrowserClientSession` 的 `paired` / `pairRequest` 生命周期、
+   `approvePair` / `rejectPair` / `regenerateToken`、`_onHello` 的协议版本判定、
+   `_onCreateTask` → 解析 → 草稿/直加，全摊成效果队列（同本步手法）。
+
+Qt 部分（托盘图标、配对对话框、`extensionUpdated` 的 UI 提示）归 Phase 7 主窗口那条线。
