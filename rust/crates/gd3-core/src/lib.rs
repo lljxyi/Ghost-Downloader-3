@@ -14,6 +14,7 @@ pub mod ghd;
 pub mod github;
 pub mod hls;
 pub mod http_pack;
+pub mod httpdate;
 pub mod install;
 pub mod loader;
 pub mod m3u8;
@@ -57,6 +58,7 @@ pub use filesystem::{
     to_posix_path, which,
 };
 pub use ghd::PartRecord;
+pub use httpdate::{LastModifiedError, apply_last_modified, parse as parse_http_date};
 pub use install::{delete_installed, install_file};
 pub use loader::{
     DependencyError, DependencySkip, LoadReport, OrderReport, ScanReport, SeedReport, SeededPack,

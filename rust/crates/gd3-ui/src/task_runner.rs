@@ -72,7 +72,7 @@ pub const RETRY_DELAY: Duration = Duration::from_millis(5000);
 /// `HttpTaskStep.subworkerCount` 的默认值（`features/http_pack/task.py:69`）。
 pub const DEFAULT_SUBWORKER_COUNT: usize = 8;
 
-/// 运行期需要从 `cfg` 现读的六项。
+/// 运行期需要从 `cfg` 现读的七项。
 ///
 /// Python 里这些是全局 `cfg` 的 `ConfigItem`，每次用到时现读；Rust 侧由宿主在
 /// 每轮 tick 用 [`RunnerSettings::from_config`] 重新取一份（设置页改完立刻生效）。
@@ -90,6 +90,8 @@ pub struct RunnerSettings {
     pub max_reassign_size: u64,
     /// `cfg.autoSpeedUp`。
     pub auto_speed_up: bool,
+    /// `cfg.shouldPreserveLastModified`（跑完把 mtime 设成响应头里的时间）。
+    pub preserve_last_modified: bool,
 }
 
 impl Default for RunnerSettings {
@@ -101,6 +103,7 @@ impl Default for RunnerSettings {
             retry_delay: RETRY_DELAY,
             max_reassign_size: 512 * 1024,
             auto_speed_up: true,
+            preserve_last_modified: false,
         }
     }
 }
@@ -120,6 +123,8 @@ impl RunnerSettings {
                 .unwrap_or(defaults.max_reassign_size),
             auto_speed_up: settings::read_bool(config, "autoSpeedUp")
                 .unwrap_or(defaults.auto_speed_up),
+            preserve_last_modified: settings::read_bool(config, "shouldPreserveLastModified")
+                .unwrap_or(defaults.preserve_last_modified),
         }
     }
 }
@@ -142,6 +147,10 @@ pub struct DownloadStep {
     pub subworker_count: usize,
     pub can_use_range_requests: bool,
     pub http_byte_offset: u64,
+    /// 响应头里的 `Last-Modified`（`HttpTaskStep.lastModified`，可能为空/缺失）。
+    ///
+    /// 只有 `shouldPreserveLastModified` 打开时才会用到（[`DownloadJob::preserve_last_modified`]）。
+    pub last_modified: Option<String>,
 }
 
 /// 一个 Task 的一次运行：按 `stepIndex` 顺序跑完所有待跑步骤。
@@ -153,6 +162,8 @@ pub struct DownloadJob {
     pub retry_delay: Duration,
     pub max_reassign_size: u64,
     pub auto_speed_up: bool,
+    /// `cfg.shouldPreserveLastModified` 在派发时的快照。
+    pub preserve_last_modified: bool,
 }
 
 impl DownloadJob {
@@ -228,6 +239,7 @@ pub fn plan_job(
                     .unwrap_or(settings.subworker_count),
                 can_use_range_requests: step_bool(step, "canUseRangeRequests").unwrap_or(false),
                 http_byte_offset: step_u64(step, "httpByteOffset").unwrap_or(0),
+                last_modified: step_text(step, "lastModified").filter(|value| !value.is_empty()),
             })
         })
         .collect();
@@ -239,6 +251,7 @@ pub fn plan_job(
         retry_delay: settings.retry_delay,
         max_reassign_size: settings.max_reassign_size,
         auto_speed_up: settings.auto_speed_up,
+        preserve_last_modified: settings.preserve_last_modified,
     }
 }
 
@@ -407,6 +420,26 @@ impl Spawner for ThreadSpawner {
     }
 }
 
+/// `features/http_pack/rust_engine.py:103-110` 的 `_restoreMtime`：
+/// 开关打开且步骤带 `Last-Modified` 时把输出文件的 mtime 设回去。
+///
+/// Python 侧只是 `logger.warning`，**绝不让任务失败**（很多文件系统/挂载点不支持
+/// 改时间戳，这里失败不影响「文件已下完」这个事实），所以错了只打 stderr。
+fn restore_last_modified(job: &DownloadJob, step: &DownloadStep) {
+    if !job.preserve_last_modified {
+        return;
+    }
+    let Some(raw) = step.last_modified.as_deref() else {
+        return;
+    };
+    if let Err(error) = gd3_core::apply_last_modified(&step.output_path, raw) {
+        eprintln!(
+            "设置文件修改时间失败 {}：{error}",
+            step.output_path.display()
+        );
+    }
+}
+
 /// 逐步跑完一个 job，把过程发成事件（`Task.run` 的循环 + `HttpTask.run` 的传输）。
 async fn run_job(job: DownloadJob, cancel: CancellationToken, sink: Sender<RunnerEvent>) {
     for step in &job.steps {
@@ -460,6 +493,7 @@ async fn run_job(job: DownloadJob, cancel: CancellationToken, sink: Sender<Runne
 
         match outcome {
             Ok(()) => {
+                restore_last_modified(&job, step);
                 let _ = sink.send(RunnerEvent::StepFinished {
                     work_id: job.work_id.clone(),
                     task_id: job.task_id.clone(),
@@ -1106,11 +1140,16 @@ mod tests {
         step.extra
             .insert("canUseRangeRequests".to_string(), json!(true));
         step.extra.insert("httpByteOffset".to_string(), json!(128));
+        step.extra.insert(
+            "lastModified".to_string(),
+            json!("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
         record.steps.push(step);
 
         let settings = RunnerSettings {
             subworker_count: 2,
             client_profile: "auto".to_string(),
+            preserve_last_modified: true,
             ..Default::default()
         };
         let job = plan_job(&record, &settings, "wrk_1");
@@ -1129,12 +1168,97 @@ mod tests {
         assert!(planned.can_use_range_requests);
         assert_eq!(planned.http_byte_offset, 128);
         assert_eq!(
+            planned.last_modified.as_deref(),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+        assert!(job.preserve_last_modified);
+        assert_eq!(
             planned.headers,
             vec![
                 ("Referer".to_string(), "https://example.com/".to_string()),
                 ("X-Count".to_string(), "3".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn an_empty_last_modified_counts_as_absent() {
+        // `HttpTaskStep.lastModified` 缺省是 `""`（`task.py:72`），不能当成有值。
+        let mut record = record("a", TaskStatus::Running);
+        let mut step = http_step(0, "u");
+        step.extra.insert("lastModified".to_string(), json!(""));
+        record.steps.push(step);
+        let job = plan_job(&record, &RunnerSettings::default(), "wrk_1");
+        assert_eq!(job.steps[0].last_modified, None);
+        assert!(!job.preserve_last_modified, "缺省关（`cfg.py:254`）");
+    }
+
+    #[test]
+    fn restore_last_modified_sets_the_mtime_only_when_enabled() {
+        let dir = temp_dir("mtime");
+        let output = dir.join("out.bin");
+        std::fs::write(&output, b"payload").expect("写文件");
+        let snapshot = std::fs::metadata(&output)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+
+        let mut record = record("a", TaskStatus::Running);
+        let mut step = http_step(0, "u");
+        step.extra.insert(
+            "lastModified".to_string(),
+            json!("Sun, 06 Nov 1994 08:49:37 GMT"),
+        );
+        record.steps.push(step);
+        let mut job = plan_job(&record, &RunnerSettings::default(), "wrk_1");
+        let planned = job.steps[0].clone();
+        assert_eq!(
+            planned.output_path,
+            PathBuf::from("/out/a.bin"),
+            "计划层用记录里的路径"
+        );
+
+        // 开关关着：一个字节都不动
+        let mut on_disk = planned.clone();
+        on_disk.output_path = output.clone();
+        restore_last_modified(&job, &on_disk);
+        assert_eq!(
+            std::fs::metadata(&output)
+                .expect("stat")
+                .modified()
+                .expect("mtime"),
+            snapshot,
+            "开关关着不能碰 mtime"
+        );
+
+        // 开关开着：mtime 变成 1994-11-06T08:49:37Z
+        job.preserve_last_modified = true;
+        restore_last_modified(&job, &on_disk);
+        let modified = std::fs::metadata(&output)
+            .expect("stat")
+            .modified()
+            .expect("mtime");
+        assert_eq!(
+            modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("1970 之后")
+                .as_secs(),
+            784_111_777
+        );
+        assert_eq!(
+            std::fs::read(&output).expect("读回"),
+            b"payload",
+            "内容不能动"
+        );
+
+        // 解析不出来 / 文件不在：只打告警，不 panic（`logger.warning` 口径）
+        let mut bad = on_disk.clone();
+        bad.last_modified = Some("not a date".to_string());
+        restore_last_modified(&job, &bad);
+        let mut missing = on_disk.clone();
+        missing.output_path = dir.join("nope.bin");
+        restore_last_modified(&job, &missing);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1149,6 +1273,7 @@ mod tests {
             retry_delay: Duration::from_millis(123),
             max_reassign_size: 777,
             auto_speed_up: false,
+            preserve_last_modified: true,
         };
         let job = plan_job(&record, &settings, "wrk_2");
         let planned = &job.steps[0];
@@ -1161,6 +1286,8 @@ mod tests {
         assert_eq!(planned.user_agent, "");
         assert!(planned.headers.is_empty());
         assert!(!planned.can_use_range_requests);
+        assert_eq!(planned.last_modified, None);
+        assert!(job.preserve_last_modified, "开关走 settings");
         assert_eq!(planned.http_byte_offset, 0);
         assert_eq!(job.retry_delay, Duration::from_millis(123));
         assert_eq!(job.max_reassign_size, 777);
@@ -1208,6 +1335,8 @@ mod tests {
         settings::write(&mut config, "clientProfile", &json!("chrome")).expect("已知 attr");
         settings::write(&mut config, "maxReassignSize", &json!(101)).expect("已知 attr");
         settings::write(&mut config, "autoSpeedUp", &json!(false)).expect("已知 attr");
+        settings::write(&mut config, "shouldPreserveLastModified", &json!(true))
+            .expect("已知 attr");
 
         let parsed = RunnerSettings::from_config(&config);
 
@@ -1215,8 +1344,21 @@ mod tests {
         assert_eq!(parsed.client_profile, "chrome");
         assert_eq!(parsed.max_reassign_size, 101 * 1024, "cfg 里是 KiB");
         assert!(!parsed.auto_speed_up);
+        assert!(parsed.preserve_last_modified);
         assert_eq!(parsed.subworker_count, DEFAULT_SUBWORKER_COUNT);
         assert_eq!(parsed.retry_delay, RETRY_DELAY);
+    }
+
+    #[test]
+    fn the_settings_page_key_is_the_same_setting_the_runner_reads() {
+        // 设置页写的是 `GeneralDownload/PreserveLastModified`（`settings_spec.rs:365`），
+        // runner 读的是属性名 `shouldPreserveLastModified` —— 两条必须指向同一个键。
+        let mut config = settings::default_config();
+        config.set_bool("GeneralDownload", "PreserveLastModified", true);
+        assert!(
+            RunnerSettings::from_config(&config).preserve_last_modified,
+            "设置页勾上之后 runner 必须看得到"
+        );
     }
 
     // ---- 派发 ----

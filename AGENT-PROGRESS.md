@@ -9397,3 +9397,59 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
 - 下一步：托盘（`SystemTrayIcon`）→ `shouldPreserveLastModified` 的 `os.utime` →
   限速门 → `update_service` 的 tokio 宿主适配。
 - 卡点：无
+
+## 第 133 步：`shouldPreserveLastModified` —— 跑完把 mtime 设回去（2026-10-19 15:58 UTC）
+
+接第 132 步「下一步」里的第 2 项。Python 侧的行为在
+`features/http_pack/rust_engine.py:103-110`（`_restoreMtime`）和
+`features/http_pack/task.py:472-480`（任务被删记录时的重复实现）：
+`cfg.shouldPreserveLastModified` 打开且 `step.lastModified` 非空时，
+`os.utime(outputPath, (mtime, mtime))`，失败只 `logger.warning("设置文件修改时间失败 {}")`。
+
+- 做了什么：
+  - **新模块 `gd3-core::httpdate`**（`lib.rs` 注册 + 导出 `parse` / `apply_last_modified` /
+    `LastModifiedError`）。`parse` / `parse_unix_seconds` 手写 HTTP-date 解析：IMF-fixdate
+    （`Sun, 06 Nov 1994 08:49:37 GMT`）、RFC 850（`Sunday, 06-Nov-94 08:49:37 GMT`）、
+    asctime（`Sun Nov  6 08:49:37 1994`），数值（`+0200`）与缩写（`EST`…）时区都认，
+    两位年份的世纪归属照 `email._parseaddr._parsedate_tz`（`0..=68` → 2000 年代）。
+    `apply_last_modified` 用 `File::set_modified`：先试写句柄、失败退只读句柄
+    （`os.utime` 只要属主，不需要写权限，单测里用 `chmod 444` 验过）。
+  - **`task_runner`**：`RunnerSettings` 从六项变七项（新增
+    `preserve_last_modified` ← `settings::read_bool(config, "shouldPreserveLastModified")`，
+    缺省 `false`）；`DownloadStep.last_modified` 从 `step.extra["lastModified"]` 取
+    （空串按缺失 —— `HttpTaskStep.lastModified` 缺省就是 `""`）；`DownloadJob`
+    带上开关快照；`run_job` 在 `engine.run()` 返回 `Ok(())` 之后、发 `StepFinished`
+    之前调新加的 `restore_last_modified`，**失败只打 stderr，绝不让任务失败**。
+  - 没动 `gd3-net`：`lastModified` 是建任务时（`pack.py:177` / `rust_probe.py:48`）就
+    写进 `tasks.jsonl` 的字符串，传输层不需要再解析响应头。
+- 与 Python 的差异（都写进模块头和 README）：**只改 mtime 不改 atime**（std 没有
+  atime 的 API，为一个看不见的属性引 `filetime` 不值得）；**表外时区缩写按 UTC**
+  （Python 得到 naive datetime，`.timestamp()` 按本地 `TZ` 解释，结果随机器变）；
+  数值时区额外接受 `+08:00`；星期名只跳过不校验。
+- 验证（全部本轮实跑）：
+  - `gd3-core::httpdate` **11 passed**，其中 `matches_python_parsedate` 是一张
+    逐条对齐 CPython 的表（12 个样本全是 `parsedate_to_datetime(s).timestamp()` 的
+    实跑值，含 `-0800`、`EST`、两位年份、1970 之前）—— 防「自洽但错」；
+  - `cargo test -p gd3-ui --lib task_runner` **34 passed**（新增：空串按缺失、
+    开关开/关只影响 mtime、**设置页写的 `GeneralDownload/PreserveLastModified` 与
+    runner 读的属性名指向同一个键**）；
+  - `tests/runner_e2e.rs` **4 passed**（新增 `preserving_last_modified_stamps_the_real_download`
+    → 真 HTTP 下载 + 逐字节一致 + mtime = `784111777`；
+    `the_default_settings_leave_the_mtime_alone` → 缺省不动 mtime）；
+  - **真二进制**：`gd3-ui --headless --until-idle --set shouldPreserveLastModified=true`
+    → `stat` 显示 `1994-11-06 08:49:37`、`cmp` 逐字节一致、`rc=0`、任务 `COMPLETED`；
+    `UserConfig.json` 里 `PreserveLastModified: true` 落在 Python 的同一位置
+    （`DeleteFilesOnRemove` 与 `shouldVerifySsl` 之间）；不带 `--set` 的默认配置
+    跑同一条任务 → mtime 是当前时间（开关真的在起作用）。
+  - 质量门：`cargo fmt --all --check` OK；`cargo clippy --workspace --all-targets
+    -- -D warnings` **exit 0**（25m28s）；`cargo test -p gd3-core -p gd3-net
+    -p gd3-servers -p gd3-ui` **GATE_EXIT=0**，28 个 test target 全 ok、
+    **1751 passed**（第 132 步是 1735，+16 = 本次新增）；Python 全量
+    `pytest -q --continue-on-collection-errors` → 3 failed / 1370 passed / 8 skipped /
+    35 errors，与 `/root/baseline-failures.txt` **逐条相同（新增 0、消失 0）**。
+- 踩到的坑：`cargo test` 的 test profile 在这台机器上仍然要 50 分钟以上
+  （第一次 `timeout 3000` 正好在编 `gd3-ui` 时被截断，exit 124 = 假超时），
+  重跑一次（缓存在）才拿到结果；结论：**test 门要按 ≥90 分钟给超时**。
+- 下一步：限速门（`SpeedMeter::waitForSpeedLimit` 的落点）→ 托盘
+  （`SystemTrayIcon` + `shell.rs` 五项菜单）→ `update_service` 的 tokio 宿主适配。
+- 卡点：无

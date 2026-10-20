@@ -228,3 +228,93 @@ fn pausing_keeps_the_part_record_and_resuming_finishes_the_download() {
     assert!(runner.shutdown(Duration::from_secs(5)).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn preserving_last_modified_stamps_the_real_download() {
+    // 第 133 步：`cfg.shouldPreserveLastModified` 打开时，跑完要把输出文件的 mtime
+    // 设成 `step.lastModified`（`rust_engine.py:103-110` 的 `_restoreMtime`）。
+    let content: Vec<u8> = (0..120_000u32).map(|index| (index % 241) as u8).collect();
+    let harness = Harness::start(content.clone(), Mode::Range);
+    let dir = temp_dir("mtime");
+    let url = harness.server.url("/file.bin");
+
+    let mut service = TaskService::new();
+    let mut task = record("dl", &dir, &url, content.len(), 2);
+    task.steps[0].extra.insert(
+        "lastModified".to_string(),
+        json!("Sun, 06 Nov 1994 08:49:37 GMT"),
+    );
+    let _ = service.add(task, true);
+
+    let mut runner = TaskRunner::new(RunnerSettings {
+        preserve_last_modified: true,
+        ..Default::default()
+    });
+    assert_eq!(runner.pump(&mut service), vec!["dl".to_string()]);
+    drive(&mut runner, &mut service, Duration::from_secs(120));
+
+    let output = dir.join("dl.bin");
+    assert_eq!(
+        std::fs::read(&output).expect("读下载结果"),
+        content,
+        "下载结果要逐字节一致（改时间戳不能碰内容）"
+    );
+    assert_eq!(
+        service.task("dl").expect("任务还在").status,
+        TaskStatus::Completed
+    );
+    let modified = std::fs::metadata(&output)
+        .expect("stat")
+        .modified()
+        .expect("mtime");
+    assert_eq!(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("1970 之后")
+            .as_secs(),
+        784_111_777,
+        "mtime 要变成 Last-Modified 里的时间"
+    );
+
+    assert!(runner.shutdown(Duration::from_secs(5)).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_default_settings_leave_the_mtime_alone() {
+    // 开关关着（`cfg.py:254` 的缺省）时不能碰 mtime。
+    let content: Vec<u8> = (0..40_000u32).map(|index| (index % 239) as u8).collect();
+    let harness = Harness::start(content.clone(), Mode::Range);
+    let dir = temp_dir("mtime-off");
+    let url = harness.server.url("/file.bin");
+
+    let mut service = TaskService::new();
+    let mut task = record("dl", &dir, &url, content.len(), 2);
+    task.steps[0].extra.insert(
+        "lastModified".to_string(),
+        json!("Sun, 06 Nov 1994 08:49:37 GMT"),
+    );
+    let _ = service.add(task, true);
+
+    let mut runner = TaskRunner::new(RunnerSettings::default());
+    assert_eq!(runner.pump(&mut service), vec!["dl".to_string()]);
+    drive(&mut runner, &mut service, Duration::from_secs(120));
+
+    let output = dir.join("dl.bin");
+    assert_eq!(std::fs::read(&output).expect("读下载结果"), content);
+    let modified = std::fs::metadata(&output)
+        .expect("stat")
+        .modified()
+        .expect("mtime");
+    assert!(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("1970 之后")
+            .as_secs()
+            > 784_111_777,
+        "缺省不该把 mtime 拉回 1994 年"
+    );
+
+    assert!(runner.shutdown(Duration::from_secs(5)).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

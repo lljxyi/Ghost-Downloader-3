@@ -3290,7 +3290,7 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–132 步）
+## Phase 8 进展（第 126–133 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3331,7 +3331,8 @@ tick = 现读 cfg（maxTaskNum 改了下一 tick 就生效）
 保住 `.ghd`）**先于** `Engine::stop()`（落盘）——反过来的话 `TaskService` 已经收工，
 晚到的运行期事件没人收。
 
-端到端验收：`tests/runner_e2e.rs`（2 条，`TaskRunner` 直驱）、
+端到端验收：`tests/runner_e2e.rs`（4 条，`TaskRunner` 直驱；后两条是第 133 步的
+mtime 断言）、
 `tests/runtime_e2e.rs`（2 条，`boot::run(--until-idle)` 与 `Runtime::pause`/`start`）、
 `tests/test_config_roundtrip.py`（6 条 cfg 往返）。
 
@@ -3462,9 +3463,66 @@ Slint 的 `on_close_requested` **缺省返回 `CloseRequestResponse::HideWindow`
 整条任务按加载失败丢掉（摘要里 `tasks=0`）；`.ghd` **只在范围请求模式下**写，
 非 Range 服务器上暂停后没有 `.ghd` 是预期行为。
 
+### `shouldPreserveLastModified`：跑完把 mtime 设回去（第 133 步）
+
+Python 在两处做同一件事（`features/http_pack/rust_engine.py:103-110` 的
+`_restoreMtime`，以及 `features/http_pack/task.py:472-480` 里任务被删记录时的重复实现）：
+
+```python
+if not cfg.shouldPreserveLastModified.value or not step.lastModified:
+    return
+try:
+    mtime = parsedate_to_datetime(step.lastModified).timestamp()
+    os.utime(Path(step.outputPath), (mtime, mtime))
+except Exception as e:
+    logger.opt(exception=e).warning("设置文件修改时间失败 {}", step.outputPath)
+```
+
+Rust 侧没有要新增的头部/探测逻辑：`lastModified` 是**建任务时**（`pack.py:177` 取响应头
+`last-modified`、`rust_probe.py:48`）写进 `tasks.jsonl` 的字符串，`task_runner` 从
+`step.extra` 读就行。缺的两块是：一个 HTTP-date 解析器（std 没有），和一个「只改 mtime」
+的落盘点。
+
+- 新模块 **`gd3-core::httpdate`**：`parse` / `parse_unix_seconds` 认 HTTP-date 的三种历史
+  格式（IMF-fixdate `Sun, 06 Nov 1994 08:49:37 GMT`、RFC 850
+  `Sunday, 06-Nov-94 08:49:37 GMT`、asctime `Sun Nov  6 08:49:37 1994`），带数值/缩写时区；
+  `apply_last_modified(path, raw)` 才是落地那步。两位年份的世纪归属照抄
+  `email._parseaddr._parsedate_tz`（`0..=68` → 2000 年代，`69..=99` → 1900 年代）。
+  单测里有一张**逐条对齐 CPython** 的表（`matches_python_parsedate`，12 个样本都是
+  `parsedate_to_datetime(s).timestamp()` 的实跑值），避免「自洽但错」。
+- **`task_runner`**：`RunnerSettings.preserve_last_modified`（读属性名
+  `shouldPreserveLastModified`，缺省 `false`）→ `plan_job` 快照进
+  `DownloadJob.preserve_last_modified`，`step.extra["lastModified"]` 进
+  `DownloadStep.last_modified`（空串按缺失处理，`HttpTaskStep.lastModified` 的缺省就是
+  `""`）。`run_job` 在 `engine.run()` 返回 `Ok(())` 之后、发 `StepFinished` 之前调
+  `restore_last_modified`：**失败只打 stderr**（`设置文件修改时间失败 <path>：<err>`），
+  绝不让任务失败 —— 很多挂载点不支持改时间戳，而「文件已下完」是既定事实。
+
+| 差异 | 说明 |
+|---|---|
+| 只改 mtime，不改 atime | `os.utime` 两个都设；std 只有 `File::set_modified`，设 atime 要 `filetime` 这类外部依赖，为一个看得见的属性不值得 |
+| 表外时区缩写按 UTC | Python 得到 naive datetime，`.timestamp()` 再按**本地** `TZ` 解释（结果随机器变）；这里固定 UTC，可复现 |
+| 数值时区也接受 `+08:00` | Python 的 `parsedate` 只吃 `+0800`；放宽只会让更多输入可用 |
+| 星期名只跳过、不校验 | 与 `parsedate_tz` 一致 |
+| 只读文件照样能改 mtime | 先试写句柄，失败退只读句柄（`os.utime` 只要属主，不需要写权限） |
+
+验收（第 133 步实跑）：
+
+- 单测：`gd3-core::httpdate` 11 条全绿；`task_runner` 34 条全绿（新增「空串按缺失」
+  「开关开/关只影响 mtime」「设置页的 `GeneralDownload/PreserveLastModified` 与 runner 读的
+  属性名指向同一个键」）。
+- e2e（生产路径 `TaskRunner::new` + `gd3_net::HttpEngine` + 本地 HTTP 服务）：
+  `runner_e2e::preserving_last_modified_stamps_the_real_download` → 文件逐字节一致且
+  mtime = `784111777`（1994-11-06T08:49:37Z）；`the_default_settings_leave_the_mtime_alone`
+  → 缺省不动 mtime。
+- 真二进制：`gd3-ui --headless --until-idle --set shouldPreserveLastModified=true`
+  → `stat` 显示 `1994-11-06 08:49:37`、`cmp` 逐字节一致、rc=0，`UserConfig.json` 里
+  `PreserveLastModified` 落在 Python 的同一位置（`DeleteFilesOnRemove` 与
+  `shouldVerifySsl` 之间）；不带 `--set` 的默认配置跑同一条任务 → mtime 是当前时间。
+
 ### 尚未接的
 
-尚未接的还有：`shouldPreserveLastModified` 的 `os.utime`、限速钩子
-（`SpeedMeter::waitForSpeedLimit`）、建任务链路（解析器仍在 Python 侧，Rust 只跑
-已经在 `tasks.jsonl` 里的任务）、托盘 / Dock（`SystemTrayIcon` 现成，见上一节）。
+尚未接的还有：限速钩子（`SpeedMeter::waitForSpeedLimit`）、建任务链路（解析器仍在
+Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的任务）、托盘 / Dock（`SystemTrayIcon` 现成，
+见上一节）。`shouldPreserveLastModified` 第 133 步已接（见上一节）。
 窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：起窗、下载、三种关窗模式都对。
