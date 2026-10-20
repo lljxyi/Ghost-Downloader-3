@@ -3290,7 +3290,7 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–130 步）
+## Phase 8 进展（第 126–132 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3379,13 +3379,20 @@ tick = 现读 cfg（maxTaskNum 改了下一 tick 就生效）
 `shell.rs`（第 75 步）已经有全套**语义**（`tray_menu()` 五项顺序、`toTraySpeed` /
 `toDockSpeed` 的两套小数口径、`dock.onSpeedChanged` 的 `shouldShowDockSpeed and
 shouldShowDockIcon` 条件、Windows 菜单定位钳制、激活原因到信号的映射），但
-**Slint 1.18 没有原生托盘 / Dock / 状态项能力**，所以这一步不硬造。方案：
+**更正（第 132 步实测）**：Slint 1.18.1 **有**原生托盘元素 `SystemTrayIcon`
+（`i-slint-core-1.18.1/items/system_tray.rs`，后端 `appkit` / `windows` / `ksni`），
+而且 `system-tray` 就在 `slint` 的 default features 里 —— `gd3-ui` 当前的依赖已经把它
+编译进去了。所以这项不必「降级到底」：在 `.slint` 里派生一个
+`inherits SystemTrayIcon` 的组件、把 `shell.rs` 算好的五项菜单接上去即可，Linux 走
+`ksni`（StatusNotifierItem over D-Bus）。`run_event_loop()` 在有可见托盘图标时也会
+继续跑，正好配 `CloseMode=Background`。**当前仍未接**，`CloseMode=Background` 还是
+「藏窗口 + 一条 stderr 提示」。原方案（万一要用平台原生 API）：
 
 | 平台 | 要用的 API | 现状 |
 |---|---|---|
-| Linux | `libappindicator` / `ksni`（StatusNotifierItem over D-Bus），菜单走 `com.canonical.dbusmenu` | TODO，未接 |
-| Windows | Win32 `Shell_NotifyIcon` + `TrackPopupMenu`（`tray.py` 的 `AcrylicMenu` 定位钳制对应 `TrackPopupMenuEx` 的屏幕工作区） | TODO，未接 |
-| macOS | AppKit `NSStatusItem` + `NSMenu`（`mac_status_item.py`） | TODO，未接 |
+| Linux | `libappindicator` / `ksni`（StatusNotifierItem over D-Bus），菜单走 `com.canonical.dbusmenu` | 未接（`SystemTrayIcon` + `ksni` 后端现成） |
+| Windows | Win32 `Shell_NotifyIcon` + `TrackPopupMenu`（`tray.py` 的 `AcrylicMenu` 定位钳制对应 `TrackPopupMenuEx` 的屏幕工作区） | 未接（`SystemTrayIcon` + windows 后端现成） |
+| macOS | AppKit `NSStatusItem` + `NSMenu`（`mac_status_item.py`） | 未接（`SystemTrayIcon` + AppKit 后端现成） |
 
 接线方式（**不改现有契约**）：加一个 `TrayHost` trait（`show_menu(entries)` /
 `set_tooltip(text)` / `set_icon(bytes)` / `set_dock_speed(text)`），宿主按平台选实现，
@@ -3408,9 +3415,56 @@ comm -13 /root/baseline-failures.txt /root/run-failures.txt   # 只看新增
 
 （`/root/baseline-failures.txt` 第 25 行就是这个收集错误，说明基线也是这么跑的。）
 
+### 关窗语义与窗口分支验收（第 132 步）
+
+Slint 的 `on_close_requested` **缺省返回 `CloseRequestResponse::HideWindow`**
+（`i-slint-core-1.18.1/window.rs:2421`）：窗口隐藏，事件循环照跑。`gd3-ui` 还有
+`Runtime` 的 `slint::Timer`，所以「点 ✕」若不接管，进程会变成看不见的僵尸。
+第 132 步按 Python `_onCloseClicked`（`app/view/windows/main_window.py:440-475`）
+补齐 `gd3-ui::close_request`：
+
+| `Software/CloseMode` | Python | `gd3-ui` |
+|---|---|---|
+| 任意，但消息框开着 | 先 `reject()` 那个框，窗口留着 | `CloseDecision::RejectDialog` |
+| `Ask`（缺省） | `MessageBox`：退出程序 / 继续在后台运行 + 记住我的选择 | `window::close_ask_dialog()` |
+| `Background` | `self.close()` 隐藏，托盘图标留着 | `Window::hide()` + 首次降级时一条 stderr 提示 |
+| `Quit` | `self.close()` + `QApplication.quit()` | `quit_event_loop()` |
+
+未知字面量 / 缺键按 `Ask` 兜底（`close_mode.rs` 的既有口径，不复刻 Python 的
+`KeyError`）。`dialogButtonClicked` 是**单槽**回调，`close_request::install` 独占；
+将来别的对话框要分派按钮时先问 `handle_dialog_button`（返回 `false` = 不归它管，
+交给下一个处理器）。darwin 的两个特例（`mode != QUIT` 时只 `hide` 并先存几何、
+全屏时 `showNormal` + 1 秒后重来）依赖 AppKit 窗口状态，暂未镜像。
+
+**两个坑（都会让人误判）**：
+
+1. **`window.run()` 不等价于「跑到用户退出」**。`ComponentHandle::run()` =
+   `show` + `run_event_loop()` + `hide`，而 `run_event_loop()` 在**最后一个窗口隐藏时
+   自己结束** —— `CloseMode=Background` 会变成「藏了窗口然后静默退出」。改用
+   `window.show()` + `slint::run_event_loop_until_quit()`（官方文档：
+   “continues to run even when no windows or system tray icons are visible, until
+   `quit_event_loop()` is called”）。
+2. **`xdotool windowclose` 是 `XDestroyWindow`**，不产生关闭请求，`on_close_requested`
+   根本不会被调用（实测：窗口没了、处理器一次没进）。真正的「点 ✕」是给窗口发
+   `WM_PROTOCOLS` / `WM_DELETE_WINDOW` 的 `ClientMessage`；第 132 步用
+   libX11 + ctypes 写了个几十行的小工具才拿到真事件。
+
+窗口分支的验收（`Xvfb :99` + `WM_DELETE_WINDOW`，2 MiB 限速载荷）：
+
+| 场景 | 期望 | 实测 |
+|---|---|---|
+| `Quit` | 进程干净退出 | `rc=0`，事件循环返回，停机序列 flush 完才走 |
+| `Ask` | 窗口留住 + 弹框 | 窗口仍 `IsViewable`、进程活；按钮文案/勾选落盘由单测覆盖 |
+| `Background` | 窗口消失、进程继续下载 | 无可见窗口、进程活，任务照样 `COMPLETED`、`cmp` 逐字节一致 |
+
+顺带两条口径：手写 `tasks.jsonl` 种子时 `completedAt` 必须写 `0`
+（Python 是 `Task.completedAt: int = 0`），写 `null` 会被 `TaskRecord` 的 `i64` 拒掉、
+整条任务按加载失败丢掉（摘要里 `tasks=0`）；`.ghd` **只在范围请求模式下**写，
+非 Range 服务器上暂停后没有 `.ghd` 是预期行为。
+
 ### 尚未接的
 
 尚未接的还有：`shouldPreserveLastModified` 的 `os.utime`、限速钩子
 （`SpeedMeter::waitForSpeedLimit`）、建任务链路（解析器仍在 Python 侧，Rust 只跑
-已经在 `tasks.jsonl` 里的任务）、窗口无显示服务时的 winit 分支（本机没有
-`DISPLAY`，只验了无头分支）。
+已经在 `tasks.jsonl` 里的任务）、托盘 / Dock（`SystemTrayIcon` 现成，见上一节）。
+窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：起窗、下载、三种关窗模式都对。

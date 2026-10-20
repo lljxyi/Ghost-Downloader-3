@@ -30,6 +30,7 @@ pub mod category;
 pub mod category_settings;
 pub mod clipboard;
 pub mod close_mode;
+pub mod close_request;
 pub mod config_store;
 pub mod conflict;
 pub mod draft;

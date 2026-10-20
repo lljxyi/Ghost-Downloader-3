@@ -9349,3 +9349,51 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
 - 下一步：**停止推进，等人工验收**。验收建议按 `AGENT-DONE` §5 顺序：
   ① 有显示服务的机器跑窗口分支；② 托盘/Dock；③ 更新检查宿主适配。Phase 8 的代码工作到此为止。
 - 卡点：无（唯一「非绿」的是基线里那些既有红灯，与本次工作无关）。
+
+## 第 132 步：窗口分支验收 + 关窗语义补齐（`gd3-ui::close_request`）（2026-10-19 15:58 UTC）
+
+接第 131 步留下的未完成项 1「窗口分支没有运行证据」。本机无显示器，装了 `xvfb` +
+`x11-utils` + `x11-xserver-utils` + `xdotool`，用 `Xvfb :99` 起真窗口。
+
+- 做了什么：
+  - **新模块 `gd3-ui::close_request`**（`lib.rs` 注册、`boot::run` 在 `push_settings`
+    之后装配一次）。Slint 的 `on_close_requested` **缺省返回 `HideWindow`**
+    （`i-slint-core-1.18.1/window.rs:2421`），而我们还有 `Runtime` 的 `slint::Timer`
+    —— 不接管就是「窗口没了、进程还在」的隐形僵尸。按 Python `_onCloseClicked`
+    （`main_window.py:440-475`）落四条分支：消息框开着 → `RejectDialog`；
+    `Ask` → `window::close_ask_dialog()`；`Background` → `Window::hide()`（首次降级打
+    一条 stderr，说明托盘未接）；`Quit` → `quit_event_loop()`。未知字面量/缺键按
+    `Ask` 兜底（`close_mode.rs` 既有口径，不复刻 `KeyError`）。勾「记住我的选择」时
+    按 Python 写 `cfg.set(cfg.closeMode, mode)`。`dialogButtonClicked` 是**单槽**，
+    本模块独占；后来者先问 `handle_dialog_button`（`false` = 不归它管）。
+  - **`boot.rs` 窗口分支改驱动方式**：`window.run()` → `window.show()` +
+    `slint::run_event_loop_until_quit()` + `hide()`。原因：`ComponentHandle::run()` =
+    `show` + `run_event_loop()` + `hide`，而 `run_event_loop()` 在**最后一个窗口隐藏时
+    自己结束** —— `CloseMode=Background` 实测就是「藏了窗口、`rc=0` 静默退出」。
+  - `quit()` 不再吞错：`quit_event_loop()` 失败要打 stderr（这类「静默不退出」正是
+    最难查的形态）。
+- 踩到的两个坑（都写进 `rust/README.md` 了）：
+  1. **`xdotool windowclose` 是 `XDestroyWindow`**，不产生关闭请求，`on_close_requested`
+     一次都不进（用探针程序确认过）。真正的「点 ✕」是发 `WM_DELETE_WINDOW`
+     `ClientMessage`；用 libX11 + ctypes 写了个几十行的小工具才拿到真事件。
+     第 131 步记的「关窗后进程不退」其实是这个假事件造成的。
+  2. **手写 `tasks.jsonl` 种子时 `completedAt` 必须写 `0`**（Python
+     `Task.completedAt: int = 0`）。写 `null` 会被 `TaskRecord` 的 `i64` 拒掉，
+     整条任务按加载失败丢掉 —— 摘要里 `tasks=0`，白查了一阵「窗口分支不下载」。
+- 验证（全部本轮实跑）：
+  - `cargo test -p gd3-ui --lib`：**1175 passed**（新增 `close_request` 10 条，其中两条
+    走真实接线：`dispatch_event(CloseRequested)` 的答复 + `invoke_dialogButtonClicked`
+    后 `CloseMode` 落盘）；
+  - `cargo fmt --all --check` OK；`cargo clippy --workspace --all-targets -D warnings` exit 0；
+  - `Xvfb :99` + 2 MiB 限速载荷 + `WM_DELETE_WINDOW`：`Quit` → **rc=0**（停机序列
+    flush 完才走）；`Ask` → 窗口仍 `IsViewable`、进程活、框内两个按钮文案与 Python 一致；
+    `Background` → **无可见窗口、进程活、任务照样 `COMPLETED`**、`cmp` 逐字节一致
+    （`Ask`/`Background` 两次都跑出 `BYTES_IDENTICAL`）。
+- 附带发现：**Slint 1.18.1 有原生 `SystemTrayIcon`**（后端 appkit / windows / ksni，
+  且 `system-tray` 在 `slint` 的 default features 里 = 我们已经编译进去了）。所以第 131 步
+  「8f 托盘降级」的结论要更正：不用自己写平台外壳，在 `.slint` 里
+  `inherits SystemTrayIcon` 接 `shell.rs` 的五项菜单即可。已写进 `rust/README.md`
+  与 `AGENT-DONE` §3.8f / §5。
+- 下一步：托盘（`SystemTrayIcon`）→ `shouldPreserveLastModified` 的 `os.utime` →
+  限速门 → `update_service` 的 tokio 宿主适配。
+- 卡点：无

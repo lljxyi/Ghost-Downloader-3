@@ -638,6 +638,9 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     );
     crate::extension_install::install(&window, Rc::new(crate::extension_install::SystemGuide));
     crate::push_settings(&window, &writer.config(), &default_download);
+    // 关窗语义（`Software/CloseMode`）：Slint 缺省只隐藏窗口，而 `Runtime` 的
+    // 定时器会让事件循环活着 —— 必须显式接管，否则关窗后进程变成看不见的僵尸。
+    crate::close_request::install(&window, Rc::clone(&writer));
 
     // 下载运行期（`task_runner` → 工作线程 → `gd3-net`）。设置每 tick 现读
     // `engine.config()`，所以设置页改 `maxTaskNum` 下一 tick 就生效（Python 的
@@ -671,8 +674,18 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     } else {
         // 有头：窗口事件循环驱动 tick 定时器（`Runtime::install`），阻塞到窗口关闭
         // （Python 的 `app.exec()`）。
+        //
+        // 用 `run_event_loop_until_quit()` 而不是 `window.run()`：后者内部是
+        // `show` + `run_event_loop()` + `hide`，而 `run_event_loop()` 在**最后一个窗口
+        // 隐藏时**就自己结束 —— `CloseMode=Background`（藏窗口、进程继续下载）会因此
+        // 变成静默退出。第 132 步实测：Background 下进程 rc=0 直接走了。
         runtime.install();
-        window.run().map_err(|err| format!("事件循环失败：{err}"))?;
+        window
+            .show()
+            .map_err(|err| format!("窗口显示失败：{err}"))?;
+        let loop_result = slint::run_event_loop_until_quit();
+        let _ = window.hide();
+        loop_result.map_err(|err| format!("事件循环失败：{err}"))?;
         bridge.stop();
     }
 
