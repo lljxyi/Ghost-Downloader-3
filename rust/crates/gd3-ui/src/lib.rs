@@ -80,6 +80,7 @@ pub mod settings_group;
 pub mod settings_spec;
 pub mod settings_writer;
 pub mod shell;
+pub mod shell_host;
 pub mod single_instance;
 pub mod sort;
 pub mod speed;

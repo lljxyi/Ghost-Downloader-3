@@ -3851,9 +3851,8 @@ ParserChain::parse(options)                  ← 第 108 步已有
 | `folder_history` 传空 | Qt 的 `ConfigItem.history`（目录下拉历史）还没建模 |
 | `file_types` 为空 | `FeatureService` 还没有 `fileTypes()`，所以「导入文件」按钮不显示 |
 
-**还没接**：「新建任务」导航项（`ROUTE_ADD_TASK`）没有触发点——`boot` 还没装
-`lib.rs::install_shell_actions`（导航 / 搜索 / 通知条 / 消息框 / 拖放那一套），
-所以目前只有 CLI URL / 单实例交接能把对话框叫出来。
+第 139 步时「新建任务」导航项还没有触发点（`boot` 没装 `install_shell_actions`），
+只有 CLI URL / 单实例交接能把对话框叫出来；**第 140 步补上了**（见下节）。
 
 验收（第 139 步实跑）：
 
@@ -3870,11 +3869,76 @@ ParserChain::parse(options)                  ← 第 108 步已有
   31 个 target 全 ok、**1814 passed**（第 138 步 1808，+6）；Python 全量
   → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**（`comm -3` 0 行）。
 
+### 外壳动作集：导航 / 搜索 / 通知条 / 消息框 / 拖放（第 140 步，`gd3-ui::shell_host`）
+
+第 57 步的 `lib.rs::install_shell_actions` 只给了**空壳**：`nav_item` / `search` /
+`info_bar_button` / `info_bar_closed` / `dialog_button` / `dialog_checkbox` /
+`can_drop` / `drop` 八个盒子，一直没人填、也从没被 `boot` 调过。这一步给出宿主
+[`crate::shell_host::ShellHost`]，把八个动作接到引擎 / 草稿对话框 / 关窗链 / 页面上。
+
+| 动作 | Python（`main_window.py`） | 这里 |
+|---|---|---|
+| `nav_item("addTaskButton")` | `onClick=lambda: self.addUrls([])` → `showMask()` | `DraftUi::open()`（不切页） |
+| `nav_item("TaskPage"/"SettingPage")` | `_showPage` → `switchTo` + `_updateSearchTarget` | `switch_page` + 任务页重推一遍行 |
+| `search(text)` | `_onSearchTextChanged` → `page.setSearchText` | 任务页：`filter::TaskFilter` → `sort::sort_refs` → `refresh_task_rows` |
+| `info_bar_button(i)` | 每个按钮自己的 `clicked.connect(...)` | 宿主登记的动作表（`show_info_bar(spec, actions)`） |
+| `info_bar_closed()` | `InfoBar.close()` | `hide_info_bar` + 清动作表 |
+| `dialog_button(i)` | `dialog.exec()` 的返回值 | 先问 `CloseHooks::handle_button`，再问登记的动作表 |
+| `dialog_checkbox(on)` | `checkbox.isChecked()` | `CloseHooks::set_remember` |
+| `can_drop` / `drop` | `dragEnterEvent` / `dropEvent` | `window::drop_decision` / `drop_urls` → `DraftUi::open_with_urls` |
+
+#### 关窗链：`CloseHooks` + `install_shared`
+
+`on_dialogButtonClicked` 是**单槽**回调（后装的覆盖先装的）。第 132 步的关窗模块
+原来自己独占这个槽，第 140 步起必须让给外壳动作集，所以 `close_request` 拆成两半：
+
+- `install_shared(window, writer) -> Rc<CloseHooks>`：只装 `on_close_requested`，
+  返回句柄；`boot` 用这条。
+- `install(window, writer) -> Rc<CloseHooks>`：再加上两个对话框槽（给「没有别家
+  对话框分派」的场景和既有单测）。
+- `CloseHooks::{handle_close, handle_button, set_remember, remember}`。
+
+外壳的分派链因此是「先问关窗（`handle_button` 返回 `true` 就到此为止）→ 再问本轮
+登记的对话框动作表」。这样「删除确认 / 异常框 / 配对请求」将来都能挂上去，不必再抢槽。
+
+#### 任务页检索是真接的
+
+`ShellHost::apply_task_search` 逐字镜像 `task_page.py::_refreshList` 的末段：
+过滤条件读窗口上**现态**（`filterMode` / `categoryIndex`+`categoryNames` /
+`sortFieldIndex` / `sortOrderIndex`，`sortOrderIndex == 0` 就是升序），
+`filter::filtered` → `sort::sort_refs` → 行。切回任务页时（`_updateSearchTarget`
+会 `searchEdit.clear()`）按**空检索**重推一遍，否则旧过滤会残留。
+
+#### 与 Python 的已知差异
+
+| 差异 | 说明 |
+|---|---|
+| 设置页检索未接 | `settings_page.slint` 的卡片是一整块静态布局、没有逐卡可见性属性，`SettingPage.setSearchText` 的折叠/隐藏做不了。只打**一次** stderr，搜索框照常可输入 |
+| 未知导航项只记一行 | `setupPacks` 的动态页面在 Rust 侧没有页面类，`currentRoute` 不动 |
+| 拖放只认本地文件 | `DataTransfer` 不暴露 URL 列表（`lib.rs::DropPayload` 已记）；本地路径按 `QUrl::fromLocalFile` 口径拼 `file://…`，**不做百分号编码** |
+| 「有模态框盖着」是粗判 | 按「草稿框 / 消息框 / 扩展安装引导框任一可见」合成，Python 是逐个 `MaskDialogBase.isVisible()` |
+| 通知条 / 消息框各只有一份 | Slint 侧是单组属性，新的覆盖旧的（Qt 可以叠多条 `InfoBar`）；按钮动作表同理 |
+| 通知条不自动消失 | Python 的 `InfoBar` 有计时器、`ProgressToast` 另有生命周期；这里由关闭按钮收起 |
+
+验收（第 140 步实跑）：
+
+- 单测 `shell_host` **14 条**（真引擎 + 真草稿框 + 桩探测器 + 无头窗口，全部走
+  `install` 装的真回调）：导航切页 / 「新建任务」开框且不切页 / 未知路由不动；
+  任务页检索过滤 + 段筛选叠加 + 切页清检索 + 设置页检索不动任务行；拖放
+  （链接文本、本地文件 → `file://`、模态框挡住）与 `file://` 拼装；通知条的
+  「前往设置」跳转与关闭清表；关窗框经外壳仍能收；宿主登记的对话框按钮动作；
+  勾选态传进关窗链。
+- **真二进制 + `Xvfb :99`**：`--data-dir /tmp/...` + 位置参数
+  `http://127.0.0.1:18778/f.bin`，18 秒后仍活着（rc=124），服务器日志里一条
+  `GET /f.bin`；托盘照旧 D-Bus 起不来（环境限制）。
+- 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**；
+  `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` **GATE_EXIT=0**；
+  Python 全量 → 与基线**逐条相同**。
+
 ### 尚未接的
 
-剩下的都是 P2–P6 的 UI：外壳动作集（导航 / 搜索 / 通知条 / 消息框 / 拖放的
-`install_shell_actions`，含「新建任务」入口）、草稿对话框里还没接的五个子对话框、
-OOBE / 组件库 / 其它对话框。
+剩下的都是 P2–P6 的 UI：设置页检索的逐卡可见性、草稿对话框里还没接的五个子对话框
+（目录选择 / 编辑 / 批量添加 / 导入文件 / 分类菜单）、OOBE / 组件库 / 其它对话框。
 `shouldPreserveLastModified`（第 133 步）、限速闸门（第 134 步）、`update_service` 的执行层
 （第 135 步）、托盘（第 136 步）、建任务链路（第 137 步）、后台解析（第 138 步）都已落地。
 窗口分支（winit）

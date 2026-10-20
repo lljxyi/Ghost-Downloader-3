@@ -640,7 +640,10 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     crate::push_settings(&window, &writer.config(), &default_download);
     // 关窗语义（`Software/CloseMode`）：Slint 缺省只隐藏窗口，而 `Runtime` 的
     // 定时器会让事件循环活着 —— 必须显式接管，否则关窗后进程变成看不见的僵尸。
-    crate::close_request::install(&window, Rc::clone(&writer));
+    //
+    // 装的是 `install_shared`：`dialogButtonClicked` 这个**单槽**回调留给外壳动作集
+    // （第 140 步），关窗链是它分派链的第一站（见 `shell_host::ShellHost::dialog_button`）。
+    let close_hooks = crate::close_request::install_shared(&window, Rc::clone(&writer));
 
     // 草稿对话框（`TaskDraftDialog`）：建任务链路（第 137 步）+ 后台解析
     // （第 138 步）在这里装成真窗口上的对话框（第 139 步）。解析线程起不来只影响
@@ -650,20 +653,30 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         let defaults = crate::task_create::CreateDefaults::from_config(&config);
         let subworker = gd3_core::settings::read_i64(&config, "preBlockNum").unwrap_or(8) as i32;
         match crate::draft_worker::ParseWorker::spawn(defaults) {
-            Ok(worker) => Some(crate::draft_host::DraftUi::build(
+            Ok(worker) => Some(Rc::new(crate::draft_host::DraftUi::build(
                 &window,
                 Rc::clone(&engine),
                 std::sync::Arc::new(worker),
                 &default_download,
                 &[],
                 subworker,
-            )),
+            ))),
             Err(err) => {
                 eprintln!("后台解析线程起不来（草稿对话框不可用）：{err}");
                 None
             }
         }
     };
+
+    // 外壳动作集（第 140 步）：导航栏（含「新建任务」入口）/ 标题栏搜索框 / 通知条
+    // 按钮 / 消息框按钮 / 拖放。`dialogButtonClicked` / `dialogCheckboxToggled` 两个
+    // 单槽都归它，关窗链以 `CloseHooks` 的形式串在分派链最前面。
+    let shell = crate::shell_host::ShellHost::new(
+        Rc::clone(&engine),
+        draft.clone(),
+        Rc::clone(&close_hooks),
+    );
+    crate::shell_host::install(&window, Rc::clone(&shell));
 
     // 下载运行期（`task_runner` → 工作线程 → `gd3-net`）。设置每 tick 现读
     // `engine.config()`，所以设置页改 `maxTaskNum` 下一 tick 就生效（Python 的

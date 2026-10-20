@@ -28,10 +28,11 @@
 //! - **darwin 的两个特例未镜像**：`sys.platform == "darwin" and mode != QUIT` 时
 //!   Python 只 `hide()`（并先存几何）、全屏时先 `showNormal()` 再 1 秒后重来。
 //!   这两支依赖 AppKit 的窗口状态，Rust 侧没有对应能力，等 8f 平台外壳那一步一起接。
-//! - **`dialogButtonClicked` 是单槽回调**：本模块装进去之后，**同一个槽不能再被别人覆盖**。
-//!   当前 `boot::run` 没装别家的对话框分派（`lib.rs` 的 `ShellActions.dialog_button` 只有
-//!   测试在用），所以这里独占；将来接「删除确认 / 异常框」时要把它们串成一条分派链
-//!   （先问 [`handle_dialog_button`]，返回 `false` 再交给下一个）。
+//! - **`dialogButtonClicked` 是单槽回调**：Slint 的 `on_dialogButtonClicked` 只能有一个
+//!   处理函数，后装的会覆盖先装的。所以第 140 步起由外壳动作集（[`crate::shell_host`]）
+//!   独占这个槽，再用 [`CloseHooks::handle_button`] 把点击**先问一遍**本模块的关窗链
+//!   （返回 `false` 表示不是关窗框，交回调用方）。`boot` 因此调 [`install_shared`]
+//!   而不是 [`install`]。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -168,31 +169,75 @@ pub fn handle_dialog_button(
     true
 }
 
-/// 把关窗闭环装到窗口上（`boot::run` 在窗口装配处调用一次）。
-pub fn install(window: &AppWindow, cfg: Rc<SettingsWriter>) {
-    let state = Rc::new(CloseState::new());
+/// 关窗链的句柄：装完返回，让**别的**分派链（外壳动作集）能复用它，
+/// 而不去抢 `on_dialogButtonClicked` 那个单槽。
+pub struct CloseHooks {
+    cfg: Rc<SettingsWriter>,
+    state: Rc<CloseState>,
+}
+
+impl CloseHooks {
+    /// [`handle_close`] 的句柄版。
+    pub fn handle_close(&self, window: &AppWindow) -> CloseRequestResponse {
+        handle_close(window, &self.cfg, &self.state)
+    }
+
+    /// [`handle_dialog_button`] 的句柄版：`true` = 这是关窗框，已经处理完。
+    pub fn handle_button(&self, window: &AppWindow, index: usize) -> bool {
+        handle_dialog_button(window, &self.cfg, &self.state, index)
+    }
+
+    /// 「记住我的选择」复选框。
+    pub fn set_remember(&self, checked: bool) {
+        self.state.set_remember(checked);
+    }
+
+    pub fn remember(&self) -> bool {
+        self.state.remember()
+    }
+}
+
+/// 只装 `on_close_requested`，把按钮 / 勾选槽**留给调用方**。
+///
+/// `boot` 走这条：`dialogButtonClicked` 由 [`crate::shell_host`] 独占，它的分派链里
+/// 第一站就是 [`CloseHooks::handle_button`]。
+pub fn install_shared(window: &AppWindow, cfg: Rc<SettingsWriter>) -> Rc<CloseHooks> {
+    let hooks = Rc::new(CloseHooks {
+        cfg,
+        state: Rc::new(CloseState::new()),
+    });
 
     let close_window = window.as_weak();
-    let close_cfg = Rc::clone(&cfg);
-    let close_state = Rc::clone(&state);
+    let close_hooks = Rc::clone(&hooks);
     window
         .window()
         .on_close_requested(move || match close_window.upgrade() {
-            Some(window) => handle_close(&window, &close_cfg, &close_state),
+            Some(window) => close_hooks.handle_close(&window),
             None => CloseRequestResponse::HideWindow,
         });
 
+    hooks
+}
+
+/// 把关窗闭环**整份**装到窗口上（`on_close_requested` + 两个对话框槽）。
+///
+/// 两个槽也被本模块占住，所以只适合「没有别家对话框分派」的场景（单测 / 将来的
+/// 独立窗口）；`boot` 用的是 [`install_shared`]。
+pub fn install(window: &AppWindow, cfg: Rc<SettingsWriter>) -> Rc<CloseHooks> {
+    let hooks = install_shared(window, cfg);
+
     let button_window = window.as_weak();
-    let button_cfg = Rc::clone(&cfg);
-    let button_state = Rc::clone(&state);
+    let button_hooks = Rc::clone(&hooks);
     window.on_dialogButtonClicked(move |index| {
         if let Some(window) = button_window.upgrade() {
-            handle_dialog_button(&window, &button_cfg, &button_state, index.max(0) as usize);
+            button_hooks.handle_button(&window, index.max(0) as usize);
         }
     });
 
-    let checkbox_state = Rc::clone(&state);
-    window.on_dialogCheckboxToggled(move |checked| checkbox_state.set_remember(checked));
+    let checkbox_hooks = Rc::clone(&hooks);
+    window.on_dialogCheckboxToggled(move |checked| checkbox_hooks.set_remember(checked));
+
+    hooks
 }
 
 /// 隐藏窗口但留着进程（`CloseMode=Background`）。

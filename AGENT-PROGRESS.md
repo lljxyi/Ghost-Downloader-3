@@ -9757,3 +9757,60 @@ features 里 —— 早就编进二进制了，缺的只是「把语义层接上
   含「新建任务」入口）→ 草稿对话框缺的五个子对话框（目录选择 / 编辑 / 批量添加 /
   导入文件 / 分类菜单）→ OOBE / 组件库（P2–P6）。
 - 卡点：无（真窗口里对话框的观感仍需人工验收）。
+
+## 第 140 步：外壳动作集（`gd3-ui::shell_host`）（2026-10-19 19:00 UTC）
+
+第 57 步的 `lib.rs::install_shell_actions` 一直是**空壳**：八个动作盒子没人填、
+`boot` 也从没调用过。窗口里的导航栏「新建任务」、标题栏搜索框、通知条按钮、
+消息框按钮、拖放区全是死的。这一步补宿主。
+
+- 做了什么：
+  - **新模块 `gd3-ui::shell_host`**：
+    - `ShellHost`：引擎 + `Option<Rc<DraftUi>>` + `Rc<CloseHooks>`，外加「通知条 /
+      消息框按钮动作表」（`RefCell<Vec<…>>`）。只持窗口**弱**引用（回调里存着宿主的
+      `Rc`，强引用会成环）。
+    - `nav_item`：`addTaskButton` → `DraftUi::open()`（不切页）；`TaskPage` /
+      `SettingPage` → `switch_page` + 任务页按空检索重推行；未知路由只记一行。
+    - `search`：任务页真接（`filter::TaskFilter` 读窗口现态 `filterMode` /
+      `categoryIndex` / `sortFieldIndex` / `sortOrderIndex` → `sort::sort_refs` →
+      `refresh_task_rows`，镜像 `task_page._refreshList` 末段）；设置页记一次
+      stderr（卡片没有逐卡可见性）。
+    - `show_info_bar(spec, actions)` / `show_listen_failed`（`_onListenFailed`：
+      「前往设置」= 收通知条 + 切设置页）/ `info_bar_button` / `hide_info_bar`。
+    - `show_dialog(spec, actions)` / `dialog_button`（**先问关窗链**，`false` 再问
+      登记的动作表）/ `dialog_checkbox`（→ `CloseHooks::set_remember`）。
+    - `can_drop` / `drop_payload`：`window::drop_decision` / `drop_urls`，本地路径按
+      `QUrl::fromLocalFile` 口径拼 `file://`（`file_url`，不编码），再
+      `DraftUi::open_with_urls`。
+    - `install(window, host)`：拼 `ShellActions` → `install_shell_actions`。
+  - **`close_request` 拆两半**：`install_shared(window, cfg) -> Rc<CloseHooks>` 只装
+    `on_close_requested`；`install` = `install_shared` + 两个对话框槽（给既有单测）。
+    `CloseHooks::{handle_close, handle_button, set_remember, remember}`。
+    理由：`on_dialogButtonClicked` 是**单槽**，第 140 步起归外壳动作集，关窗链降级成
+    它分派链的第一站。
+  - **`boot` 接线**：`close_request::install_shared` 取句柄 → 草稿框改成
+    `Option<Rc<DraftUi>>` → `ShellHost::new(engine, draft.clone(), close_hooks)` +
+    `shell_host::install`。有头 / 无头两条路径都装。
+- 验证（全部本轮实跑）：
+  - 单测 `shell_host` **14 条**（真引擎 + 真草稿框 + 桩探测器 + 无头窗口，全部经
+    `install` 装的真回调）：导航 / 未知路由 / 任务页检索 + 段筛选叠加 / 切页清检索 /
+    设置页检索不动任务行 / 拖放链接文本 / 本地文件 → `file://` / `file_url` 三种写法 /
+    模态框挡住拖放 / 通知条「前往设置」/ 通知条关闭清表 / 关窗框经外壳仍能收 /
+    宿主登记的对话框按钮 / 勾选态进关窗链。
+  - 真二进制 + `Xvfb :99`：位置参数 `http://127.0.0.1:18778/f.bin` + 本地
+    `python3 -m http.server`，`timeout 18` → rc=124（窗口活着、无 panic），服务器
+    日志一条 `GET /f.bin`；托盘照旧 D-Bus 起不来（环境限制）。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings`
+    **exit 0**；四 crate 门 **GATE_EXIT=0**；Python 全量 → 与基线**逐条相同**。
+- 踩过的坑：
+  - `Engine::new` 不装解析器（第 137 步的决定），所以外壳的拖放判定
+    `features().matches()` 在单测里恒假——桩解析器要显式
+    `features_mut().parsers_mut().register(...)`。另外 `matches` 在 `ParserChain`
+    上，`FeatureService` 得先 `.parsers()`。
+  - `DraftUi::build` 返回的是 `DraftUi` 不是 `Rc<DraftUi>`；`boot` 里要自己
+    `Rc::new` 包一层才能交给 `ShellHost`。
+  - 编辑这个新文件时随手用了行号 PUT，把自己刚写的测试段落切掉两段——大文件的
+    行号修改必须先在写之前定稿结构，或者改完立刻整段 Read 复核（这次是读回来补的）。
+- 下一步：草稿对话框缺的五个子对话框（目录选择 / 编辑 / 批量添加 / 导入文件 /
+  分类菜单）→ 设置页检索的逐卡可见性 → OOBE / 组件库（P2–P6）。
+- 卡点：无（真窗口里导航 / 搜索 / 拖放 / 通知条的观感仍需人工验收）。

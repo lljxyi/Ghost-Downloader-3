@@ -173,11 +173,23 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    `open_with_urls(&cli.urls)` 把位置参数 URL 灌进对话框（= `Ghost-Downloader-3.py:191`），
    无头分支故意不灌（冒烟模式不该发真探测）。6 条单测 + 真二进制 × `Xvfb :99`
    冒烟（18 s 后进程仍活、本地服务器收到**一条** `GET`= 真探测、且没有自动下载）。
-   **仍未接**：「新建任务」导航项没有触发点（`boot` 还没装
-   `install_shell_actions`），`pick_folder` / `edit_task` / `batch_url` /
-   `import_files` / `category_menu` 五个子对话框只打一行 stderr。
-8. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI，以及外壳动作集
-   （导航 / 搜索 / 通知条 / 消息框 / 拖放）。
+   「新建任务」入口第 140 步已补（见下条）；`pick_folder` / `edit_task` /
+   `batch_url` / `import_files` / `category_menu` 五个子对话框仍只打一行 stderr。
+8. ~~**外壳动作集**（导航 / 搜索 / 通知条 / 消息框 / 拖放）~~ **第 140 步已解决**：
+   新模块 `gd3-ui::shell_host`。`ShellHost` 把 `lib.rs::install_shell_actions` 的八个
+   空盒子填上：「新建任务」→ 开草稿框（不切页）；页面路由 → `switch_page`；标题栏
+   搜索在任务页**真过滤**（`filter::TaskFilter` 读窗口现态 `filterMode` /
+   `categoryIndex` / `sortFieldIndex` / `sortOrderIndex` → `sort::sort_refs` →
+   `refresh_task_rows`，切回任务页按空检索重推）；通知条按钮 / 消息框按钮改成
+   「动作表 + 序号分派」（`show_info_bar(spec, actions)`、`show_listen_failed` 的
+   「前往设置」= 收通知条 + 切设置页）；拖放走 `window::drop_decision` /
+   `drop_urls`，本地路径按 `QUrl::fromLocalFile` 口径拼 `file://` 后
+   `DraftUi::open_with_urls`。`on_dialogButtonClicked` 是单槽，所以 `close_request`
+   拆成 `install_shared -> Rc<CloseHooks>`（只装 `on_close_requested`，`boot` 用这条）
+   + `CloseHooks::handle_button`（外壳分派链的第一站）。14 条单测（全部走真回调）+
+   真二进制 × `Xvfb :99` 冒烟。仍缺：设置页检索的逐卡可见性（`settings_page.slint`
+   的卡片没有可见性属性，只打一次 stderr）。
+9. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI，以及草稿对话框的五个子对话框。
 
 ## 6. 已知差异与风险
 
