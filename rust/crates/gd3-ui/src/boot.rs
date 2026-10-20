@@ -19,8 +19,8 @@
 //! 已迁移的单实例锁见 [`crate::single_instance`]（`APP_DATA_DIR/instance.sock`）。
 //!
 //! 未迁移（后续小步）：D-Bus 服务名注册（`org.freedesktop.Application`）、`app/engine.py`
-//! 剩余服务、托盘/`desktop_keepalive`/通知、功能包加载、更新检查、OOBE 分支、
-//! 多语言翻译器。
+//! 剩余服务、`desktop_keepalive`/通知、功能包加载、更新检查、OOBE 分支、
+//! 多语言翻译器。托盘已在第 136 步接上（[`crate::tray`]，只在有头分支创建）。
 //!
 //! # 路径语义（`app/config/paths.py` 58 行）
 //!
@@ -680,11 +680,38 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         // 隐藏时**就自己结束 —— `CloseMode=Background`（藏窗口、进程继续下载）会因此
         // 变成静默退出。第 132 步实测：Background 下进程 rc=0 直接走了。
         runtime.install();
+        // 托盘（`tray.py` 的 `SystemTrayIcon`）：`SystemTrayIcon` 是独立顶层组件，
+        // 只在这里创建 —— 无头分支既没有事件循环，也没有桌面会话的
+        // StatusNotifier watcher。创建失败（比如 `ksni` 连不上会话总线）只记一行，
+        // 窗口照常工作（Qt 侧同样不会因为托盘失败而拒绝启动）。
+        let tray = match crate::tray::install(
+            &window,
+            Rc::clone(runtime.engine()),
+            Rc::clone(runtime.runner()),
+        ) {
+            Ok(tray) => Some(tray),
+            Err(err) => {
+                eprintln!("托盘不可用（窗口照常运行）：{err}");
+                None
+            }
+        };
+        // 提示气泡跟着速度表走（`tray.py:201-205` 的 `speedChanged -> setToolTip`）。
+        // 运行期没有「服务层信号」，所以借 tick 这个已有的收口点。
+        if let Some(tray) = &tray {
+            let tray_weak = tray.as_weak();
+            runtime.set_tick_hook(Rc::new(move |tick: &crate::runtime::RunnerTick| {
+                if let Some(tray) = tray_weak.upgrade() {
+                    crate::tray::apply_tooltip(&tray, tick.speed);
+                }
+            }));
+        }
         window
             .show()
             .map_err(|err| format!("窗口显示失败：{err}"))?;
         let loop_result = slint::run_event_loop_until_quit();
+        runtime.clear_tick_hook();
         let _ = window.hide();
+        drop(tray);
         loop_result.map_err(|err| format!("事件循环失败：{err}"))?;
         bridge.stop();
     }

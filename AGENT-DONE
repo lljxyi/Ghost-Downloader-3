@@ -72,8 +72,11 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
 （`i-slint-core-1.18.1/items/system_tray.rs`，后端 appkit / windows / ksni），且
 `system-tray` 就在 `slint` 的 default features 里 —— `gd3-ui` 已经把它编进去了。
 所以「托盘」不需要自己写平台外壳，在 `.slint` 里 `inherits SystemTrayIcon` 接
-`shell.rs` 的五项菜单即可（Linux 走 `ksni`）。**当前仍未接**，`CloseMode=Background`
-是「藏窗口 + 一条 stderr 提示」。
+`shell.rs` 的五项菜单即可（Linux 走 `ksni`）。**第 136 步已接上**：`ui/system_tray.slint`
+（五项菜单 + 四个回调）+ `gd3-ui::tray`（窗口 show / 全部开始 / 全部暂停 / 退出，
+提示气泡跟速度表走），只在有头分支创建；创建失败（无会话总线、无
+`StatusNotifierWatcher`）只打一行 stderr，窗口照常。自绘菜单外观、菜单项图标、
+`_refreshMenuItems` 的启停用仍不搬（见 §5.2）。
 
 ### 8g 端到端验收
 见 §1 / §2。
@@ -104,9 +107,16 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    `gd3-ui::close_request`（Slint 缺省 `HideWindow` + `Timer` = 隐形僵尸），并把
    `window.run()` 换成 `run_event_loop_until_quit()`（前者在最后一个窗口隐藏时自己结束，
    `Background` 会静默退出）。
-2. **托盘 / Dock / 状态项**：语义层（`shell.rs`）已就绪但没人消费。**不再需要降级
-   API 方案** —— 直接用 Slint 的 `SystemTrayIcon`（见 §3.8f 更正），Linux 走 `ksni`。
-   剩下的是在 `.slint` 里加组件 + 把菜单动作接回 `shell.rs` 的信号。
+2. ~~**托盘 / Dock / 状态项**~~ **第 136 步已解决**：新 `ui/system_tray.slint`
+   （`Gd3TrayIcon inherits SystemTrayIcon`，五项菜单 + 四个导出回调）+ 新模块
+   `gd3-ui::tray`（`install` 把回调接到窗口 `show` / `runtime::start_all` /
+   `runtime::pause_all` / `quit_event_loop`，`apply_tooltip` 跟速度表走）。
+   `Runtime` 因此多了 `start_all` / `pause_all`（服务层只排队、派发必须过
+   `TaskRunner::dispatch`，只调服务层会留下「占槽不干活」的任务）与 tick 钩子。
+   托盘只在有头分支创建；无会话总线 / 无 `StatusNotifierWatcher` 时 Slint 只打一条
+   日志、窗口照常（`Xvfb :99` + `WM_DELETE_WINDOW` 实跑：两种失败形态都验过，
+   `closeMode=Quit` rc=0）。仍未做：自绘菜单（`AcrylicMenu` 等三种）、菜单项图标
+   （`FluentIcon`）、`_refreshMenuItems` 的启停用、`messageClicked`。
 3. ~~**`update_service` 的宿主适配**~~ **第 135 步已解决**：新模块 `gd3-ui::update_exec`
    （`UpdateExecutor::check` / `download` / `apply`）把 `UpdateRuntime` 吐的十个
    `UpdateEffect` 真的执行掉（抓 `versions.json`、下 release asset / raw 文件、算 sha256、
@@ -131,7 +141,7 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    1 MiB 限额 4.35 s、不限额 0.25 s（略高于上限是预期：一个窗口最多超一个数据块，
    与 Python 同一判据位置）。
 
-   这一条已清空（第 133/134 步），剩下的是第 2/4/6 项。
+   这一条已清空（第 133/134 步）；托盘也在第 136 步清空了，剩下的是第 4/6 项。
 6. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI。
 
 ## 6. 已知差异与风险

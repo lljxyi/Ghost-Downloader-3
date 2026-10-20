@@ -186,7 +186,8 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 二进制入口见下一节。
 （`RuntimeStatusService` 第 102 步搬完、第 107 步删掉空壳桩；`FeatureService` 的
 解析器链第 108 步搬完；`BrowserService` / `Aria2RpcService` 第 112 步收敛，见「服务装配」
-一节；托盘第 75 步已由 `shell.rs` 覆盖。）
+一节；托盘的语义第 75 步由 `shell.rs` 覆盖，装配与接线第 136 步落在
+`gd3-ui::tray` + `ui/system_tray.slint`。）
 
 ## Phase 8：启动入口（`gd3-ui` 二进制）
 
@@ -523,7 +524,8 @@ gd3-ipc/1 open\n<uri>\n<uri>\n    ← 把 URI 交给已有实例（Open / COPYDA
   `SIGINT` 处理（`_onInterrupt`）没搬。
 
 未迁移（后续小步）：D-Bus 服务名注册（`org.freedesktop.Application`）、
-托盘 / keepalive / 通知、功能包加载、更新检查、OOBE 分支、翻译器。
+`desktop_keepalive` / 通知、功能包加载、更新检查、OOBE 分支、翻译器。
+托盘已在第 136 步接上（`gd3-ui::tray`，只在有头分支创建，见「托盘」一节）。
 
 ## 平台辅助（`gd3-core::filesystem`）
 
@@ -3293,7 +3295,7 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–135 步）
+## Phase 8 进展（第 126–136 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3630,10 +3632,79 @@ async def _tickLoop(self):                # 每秒把 _bytes 清零
   zip（进度 79.3% / 100%）→ sha256 对上 → `READY` → `apply` 解出 12 项
   （`manifest.toml` / `pack.py` / `lists/` …）→ zip 被删，`errors` 空。
 
+### 托盘：`SystemTrayIcon` 真的挂上去了（第 136 步，`gd3-ui::tray`）
+
+Phase 8f 之前一直记成「Slint 无原生能力，允许降级」。第 132 步读源码时发现这个结论过时了：
+Slint 1.18 自带 `SystemTrayIcon`（Linux 走 `ksni` = StatusNotifierItem、macOS 走
+`NSStatusItem`、Windows 走 `Shell_NotifyIconW`），而且 `system-tray` 就在 `slint` 的
+default features 里 —— 也就是说早就编进二进制了。第 136 步把它接上：
+
+- **`ui/system_tray.slint`**（新文件）：`export component Gd3TrayIcon inherits
+  SystemTrayIcon`。`SystemTrayIcon` 必须是**独立顶层组件**（不能塞进 `AppWindow`，
+  它的 `Menu` 也不能放进 `if`/`for`），所以 `build.rs` 里多了第二条
+  `slint_build::compile_with_output_path("ui/system_tray.slint", $OUT_DIR/system_tray.rs)`，
+  由 `tray.rs` 显式 `include!`（`include_modules!()` 只认 `SLINT_INCLUDE_GENERATED`
+  那一份）。副作用：`compile_with_output_path` **不打印 cargo 指令**，`rerun-if-changed`
+  得自己写，否则改 `.slint` 不重编。
+- **五项菜单与 `shell::tray_menu()` 逐项对齐**（仪表盘 / 全部开始 / 全部暂停 / 分隔线 /
+  退出程序），文案与顺序由一条漂移测试盯着：它 `include_str!` 那个 `.slint`，扫出
+  `MenuItem.title` 与 `MenuSeparator` 的序列，和 `shell::tray_menu()` 比 —— 改了
+  `shell.rs` 却没改 `.slint`（或反过来）直接红。
+- **左键单击不需要在 Rust 里接**：`.slint` 里 `clicked => { root.dashboard-clicked(); }`
+  已经把 `SystemTrayIcon.clicked`（Qt 的 `ActivationReason.Trigger`）转成同一个回调，
+  与 `shell::tray_activated` 的「只有 Trigger 才算激活」一致。
+- **提示气泡跟着速度表走**：`Runtime` 多了一个 tick 钩子（`set_tick_hook`）。
+  运行期没有「服务层信号」这一层，`tick` 是既有的收口点，钩子在 tick **之后**调用，
+  读得到这一轮的 `RunnerTick::speed`；`tray::apply_tooltip` 只在 `speed` 有值时改文案
+  （`shell::tray_tooltip`：`speed > 0` → `"Ghost Downloader\n↓ 1.50 KB/s"`，归零退回名字）。
+- **「全部开始 / 全部暂停」需要两层**（`runtime::start_all` / `pause_all`）：
+  `TaskService::start_all` 只把 `PAUSED`/`WAITING`/`FAILED` 挪进等待队列（Python 的
+  `_schedule` + `_pump`），**真正的「建 job + 起工作线程」在 `TaskRunner::dispatch`**。
+  只调服务层会让队列里多出一批「占着槽位、没人干活」的任务（槽位被
+  `queue.run(id, "")` 占上，之后 `tasks.pump` 不会再挑它们）—— 第一版就是这么写的，
+  两条单测当场红。`pause_all` 同理：先快照 id，再逐个走 `TaskRunner::pause`
+  （先取消工作线程，再服务层记账），服务层 `pause` 顺带 `_pump` 出来的新 id 也要过运行器。
+- **只建在有头分支**：托盘 `ksni` 的服务循环要事件循环，无头冒烟既没有它也没有桌面会话。
+  创建失败（连不上会话总线 / 没有 `StatusNotifierWatcher`）只 `eprintln!` 一行，
+  窗口照常工作 —— Qt 侧同样不会因为托盘失败就拒绝启动。
+
+| 差异 | 说明 |
+|---|---|
+| 三个自绘菜单类不搬 | `RoundMenu` / `TrayRoundMenu` / `AcrylicMenu` 连同 `adjustPosition` 的坐标钳制、亚克力底色、`itemHeight(28)` / `iconSize(14)` 都归桌面环境（菜单由 SNI / AppKit / 系统通知区画），`shell::tray_menu_flavor` 的判据保留供对照 |
+| 菜单项没有图标 | Qt 用 `FluentIcon`（`GHOST`/`PLAY`/`PAUSE`/`CLOSE`）；Slint 的 `MenuItem.icon` 要自己准备位图资源，本步没做（只有文字） |
+| `messageClicked` 没有对应物 | Slint 的托盘只有 `clicked`，通知气泡归桌面环境 |
+| 菜单项的启用/禁用没做 | `_refreshMenuItems`（macOS 状态项）在 `PAUSED/FAILED/WAITING` 时亮「全部开始」，那需要把任务状态推进菜单 —— 属于 `status_menu` 的活 |
+
+验收（第 136 步实跑）：
+
+- 单测 `tray` **5 条**：`.slint` 菜单与 `shell::tray_menu()` 的漂移比对；
+  `tray_action` 给得出信号的四项都有人接；提示气泡（初值 = `Ghost Downloader`、
+  `None` 不动、1536 → `1.50 KB/s`、0 → 退回名字）；回调真的接上了
+  （`invoke_dashboard_clicked` → 窗口从隐藏变可见，`invoke_start_all_clicked` /
+  `invoke_pause_all_clicked` / `invoke_quit_clicked` 在空任务表上安静跑完、不 panic）；
+  `SystemTrayIcon` 在无头平台上也构造得出来（注册失败只是 Slint 的一条 debug 日志）。
+- `runtime` 新增 **4 条**：`start_all` 派发 `PAUSED`/`FAILED`、不动 `COMPLETED`；
+  `pause_all` 取消每个在跑的工作线程并置 `PAUSED`；没有在跑/等待的任务就一条都不动；
+  tick 钩子每轮都跑且读得到速度。顺带把测试脚手架拆成 `harness` / `harness_with`
+  —— `add(record, true)` 会把**每条**记录塞进等待队列（与记录的 `status` 无关），
+  想复现「库里躺着一条完成的任务」必须关掉它。
+- **真二进制 + `Xvfb :99`**（`WM_DELETE_WINDOW` 的 ClientMessage，不是 `xdotool
+  windowclose`）：托盘创建路径真的被走到且失败是软的 —— 无会话总线时
+  `Slint: Failed to create system tray icon: … Failed to connect to address
+  unix:path=/run/user/0/bus`；起一个 `dbus-daemon --session`（没有
+  `org.kde.StatusNotifierWatcher`）时变成
+  `failed to register to the StatusNotifierWatcher: … ServiceUnknown`。
+  两种情况下窗口都正常显示、`--set closeMode=Quit` 发 `WM_DELETE_WINDOW` 后
+  **rc=0**（停机序列照跑），`closeMode=Ask`（缺省）按原语义只弹框不退。
+- 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**；
+  `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` **GATE_EXIT=0**、
+  29 个 target 全 ok、**1783 passed**（第 135 步 1774，+9）；Python 全量
+  → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
+
 ### 尚未接的
 
-尚未接的还有两项：建任务链路（解析器仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的
-任务）与托盘 / Dock（`SystemTrayIcon` 现成，见上一节）。
+尚未接的只剩建任务链路（解析器仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的任务）
+与 OOBE / 组件库 / 其它对话框这些 P2–P6 的 UI。
 `shouldPreserveLastModified`（第 133 步）、限速闸门（第 134 步）、`update_service` 的执行层
-（第 135 步）都已接。窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：起窗、下载、
-三种关窗模式都对。
+（第 135 步）、托盘（第 136 步）都已接。窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：
+起窗、下载、三种关窗模式都对。

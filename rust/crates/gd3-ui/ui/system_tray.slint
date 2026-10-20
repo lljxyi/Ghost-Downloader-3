@@ -1,0 +1,66 @@
+// Ghost-Downloader-3 托盘（第 136 步）：`app/view/shell/tray.py` 的原生落地。
+//
+// 语义层在 Rust 侧 `shell.rs`（`tray_menu()` 五项、`tray_tooltip()` 文案、
+// `tray_action()` 到信号的映射），这里只做**装配**：把五项菜单按同一顺序
+// 摆出来，每个 `MenuItem.activated` 转成一个 export 的回调，由
+// `tray.rs` 接到 `Runtime` / 窗口上。
+//
+// 与 Qt 侧的已知差异（Qt 有、Slint 没有，或反过来）：
+// - 图标只有一张静态 PNG。Qt 用 `FluentIcon` 给每个菜单项画图标，Slint 的
+//   `MenuItem.icon` 需要自己准备位图资源，这一步没做（菜单只有文字）。
+// - `RoundMenu` / `TrayRoundMenu` / `AcrylicMenu` 三种自绘菜单（Windows 10/11
+//   的亚克力底、`adjustPosition` 的钳制）不在这里：菜单由平台托盘接管，
+//   定位与外观归桌面环境（`shell::tray_menu_flavor` 仍保留判据供对照）。
+// - `QSystemTrayIcon.ActivationReason` 只区分左键与菜单；左键 = 本组件的
+//   `clicked`（对应 Qt 的 `Trigger`），右键/双击不触发任何动作（同
+//   `shell::tray_activated` 只认 `Trigger`）。
+//
+// 菜单文案必须与 `shell::tray_menu()` 逐项一致（Rust 侧有漂移测试盯着）。
+
+export component Gd3TrayIcon inherits SystemTrayIcon {
+    // `tray.py:172-178`：初值是 `SystemTrayIcon.NAME`，之后由速度表改写
+    // （`shell::tray_tooltip`，`speed > 0` 时带一行 `↓ …/s`）。
+    in property <string> tooltip-text: "Ghost Downloader";
+
+    title: "Ghost Downloader";
+    tooltip: root.tooltip-text;
+    icon: @image-url("../../../../app/assets/logo_withoutBackground.png");
+
+    // 左键单击托盘图标（`_onActivated` 的 `Trigger`）→ `signalBus.activationRequested`。
+    callback dashboard-clicked;
+    callback start-all-clicked;
+    callback pause-all-clicked;
+    callback quit-clicked;
+
+    clicked => {
+        root.dashboard-clicked();
+    }
+
+    Menu {
+        MenuItem {
+            title: "仪表盘";
+            activated => {
+                root.dashboard-clicked();
+            }
+        }
+        MenuItem {
+            title: "全部开始";
+            activated => {
+                root.start-all-clicked();
+            }
+        }
+        MenuItem {
+            title: "全部暂停";
+            activated => {
+                root.pause-all-clicked();
+            }
+        }
+        MenuSeparator { }
+        MenuItem {
+            title: "退出程序";
+            activated => {
+                root.quit-clicked();
+            }
+        }
+    }
+}

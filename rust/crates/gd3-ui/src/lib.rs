@@ -91,6 +91,7 @@ pub mod task_runner;
 pub mod task_service;
 pub mod token_line_edit;
 pub mod track_bar;
+pub mod tray;
 pub mod tree_view;
 pub mod update_exec;
 pub mod update_service;

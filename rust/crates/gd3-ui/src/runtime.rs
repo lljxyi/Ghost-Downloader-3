@@ -30,6 +30,9 @@
 //!   [`crate::task_runner`] 里）；
 //! - **速度表按 tick 判 1 秒**，而不是每个任务一个协程定时器；`Emit` 的数字进
 //!   [`RunnerTick::speed`]，宿主要显示时读它（Python 是信号直连顶栏）。
+//! - **tick 之后可以挂一个钩子**（[`Runtime::set_tick_hook`]）：托盘提示气泡就是
+//!   这样接上的（`tray.py:201-205` 的 `speedChanged -> setToolTip`）。Python 是信号
+//!   直连，这里没有服务层信号，只能借 tick 这个既有的收口点。
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -132,6 +135,81 @@ fn tick_host(
     tick
 }
 
+/// [`start_all`] / [`pause_all`] 的产物。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AllReport {
+    /// 真的派发出去（起了工作线程）的任务 id。
+    pub started: Vec<String>,
+    /// 被置成 `PAUSED` 的任务 id（只 [`pause_all`] 会填）。
+    pub paused: Vec<String>,
+}
+
+/// `startAll()`（`task_service.py:530-534`）：托盘「全部开始」的落点。
+///
+/// 两层配合，缺一不可：
+///
+/// 1. 服务层 [`TaskService::start_all`] 只把 `PAUSED` / `WAITING` / `FAILED` 挪进
+///    等待队列（Python 的 `_schedule` + `_pump`），**不建 job、不起线程**；
+/// 2. 真正的「建 job + 起工作线程」在运行器（[`TaskRunner::dispatch`]），与每个
+///    tick 的 `pump` 同一份实现。
+///
+/// 所以这里不能只调服务层：那样队列里会多出一批「占着槽位、没人干活」的任务
+/// （槽位由 `_pump` 的 `queue.run(id, "")` 占上，之后 `tasks.pump` 不会再挑它们）。
+pub fn start_all(engine: &Rc<RefCell<Engine>>, runner: &Rc<RefCell<TaskRunner>>) -> AllReport {
+    // 先克隆 Rc：下面要同时借 engine 与 runner，不能再借 `engine` / `runner` 形参。
+    let engine_rc = Rc::clone(engine);
+    let runner_rc = Rc::clone(runner);
+    let mut engine = engine_rc.borrow_mut();
+    let mut runner = runner_rc.borrow_mut();
+    let max_task_num = engine.max_task_num();
+    let mut report = AllReport::default();
+    for task_id in engine.tasks_mut().start_all(max_task_num) {
+        if runner.dispatch(engine.tasks_mut(), &task_id) {
+            report.started.push(task_id);
+        }
+    }
+    report
+}
+
+/// `pauseAll()`（`task_service.py:536-539`）：托盘「全部暂停」的落点。
+///
+/// 与 [`start_all`] 同样的两层：先快照「运行中或等待中」的 id（Python 的
+/// `list(self._store.tasks.values())`，否则 `pause` 里的 `_pump` 会改动正在遍历的
+/// 队列），再逐个走 [`TaskRunner::pause`]（**先取消工作线程**，再服务层记账）。
+/// 服务层 `pause` 顺带 `_pump` 出来的新 id 同样要过运行器，否则占槽不干活。
+pub fn pause_all(engine: &Rc<RefCell<Engine>>, runner: &Rc<RefCell<TaskRunner>>) -> AllReport {
+    let engine_rc = Rc::clone(engine);
+    let runner_rc = Rc::clone(runner);
+    let mut engine = engine_rc.borrow_mut();
+    let mut runner = runner_rc.borrow_mut();
+    let max_task_num = engine.max_task_num();
+    let ids: Vec<String> = {
+        let tasks = engine.tasks();
+        tasks
+            .records()
+            .iter()
+            .filter(|record| tasks.is_running(&record.task_id) || tasks.is_waiting(&record.task_id))
+            .map(|record| record.task_id.clone())
+            .collect()
+    };
+    let mut report = AllReport::default();
+    for task_id in ids {
+        let Some(paused) = runner.pause(engine.tasks_mut(), &task_id, max_task_num) else {
+            continue;
+        };
+        report.paused.push(task_id);
+        for started in paused.started {
+            if runner.dispatch(engine.tasks_mut(), &started) {
+                report.started.push(started);
+            }
+        }
+    }
+    report
+}
+
+/// 一次 tick 结束后调用的钩子（[`Runtime::set_tick_hook`]）。
+pub type TickHook = Rc<dyn Fn(&RunnerTick)>;
+
 /// 运行期宿主：引擎 + 运行器 + 窗口 + 一个 tick 定时器。
 pub struct Runtime {
     engine: Rc<RefCell<Engine>>,
@@ -142,6 +220,9 @@ pub struct Runtime {
     last_speed_tick: Rc<Cell<Instant>>,
     /// `Some` 表示定时器在跑；[`Runtime::shutdown`] 之后是 `None`。
     timer: Option<slint::Timer>,
+    /// 每次 tick 之后的回调（托盘提示气泡）。`Rc<RefCell<_>>` 是因为定时器闭包里
+    /// 只拿得到一份共享句柄，而 `set_tick_hook` 在闭包外面。
+    tick_hook: Rc<RefCell<Option<TickHook>>>,
 }
 
 impl Runtime {
@@ -158,6 +239,7 @@ impl Runtime {
             speed_tick_interval: SPEED_TICK_INTERVAL,
             last_speed_tick: Rc::new(Cell::new(Instant::now())),
             timer: None,
+            tick_hook: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -183,6 +265,19 @@ impl Runtime {
         self.speed_tick_interval = interval;
     }
 
+    /// 挂一个「每次 tick 之后」的回调（托盘提示气泡用）。
+    ///
+    /// 无头 `--until-idle` 走的是 [`Runtime::tick`]，有头走定时器闭包 —— 两条路径都
+    /// 会调它，语义一致。回调在 tick **之后**跑，所以能读到这一轮的速度表数字。
+    pub fn set_tick_hook(&mut self, hook: TickHook) {
+        *self.tick_hook.borrow_mut() = Some(hook);
+    }
+
+    /// 摘掉 tick 钩子（托盘销毁时用；没挂过也没事）。
+    pub fn clear_tick_hook(&mut self) {
+        *self.tick_hook.borrow_mut() = None;
+    }
+
     /// 装 tick 定时器（窗口事件循环驱动它）。
     pub fn install(&mut self) {
         let engine = Rc::clone(&self.engine);
@@ -190,15 +285,17 @@ impl Runtime {
         let window = self.window.clone_strong();
         let last_speed_tick = Rc::clone(&self.last_speed_tick);
         let speed_tick_interval = self.speed_tick_interval;
+        let tick_hook = Rc::clone(&self.tick_hook);
         let timer = slint::Timer::default();
         timer.start(slint::TimerMode::Repeated, self.tick_interval, move || {
-            tick_host(
+            let tick = tick_host(
                 &engine,
                 &runner,
                 &window,
                 &last_speed_tick,
                 speed_tick_interval,
             );
+            run_tick_hook(&tick_hook, &tick);
         });
         self.timer = Some(timer);
     }
@@ -209,13 +306,15 @@ impl Runtime {
 
     /// 一次 tick（与定时器回调完全同一份实现）。
     pub fn tick(&self) -> RunnerTick {
-        tick_host(
+        let tick = tick_host(
             &self.engine,
             &self.runner,
             &self.window,
             &self.last_speed_tick,
             self.speed_tick_interval,
-        )
+        );
+        run_tick_hook(&self.tick_hook, &tick);
+        tick
     }
 
     /// 没有任务在跑（等价于 Python 的 `queue.runningCount() == 0`）。
@@ -237,6 +336,16 @@ impl Runtime {
     /// `start(task)`（`task_service.py:392`）：入队，派发交给下一次 tick 的 `_pump`。
     pub fn start(&self, task_id: &str) -> bool {
         self.engine.borrow_mut().tasks_mut().start(task_id)
+    }
+
+    /// [`start_all`] 的方法形态（托盘「全部开始」）。
+    pub fn start_all(&self) -> AllReport {
+        start_all(&self.engine, &self.runner)
+    }
+
+    /// [`pause_all`] 的方法形态（托盘「全部暂停」）。
+    pub fn pause_all(&self) -> AllReport {
+        pause_all(&self.engine, &self.runner)
     }
 
     /// 一直 tick 到没有任务在跑，或到 `timeout`。返回 tick 次数。
@@ -276,6 +385,15 @@ impl Runtime {
     /// `isSeeding` / `canSeed` / `hasOutputFile` 这几个运行期事实。
     pub fn refresh(&self) {
         self.engine.borrow().tasks().refresh(&self.window);
+    }
+}
+
+/// 调一次 tick 钩子。先把 `Rc` 克隆出来再调：回调里若想再挂/摘钩子也不会撞上
+/// `RefCell` 的借用（`set_tick_hook` 要 `&mut Runtime`，正常路径上也进不来）。
+fn run_tick_hook(hook: &RefCell<Option<TickHook>>, tick: &RunnerTick) {
+    let hook = hook.borrow().clone();
+    if let Some(hook) = hook {
+        hook(tick);
     }
 }
 
@@ -405,7 +523,20 @@ mod tests {
     }
 
     /// 造一套运行期：临时数据目录 + `tasks.jsonl` + 假 spawner。
+    ///
+    /// 缺省 `auto_start = true`：每条记录都会被塞进等待队列（`add` 的 `_schedule`），
+    /// 与记录自己的 `status` 无关 —— 想复现「库里躺着一条完成的任务」得用
+    /// [`harness_with`] 并关掉它。
     fn harness(tag: &str, tasks: &[(&str, TaskStatus)]) -> (Runtime, FakeSpawner, PathBuf) {
+        harness_with(tag, tasks, true)
+    }
+
+    /// 同上，可选「入队时是否自动进等待队列」。
+    fn harness_with(
+        tag: &str,
+        tasks: &[(&str, TaskStatus)],
+        auto_start: bool,
+    ) -> (Runtime, FakeSpawner, PathBuf) {
         let dir = temp_dir(tag);
         let tasks_path = dir.join("tasks.jsonl");
         let mut config = settings::default_config_with_download_folder(&dir.to_string_lossy());
@@ -415,7 +546,7 @@ mod tests {
             let url = format!("https://example.com/{task_id}.bin");
             let _ = engine
                 .tasks_mut()
-                .add(record(task_id, *status, &url, &dir), true);
+                .add(record(task_id, *status, &url, &dir), auto_start);
         }
         config = engine.config().clone();
         let spawner = FakeSpawner::default();
@@ -576,6 +707,90 @@ mod tests {
         assert_eq!(tick.started, 1);
         assert_eq!(spawner.jobs(), 2, "第二次派发是新的一条运行");
         assert_eq!(status_of(&runtime, "a"), TaskStatus::Running);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_all_dispatches_paused_waiting_and_failed_tasks() {
+        let (runtime, spawner, dir) = harness_with(
+            "start-all",
+            &[
+                ("a", TaskStatus::Paused),
+                ("b", TaskStatus::Failed),
+                ("c", TaskStatus::Completed),
+            ],
+            false,
+        );
+
+        let report = runtime.start_all();
+
+        // 服务层的判据是 `PAUSED` / `WAITING` / `FAILED`（`startAll`），完成的那个不动。
+        assert_eq!(report.started, vec!["a".to_string(), "b".to_string()]);
+        assert!(report.paused.is_empty());
+        assert_eq!(spawner.jobs(), 2, "两个任务都真的起了工作线程");
+        assert_eq!(status_of(&runtime, "a"), TaskStatus::Running);
+        assert_eq!(status_of(&runtime, "b"), TaskStatus::Running);
+        assert_eq!(status_of(&runtime, "c"), TaskStatus::Completed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_all_cancels_every_running_worker() {
+        let (runtime, spawner, dir) = harness(
+            "pause-all",
+            &[("a", TaskStatus::Waiting), ("b", TaskStatus::Waiting)],
+        );
+        let tick = runtime.tick();
+        assert_eq!(tick.started, 2);
+        assert_eq!(spawner.jobs(), 2);
+
+        let report = runtime.pause_all();
+
+        assert_eq!(report.paused, vec!["a".to_string(), "b".to_string()]);
+        assert!(spawner.cancel_token(0).is_cancelled());
+        assert!(spawner.cancel_token(1).is_cancelled());
+        assert_eq!(status_of(&runtime, "a"), TaskStatus::Paused);
+        assert_eq!(status_of(&runtime, "b"), TaskStatus::Paused);
+        assert!(runtime.is_idle());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pause_all_leaves_idle_tasks_alone() {
+        let (runtime, _spawner, dir) = harness_with(
+            "pause-all-idle",
+            &[("a", TaskStatus::Completed), ("b", TaskStatus::Paused)],
+            false,
+        );
+
+        let report = runtime.pause_all();
+
+        assert!(report.paused.is_empty(), "没有在跑/等待的任务就不动");
+        assert_eq!(status_of(&runtime, "a"), TaskStatus::Completed);
+        assert_eq!(status_of(&runtime, "b"), TaskStatus::Paused);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_tick_hook_runs_after_every_tick() {
+        let (mut runtime, _spawner, dir) = harness("hook", &[("a", TaskStatus::Waiting)]);
+        // 速度表每秒一次；这里把它压到 0，保证每个 tick 都有数字可读。
+        runtime.set_speed_tick_interval(Duration::from_millis(0));
+        let calls = Rc::new(Cell::new(0u32));
+        let last_speed: Rc<Cell<Option<i64>>> = Rc::new(Cell::new(None));
+        let (calls_in_hook, speed_in_hook) = (Rc::clone(&calls), Rc::clone(&last_speed));
+        runtime.set_tick_hook(Rc::new(move |tick: &RunnerTick| {
+            calls_in_hook.set(calls_in_hook.get() + 1);
+            if tick.speed.is_some() {
+                speed_in_hook.set(tick.speed);
+            }
+        }));
+
+        runtime.tick();
+        runtime.tick();
+
+        assert_eq!(calls.get(), 2, "每个 tick 之后一次");
+        assert_eq!(last_speed.get(), Some(0), "没有在跑的任务，速度是 0");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

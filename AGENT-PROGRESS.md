@@ -9553,3 +9553,60 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
     Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
 - 下一步：托盘（`SystemTrayIcon` + `shell.rs` 五项菜单）→ 建任务链路（解析器）。
 - 卡点：无
+
+## 第 136 步：托盘（`SystemTrayIcon` + `gd3-ui::tray`）（2026-10-19 19:00 UTC）
+
+接 `AGENT-DONE` §5 第 2 项。Phase 8f 一直被记成「Slint 无原生能力，允许降级」，
+第 132 步读源码时已经发现结论过时：Slint 1.18 自带 `SystemTrayIcon`（后端
+`ksni` / appkit / `Shell_NotifyIconW`），`system-tray` 就在 `slint` 的 default
+features 里 —— 早就编进二进制了，缺的只是「把语义层接上去」这一步。
+
+- 做了什么：
+  - **`ui/system_tray.slint`**（新文件）：`export component Gd3TrayIcon inherits
+    SystemTrayIcon`，五项菜单（仪表盘 / 全部开始 / 全部暂停 / `MenuSeparator` /
+    退出程序）+ 四个导出回调，`tooltip` 绑到 `tooltip-text`，图标用
+    `@image-url("../../../../app/assets/logo_withoutBackground.png")`（512×512 PNG）。
+  - **`build.rs`**：多一条 `compile_with_output_path("ui/system_tray.slint",
+    $OUT_DIR/system_tray.rs)`。`SystemTrayIcon` 必须是独立顶层组件（不能塞进
+    `AppWindow`），而 `include_modules!()` 只认 `SLINT_INCLUDE_GENERATED` 那一份，
+    所以托盘产物由 `tray.rs` 显式 `include!`。顺手补了 `rerun-if-changed`
+    （`compile_with_output_path` 不打印任何 cargo 指令，漏了就会改 `.slint` 不重编）。
+  - **新模块 `gd3-ui::tray`**：`install(window, engine, runner)` 建组件、把四个回调
+    接到「窗口 show / `runtime::start_all` / `runtime::pause_all` /
+    `slint::quit_event_loop`」；`dispatch(signal, …) -> TrayOutcome` 是纯分派
+    （测试用）；`apply_tooltip(tray, speed)` 走 `shell::tray_tooltip`。
+    左键单击不用在 Rust 里接：`.slint` 的 `clicked => dashboard-clicked` 就是
+    Qt 的 `ActivationReason.Trigger`。
+  - **`runtime.rs`**：新增 `start_all` / `pause_all`（自由函数 + `Runtime` 方法形态）
+    与 `AllReport`。**必须两层**：`TaskService::start_all` 只把
+    `PAUSED`/`WAITING`/`FAILED` 挪进等待队列，真正「建 job + 起工作线程」在
+    `TaskRunner::dispatch`；只调服务层会留下一批「占着槽位、没人干活」的任务
+    （槽位被 `queue.run(id, "")` 占上，`tasks.pump` 之后不会再挑它们）——
+    第一版就是这样，两条单测当场红。另加 tick 钩子（`set_tick_hook` /
+    `clear_tick_hook` / `TickHook`），无头与定时器两条路径都会调，钩子在 tick
+    之后跑，读得到 `RunnerTick::speed`。
+  - **`boot.rs`**：只有有头分支建托盘；失败只 `eprintln!`（Qt 侧同样不会因为托盘
+    失败就拒绝启动）；挂速度钩子，循环退出后 `clear_tick_hook` + `drop(tray)`。
+- 验证（全部本轮实跑）：
+  - 单测 `tray` **5 条**：`.slint` 菜单序列 vs `shell::tray_menu()`（漂移，
+    `include_str!` 扫 `MenuItem.title` / `MenuSeparator`，第一次红是因为把组件顶部
+    的 `title:` 也算进去了）；`tray_action` 四项都有信号；提示气泡（初值 /
+    `None` 不动 / 1536 → `1.50 KB/s` / 0 → 退回名字）；回调真的接上
+    （`invoke_dashboard_clicked` → 窗口从隐藏变可见，另外三条在空任务表上安静跑完）；
+    `SystemTrayIcon` 在无头平台也构造得出来。
+  - `runtime` 新增 **4 条**（`start_all` 派发 PAUSED/FAILED 不动 COMPLETED；
+    `pause_all` 取消每个工作线程；没有在跑/等待就不动；tick 钩子每轮都跑）。
+    测试脚手架拆成 `harness` / `harness_with`：`add(record, true)` 会把**每条**
+    记录塞进等待队列（与 `status` 无关），想复现「库里躺着一条完成的任务」得关掉。
+  - **真二进制 + `Xvfb :99`**（`WM_DELETE_WINDOW` ClientMessage，libX11+ctypes）：
+    无会话总线 → `Slint: Failed to create system tray icon: … unix:path=/run/user/0/bus`；
+    起 `dbus-daemon --session`（无 `org.kde.StatusNotifierWatcher`）→
+    `failed to register to the StatusNotifierWatcher: … ServiceUnknown`。两种情况下
+    窗口正常、`--set closeMode=Quit` 发关窗后 **rc=0**，`closeMode=Ask`（缺省）照旧只弹框。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**
+    （4m36s）；`cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+    **GATE_EXIT=0**、29 个 target 全 ok、**1783 passed**（第 135 步 1774，+9）；
+    Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
+- 下一步：建任务链路（解析器仍在 Python 侧）→ OOBE / 组件库 / 其它对话框（P2–P6）。
+- 卡点：无（托盘在无桌面会话的机器上**必然**注册失败，这是环境限制，不是缺陷；
+  有 StatusNotifierWatcher 的桌面上的实际图标/菜单外观无法在本机肉眼验收）。
