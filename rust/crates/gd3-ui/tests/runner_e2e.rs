@@ -318,3 +318,65 @@ fn the_default_settings_leave_the_mtime_alone() {
     assert!(runner.shutdown(Duration::from_secs(5)).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_speed_limit_actually_throttles_a_real_download() {
+    // 第 134 步：`cfg.isSpeedLimitEnabled` 打开时下载要真的慢下来。
+    //
+    // 断言用的是**同一台机器上的自校准倍数**（限速耗时 ≥ 不限速耗时的 4 倍），
+    // 不是绝对秒数：这台 VPS 上 512 KiB / 128 KiB·s⁻¹ 实测 2–3.2 s（一个窗口最多
+    // 多放一个数据块，与 Python 同一判据位置），写死秒数会随机飘红。
+    let content: Vec<u8> = (0..512 * 1024u32)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let harness = Harness::start(content.clone(), Mode::Range);
+    let url = harness.server.url("/file.bin");
+
+    fn run(
+        tag: &str,
+        content: &[u8],
+        url: &str,
+        limit: Option<(bool, i64)>,
+    ) -> (std::time::Duration, Vec<u8>, TaskStatus) {
+        let dir = temp_dir(tag);
+        let mut service = TaskService::new();
+        let _ = service.add(record("dl", &dir, url, content.len(), 2), true);
+        let settings = match limit {
+            Some((enabled, bytes)) => RunnerSettings {
+                speed_limit_enabled: enabled,
+                speed_limit_bytes: bytes,
+                ..Default::default()
+            },
+            None => RunnerSettings::default(),
+        };
+        let mut runner = TaskRunner::new(settings);
+        assert_eq!(runner.pump(&mut service), vec!["dl".to_string()]);
+        let started = Instant::now();
+        drive(&mut runner, &mut service, Duration::from_secs(120));
+        let elapsed = started.elapsed();
+        let bytes = std::fs::read(dir.join("dl.bin")).expect("读下载结果");
+        let status = service.task("dl").expect("任务还在").status;
+        assert!(runner.shutdown(Duration::from_secs(5)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        (elapsed, bytes, status)
+    }
+
+    let (free, free_bytes, free_status) = run("throttle-free", &content, &url, None);
+    assert_eq!(free_bytes, content, "不限速时内容也得逐字节一致");
+    assert_eq!(free_status, TaskStatus::Completed);
+
+    let (limited, limited_bytes, limited_status) =
+        run("throttle-limited", &content, &url, Some((true, 128 * 1024)));
+    assert_eq!(limited_bytes, content, "限速不能影响内容");
+    assert_eq!(limited_status, TaskStatus::Completed);
+
+    assert!(
+        limited >= free * 4,
+        "限速应该明显更慢：不限速 {free:?} / 限速 {limited:?}"
+    );
+    assert!(
+        limited >= Duration::from_secs(1),
+        "512 KiB / 128 KiB·s⁻¹ 不可能在一秒内下完（实际 {limited:?}）"
+    );
+    assert!(limited < Duration::from_secs(60), "别慢得离谱：{limited:?}");
+}

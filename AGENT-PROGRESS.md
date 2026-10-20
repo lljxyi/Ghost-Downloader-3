@@ -9453,3 +9453,47 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
 - 下一步：限速门（`SpeedMeter::waitForSpeedLimit` 的落点）→ 托盘
   （`SystemTrayIcon` + `shell.rs` 五项菜单）→ `update_service` 的 tokio 宿主适配。
 - 卡点：无
+
+## 第 134 步：限速闸门接进下载循环（`gd3-ui::speed_limit`）（2026-10-19 15:58 UTC）
+
+接第 133 步「下一步」里的限速门。`app/services/speed_meter.py` 其实有两半：速度表那半
+第 104 步已经做成 `gd3-ui::speed_meter`（`Cell` 版，活在 UI 线程），**限速那半一直没落地**
+—— `gd3-net` 早就有 `SpeedGate` trait（`engine.rs:59`，每个数据块后 `gate.wait().await`），
+但 `HttpEngine.speed_gate` 永远是 `None`，所以 `cfg.speedLimitation` 在 Rust 侧从来没生效过。
+
+- 做了什么：
+  - **新模块 `gd3-ui::speed_limit`**：`SpeedLimit`（`bytes` / `enabled` / `limit` /
+    `closed` 四个原子量 + 窗口起点）实现 `gd3_net::SpeedGate`，`wait()` =
+    `while exceeded() { sleep(100ms) }`；判断是 `_bytes > limit`（严格大于，别「修正」）。
+  - **`task_runner`**：`RunnerSettings` 七项 → 九项（`speed_limit_enabled` ←
+    `isSpeedLimitEnabled`、`speed_limit_bytes` ← `speedLimitation`，缺省 `false` / 4 MiB）；
+    `TaskRunner` 持一份 `Arc<SpeedLimit>`，`set_settings` 每轮推给它（等价 Python 的
+    「每轮重读 `cfg`」）；`Spawner::spawn` 多一个 `gate` 参数（工作线程拿到同一份，
+    Python 也只有一个 `speedMeter`）；`run_job` 装进 `engine.speed_gate`，进度回调里
+    `add(chunk_delta)`；`shutdown` 先 `close()` 再 `cancel_all()`。
+  - `runtime::tick_host` 每秒 `speed_limit().reset()`，让放行节拍与顶栏速度表对齐。
+- 踩到的三个坑（都留了测试）：
+  1. **闸门不能依赖宿主 tick**。第一版把窗口清零全交给 UI 线程的 1 秒节拍，e2e（只
+     `drain`、不起 Runtime）把一个 512 KiB 下载挂死 120 秒。改成闸门**自带时钟**：
+     `exceeded()` 先看窗口过没过期，过期就滚 —— 外部行为与「每秒清零」一致，但不再
+     假设「宿主一定在 tick」（无头测试、停机之后都没有）。
+  2. **滚窗口的目标必须严格前进**：`compare_exchange` 在「值没变」时也会成功，同一
+     毫秒两次滚动会把窗口清两遍（刚加的字节被抹掉）。目标取 `now.max(start + 1)`，
+     顺带修掉 `reset()` 在 `epoch` 第一毫秒不生效。
+  3. **e2e 断言不能写死秒数**：512 KiB / 128 KiB·s⁻¹ 实测 2.0–3.2 s（一个窗口最多多放
+     一个数据块，与 Python 同一判据位置），第一次写 `>= 2.5s` 就在质量门里飘红了。
+     改成自校准：同一份载荷跑两遍（不限速 vs 限速），断言 ≥ 4 倍且 ≥ 1 s；连跑 3 次稳定。
+- 验证（全部本轮实跑）：
+  - 单测：`speed_limit` 8 条 + `task_runner` 2 条（闸门与 spawner 共享同一份、跟随配置、
+    `shutdown` 会 `close`）；
+  - e2e `runner_e2e` **5 passed**（新增限速那条）；
+  - 真二进制：1 MiB 载荷 `--set isSpeedLimitEnabled=true --set speedLimitation=131072`
+    → **4.35 s**（≈235 KiB/s）；同一任务不限额 → **0.25 s**；两次产物都 `cmp` 一致。
+    略高于上限是预期（判据在「写完之后、下一个数据块之前」，一个窗口最多超一个数据块）。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**
+    （4m17s）；`cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+    **GATE_EXIT=0**、28 个 target 全 ok、**1762 passed**（第 133 步 1751，+11）；
+    Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
+- 下一步：托盘（`SystemTrayIcon` + `shell.rs` 五项菜单）→ `update_service` 的 tokio
+  宿主适配 → 建任务链路（解析器）。
+- 卡点：无

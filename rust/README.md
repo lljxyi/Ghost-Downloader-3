@@ -3290,7 +3290,7 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–133 步）
+## Phase 8 进展（第 126–134 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3331,8 +3331,8 @@ tick = 现读 cfg（maxTaskNum 改了下一 tick 就生效）
 保住 `.ghd`）**先于** `Engine::stop()`（落盘）——反过来的话 `TaskService` 已经收工，
 晚到的运行期事件没人收。
 
-端到端验收：`tests/runner_e2e.rs`（4 条，`TaskRunner` 直驱；后两条是第 133 步的
-mtime 断言）、
+端到端验收：`tests/runner_e2e.rs`（5 条，`TaskRunner` 直驱；其中两条是第 133 步的
+mtime 断言，一条是第 134 步的限速断言）、
 `tests/runtime_e2e.rs`（2 条，`boot::run(--until-idle)` 与 `Runtime::pause`/`start`）、
 `tests/test_config_roundtrip.py`（6 条 cfg 往返）。
 
@@ -3520,9 +3520,65 @@ Rust 侧没有要新增的头部/探测逻辑：`lastModified` 是**建任务时
   `PreserveLastModified` 落在 Python 的同一位置（`DeleteFilesOnRemove` 与
   `shouldVerifySsl` 之间）；不带 `--set` 的默认配置跑同一条任务 → mtime 是当前时间。
 
+### 限速闸门：`waitForSpeedLimit` 接进下载循环（第 134 步）
+
+Python 侧的速度表兼限速器（`app/services/speed_meter.py`，56 行）有两半：
+
+```python
+def addSpeed(self, byteCount): self._bytes += byteCount          # 每个数据块
+async def waitForSpeedLimit(self):
+    while cfg.isSpeedLimitEnabled.value and self._bytes > cfg.speedLimitation.value:
+        await asyncio.sleep(0.1)                                  # 每个数据块之后
+async def _tickLoop(self):                # 每秒把 _bytes 清零
+    while True: await asyncio.sleep(1); self._coroutineRunner.post(self._tick)
+```
+
+第 104 步已经把「速度表」这一半做成了 `gd3-ui::speed_meter`（`Cell` 版，活在 UI 线程，
+`add_speed` / `should_wait` / `tick` 都在那儿）。缺的是**真的能拦住工作线程**的那一半：
+`gd3-net` 早就有 `SpeedGate` trait（`engine.rs:59`，每个数据块后 `gate.wait().await`），
+但没人实现它 —— `HttpEngine.speed_gate` 一直是 `None`。
+
+- 新模块 **`gd3-ui::speed_limit`**：`SpeedLimit` 用四个原子量（`bytes` / `enabled` /
+  `limit` / `closed`）+ 一个窗口起点做跨线程共享，`impl gd3_net::SpeedGate`，
+  `wait()` 就是 `while self.exceeded() { tokio::time::sleep(100ms).await }`。
+- **`task_runner`**：`RunnerSettings` 从七项变九项（新增 `speed_limit_enabled` ←
+  `isSpeedLimitEnabled`、`speed_limit_bytes` ← `speedLimitation`，缺省
+  `false` / 4 MiB）；`TaskRunner` 持一份 `Arc<SpeedLimit>`，`set_settings` 每轮把
+  两个值推进去（等价于 Python 的「每轮重读 `cfg`」），`Spawner::spawn` 多一个 `gate`
+  参数（工作线程拿到**同一份**，Python 也只有一个 `speedMeter`）；`run_job` 把它装进
+  `engine.speed_gate`，并在进度回调里 `add(chunk_delta)`。
+- `runtime::tick_host` 每秒 `runner.speed_limit().reset()`，让清零时刻与顶栏速度表同一拍。
+
+踩到的坑（都已修，且都留了测试）：
+
+1. **闸门不能依赖宿主 tick**。第一版把窗口清零完全交给 UI 线程的 1 秒节拍，e2e 测试
+   （只 `drain`、不起 Runtime）直接把一个 512 KiB 的下载挂死在那儿 120 秒。改成闸门
+   **自带时钟**：`exceeded()` 先看窗口是不是过期（`WINDOW = 1s`），过期就滚 —— 外部行为
+   与「每秒清零」完全一致，但正确性不再建立在「宿主一定在 tick」这个假设上（无头测试、
+   停机之后都没有 tick）。
+2. **滚窗口的目标必须严格前进**。`compare_exchange` 在「值没变」时也会成功，
+   同一毫秒里两次滚动就会把窗口清两遍（刚加进来的字节被抹掉）。目标取
+   `now.max(start + 1)`，`reset()` 在 `epoch` 的第一毫秒也能真的清零。
+3. **停机要主动放行**。`TaskRunner::shutdown` 先 `speed_limit.close()` 再 `cancel_all()`：
+   否则正卡在闸门上的工作线程要等满一个窗口才可能出来。
+
+验收（第 134 步实跑）：
+
+- 单测：`speed_limit` 8 条（严格大于、`reset`、**自己滚窗口**、并发滚动只清一次、
+  不超限立即返回、清零后放行、`close` 放行、关闭时不拦人）+ `task_runner` 2 条
+  （闸门与 spawner 共享同一份且跟随配置；`shutdown` 会 `close` 它）。
+- e2e（生产路径）：`runner_e2e::the_speed_limit_actually_throttles_a_real_download`
+  —— 同一份 512 KiB 载荷跑两遍（不限速 vs 128 KiB·s⁻¹），断言**倍数**而不是绝对秒数：
+  限速耗时 ≥ 不限速的 4 倍且 ≥ 1 s（本机实测 2.0–3.2 s vs 0.25 s 上下，写死秒数会飘红
+  —— 第一次就是这么红的）。两遍内容都逐字节一致。
+- 真二进制：1 MiB 载荷，`--set isSpeedLimitEnabled=true --set speedLimitation=131072`
+  → **4.35 s**（≈235 KiB/s）；同样的任务不限额 → **0.25 s**；两次的产物都 `cmp` 一致。
+  实测略高于上限是**预期**：判据在「写完之后、下一个数据块之前」，一个窗口最多超出
+  一个数据块，Python 的 `waitForSpeedLimit` 位置一模一样。
+
 ### 尚未接的
 
-尚未接的还有：限速钩子（`SpeedMeter::waitForSpeedLimit`）、建任务链路（解析器仍在
-Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的任务）、托盘 / Dock（`SystemTrayIcon` 现成，
-见上一节）。`shouldPreserveLastModified` 第 133 步已接（见上一节）。
+尚未接的还有：建任务链路（解析器仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的
+任务）、托盘 / Dock（`SystemTrayIcon` 现成，见上一节）、`update_service` 的 tokio 宿主
+适配。`shouldPreserveLastModified`（第 133 步）与限速闸门（第 134 步）已接。
 窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：起窗、下载、三种关窗模式都对。

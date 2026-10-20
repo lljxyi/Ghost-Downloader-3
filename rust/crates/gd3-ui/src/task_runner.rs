@@ -64,6 +64,7 @@ use gd3_net::{CancellationToken, HttpEngine, TransferProgress};
 use serde_json::Value;
 use tokio::runtime::Runtime;
 
+use crate::speed_limit::SpeedLimit;
 use crate::task_service::{PauseReport, TaskService};
 
 /// Python `rust_engine.RETRY_DELAY_MS`。
@@ -72,7 +73,7 @@ pub const RETRY_DELAY: Duration = Duration::from_millis(5000);
 /// `HttpTaskStep.subworkerCount` 的默认值（`features/http_pack/task.py:69`）。
 pub const DEFAULT_SUBWORKER_COUNT: usize = 8;
 
-/// 运行期需要从 `cfg` 现读的七项。
+/// 运行期需要从 `cfg` 现读的九项。
 ///
 /// Python 里这些是全局 `cfg` 的 `ConfigItem`，每次用到时现读；Rust 侧由宿主在
 /// 每轮 tick 用 [`RunnerSettings::from_config`] 重新取一份（设置页改完立刻生效）。
@@ -92,6 +93,10 @@ pub struct RunnerSettings {
     pub auto_speed_up: bool,
     /// `cfg.shouldPreserveLastModified`（跑完把 mtime 设成响应头里的时间）。
     pub preserve_last_modified: bool,
+    /// `cfg.isSpeedLimitEnabled`（限速总开关）。
+    pub speed_limit_enabled: bool,
+    /// `cfg.speedLimitation`（字节/秒，缺省 4 MiB/s）。
+    pub speed_limit_bytes: i64,
 }
 
 impl Default for RunnerSettings {
@@ -104,6 +109,8 @@ impl Default for RunnerSettings {
             max_reassign_size: 512 * 1024,
             auto_speed_up: true,
             preserve_last_modified: false,
+            speed_limit_enabled: false,
+            speed_limit_bytes: 4_194_304,
         }
     }
 }
@@ -125,6 +132,10 @@ impl RunnerSettings {
                 .unwrap_or(defaults.auto_speed_up),
             preserve_last_modified: settings::read_bool(config, "shouldPreserveLastModified")
                 .unwrap_or(defaults.preserve_last_modified),
+            speed_limit_enabled: settings::read_bool(config, "isSpeedLimitEnabled")
+                .unwrap_or(defaults.speed_limit_enabled),
+            speed_limit_bytes: settings::read_i64(config, "speedLimitation")
+                .unwrap_or(defaults.speed_limit_bytes),
         }
     }
 }
@@ -375,7 +386,15 @@ impl RunnerEvent {
 
 /// 跑 job 的东西：生产环境是 tokio 工作线程（[`ThreadSpawner`]），测试里是假实现。
 pub trait Spawner {
-    fn spawn(&self, job: DownloadJob, cancel: CancellationToken, sink: Sender<RunnerEvent>);
+    /// `gate` 是全局限速闸门（`app/services/speed_meter.py` 的 `waitForSpeedLimit`），
+    /// 所有 job 共用一份（Python 也是一个 `speedMeter`）。
+    fn spawn(
+        &self,
+        job: DownloadJob,
+        cancel: CancellationToken,
+        sink: Sender<RunnerEvent>,
+        gate: Arc<SpeedLimit>,
+    );
     /// 停机（默认空操作）。[`TaskRunner::shutdown`] 在所有工作线程收工之后调它。
     fn shutdown(&mut self) {}
 }
@@ -403,13 +422,19 @@ impl ThreadSpawner {
 }
 
 impl Spawner for ThreadSpawner {
-    fn spawn(&self, job: DownloadJob, cancel: CancellationToken, sink: Sender<RunnerEvent>) {
+    fn spawn(
+        &self,
+        job: DownloadJob,
+        cancel: CancellationToken,
+        sink: Sender<RunnerEvent>,
+        gate: Arc<SpeedLimit>,
+    ) {
         let Some(runtime) = &self.runtime else {
             // `new` 失败时 runner 仍然可用（只是不派发），所以这里静默返回。
             return;
         };
         runtime.spawn(async move {
-            run_job(job, cancel, sink).await;
+            run_job(job, cancel, sink, gate).await;
         });
     }
 
@@ -441,7 +466,12 @@ fn restore_last_modified(job: &DownloadJob, step: &DownloadStep) {
 }
 
 /// 逐步跑完一个 job，把过程发成事件（`Task.run` 的循环 + `HttpTask.run` 的传输）。
-async fn run_job(job: DownloadJob, cancel: CancellationToken, sink: Sender<RunnerEvent>) {
+async fn run_job(
+    job: DownloadJob,
+    cancel: CancellationToken,
+    sink: Sender<RunnerEvent>,
+    gate: Arc<SpeedLimit>,
+) {
     for step in &job.steps {
         if cancel.is_cancelled() {
             let _ = sink.send(RunnerEvent::Cancelled {
@@ -467,8 +497,10 @@ async fn run_job(job: DownloadJob, cancel: CancellationToken, sink: Sender<Runne
         engine.retry_delay = job.retry_delay;
         engine.max_reassign_size = job.max_reassign_size;
         engine.auto_speed_up = job.auto_speed_up;
+        engine.speed_gate = Some(Arc::clone(&gate) as Arc<dyn gd3_net::SpeedGate>);
 
         let received = Arc::new(AtomicU64::new(0));
+        let progress_gate = Arc::clone(&gate);
         let progress_sink = sink.clone();
         let progress_work = job.work_id.clone();
         let progress_task = job.task_id.clone();
@@ -476,6 +508,8 @@ async fn run_job(job: DownloadJob, cancel: CancellationToken, sink: Sender<Runne
         let received_ref = Arc::clone(&received);
         engine.on_progress = Some(Arc::new(move |update: TransferProgress| {
             received_ref.store(update.received_bytes, Ordering::Relaxed);
+            // `reportSpeed(delta)` → `speedMeter.addSpeed(delta)`，闸门按这个数判断超限。
+            progress_gate.add(update.chunk_delta);
             let _ = progress_sink.send(RunnerEvent::Progress {
                 work_id: progress_work.clone(),
                 task_id: progress_task.clone(),
@@ -567,6 +601,8 @@ impl DrainReport {
 /// 任务运行器：`_pump` / `_dispatch` / 事件回灌 三件事。
 pub struct TaskRunner {
     settings: RunnerSettings,
+    /// 全局限速闸门（`speed_meter.py:39-41`）。工作线程读、UI 线程写。
+    speed_limit: Arc<SpeedLimit>,
     spawner: Box<dyn Spawner>,
     sender: Sender<RunnerEvent>,
     events: Receiver<RunnerEvent>,
@@ -579,8 +615,11 @@ impl TaskRunner {
     /// 用给定的 spawner 建一个（测试用假 spawner）。
     pub fn with_spawner(settings: RunnerSettings, spawner: Box<dyn Spawner>) -> Self {
         let (sender, events) = channel();
+        let speed_limit = SpeedLimit::new();
+        speed_limit.configure(settings.speed_limit_enabled, settings.speed_limit_bytes);
         TaskRunner {
             settings,
+            speed_limit,
             spawner,
             sender,
             events,
@@ -601,8 +640,18 @@ impl TaskRunner {
     }
 
     /// 每轮 tick 现读配置（`cfg.maxTaskNum` 之类的改动立刻生效）。
+    ///
+    /// 限速的两项要顺手推给闸门：那个对象是 `Arc` 共享给工作线程的，
+    /// 不同步就只有 UI 见过新值（`waitForSpeedLimit` 每轮直接读 `cfg`，等价于这里推）。
     pub fn set_settings(&mut self, settings: RunnerSettings) {
+        self.speed_limit
+            .configure(settings.speed_limit_enabled, settings.speed_limit_bytes);
         self.settings = settings;
+    }
+
+    /// 全局限速闸门（宿主每秒 `reset` 一次，见 `runtime::tick_host`）。
+    pub fn speed_limit(&self) -> &Arc<SpeedLimit> {
+        &self.speed_limit
     }
 
     pub fn is_running(&self, task_id: &str) -> bool {
@@ -668,7 +717,12 @@ impl TaskRunner {
                 positions,
             },
         );
-        self.spawner.spawn(job, cancel, self.sender.clone());
+        self.spawner.spawn(
+            job,
+            cancel,
+            self.sender.clone(),
+            Arc::clone(&self.speed_limit),
+        );
         true
     }
 
@@ -812,6 +866,9 @@ impl TaskRunner {
     ///
     /// 返回值是**超时前没收到收尾事件**的任务 id（正常情况下是空的）。
     pub fn shutdown(&mut self, wait: Duration) -> Vec<String> {
+        // 先放开限速闸门：卡在 `wait()` 里的工作线程要靠它返回 —— 停机之后没人再
+        // `reset` 那个计数窗口，闸门会把它们一直按住。
+        self.speed_limit.close();
         self.cancel_all();
         let deadline = Instant::now() + wait;
         while !self.running.is_empty() && Instant::now() < deadline {
@@ -962,6 +1019,7 @@ mod tests {
         cancels: RefCell<Vec<CancellationToken>>,
         sink: RefCell<Option<Sender<RunnerEvent>>>,
         shutdowns: Cell<usize>,
+        gates: RefCell<Vec<Arc<SpeedLimit>>>,
     }
 
     impl FakeSpawner {
@@ -993,10 +1051,17 @@ mod tests {
     }
 
     impl Spawner for FakeSpawner {
-        fn spawn(&self, job: DownloadJob, cancel: CancellationToken, sink: Sender<RunnerEvent>) {
+        fn spawn(
+            &self,
+            job: DownloadJob,
+            cancel: CancellationToken,
+            sink: Sender<RunnerEvent>,
+            gate: Arc<SpeedLimit>,
+        ) {
             self.0.jobs.borrow_mut().push(job);
             self.0.cancels.borrow_mut().push(cancel);
             *self.0.sink.borrow_mut() = Some(sink);
+            self.0.gates.borrow_mut().push(gate);
         }
 
         fn shutdown(&mut self) {
@@ -1274,6 +1339,8 @@ mod tests {
             max_reassign_size: 777,
             auto_speed_up: false,
             preserve_last_modified: true,
+            speed_limit_enabled: true,
+            speed_limit_bytes: 2048,
         };
         let job = plan_job(&record, &settings, "wrk_2");
         let planned = &job.steps[0];
@@ -1359,6 +1426,56 @@ mod tests {
             RunnerSettings::from_config(&config).preserve_last_modified,
             "设置页勾上之后 runner 必须看得到"
         );
+    }
+
+    #[test]
+    fn the_speed_limit_gate_is_shared_with_the_spawner_and_follows_the_config() {
+        let mut service = service_of(vec![http_record("a", TaskStatus::Waiting)]);
+        let spawner = FakeSpawner::default();
+        let mut runner = runner(
+            RunnerSettings {
+                speed_limit_enabled: true,
+                speed_limit_bytes: 1024,
+                ..Default::default()
+            },
+            &spawner,
+        );
+        assert_eq!(runner.pump(&mut service), vec!["a".to_string()]);
+
+        let gate = spawner.0.gates.borrow()[0].clone();
+        assert!(
+            Arc::ptr_eq(&gate, runner.speed_limit()),
+            "工作线程拿到的必须是 runner 那一份（Python 也只有一个 speedMeter）"
+        );
+        assert!(gate.is_enabled());
+        assert_eq!(gate.limit_bytes(), 1024);
+
+        // 设置页改完 → 下一轮 `set_settings` 推给闸门（`waitForSpeedLimit` 的每轮重读）
+        runner.set_settings(RunnerSettings {
+            speed_limit_enabled: false,
+            speed_limit_bytes: 10,
+            ..Default::default()
+        });
+        assert!(!gate.is_enabled());
+        assert_eq!(gate.limit_bytes(), 10);
+        assert!(!runner.settings().speed_limit_enabled);
+    }
+
+    #[test]
+    fn shutdown_releases_a_gate_that_is_holding_a_worker() {
+        // 停机之后没人再 `reset` 计数窗口，闸门必须自己放行，否则 shutdown 会卡满。
+        let mut service = service_of(vec![http_record("a", TaskStatus::Waiting)]);
+        let spawner = FakeSpawner::default();
+        let mut runner = runner(RunnerSettings::default(), &spawner);
+        assert_eq!(runner.pump(&mut service), vec!["a".to_string()]);
+        let gate = spawner.0.gates.borrow()[0].clone();
+        gate.configure(true, 1);
+        gate.add(1024);
+        assert!(gate.exceeded());
+
+        let _ = runner.shutdown(Duration::from_millis(50));
+        assert!(gate.is_closed());
+        assert!(!gate.exceeded(), "停机后不能再拦人");
     }
 
     // ---- 派发 ----

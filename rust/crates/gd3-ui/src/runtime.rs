@@ -105,6 +105,10 @@ fn tick_host(
     if last_speed_tick.get().elapsed() >= speed_tick_interval {
         last_speed_tick.set(Instant::now());
         engine.tasks_mut().tick_speed_meter();
+        // 限速闸门的计数窗口与速度表对齐成同一个 1 秒节拍（`SpeedMeter._tick` 里
+        // `self._bytes = 0`）。闸门自己也会滚窗口，这里对齐只为让「放行时刻」
+        // 与顶栏速度表同一拍。
+        runner.speed_limit().reset();
     }
     for effect in engine.drain_speed_effects() {
         if let crate::speed_meter::SpeedEffect::Emit { speed } = effect {
@@ -286,6 +290,7 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc::Sender;
 
@@ -304,6 +309,7 @@ mod tests {
         jobs: RefCell<Vec<DownloadJob>>,
         cancels: RefCell<Vec<CancellationToken>>,
         sink: RefCell<Option<Sender<RunnerEvent>>>,
+        gates: RefCell<Vec<Arc<crate::speed_limit::SpeedLimit>>>,
     }
 
     #[derive(Default, Clone)]
@@ -334,10 +340,17 @@ mod tests {
     }
 
     impl Spawner for FakeSpawner {
-        fn spawn(&self, job: DownloadJob, cancel: CancellationToken, sink: Sender<RunnerEvent>) {
+        fn spawn(
+            &self,
+            job: DownloadJob,
+            cancel: CancellationToken,
+            sink: Sender<RunnerEvent>,
+            gate: Arc<crate::speed_limit::SpeedLimit>,
+        ) {
             self.0.jobs.borrow_mut().push(job);
             self.0.cancels.borrow_mut().push(cancel);
             *self.0.sink.borrow_mut() = Some(sink);
+            self.0.gates.borrow_mut().push(gate);
         }
     }
 

@@ -118,7 +118,14 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    `RunnerSettings.preserve_last_modified` 落 mtime，失败只打 stderr。e2e 两条
    （开/关）与真二进制（`--set shouldPreserveLastModified=true` → mtime 变成
    1994-11-06T08:49:37Z、字节一致、rc=0）都验过。
-   **剩下的**是**限速门**（`SpeedMeter::waitForSpeedLimit` 的落点）。
+   ~~限速门~~ **第 134 步也已解决**：新模块 `gd3-ui::speed_limit` 实现
+   `gd3_net::SpeedGate`（原子量共享、自带 1 秒计数窗口、`shutdown` 时 `close()`
+   放行），`task_runner` 每轮把 `isSpeedLimitEnabled` / `speedLimitation` 推进去，
+   工作线程在每个数据块后 `wait()`。e2e：512 KiB / 128 KiB·s⁻¹ = 3.17 s；真二进制
+   1 MiB 限额 4.35 s、不限额 0.25 s（略高于上限是预期：一个窗口最多超一个数据块，
+   与 Python 同一判据位置）。
+
+   这一条已清空，剩下的是第 2/3/4/6 项。
 6. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI。
 
 ## 6. 已知差异与风险
