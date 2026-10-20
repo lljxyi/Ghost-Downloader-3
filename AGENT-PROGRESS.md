@@ -9610,3 +9610,47 @@ features 里 —— 早就编进二进制了，缺的只是「把语义层接上
 - 下一步：建任务链路（解析器仍在 Python 侧）→ OOBE / 组件库 / 其它对话框（P2–P6）。
 - 卡点：无（托盘在无桌面会话的机器上**必然**注册失败，这是环境限制，不是缺陷；
   有 StatusNotifierWatcher 的桌面上的实际图标/菜单外观无法在本机肉眼验收）。
+
+## 第 137 步：建任务链路（`gd3-ui::task_create`）（2026-10-19 19:00 UTC）
+
+接 `AGENT-DONE` §5 第 4 项。到第 136 步为止 Rust 只跑**已经在** `tasks.jsonl` 里的
+任务：不解析 URL、不探测、不造记录 —— 「URL → 任务」这一段一直留在 Python 的
+`features/http_pack/pack.py`。这一步把 `buildTask` + `HttpParser` 搬过来。
+
+- 做了什么：
+  - **新模块 `gd3-ui::task_create`**：`CreateOptions`/`ResourceOptions`（Python 的
+    `TaskOptions`/`ResourceTaskOptions`）、`CreateDefaults`（四个
+    `field(default_factory=...)` 的落点，`from_config(&UserConfig)` 一次读齐
+    `downloadFolder` / `currentHeaders()` / `clientProfile` / `preBlockNum`）、
+    `build_task`（镜像 `buildTask`）、`Prober` trait + `NetProber`（current-thread
+    runtime + `block_on(gd3_net::probe::probe)`）、`HttpParser`（`priority = 100`，
+    `match`/`matchPassive` 转调 `gd3-core::http_pack`）、`create_tasks`（装解析器 +
+    逐条 `parse` + `TaskService::add`，**三条入口共用的那段胶水**）。
+  - **`gd3-core::task`**：`new_task_id` / `new_step_id` / `now_seconds` 改 `pub`
+    （builder 要造 id 与 `createdAt`，原来只给 serde 的 `default = ...` 用）。
+  - **落盘形状与 Python 逐键同序**：`serde_json` 的 `preserve_order` 让
+    `TaskStep.extra` 的插入顺序就是 JSON 顺序；`subworkers`/`error` 不落盘
+    （Python `field(repr=False)`），`shouldSeed` 是 `false`。
+  - **入口**：位置参数 URL / 浏览器扩展 / aria2 RPC 三处**仍然**只有空解析器链。
+    `Engine::new` 不装解析器是有意的（装了以后 `parse` 会在 UI 线程里同步探测
+    30 秒级）；草稿对话框要的是「提交 → 后台探测 → 回填 `on_parsed`」，得配
+    worker 线程 + 通道 —— 那是下一步。这一步交付的是链路本身。
+- 验证（全部本轮实跑）：
+  - 单测 `task_create` **10 条**：拿一份**真 Python** 跑出来的 `toDict()` 当基准逐字节
+    比对（`concat!` 拼的期望串）；resource 名走 `toSafeFilename`
+    （`weird/name?.mp4` → `weird_name_.mp4`）且不探测；`size <= 0` 仍探测；探测入参
+    回落 cfg；探测错误冒泡；`match`/`matchPassive`；进 `ParserChain` 同一条路；
+    `headers` 保序 + 丢非字符串；`CreateDefaults::from_config`；`create_tasks`
+    建成 / 失败 / 落盘。
+  - e2e `tests/task_create_e2e.rs` **2 条**（本地 HTTP 服务器 + **真** `NetProber`）：
+    真探测（`Range: bytes=1-1`）→ 记录 → `tasks.jsonl` → `boot::run(--until-idle)`
+    下完、逐字节一致、状态回写；以及同一条记录直接进 `TaskService` 由 `Runtime`
+    推着下完、`.ghd` 删掉。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**
+    （4m36s）；`cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+    **GATE_EXIT=0**、30 个 target 全 ok、**1795 passed**（第 136 步 1783，+12）；
+    Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**
+    （`comm -3` 0 行）。
+- 下一步：草稿对话框接真解析（worker 线程 + 通道回灌 `DraftStore::on_parsed`）→
+  OOBE / 组件库 / 其它对话框（P2–P6）。
+- 卡点：无（本机无桌面会话，探测走的是本地测试服务器，真外网探测没在本步验）。

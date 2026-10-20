@@ -126,8 +126,18 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    app 4.4.0→4.4.3 与 bittorrent_pack 1.0.0→1.1.1 双 `AVAILABLE` → 真下 20 657 字节 zip →
    sha256 对上 → `READY` → `apply` 解出 12 项、zip 删。仍缺：`tar.xz` / `dmg` 解包
    （离线缺 `xz2`、`dmg` 要 `hdiutil`）与 updater 进程的 spawn（只交出 `UpdaterCommand`）。
-4. **建任务链路（解析器）仍在 Python 侧**：Rust 只跑**已经在 `tasks.jsonl` 里**的任务，
-   不解析 URL、不生成草稿落盘。
+4. ~~**建任务链路（解析器）仍在 Python 侧**~~ **第 137 步已解决（链路），入口待接**：
+   新模块 `gd3-ui::task_create` 把 `features/http_pack/pack.py` 的 `buildTask` 与
+   `HttpParser` 搬过来了 —— `CreateOptions`/`CreateDefaults`（四个
+   `field(default_factory=...)`）、`build_task`（与 Python `toDict()` 逐键同序，
+   单测拿真 Python 输出逐字节比对）、`Prober` + `NetProber`（current-thread
+   runtime + `gd3_net::probe::probe`）、`HttpParser`（`priority = 100`，
+   `match`/`matchPassive` 转调 `gd3-core::http_pack`）、`create_tasks`（装解析器 +
+   逐条 `parse` + `TaskService::add`）。e2e：本地服务器上真探测 → 记录 →
+   `tasks.jsonl` → `--until-idle` 下完（另一条走 `Runtime`），逐字节一致。
+   **仍未接**：位置参数 URL / 浏览器扩展 / aria2 RPC 三处的入口仍是空解析器链
+   （`Engine::new` 故意不装 —— `parse` 同步探测会卡住 UI 线程），草稿对话框的
+   `DraftParser` 还要一条 worker 线程 + 通道把探测结果回灌 `on_parsed`。
 5. ~~`shouldPreserveLastModified` 的 `os.utime`~~ **第 133 步已解决**：新模块
    `gd3-core::httpdate`（HTTP-date 三种历史格式 + `apply_last_modified`，单测里有一张
    逐条对齐 CPython 的样本表），`task_runner` 在步骤跑完后按
@@ -141,7 +151,8 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    1 MiB 限额 4.35 s、不限额 0.25 s（略高于上限是预期：一个窗口最多超一个数据块，
    与 Python 同一判据位置）。
 
-   这一条已清空（第 133/134 步）；托盘也在第 136 步清空了，剩下的是第 4/6 项。
+   这一条已清空（第 133/134 步）；托盘第 136 步、建任务链路第 137 步也清空/基本清空，
+   真正剩下的只有第 6 项（P2–P6 的 UI：草稿对话框的真解析接线、OOBE、组件库、其它对话框）。
 6. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI。
 
 ## 6. 已知差异与风险

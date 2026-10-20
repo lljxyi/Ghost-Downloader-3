@@ -85,6 +85,7 @@ pub mod speed_limit;
 pub mod speed_meter;
 pub mod subtitle_select;
 pub mod task_actions;
+pub mod task_create;
 pub mod task_draft;
 pub mod task_draft_ui;
 pub mod task_runner;

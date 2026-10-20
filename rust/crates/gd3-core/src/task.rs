@@ -183,15 +183,18 @@ fn is_selected() -> bool {
     true
 }
 
-fn new_task_id() -> String {
+/// `Task.taskId = f"tsk_{uuid4().hex}"`（`app/models/task.py:47`）。
+pub fn new_task_id() -> String {
     format!("tsk_{}", Uuid::new_v4().simple())
 }
 
-fn new_step_id() -> String {
+/// `TaskStep.stepId = f"stp_{uuid4().hex}"`（`app/models/task.py:114`）。
+pub fn new_step_id() -> String {
     format!("stp_{}", Uuid::new_v4().simple())
 }
 
-fn now_seconds() -> i64 {
+/// `int(time())`：`Task.createdAt` 的缺省值。
+pub fn now_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs() as i64)

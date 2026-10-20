@@ -3293,9 +3293,10 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    离线缺包限制。之后才是更新卡片 / 进度条 UI。
 2. ~~**安装引导框**~~：第 123 步完成（`gd3-ui::extension_install` +
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
-3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
+3. **P2–P6 剩余 UI**：草稿对话框的真解析接线（链路本身第 137 步已通）、
+   其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–136 步）
+## Phase 8 进展（第 126–137 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3701,10 +3702,68 @@ default features 里 —— 也就是说早就编进二进制了。第 136 步�
   29 个 target 全 ok、**1783 passed**（第 135 步 1774，+9）；Python 全量
   → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
 
+### 建任务链路：`URL → TaskRecord`（第 137 步，`gd3-ui::task_create`）
+
+到第 136 步为止，Rust 只跑**已经在** `tasks.jsonl` 里的任务：不解析 URL、不探测、
+不造记录 —— 建任务那一段一直留在 Python（`features/http_pack/pack.py`）。这一步把
+`buildTask` 与 `HttpParser` 搬过来，整条流水线是：
+
+```text
+ParserChain::parse(options)                  ← 第 108 步已有
+  └─ HttpParser::parse(options)              ← 本步
+       ├─ ResourceTaskOptions(name, size>0)  → 直接当 RemoteFile（不探测）
+       └─ 否则 probe(options)                → gd3_net::probe::probe（第 113 步）
+       └─ build_task(options, file)          ← 本步
+```
+
+- **`build_task` 与 Python 逐键同序**（`serde_json` 开了 `preserve_order`，
+  `TaskStep.extra` 的插入顺序就是 JSON 顺序）。单测拿一份真 Python
+  跑出来的 `toDict()` 当基准，逐字节比对：`stepIndex: 1`、`httpByteOffset: 0`、
+  `isAccelerated: false`、`type: features.http_pack.task.HttpTaskStep` 等等一个不差。
+  `subworkers` / `error` 不落盘（Python 的 `field(repr=False)`），`shouldSeed` 是
+  `false`（播种标记归 `TaskService::add`）。
+- **`TaskOptions` → [`CreateOptions`]**：`fromOptions` 的 `filterFields` 语义（只认自己
+  那批键）+ 四个 `field(default_factory=...)` 由 [`CreateDefaults`] 承担。
+  `CreateDefaults::from_config(&UserConfig)` 一次读齐 `downloadFolder` /
+  `headersPresets`+`currentHeadersPreset`（即 `cfg.currentHeaders()`）/
+  `clientProfile` / `preBlockNum`。
+- **探测做成可注入的 [`Prober`]**：`parse` 是同步签名，生产实现 `NetProber` 自带一个
+  current-thread runtime 并 `block_on`；单测塞桩，一条网络都不发。
+- **`create_tasks` 是三条入口共用的胶水**（装解析器 + 逐条 `parse` + `add`），
+  单测验过「1 条 http 建成、1 条 ftp 记失败、落盘可读回」。
+
+| 差异 | 说明 |
+|---|---|
+| `ResourceTaskOptions` 靠键存在性判 | Python 有类型（`isinstance`），Rust 的 options 是 `Map`：`name`/`size`/`canUseRangeRequests` 任一存在即视为 resource |
+| `headers` 只收字符串值 | Python `dict(options.headers)` 原样保留任意值（非 str 会在 httpx 里炸），Rust 直接跳过 |
+| `clientProfile` 两处用法分开 | 探测用 `options.clientProfile or cfg.clientProfile`（空则回落），落盘写原始值（可能空串）——与 Python 同 |
+| `guess_extension` 不在本模块 | `gd3-net::probe` 的 `ExtensionResolver` 由调用方注入（mimetypes 是平台相关的表），不注入则兜底名没有扩展名 |
+| 探测是阻塞的 | Python 是 `await`；Rust 侧 `TaskParser::parse` 同步 → 宿主该在后台线程里调（**不要**在 tokio 运行时线程里调 `NetProber`） |
+
+**入口还没接**：位置参数 URL / 浏览器扩展 / aria2 RPC 三处仍然只有空的解析器链
+（`Engine::new` 不装解析器），草稿对话框的 `DraftParser` 要的是「提交 → 后台探测 →
+回填 `on_parsed`」，得配一条 worker 线程 + 通道。链路本身已通，入口接线是下一步。
+
+验收（第 137 步实跑）：
+
+- 单测 `task_create` **10 条**：与 Python `toDict()` 逐字节对齐；resource 名走
+  `toSafeFilename`（`weird/name?.mp4` → `weird_name_.mp4`）且不探测；`size <= 0`
+  仍然探测；探测入参回落 cfg（`clientProfile` / `headers` / `fallbackName` 前缀）；
+  探测错误原样冒泡；`match`/`matchPassive` 转调 `gd3-core::http_pack`；进
+  `ParserChain` 后同一条路；`headers` 保序且丢非字符串；`CreateDefaults::from_config`
+  读的是宿主配置；`create_tasks` 的建成 / 失败 / 落盘三条断言。
+- e2e `tests/task_create_e2e.rs` **2 条**（本地 HTTP 服务器 + **真** `NetProber`）：
+  1. URL →（真探测）→ 记录 → 写进 `tasks.jsonl` → `boot::run(--until-idle)` 下完 →
+     逐字节一致、状态回写 `COMPLETED`；
+  2. 同一条记录直接进 `TaskService` → `Runtime::tick` 推着下完、`.ghd` 删掉。
+- 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**；
+  `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` **GATE_EXIT=0**、
+  30 个 target 全 ok、**1795 passed**（第 136 步 1783，+12）；Python 全量
+  → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
+
 ### 尚未接的
 
-尚未接的只剩建任务链路（解析器仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的任务）
-与 OOBE / 组件库 / 其它对话框这些 P2–P6 的 UI。
+剩下的都是 P2–P6 的 UI：草稿对话框的真解析接线、OOBE / 组件库 / 其它对话框。
 `shouldPreserveLastModified`（第 133 步）、限速闸门（第 134 步）、`update_service` 的执行层
-（第 135 步）、托盘（第 136 步）都已接。窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：
-起窗、下载、三种关窗模式都对。
+（第 135 步）、托盘（第 136 步）、建任务链路（第 137 步）都已接。窗口分支（winit）
+第 132 步已在 `Xvfb :99` 上验过：起窗、下载、三种关窗模式都对。
