@@ -345,7 +345,10 @@ pub fn build_task(options: &CreateOptions, file: &RemoteFile) -> TaskRecord {
 /// 探测一个 URL（`pack.py::probe` 的可注入形态）。
 ///
 /// 抽成 trait 是为了让 `parse` 在单测里不碰网络；生产实现见 [`NetProber`]。
-pub trait Prober {
+///
+/// `Send` 是给后台解析用的（`crate::draft_worker` 把 [`HttpParser`] 整个搬进
+/// 工作线程）：`NetProber` 里装的是 `tokio::runtime::Runtime`，本来就是 `Send`。
+pub trait Prober: Send {
     fn probe(&self, options: &ProbeOptions) -> Result<RemoteFile, TaskError>;
 }
 
@@ -574,8 +577,7 @@ fn headers_object(headers: &[(String, String)]) -> Map<String, Value> {
 mod tests {
     use super::*;
     use crate::feature_service::ParserChain;
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     fn defaults() -> CreateDefaults {
         CreateDefaults {
@@ -607,16 +609,16 @@ mod tests {
     /// 记下被问过的探测入参；`file` 为 `None` 时抛错。
     struct StubProber {
         file: Option<RemoteFile>,
-        seen: Rc<RefCell<Vec<ProbeOptions>>>,
+        seen: Arc<Mutex<Vec<ProbeOptions>>>,
     }
 
     impl StubProber {
-        fn new(file: Option<RemoteFile>) -> (StubProber, Rc<RefCell<Vec<ProbeOptions>>>) {
-            let seen = Rc::new(RefCell::new(Vec::new()));
+        fn new(file: Option<RemoteFile>) -> (StubProber, Arc<Mutex<Vec<ProbeOptions>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
             (
                 StubProber {
                     file,
-                    seen: Rc::clone(&seen),
+                    seen: Arc::clone(&seen),
                 },
                 seen,
             )
@@ -625,7 +627,7 @@ mod tests {
 
     impl Prober for StubProber {
         fn probe(&self, options: &ProbeOptions) -> Result<RemoteFile, TaskError> {
-            self.seen.borrow_mut().push(options.clone());
+            self.seen.lock().expect("seen").push(options.clone());
             match &self.file {
                 Some(file) => Ok(file.clone()),
                 None => Err(TaskError::io("探测失败")),
@@ -633,7 +635,7 @@ mod tests {
         }
     }
 
-    fn parser(file: Option<RemoteFile>) -> (HttpParser, Rc<RefCell<Vec<ProbeOptions>>>) {
+    fn parser(file: Option<RemoteFile>) -> (HttpParser, Arc<Mutex<Vec<ProbeOptions>>>) {
         let (prober, seen) = StubProber::new(file);
         (HttpParser::new(Box::new(prober), defaults()), seen)
     }
@@ -694,7 +696,10 @@ mod tests {
             ("size", Value::from(7)),
         ]);
         let record = parser.parse(&options).expect("不该探测");
-        assert!(seen.borrow().is_empty(), "有 name+size 就不该发探测请求");
+        assert!(
+            seen.lock().expect("seen").is_empty(),
+            "有 name+size 就不该发探测请求"
+        );
         assert_eq!(record.name, "weird_name_.mp4");
         assert_eq!(record.file_size, 7);
         assert_eq!(record.url, "https://example.com/b?x=1");
@@ -714,7 +719,7 @@ mod tests {
             ("size", Value::from(0)),
         ]);
         let record = parser.parse(&options).expect("应当探测");
-        assert_eq!(seen.borrow().len(), 1);
+        assert_eq!(seen.lock().expect("seen").len(), 1);
         // 探测成功后 name 仍取 options.name（`buildTask` 的覆盖分支）
         assert_eq!(record.name, "given.bin");
         assert_eq!(record.file_size, 1234);
@@ -727,7 +732,7 @@ mod tests {
         let options = map_of(&[("url", Value::from("https://example.com/a.bin"))]);
         let record = parser.parse(&options).expect("应当探测");
 
-        let seen = seen.borrow();
+        let seen = seen.lock().expect("seen");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].client_profile, "chrome", "空则回落 cfg");
         assert_eq!(seen[0].url, "https://example.com/a.bin");
@@ -789,7 +794,7 @@ mod tests {
         let record = chain.parse(&mut options, &[]).expect("链条应当命中");
         assert_eq!(record.pack_id, "http");
         assert_eq!(record.name, "a.bin");
-        assert_eq!(seen.borrow().len(), 1);
+        assert_eq!(seen.lock().expect("seen").len(), 1);
         assert!(chain.matches("https://x/y.zip"));
     }
 
@@ -831,7 +836,7 @@ mod tests {
             "{}",
             report.failures[0].1
         );
-        assert_eq!(seen.borrow().len(), 1, "只有一条 URL 需要探测");
+        assert_eq!(seen.lock().expect("seen").len(), 1, "只有一条 URL 需要探测");
         assert_eq!(engine.tasks().len(), 1);
         assert_eq!(engine.features().parsers().priorities(), vec![100]);
 

@@ -9654,3 +9654,59 @@ features 里 —— 早就编进二进制了，缺的只是「把语义层接上
 - 下一步：草稿对话框接真解析（worker 线程 + 通道回灌 `DraftStore::on_parsed`）→
   OOBE / 组件库 / 其它对话框（P2–P6）。
 - 卡点：无（本机无桌面会话，探测走的是本地测试服务器，真外网探测没在本步验）。
+
+## 第 138 步：草稿对话框接真解析（`gd3-ui::draft_worker`）（2026-10-19 19:00 UTC）
+
+接第 137 步留下的最后一环：`TaskParser::parse` 是**同步**的，真 `NetProber` 会
+`block_on` 一次探测（秒级、30 s 超时）。在 UI 线程里直接调就是窗口卡死，而 Python
+侧草稿对话框走的是 `coroutineRunner.submit(coro, done=…, failed=…)`
+（`app/view/dialogs/task_draft.py`），天生异步。这一步补上机制层。
+
+- 做了什么：
+  - **新模块 `gd3-ui::draft_worker`**：`ParseWorker`（`gd3-draft-parse` 工作线程 +
+    两个 `std::sync::mpsc` 通道，`spawn(CreateDefaults)` / `with_parser(HttpParser)` /
+    `submit` / `cancel` / `drain` / `recv_timeout` / `shutdown`）、
+    `ParseOutcome::{Parsed, Failed}`（`work_id` 是不透明句柄）、
+    `drain_into(worker, &mut TaskDraftUi, host)`（回灌状态机，效果照旧走
+    `task_draft_ui::handle`）、`WorkerSubmitter`（宿主实现 `submit_parse`/`cancel_parse`
+    的最小粘合）。
+  - **异步是 opt-in**：`DraftHost::submit_parse` 缺省 `ParseSubmit::Sync(self.parse(..))`，
+    既有同步宿主/测试行为一字不变；真后台宿主返回 `ParseSubmit::Async`，
+    `TaskDraftUi::run` 只推一条 `UiEffect::ParseSubmitted { work_id }` 就返回。
+    `DraftEffect::Cancel` 现在转成 `host.cancel_parse(..)`（之前被吞在
+    `UiEffect::Draft` 里，后台线程会白跑一次探测）。新增
+    `TaskDraftUi::{on_parsed, on_parse_failed}` 公开入口，`handle` 改 `pub`。
+  - **`draft_worker.rs` 的 `ParseWorker: Send + Sync`**：`Sender`/`Receiver` 都不是
+    `Sync`，而宿主必然要 `Arc<ParseWorker>`（`WorkerSubmitter` 与 UI 线程各一份），
+    所以两处都包了 `Mutex`。
+  - **`Prober: Send`**（`gd3-ui::task_create`）：`HttpParser` 要整个搬进工作线程；
+    `NetProber` 本来就 `Send`，只动了 trait 约束与测试里的 `Rc<RefCell<_>>` →
+    `Arc<Mutex<_>>`。
+  - `ParseOutcome::Parsed` 与 `ParseSubmit::Sync` 都改 `Box<TaskRecord>`
+    （`TaskRecord` 几百字节，过通道/穿 trait 只搬指针；`clippy::large_enum_variant`）。
+- 验证（全部本轮实跑）：
+  - 单测 `draft_worker` **12 条**（桩探测器，零网络）：成功/失败回灌、提交前取消、
+    **跑着取消**（`Gate` 把探测卡在 `probe` 里，测试控制放行 → 时序钉死，不靠赛跑）、
+    取消集合回收、FIFO 串行顺序、提交端消失后 `submit == false`、`drain_into` 喂对话框 /
+    报失败给宿主、确认后保留探测记录、迟到结果无害。
+  - e2e `tests/draft_worker_e2e.rs` **1 条**（本地 HTTP 服务器 + **真** `NetProber`）：
+    粘 URL → `parse_needed` 立刻返回 `ParseSubmitted`（那一刻 `view().rows` 为空，
+    UI 线程没被探测挡住）→ tick 里 `drain_into` 拿到真记录（名字 / 大小 /
+    `canUseRangeRequests` 都来自真探测）→ `accept` → 记录进 `TaskService` →
+    `Runtime` 推着下完、逐字节一致、服务器至少收了 2 个请求。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings`
+    **exit 0**；`cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+    **GATE_EXIT=0**、31 个 target 全 ok、**1808 passed**（第 137 步 1795，+13）；
+    Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**
+    （把两边都去掉 ` - …` 尾巴再 `comm -3` → 0 行）。
+- 踩过的坑：
+  - `a_cancelled_parse_leaves_the_dialog_alone` 一开始断言「取消后 `recv_timeout`
+    一定收不到结果」——桩探测是毫秒级，「取消」与「结果落地」本来就在赛跑，门在别的
+    机器上就红。改法：这条只断言「对话框不受影响」，另加一条用 `Gate` 钉死时序的
+    `a_cancelled_inflight_parse_is_dropped`。
+  - 本机 rustfmt 会重排 `use`（`channel` 排到最后）与短结构体变体，所以新文件写完
+    一律先 `cargo fmt --all` 再 `--check`。
+- 下一步：把草稿对话框**装进真窗口**（`task_draft_ui::install` + 一个真 `DraftHost`
+  + Slint 定时器里 `drain_into`），顺手把位置参数 URL / 浏览器扩展 / aria2 RPC 三处
+  入口接到 `create_tasks`；之后 OOBE / 组件库 / 其它对话框（P2–P6）。
+- 卡点：无（机制层与本机实测都通过；真窗口里对话框的观感仍需人工验收）。

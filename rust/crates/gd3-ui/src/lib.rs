@@ -35,6 +35,7 @@ pub mod config_store;
 pub mod conflict;
 pub mod draft;
 pub mod draft_card;
+pub mod draft_worker;
 pub mod drawer;
 pub mod edit_task;
 pub mod editors;

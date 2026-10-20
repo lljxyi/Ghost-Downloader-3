@@ -151,9 +151,22 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    1 MiB 限额 4.35 s、不限额 0.25 s（略高于上限是预期：一个窗口最多超一个数据块，
    与 Python 同一判据位置）。
 
-   这一条已清空（第 133/134 步）；托盘第 136 步、建任务链路第 137 步也清空/基本清空，
-   真正剩下的只有第 6 项（P2–P6 的 UI：草稿对话框的真解析接线、OOBE、组件库、其它对话框）。
-6. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI。
+   这一条已清空（第 133/134 步）；托盘第 136 步、建任务链路第 137 步也清空/基本清空。
+6. ~~**草稿对话框的真解析**~~ **第 138 步已解决（机制层）**：新模块
+   `gd3-ui::draft_worker`——一条 `gd3-draft-parse` 工作线程 + 两个 `std::sync::mpsc`
+   通道，`submit` / `cancel` / `drain` / `shutdown`，把探测从 UI 线程上挪走；
+   `ParseOutcome::Parsed/Failed` 经 `drain_into` 回灌 `TaskDraftUi::on_parsed` /
+   `on_parse_failed`。异步是 **opt-in**：`DraftHost::submit_parse` 缺省仍是同步
+   （`ParseSubmit::Sync`），真后台宿主返回 `Async`，`TaskDraftUi::run` 只推一条
+   `UiEffect::ParseSubmitted` 就返回；`DraftEffect::Cancel` 现在会转给
+   `DraftHost::cancel_parse`（之前被吞掉，后台会白跑一次探测）。12 条单测（含用闸门
+   把探测卡在 `probe` 里、钉死「跑着取消 → 结果丢弃」时序）+ 1 条 e2e（本地服务器 +
+   真 `NetProber`：粘 URL → 立刻 `ParseSubmitted` → tick 里 `drain_into` 拿到真记录 →
+   `accept` → `Runtime` 下完、逐字节一致）。
+   **仍未接**：`boot` 还没有 `task_draft_ui::install`（`ui/task_draft.slint` 已在
+   `appwindow.slint` 里），差「装回调 + 一个真 `DraftHost` + Slint 定时器里 `drain_into`」；
+   位置参数 URL / 浏览器扩展 / aria2 RPC 三处入口也还没接这条链路。
+7. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI，以及上面第 6 项的宿主适配。
 
 ## 6. 已知差异与风险
 

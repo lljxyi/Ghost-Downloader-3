@@ -3293,10 +3293,11 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    离线缺包限制。之后才是更新卡片 / 进度条 UI。
 2. ~~**安装引导框**~~：第 123 步完成（`gd3-ui::extension_install` +
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
-3. **P2–P6 剩余 UI**：草稿对话框的真解析接线（链路本身第 137 步已通）、
-   其它对话框、组件库、OOBE、平台外壳。
+3. **P2–P6 剩余 UI**：草稿对话框装进真窗口（建任务链路第 137 步、后台解析机制
+   第 138 步都已就位，差的只是宿主适配：`task_draft_ui::install` + 一个真 `DraftHost`
+   + Slint 定时器里 `drain_into`）、其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–137 步）
+## Phase 8 进展（第 126–138 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3761,9 +3762,64 @@ ParserChain::parse(options)                  ← 第 108 步已有
   30 个 target 全 ok、**1795 passed**（第 136 步 1783，+12）；Python 全量
   → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
 
+### 后台解析：`draft_worker`（第 138 步，`gd3-ui::draft_worker`）
+
+第 137 步交付了「URL → TaskRecord」的链路，但 `TaskParser::parse` 是**同步**的，
+真实现 `NetProber` 会 `block_on` 一次探测（秒级，30 s 超时）——直接在 UI 线程里调就是
+窗口卡死。草稿对话框在 Python 侧是 `coroutineRunner.submit(coro, done=…, failed=…)`
+（`app/view/dialogs/task_draft.py`），天生异步，所以这一步补上「提交 → 后台探测 →
+结果回灌」的那层：一个工作线程 + 两个 `std::sync::mpsc` 通道。
+
+- **[`ParseWorker`]**：`spawn(CreateDefaults)` / `with_parser(HttpParser)` 起一条
+  `gd3-draft-parse` 线程；`submit(work_id, options) -> bool`、`cancel(work_id)`、
+  `drain() -> Vec<ParseOutcome>`（UI tick 每轮非阻塞取）、`recv_timeout`（测试用）、
+  `shutdown()`（关提交端并 join）。
+- **[`ParseOutcome`]**：`Parsed { work_id, task }` / `Failed { work_id, error }`。
+  `work_id` 是 [`crate::task_draft::TaskDraft`] 发的不透明句柄，原样交回。
+- **`drain_into(worker, &mut TaskDraftUi, host)`**：把回来的结果灌进对话框状态机
+  （`on_parsed` / `on_parse_failed`），返回的效果照旧走
+  [`task_draft_ui::handle`]——那条路第 138 步之前就存在，只是结果来自通道而不是递归。
+- **[`WorkerSubmitter`]**：宿主实现 `DraftHost::submit_parse` 的最小粘合
+  （`submit` / `cancel` 转调），真正的宿主还要自己实现 `can_edit` / `confirmed` 等钩子。
+- **`ParseSubmit`（异步是 opt-in）**：`DraftHost::submit_parse` 有默认实现
+  `ParseSubmit::Sync(self.parse(options))`，所有既有的同步宿主/测试**行为一字不变**；
+  真后台宿主返回 `ParseSubmit::Async`，`TaskDraftUi::run` 就只推一条
+  `UiEffect::ParseSubmitted { work_id }` 并立刻返回。`DraftEffect::Cancel` 现在会
+  转成 `DraftHost::cancel_parse`（之前被吞在 `UiEffect::Draft` 里，后台线程会白跑）。
+- `TaskDraftUi::handle` 改 `pub`：宿主 tick 里「先 `drain_into` 再 `handle`」，
+  窗口那层不新增可测性很差的胶水函数。
+
+| 差异 | 说明 |
+|---|---|
+| 串行而非并发 | Python 每条 URL 一个 `Task`；这里一条线程按 FIFO 跑，一个 `NetProber`/runtime 复用到底。批量粘 20 条是慢一点，不是错 |
+| 取消是协作式的 | `block_on` 里的探测打断不了，只能「结果回来时丢掉」。提交前取消、落地前取消都会丢；项上 `parse_id` 清空后迟到结果无副作用 |
+| 不做 `Drop` join | 正卡在探测里的线程会把宿主拖死，所以 `ParseWorker` 故意不实现 `Drop`：丢掉时提交端消失，线程跑完手上这条自然退出 |
+| `ParseOutcome` 装 `Box<TaskRecord>` | `TaskRecord` 几百字节，过通道只搬指针（`clippy::large_enum_variant`）；`ParseSubmit::Sync` 同理 |
+
+**入口还没接**：`Engine::new` 仍然不装解析器，`boot` 也没有 `task_draft_ui::install`
+——真窗口里的草稿对话框（`ui/task_draft.slint` 已在 `appwindow.slint` 里）还差
+「装回调 + 一个真 `DraftHost` + Slint 定时器里 `drain_into`」。这一步交付的是那层机制。
+
+验收（第 138 步实跑）：
+
+- 单测 `draft_worker` **12 条**（桩探测器，零网络）：成功/失败回灌、提交前取消与
+  **跑着取消**（`Gate` 把探测卡在 `probe` 里，时序是钉死的，不靠赛跑）、取消集合的
+  回收、FIFO 串行顺序、提交端消失后 `submit == false`、`drain_into` 喂对话框 /
+  报失败给宿主、确认后保留探测记录、给已清空草稿的迟到结果无害。
+- e2e `tests/draft_worker_e2e.rs` **1 条**（本地 HTTP 服务器 + **真** `NetProber`）：
+  粘 URL → `parse_needed` 立刻返回 `ParseSubmitted`（那一刻 `view().rows` 还是空的
+  ——UI 线程没被探测挡住）→ tick 里 `drain_into` 拿到真记录（名字 / 大小 / Range
+  支持都来自真探测）→ `accept` → 记录进 `TaskService` → `Runtime` 推着下完、逐字节一致。
+- 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**；
+  `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` **GATE_EXIT=0**、
+  31 个 target 全 ok、**1808 passed**（第 137 步 1795，+13）；Python 全量
+  → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**（`comm -3` 0 行）。
+
 ### 尚未接的
 
-剩下的都是 P2–P6 的 UI：草稿对话框的真解析接线、OOBE / 组件库 / 其它对话框。
+剩下的都是 P2–P6 的 UI：把草稿对话框装进真窗口（机制第 138 步已通，宿主适配待做）、
+OOBE / 组件库 / 其它对话框。
 `shouldPreserveLastModified`（第 133 步）、限速闸门（第 134 步）、`update_service` 的执行层
-（第 135 步）、托盘（第 136 步）、建任务链路（第 137 步）都已接。窗口分支（winit）
+（第 135 步）、托盘（第 136 步）、建任务链路（第 137 步）、后台解析（第 138 步）都已落地。
+窗口分支（winit）
 第 132 步已在 `Xvfb :99` 上验过：起窗、下载、三种关窗模式都对。

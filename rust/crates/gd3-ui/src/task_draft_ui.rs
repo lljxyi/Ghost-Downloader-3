@@ -58,8 +58,13 @@
 //! - **子对话框（批量 URL / 导入文件 / 编辑任务 / 选目录）只发效果**：这几层
 //!   （`batch_url.py` / `file_select.py` / `edit_task.py`）的 UI 还没迁，
 //!   [`DraftHost`] 的默认实现是空操作。
-//! - **解析是同步的**：`coroutineRunner.submit` 换成 [`DraftHost::parse`] 的直接调用，
-//!   宿主在自己的线程/事件循环里跑（`ParserChain::parse` 本身是同步函数）。
+//! - **解析默认同步、可选异步**：`coroutineRunner.submit` 由
+//!   [`DraftHost::submit_parse`] 承接——缺省实现直接调 [`DraftHost::parse`]
+//!   （同步；单测与「还没接 worker」的宿主走这条），真后台解析的宿主返回
+//!   [`ParseSubmit::Async`]，结果由 [`TaskDraftUi::on_parsed`] /
+//!   [`TaskDraftUi::on_parse_failed`] 回灌（见 `crate::draft_worker`）。
+//!   `DraftEffect::Cancel` 转给 [`DraftHost::cancel_parse`]：后台线程据此
+//!   丢掉迟到的结果，别白跑一次探测。
 
 use crate::card_groups::{self, DraftStats};
 use crate::category::CategoryRule;
@@ -207,11 +212,15 @@ pub struct DraftView {
 /// 测试用 `matches!` 断言语义。
 #[derive(Clone, Debug)]
 pub enum UiEffect {
-    /// 状态机自己的信号（`Cancel` / `Busy` / `Succeeded` / `Changed` / `Cleared` /
-    /// `Confirmed`）。`Parse` 已被 [`TaskDraftUi`] 就地执行，不会出现在这里。
+    /// 状态机自己的信号（`Busy` / `Succeeded` / `Changed` / `Cleared` /
+    /// `Confirmed`）。`Parse` 与 `Cancel` 已被 [`TaskDraftUi`] 转给宿主，不会出现
+    /// 在这里。
     ///
     /// 装箱：`DraftEffect` 含 `TaskRecord`，直接内联会让整个枚举 416 字节。
     Draft(Box<DraftEffect>),
+    /// 解析已经甩给宿主的后台线程了（[`ParseSubmit::Async`]）。宿主不用做事，
+    /// 这条只是让驱动方知道「这一轮不会立刻有结果」。
+    ParseSubmitted { work_id: String },
     /// `InfoBar.error("链接解析失败", ...)`（:301-305）。
     ParseError { title: String, body: String },
     /// `_onEditRequested(url)`（:287-294）。
@@ -232,6 +241,19 @@ pub enum UiEffect {
     Closed,
 }
 
+/// [`DraftHost::submit_parse`] 的两种收尾方式。
+///
+/// `Sync` 里是 `Box<TaskRecord>`：`TaskRecord` 几百字节，整个枚举跟着变胖
+/// （`clippy::large_enum_variant`），而这条值每次解析只造一次，装箱没有代价。
+#[derive(Debug)]
+pub enum ParseSubmit {
+    /// 解析已经在宿主那边跑完了（同步）。
+    Sync(Result<Box<TaskRecord>, TaskError>),
+    /// 甩给后台线程了：结果稍后回灌 [`TaskDraftUi::on_parsed`] /
+    /// [`TaskDraftUi::on_parse_failed`]。
+    Async,
+}
+
 /// 宿主钩子。全部有默认实现，宿主只覆盖它能做的部分。
 pub trait DraftHost {
     /// `task.canEdit`（Python `ClassVar`，`task.py:187-190`）。
@@ -243,6 +265,18 @@ pub trait DraftHost {
     fn has_conflict(&self, _task: &TaskRecord) -> bool {
         false
     }
+
+    /// 提交一次解析（Python 的 `coroutineRunner.submit(coro, done=…, failed=…)`）。
+    ///
+    /// `work_id` 由 [`TaskDraft`] 发号，宿主当不透明句柄**原样交回**
+    /// [`TaskDraftUi::on_parsed`] / [`TaskDraftUi::on_parse_failed`]。
+    /// 缺省实现退回同步 [`DraftHost::parse`]。
+    fn submit_parse(&self, _work_id: &str, options: &Map<String, Value>) -> ParseSubmit {
+        ParseSubmit::Sync(self.parse(options).map(Box::new))
+    }
+
+    /// `coroutineRunner.cancel(parseId)`：真后台解析的宿主据此别再送结果回来。
+    fn cancel_parse(&self, _work_id: &str) {}
 
     /// 执行一次解析（`featureService.parse(options)`）。`options` 含 `"url"` 键。
     fn parse(&self, _options: &Map<String, Value>) -> Result<TaskRecord, TaskError> {
@@ -574,6 +608,31 @@ impl TaskDraftUi {
         vec![UiEffect::FolderPickRequested]
     }
 
+    /// 后台解析成功回来（[`ParseSubmit::Async`] 的收尾）。
+    ///
+    /// `work_id` 是宿主交回的原句柄；已取消/已关闭的项查不到，效果为空
+    /// （与 Python「迟到的回调改的是已经摘掉的 item」等价）。
+    pub fn on_parsed(
+        &mut self,
+        work_id: &str,
+        task: TaskRecord,
+        host: &dyn DraftHost,
+    ) -> Vec<UiEffect> {
+        let effects = self.draft.on_parsed(work_id, task);
+        self.run(effects, host)
+    }
+
+    /// 后台解析失败回来。
+    pub fn on_parse_failed(
+        &mut self,
+        work_id: &str,
+        error: TaskError,
+        host: &dyn DraftHost,
+    ) -> Vec<UiEffect> {
+        let effects = self.draft.on_parse_failed(work_id, error);
+        self.run(effects, host)
+    }
+
     /// 属性快照。
     pub fn view(&self, host: &dyn DraftHost) -> DraftView {
         let stats = self.stats();
@@ -648,19 +707,27 @@ impl TaskDraftUi {
         effects
     }
 
-    /// 把状态机效果翻译成 [`UiEffect`]：`Parse` 就地执行并递归消费回调效果，
-    /// `Failed` 变成一条 `InfoBar` 文案。
+    /// 把状态机效果翻译成 [`UiEffect`]：`Parse` 交给宿主（同步的递归消费回调效果、
+    /// 异步的等回灌），`Cancel` 转给宿主，`Failed` 变成一条 `InfoBar` 文案。
     fn run(&mut self, effects: Vec<DraftEffect>, host: &dyn DraftHost) -> Vec<UiEffect> {
         let mut out = Vec::new();
         for effect in effects {
             match effect {
                 DraftEffect::Parse { work_id, options } => {
-                    let more = match host.parse(&options) {
-                        Ok(task) => self.draft.on_parsed(&work_id, task),
-                        Err(error) => self.draft.on_parse_failed(&work_id, error),
-                    };
-                    out.extend(self.run(more, host));
+                    match host.submit_parse(&work_id, &options) {
+                        ParseSubmit::Sync(Ok(task)) => {
+                            let more = self.draft.on_parsed(&work_id, *task);
+                            out.extend(self.run(more, host));
+                        }
+                        ParseSubmit::Sync(Err(error)) => {
+                            let more = self.draft.on_parse_failed(&work_id, error);
+                            out.extend(self.run(more, host));
+                        }
+                        ParseSubmit::Async => out.push(UiEffect::ParseSubmitted { work_id }),
+                    }
                 }
+                // 取消要及时转给宿主，否则后台线程会白跑一次探测。
+                DraftEffect::Cancel { work_id } => host.cancel_parse(&work_id),
                 DraftEffect::Failed { url, error } => out.push(UiEffect::ParseError {
                     title: self.texts.parse_failed_title.clone(),
                     body: format!("{}\n{}", error_url_display(&url), error.format()),
@@ -726,7 +793,10 @@ pub fn refresh(window: &AppWindow, ui: &Rc<RefCell<TaskDraftUi>>, host: &dyn Dra
 }
 
 /// 把效果分派给宿主，然后刷新快照。
-fn handle(
+///
+/// `pub`：后台解析回来的效果（`crate::draft_worker::drain_into`）走同一条路——
+/// 宿主 tick 里先 drain、再用这里把结果派发出去。
+pub fn handle(
     window: &AppWindow,
     ui: &Rc<RefCell<TaskDraftUi>>,
     host: &dyn DraftHost,
@@ -747,6 +817,7 @@ fn handle(
                     host.confirmed(&task, auto_start);
                 }
             }
+            UiEffect::ParseSubmitted { .. } => {}
             UiEffect::Closed => host.closed(),
         }
     }
