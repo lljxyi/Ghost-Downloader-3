@@ -9,12 +9,14 @@
 //! | `fetchLatestRelease(repo)` :101 | [`fetch_latest_release`] |
 //! | `probeDownloadUrl(repo, tag, asset)` :191 | [`probe_download_url`] |
 //! | `fetchReleaseAsset(repo, tag, asset, path, onProgress)` :204 | [`fetch_release_asset`] |
+//! | `fetchRawFile(repo, branch, path, out, onProgress)` :163 | [`fetch_raw_file`] |
 //! | `fetchPypiReleases(package)` :241 | [`fetch_pypi_releases`] |
 //! | `fetchPypiFile(url, path, onProgress)` :265 | [`fetch_pypi_file`] |
 //! | `app/client.py::fetchFile(url, path, onProgress)` :162 | [`write_stream`]（流式半边）+ [`Transport::download`] |
 //!
-//! `fetchRawFile`（:162）没有对应函数：`gd3-core` 里的 raw 下载走 `HttpEngine`，
-//! 那条路径已经有自己的重试与分片语义，不该被这里的「Range 探测 + 单流」覆盖。
+//! `fetchRawFile`（:163）→ [`fetch_raw_file`]：与 [`fetch_json`] 共用 raw 竞速，
+//! 拿到 URL 后走 [`Transport::download`]（= `fetchFile`）。它和 `gd3-core::HttpEngine`
+//! 是两条不同的路径（引擎有分片与重试，这里只是「探测 + 单流」），与 Python 一致。
 //!
 //! ## 结构决策
 //!
@@ -49,6 +51,7 @@ use gd3_core::sources::{
     Repo, SOURCE_ORDER, STAGGER_DELAY, build_download_url, build_pypi_url, build_raw_url,
     download_failure, endpoints, json_failure, latest_release_failure, merge_pypi_releases,
     newest_by_version, pypi_file_candidates, pypi_file_failure, pypi_releases_failure,
+    raw_file_failure,
 };
 use serde_json::Value;
 use std::future::Future;
@@ -511,6 +514,44 @@ pub async fn fetch_release_asset(
     Ok(url)
 }
 
+/// `fetchRawFile(repo, branch, path, outputPath, onProgress)`（`sources.py:163`）：
+/// 先竞速 `Range: bytes=0-0` 探测哪条 raw 源可用，再按 `fetchFile` 流式落盘。
+///
+/// 返回**获胜的源名**。全部探测失败 → [`raw_file_failure`]（文案是「无法下载 …」，
+/// 与 [`fetch_json`] 的「无法获取 …」区分开）。
+pub async fn fetch_raw_file(
+    transport: &dyn Transport,
+    repo: &Repo,
+    branch: &str,
+    path: &str,
+    output: &Path,
+    progress: Option<&(dyn Fn(f64) + Send + Sync)>,
+) -> Result<&'static str, NetError> {
+    let attempts = raw_attempts(repo, branch, path);
+    let headers = range_headers();
+
+    let winner = race_first_ok(attempts.len(), stagger_delay(), |index| {
+        let (source, url) = &attempts[index];
+        let headers = &headers;
+        boxed(async move {
+            let result = transport.probe(url, headers, PROBE_TIMEOUT).await;
+            (index, result.map(|()| (*source, url.clone())))
+        })
+    })
+    .await;
+
+    match winner {
+        Some((_, (source, url))) => {
+            transport
+                .download(&url, output, progress)
+                .await
+                .map_err(NetError::io)?;
+            Ok(source)
+        }
+        None => Err(raw_file_failure(&repo.name, branch, path)),
+    }
+}
+
 /// `fetchPypiReleases(package)`（`sources.py:241`）：`gather` 两个源（顺序 = `SOURCE_ORDER`），
 /// 丢掉失败的，然后 `for result in reversed(succeeded): releases |= result`。
 ///
@@ -936,6 +977,73 @@ mod tests {
 
         // Python 的 `fetchFile` 抛异常 → `toTaskError` 兜底成 `发生了意外错误：…`
         assert_eq!(error.format(), "发生了意外错误：HTTP 500");
+        assert!(!output.exists());
+    }
+
+    // ── fetchRawFile ──
+
+    const GH_PACK: &str = "https://raw.githubusercontent.com/XiaoYouChR/Ghost-Downloader-3/main/dist/packs/youtube.zip";
+    const GC_PACK: &str =
+        "https://cnb.cool/XiaoYouChR/Ghost-Downloader-3/-/git/raw/main/dist/packs/youtube.zip";
+
+    #[tokio::test]
+    async fn fetch_raw_file_downloads_the_probed_url() {
+        let dir = temp_dir("raw");
+        let output = dir.join("youtube.zip");
+        let stub = Stub::new()
+            .probe_error(GC_PACK, FetchError::Status(404))
+            .probe(GH_PACK)
+            .download_body(GH_PACK, b"zip-bytes");
+
+        let source = fetch_raw_file(
+            &stub,
+            &app_repo(),
+            "main",
+            "dist/packs/youtube.zip",
+            &output,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(source, "github");
+        assert_eq!(std::fs::read(&output).unwrap(), b"zip-bytes");
+        assert!(stub.calls().contains(&format!("download {GH_PACK}")));
+        // 探测先于下载（`headers_of` 取最后一条同名记录 = 下载那条，所以这里看调用序列）
+        let calls = stub.calls();
+        let probe_at = calls
+            .iter()
+            .position(|call| call == &format!("probe {GH_PACK}"))
+            .expect("探测过 github raw");
+        let download_at = calls
+            .iter()
+            .position(|call| call == &format!("download {GH_PACK}"))
+            .expect("下载过 github raw");
+        assert!(probe_at < download_at);
+    }
+
+    #[tokio::test]
+    async fn fetch_raw_file_reports_the_python_failure() {
+        let dir = temp_dir("raw-fail");
+        let output = dir.join("youtube.zip");
+        let stub = Stub::new();
+
+        let error = fetch_raw_file(
+            &stub,
+            &app_repo(),
+            "main",
+            "dist/packs/youtube.zip",
+            &output,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.format(),
+            "无法下载 XiaoYouChR/Ghost-Downloader-3/main/dist/packs/youtube.zip"
+        );
+        assert!(!stub.calls().iter().any(|call| call.starts_with("download")));
         assert!(!output.exists());
     }
 

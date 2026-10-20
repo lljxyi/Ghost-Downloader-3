@@ -180,8 +180,8 @@ cargo clippy -p gd3-ui --all-targets -- -D warnings
 - `FAMILY_VERSIONS` 是 `wreq::emulation::Emulation` 的成员快照，wreq 升级后要重新核对。
 
 **尚未做**：`config_store` 未接进 `boot::run`（接线条件见「配置落盘」一节末尾）；
-`loadCrx` 的 crx 解包与 `fileWatcher` 归宿主；`update_service` 未接（网络半边见
-「更新源纯逻辑层」一节）；`Ghost-Downloader-3.py` 的入口用 `GHOST_UI` 切换
+`loadCrx` 的 crx 解包与 `fileWatcher` 归宿主；`update_service` 的执行层第 135 步已接
+（`gd3-ui::update_exec`，见「更新检查的执行层」一节）；`Ghost-Downloader-3.py` 的入口用 `GHOST_UI` 切换
 （缺省 `qt`，`slint` 时 `exec` 本二进制，见「前端分派」一节）。
 二进制入口见下一节。
 （`RuntimeStatusService` 第 102 步搬完、第 107 步删掉空壳桩；`FeatureService` 的
@@ -2529,7 +2529,9 @@ pub fn merge_pypi_releases<E>(
 `app/services/update_service.py`(335) 把四件事混在一个类里：①状态表（`_infos` +
 `_emit` 的合并语义）、②`versions.json` 的解析与挑选、③HTTP 下载 + 校验 + 解包、
 ④`subprocess.Popen` 起 updater。`crates/gd3-ui/src/update_service.rs`（**1492 行 /
-49 单测**）只搬**决策**，执行全归宿主。
+49 单测**，第 115 步）只搬**决策**（写完是 2408 行，`UpdateRuntime` 的状态机是第 124 步
+补的），执行全归宿主 —— **执行层第 135 步落在 `gd3-ui::update_exec`**，见
+「更新检查的执行层」一节。
 
 ### 边界
 
@@ -2600,7 +2602,8 @@ pub fn merge_pypi_releases<E>(
 - **`packData.get("file", default)` 的非字符串值**：Python 会把 `5` 拼成
   `dist/packs/5`，Rust 只认字符串，其余回退 `<packId>.zip`。
 - **解包与进程启动不在这里**：`zip` / `xz2` crate 不在离线缓存里，`zipfile` /
-  `tarfile("r:xz")` / `hdiutil` / `Popen` 全归宿主。
+  `tarfile("r:xz")` / `hdiutil` / `Popen` 全归宿主。第 135 步的 `update_exec` 把 zip 解包
+  接上了（复用 `extension_crx` 的读取器）、`xz2` / `hdiutil` 仍然缺、`Popen` 只交命令不拉起。
 
 ### 四十九条新单测
 
@@ -3290,7 +3293,7 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
 3. **P2–P6 剩余 UI**：建任务链路、其它对话框、组件库、OOBE、平台外壳。
 
-## Phase 8 进展（第 126–134 步）
+## Phase 8 进展（第 126–135 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3576,9 +3579,61 @@ async def _tickLoop(self):                # 每秒把 _bytes 清零
   实测略高于上限是**预期**：判据在「写完之后、下一个数据块之前」，一个窗口最多超出
   一个数据块，Python 的 `waitForSpeedLimit` 位置一模一样。
 
+### 更新检查的执行层：`UpdateEffect` 真的被执行（第 135 步，`gd3-ui::update_exec`）
+
+第 115 步搬完的是**计划层**（`plan_check` / `plan_app_download` / `plan_pack_download` /
+`plan_apply`），第 124 步搬完的是**状态机**（`UpdateRuntime`：十个 `UpdateEffect` 出口、
+`versions_ready` / `download_finished` / `checksum_finished` / `unpack_finished` /
+`apply` 入口）。缺的一直是中间那层：**谁去把这些动作做掉**。Python 里它是
+`UpdateService` 的 `async` 方法（`fetchJson` / `fetchReleaseAsset` / `fetchRawFile` /
+`toChecksum` / `extractZip` / `shutil.rmtree` / `subprocess.Popen`）。
+
+第 135 步补上这层：
+
+- **新模块 `gd3-ui::update_exec`**：`UpdateExecutor` 持 `Arc<dyn Transport>` + `Repo` +
+  `branch` + `features_dir`，对外三个入口 `check` / `download` / `apply`，都落到
+  `run(runtime, target_id, effects)`。`run` 把动作排进 `VecDeque`，**一条条 await**，
+  每条执行完把状态机新吐的动作接回队尾 —— 直到队列空（`MAX_EFFECTS = 4096` 兜底）。
+  这与 Python 的 `await` 串行完全同形。
+- **`gd3-net::sources::fetch_raw_file`**：`fetchRawFile`（`sources.py:163`）此前没有对应
+  函数（`update_service` 的 `FetchRaw` 走的就是它）。实现是「raw 竞速探测 → 获胜 URL 上
+  `Transport::download` → 返回获胜源名」，失败文案用 `gd3_core::sources::raw_file_failure`
+  （「无法下载 …」，注意与 `fetch_json` 的「无法获取 …」不是同一句）。
+- **校验和**在宿主算（`gd3_core::checksum::to_checksum`），**比对**在状态机
+  （`checksum_accepted`）—— 和 Python 的 `toChecksum(...) != parseChecksum(sha)` 分工一致，
+  所以「校验失败删归档 + `FAILED`」这条仍由状态机发 `RemoveFile`。
+- **解包复用 `extension_crx` 的 ZIP 读取器**：`entries` / `read_entry` / `sanitize` 第 121 步
+  已按 `zipfile.extractall` 的口径验过（deflate + 路径净化 + 中央目录序 + 父目录按需建），
+  所以 `unpack_zip` 只是「去掉 CRX 头那一步」。`_applyPack` 的 `zipPath.unlink()` 由
+  executor 在「非 pending 的 `Unpack` 成功后」补一条 `RemoveFile`（完整包的删除由状态机发）。
+
+| 差异 | 说明 |
+|---|---|
+| 进度回调**先攒后放** | `onProgress` 是同步闭包、`download_progress` 要 `&mut UpdateRuntime`，两个借用不能同时存在。回调把百分比塞进 `Mutex<Vec<f64>>`，下载返回后按原顺序回放 → UI 看到的顺序与 Python 相同，只是推送时刻集中在下载结束 |
+| `tar.xz` / `dmg` 解包**未接** | 离线环境没有 `xz2`；`dmg` 要 macOS 的 `hdiutil`。两者返回 `TaskError::io`，状态机照常 `FAILED`，归档保留（Python 的「留着好排查」） |
+| `StartUpdater` **只记录不 spawn** | updater 会顶掉当前进程，拉起时机应由 UI 层在用户确认后决定；`UpdaterCommand` 放进 `UpdateRun::spawns` 交出去 |
+| `RemoveDir` / `RemoveFile` **不存在也算成功** | 对应 Python 的 `if newDir.exists()` 与 `unlink(missing_ok=True)` |
+
+验收（第 135 步实跑）：
+
+- 单测 `update_exec` **10 条**：本地 pack 与远程更高版本 → 双 `AVAILABLE`（`_pending` /
+  隐藏目录不进扫描）；`versions.json` 抓不到 → `IDLE` + 「无法获取版本信息」；sha 对得上 →
+  `READY` 且 staging 里字节一致、进度回放两条 `DOWNLOADING`（第二条 `progress=100`）；
+  sha 对不上 → `FAILED` + 归档被删；下载 404 → `FAILED` + 「无法下载 …/dist/packs/youtube.zip」
+  （两条 raw 源都探测过、一次下载都没发起）；`apply` → `features/youtube_pending/` 里
+  `pack.py` + `assets/icon.png` 就位、zip 被删；app 完整包 → 解到 `staging/app_new/`、
+  归档删、`spawns` 空；`tar.xz` → `FAILED` 且错误里带 `xz2`、归档保留；
+  app 就绪 + updater 在场 → `apply` 交出 `UpdaterCommand`；`UnpackKind` 两路未接的错误文案。
+- **真网络 e2e**（`tests/update_exec_real.rs`，`#[ignore]` 因为要外网，本轮实跑过）：
+  生产路径 `WreqTransport` + `app_repo()` + `main` → 抓真实 `versions.json`
+  （`app 4.4.0 → 4.4.3`、`bittorrent_pack 1.0.0 → 1.1.1` 双 `AVAILABLE`）→ 真下 20 657 字节
+  zip（进度 79.3% / 100%）→ sha256 对上 → `READY` → `apply` 解出 12 项
+  （`manifest.toml` / `pack.py` / `lists/` …）→ zip 被删，`errors` 空。
+
 ### 尚未接的
 
-尚未接的还有：建任务链路（解析器仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的
-任务）、托盘 / Dock（`SystemTrayIcon` 现成，见上一节）、`update_service` 的 tokio 宿主
-适配。`shouldPreserveLastModified`（第 133 步）与限速闸门（第 134 步）已接。
-窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：起窗、下载、三种关窗模式都对。
+尚未接的还有两项：建任务链路（解析器仍在 Python 侧，Rust 只跑已经在 `tasks.jsonl` 里的
+任务）与托盘 / Dock（`SystemTrayIcon` 现成，见上一节）。
+`shouldPreserveLastModified`（第 133 步）、限速闸门（第 134 步）、`update_service` 的执行层
+（第 135 步）都已接。窗口分支（winit）第 132 步已在 `Xvfb :99` 上验过：起窗、下载、
+三种关窗模式都对。

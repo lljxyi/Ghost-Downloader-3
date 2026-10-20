@@ -107,9 +107,15 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
 2. **托盘 / Dock / 状态项**：语义层（`shell.rs`）已就绪但没人消费。**不再需要降级
    API 方案** —— 直接用 Slint 的 `SystemTrayIcon`（见 §3.8f 更正），Linux 走 `ksni`。
    剩下的是在 `.slint` 里加组件 + 把菜单动作接回 `shell.rs` 的信号。
-3. **`update_service` 的宿主适配**：`FetchAsset` / `FetchRaw` / `Checksum` / `Unpack`
-   的执行层（`UpdateRuntime` 十个 `UpdateEffect`）已就位，缺的是 tokio 侧的 I/O 接线；
-   tar.xz / dmg 还受离线 `xz2` 缺包限制。
+3. ~~**`update_service` 的宿主适配**~~ **第 135 步已解决**：新模块 `gd3-ui::update_exec`
+   （`UpdateExecutor::check` / `download` / `apply`）把 `UpdateRuntime` 吐的十个
+   `UpdateEffect` 真的执行掉（抓 `versions.json`、下 release asset / raw 文件、算 sha256、
+   解 zip、删文件），执行完把状态机新吐的动作接回队列直到收敛；顺带补了
+   `gd3-net::sources::fetch_raw_file`（`fetchRawFile` 此前没有对应函数）。真网络 e2e
+   （`tests/update_exec_real.rs`，`#[ignore]`）实跑过：线上 `versions.json` →
+   app 4.4.0→4.4.3 与 bittorrent_pack 1.0.0→1.1.1 双 `AVAILABLE` → 真下 20 657 字节 zip →
+   sha256 对上 → `READY` → `apply` 解出 12 项、zip 删。仍缺：`tar.xz` / `dmg` 解包
+   （离线缺 `xz2`、`dmg` 要 `hdiutil`）与 updater 进程的 spawn（只交出 `UpdaterCommand`）。
 4. **建任务链路（解析器）仍在 Python 侧**：Rust 只跑**已经在 `tasks.jsonl` 里**的任务，
    不解析 URL、不生成草稿落盘。
 5. ~~`shouldPreserveLastModified` 的 `os.utime`~~ **第 133 步已解决**：新模块
@@ -125,7 +131,7 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    1 MiB 限额 4.35 s、不限额 0.25 s（略高于上限是预期：一个窗口最多超一个数据块，
    与 Python 同一判据位置）。
 
-   这一条已清空，剩下的是第 2/3/4/6 项。
+   这一条已清空（第 133/134 步），剩下的是第 2/4/6 项。
 6. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI。
 
 ## 6. 已知差异与风险

@@ -9497,3 +9497,59 @@ Phase 8 的共存口径要落地：**不删 Qt 入口**，用环境变量切换�
 - 下一步：托盘（`SystemTrayIcon` + `shell.rs` 五项菜单）→ `update_service` 的 tokio
   宿主适配 → 建任务链路（解析器）。
 - 卡点：无
+
+## 第 135 步：更新检查的执行层（`gd3-ui::update_exec`）（2026-10-19 19:00 UTC）
+
+接 `AGENT-DONE` §5 第 3 项。`update_service` 的**计划层**（第 115 步）与**状态机**
+（第 124 步，`UpdateRuntime` + 十个 `UpdateEffect`）早就齐了，缺的是一直没人去执行
+那些动作的那层 —— Python 里是 `UpdateService` 的 `async` 方法（`fetchJson` /
+`fetchReleaseAsset` / `fetchRawFile` / `toChecksum` / `extractZip` / `shutil.rmtree` /
+`Popen`）。
+
+- 做了什么：
+  - **新模块 `gd3-ui::update_exec`**：`UpdateExecutor`（`Arc<dyn Transport>` + `Repo` +
+    `branch` + `features_dir`）三个入口 `check` / `download` / `apply`，都落到
+    `run(runtime, target_id, effects)`：动作进 `VecDeque`、**一条条 await**、执行完把
+    状态机新吐的动作接回队尾，直到空（`MAX_EFFECTS = 4096` 兜底）—— 与 Python 的
+    `await` 串行同形。`local_packs()` 扫 `features_dir`（`sorted(iterdir())` +
+    `pack_dir_candidate` + `PackManifest::from_dir` + `version` 非空）。
+  - **`gd3-net::sources::fetch_raw_file`**：`fetchRawFile`（`sources.py:163`）此前**没有**
+    对应函数，而 `UpdateEffect::FetchRaw` 走的就是它。实现 = raw 竞速探测 → 获胜 URL 上
+    `Transport::download` → 返回获胜源名；失败文案用现成的
+    `gd3_core::sources::raw_file_failure`（「无法下载 …」，与 `fetch_json` 的「无法获取 …」
+    不同句）。
+  - 校验和：宿主算（`gd3_core::checksum::to_checksum`）、状态机比（`checksum_accepted`），
+    与 Python 的分工一致；解包复用 `extension_crx` 的 ZIP 读取器（`entries` /
+    `read_entry` / `sanitize` 第 121 步已按 `zipfile.extractall` 验过），只是省掉 CRX 头。
+    `_applyPack` 的 `zipPath.unlink()` 由 executor 在「非 pending 的 `Unpack` 成功后」补发。
+- 刻意的差异（都写进模块头 + README）：
+  1. 进度回调**先攒后放**：`onProgress` 是同步闭包、`download_progress` 要
+     `&mut UpdateRuntime`，两个借用不能同时存在 → 百分比先进 `Mutex<Vec<f64>>`，下载返回后
+     按原顺序回放（顺序同 Python，只是推送时刻集中在下载结束）。
+  2. `tar.xz` / `dmg` 解包**未接**（离线缺 `xz2`；`dmg` 要 macOS 的 `hdiutil`）→
+     `TaskError::io`，状态机照常 `FAILED`，归档保留。
+  3. `StartUpdater` **只记录不 spawn**（updater 会顶掉当前进程，拉起时机归 UI 层），
+     命令放 `UpdateRun::spawns`。
+  4. `RemoveDir` / `RemoveFile` 不存在也算成功（`if newDir.exists()` / `missing_ok=True`）。
+- 验证（全部本轮实跑）：
+  - 单测 `update_exec` **10 条**（check 双 AVAILABLE 且 `_pending`/隐藏目录不进扫描；
+    `versions.json` 抓不到 → IDLE + 「无法获取版本信息」；sha 对 → READY + 字节一致 +
+    两条 DOWNLOADING（第二条 `progress=100`）；sha 错 → FAILED + 归档删；下载 404 →
+    FAILED + 「无法下载 …/dist/packs/youtube.zip」（两条 raw 源都探测过、0 次下载）；
+    `apply` → `youtube_pending/` 里 `pack.py` + `assets/icon.png` 就位、zip 删；
+    app 完整包 → `staging/app_new/` 解出二进制、归档删、`spawns` 空；`tar.xz` → FAILED
+    且错误带 `xz2`、归档保留；app 就绪 + updater 在场 → `apply` 交出 `UpdaterCommand`；
+    `UnpackKind` 两路未接的文案）。
+  - `gd3-net::sources` 新增 **2 条**（`fetch_raw_file` 下到获胜 raw 源的字节；全败时的
+    「无法下载 …」文案 + 不发起下载）。
+  - **真网络 e2e**（`tests/update_exec_real.rs`，`#[ignore]`，本轮手工 `--ignored` 跑过）：
+    生产路径 `WreqTransport` + `app_repo()` + `main` → 真 `versions.json`
+    （app 4.4.0→4.4.3、bittorrent_pack 1.0.0→1.1.1 双 AVAILABLE）→ 真下 **20 657 字节**
+    zip（进度 79.3% / 100%）→ sha256 对上 → READY → `apply` 解出 **12 项**
+    （`manifest.toml` / `pack.py` / `lists/` …）→ zip 被删、`errors` 空。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**
+    （4m20s）；`cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+    **GATE_EXIT=0**、**29 个 target** 全 ok、**1774 passed**（第 134 步 1762，+12）；
+    Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
+- 下一步：托盘（`SystemTrayIcon` + `shell.rs` 五项菜单）→ 建任务链路（解析器）。
+- 卡点：无
