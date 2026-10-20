@@ -3293,11 +3293,12 @@ Rust 侧再写同一个文件就会互相覆盖——所以 Rust 侧的 cfg 读�
    离线缺包限制。之后才是更新卡片 / 进度条 UI。
 2. ~~**安装引导框**~~：第 123 步完成（`gd3-ui::extension_install` +
    `ui/extension_install.slint`，17 单测），`on_chromiumInstall` 解包成功即弹五步引导。
-3. **P2–P6 剩余 UI**：草稿对话框装进真窗口（建任务链路第 137 步、后台解析机制
-   第 138 步都已就位，差的只是宿主适配：`task_draft_ui::install` + 一个真 `DraftHost`
-   + Slint 定时器里 `drain_into`）、其它对话框、组件库、OOBE、平台外壳。
+3. **P2–P6 剩余 UI**：外壳动作集（导航 / 搜索 / 通知条 / 消息框 / 拖放），
+   草稿对话框里还没接的五个子对话框（目录选择、编辑、批量添加、导入文件、分类菜单），
+   其它对话框、组件库、OOBE、平台外壳。建任务链路（第 137 步）、后台解析（第 138 步）、
+   草稿对话框宿主（第 139 步）都已就位。
 
-## Phase 8 进展（第 126–138 步）
+## Phase 8 进展（第 126–139 步）
 
 ### 下载运行期（`task_runner.rs` + `runtime.rs`）
 
@@ -3815,9 +3816,64 @@ ParserChain::parse(options)                  ← 第 108 步已有
   31 个 target 全 ok、**1808 passed**（第 137 步 1795，+13）；Python 全量
   → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**（`comm -3` 0 行）。
 
+### 草稿对话框装进真窗口：`draft_host`（第 139 步，`gd3-ui::draft_host`）
+
+第 137 步给了「URL → TaskRecord」，第 138 步给了「后台探测 + 回灌」，但
+`task_draft_ui::install` 一次都没被调用过——窗口里的草稿对话框（`ui/task_draft.slint`
+早就在 `appwindow.slint` 里）始终是死的。这一步补上宿主。
+
+- **[`UiDraftHost`]**：生产环境的 `DraftHost`。
+  - `submit_parse` / `cancel_parse` → 后台 [`crate::draft_worker::ParseWorker`]；
+  - `confirmed` → `TaskService::add(task, autoStart)`（入队；真正的派发在下一轮
+    `Runtime::tick` 的 `TaskRunner::pump`），重复任务打一行 stderr、磁盘不够弹通知条；
+  - `has_conflict` → `TaskService::probe_conflict`（`draft_cards.py:87` 的冲突图标）；
+  - `notify_parse_failure` → 窗口通知条（`infoBarVisible/Title/Text`）；
+  - 宿主只持窗口的**弱**引用（窗口回调里存着宿主的 `Rc`，强引用会绕成环）。
+- **`DraftUi::build`**：一次装齐「状态机 + 宿主 + 回灌定时器 + 窗口回调」。
+  分类规则来自 `engine.category()`，`taskDraftFolderText` 缺省取
+  `cfg.downloadFolder`，`preBlockNum` 取 `cfg.preBlockNum`。回灌定时器
+  `slint::Timer` 重复 `DRAIN_INTERVAL_MS = 100` 毫秒跑 `pump`（Python 是
+  `coroutineRunner` 直接回调，Slint 只能在 UI 线程的定时器里收）。
+- **[`seed_urls`]**：`main_window.addUrls(urls)`——开框 + 立刻解析（不走 1 秒防抖）；
+  **[`pump`]**：`drain_into` + `task_draft_ui::handle`（没有效果就不刷新，免得重灌
+  模型让输入框闪）。
+- **`boot` 接线**：`ParseWorker::spawn(CreateDefaults::from_config(cfg))` 成功就
+  `DraftUi::build(...)`（失败只打一行，窗口照常）；有头分支在 `window.show()` 之后
+  调 `open_with_urls(&cli.urls)`（= `Ghost-Downloader-3.py:191` 的
+  `openUriRequested → addUrls`）。无头分支**不**灌 URL：那是冒烟模式，
+  不该在单测里发真探测。
+
+| 差异 | 说明 |
+|---|---|
+| 原生对话框那五个钩子 | `pick_folder` / `edit_task` / `batch_url` / `import_files` / `category_menu` 在 Slint 侧要么没有原生文件对话框、要么对应组件还没接进窗口，统一记一行 stderr 返回；对话框本身照常可用（下载路径能直接改） |
+| 通知条不自动消失 | Python 的 `InfoBar` 有计时器；这里只置位 `infoBarVisible`，由通知条自己的关闭按钮收起 |
+| 定时器而不是回调 | Python 探测完直接回调，这里 UI 线程按 100ms 收一次；粘 URL 后最多多等一眨眼 |
+| `folder_history` 传空 | Qt 的 `ConfigItem.history`（目录下拉历史）还没建模 |
+| `file_types` 为空 | `FeatureService` 还没有 `fileTypes()`，所以「导入文件」按钮不显示 |
+
+**还没接**：「新建任务」导航项（`ROUTE_ADD_TASK`）没有触发点——`boot` 还没装
+`lib.rs::install_shell_actions`（导航 / 搜索 / 通知条 / 消息框 / 拖放那一套），
+所以目前只有 CLI URL / 单实例交接能把对话框叫出来。
+
+验收（第 139 步实跑）：
+
+- 单测 `draft_host` **6 条**（桩探测器 + 无头窗口）：确认入库且重复不再加一条、
+  `submit_parse` 走后台并把 `work_id` 原样交回、`has_conflict` 认得出已存在的同名文件、
+  `seed_urls` 开框 + 立刻提交、`pump` 把后台结果灌成草稿行（`rows[0].name` 对得上、
+  `parsing=false`）、解析失败落到通知条三个属性。
+- **真二进制 + `Xvfb :99`**：`--data-dir /tmp/...` + 位置参数
+  `http://127.0.0.1:18777/f.bin`，18 秒后仍活着（`timeout` rc=124 = 窗口正常、
+  无 panic），本地服务器日志里有**一条** `GET /f.bin`（= 后台探测真的发出去了，
+  且**没有**自动下载——对话框在等确认）。
+- 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings` **exit 0**；
+  `cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui` **GATE_EXIT=0**、
+  31 个 target 全 ok、**1814 passed**（第 138 步 1808，+6）；Python 全量
+  → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**（`comm -3` 0 行）。
+
 ### 尚未接的
 
-剩下的都是 P2–P6 的 UI：把草稿对话框装进真窗口（机制第 138 步已通，宿主适配待做）、
+剩下的都是 P2–P6 的 UI：外壳动作集（导航 / 搜索 / 通知条 / 消息框 / 拖放的
+`install_shell_actions`，含「新建任务」入口）、草稿对话框里还没接的五个子对话框、
 OOBE / 组件库 / 其它对话框。
 `shouldPreserveLastModified`（第 133 步）、限速闸门（第 134 步）、`update_service` 的执行层
 （第 135 步）、托盘（第 136 步）、建任务链路（第 137 步）、后台解析（第 138 步）都已落地。

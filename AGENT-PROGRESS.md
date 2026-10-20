@@ -9710,3 +9710,50 @@ features 里 —— 早就编进二进制了，缺的只是「把语义层接上
   + Slint 定时器里 `drain_into`），顺手把位置参数 URL / 浏览器扩展 / aria2 RPC 三处
   入口接到 `create_tasks`；之后 OOBE / 组件库 / 其它对话框（P2–P6）。
 - 卡点：无（机制层与本机实测都通过；真窗口里对话框的观感仍需人工验收）。
+
+## 第 139 步：草稿对话框装进真窗口（`gd3-ui::draft_host`）（2026-10-19 19:00 UTC）
+
+第 137 步给了「URL → TaskRecord」，第 138 步给了「后台探测 + 回灌」，但
+`task_draft_ui::install` 一次都没被调用过 —— 窗口里的草稿对话框
+（`ui/task_draft.slint` 早在 `appwindow.slint` 里）一直是死的。这一步补宿主。
+
+- 做了什么：
+  - **新模块 `gd3-ui::draft_host`**：
+    - `UiDraftHost`（生产 `DraftHost`）：`submit_parse`/`cancel_parse` 转给后台
+      worker；`confirmed` → `TaskService::add`（重复任务打 stderr、磁盘不够弹通知条）；
+      `has_conflict` → `TaskService::probe_conflict`；`notify_parse_failure` → 窗口
+      通知条三个属性；其余五个子对话框钩子记一行 stderr 后返回。宿主只持窗口的
+      **弱**引用（窗口回调里存着宿主的 `Rc`，强引用会绕成环）。
+    - `DraftUi::build(window, engine, worker, default_folder, folder_history,
+      subworker_default)`：一次装齐状态机 + 宿主 + 回灌定时器 + 窗口回调；分类规则
+      取自 `engine.category()`，`slint::Timer` 每 `DRAIN_INTERVAL_MS = 100` 毫秒
+      跑一次 `pump`；`_timer` 留到事件循环结束。
+    - `seed_urls`（= `main_window.addUrls`，开框 + 立刻解析，不走 1 秒防抖）与
+      `pump`（`drain_into` + `task_draft_ui::handle`，无效果就不刷新）。
+  - **`boot` 接线**：`ParseWorker::spawn(CreateDefaults::from_config(cfg))` 成功就
+    `DraftUi::build(...)`（失败只打一行、窗口照常）；有头分支在 `window.show()` 之后
+    调 `open_with_urls(&cli.urls)`（CLI 位置参数），事件循环结束后 `drop(draft)`
+    停掉定时器。无头分支**不**灌 URL：冒烟模式不该发真探测（第 137 步就是因此
+    回退过一次接线）。
+- 验证（全部本轮实跑）：
+  - 单测 `draft_host` **6 条**（桩探测器 + 无头窗口）：确认入库且重复不再加一条；
+    `submit_parse` 走后台并原样交回 `work_id`；`has_conflict` 认得出已存在的同名
+    文件；`seed_urls` 开框 + 立刻提交（空列表什么都不做）；`pump` 把后台结果灌成
+    草稿行（`rows[0].name`、`parsing=false`、`open=true`）；解析失败落到通知条。
+  - **真二进制 + `Xvfb :99`**：位置参数 `http://127.0.0.1:18777/f.bin` + 本地
+    `python3 -m http.server`，`timeout 18` 后 rc=124（窗口活着、无 panic），
+    服务器日志里**一条** `GET /f.bin` —— 探测真发出去了，而且**没有**自动下载
+    （对话框在等确认）。托盘照旧因无会话总线注册失败（环境限制）。
+  - 质量门：`fmt --check` OK；`clippy --workspace --all-targets -D warnings`
+    **exit 0**；`cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui`
+    **GATE_EXIT=0**、31 个 target 全 ok、**1814 passed**（第 138 步 1808，+6）；
+    Python 全量 → 3 failed / 1370 passed / 8 skipped / 35 errors，与基线**逐条相同**。
+- 踩过的坑：
+  - Slint 生成的属性访问器是 **`set_infoBarTitle`/`get_infoBarVisible`**（`set_` +
+    原样驼峰），不是 snake_case；`as_weak()` 要先 `use slint::ComponentHandle`。
+  - `DraftHost::confirmed` 不会自己弹提示条 —— 它只是把记录交给 `TaskService`；
+    系统提示得宿主自己处理（`UiDraftHost` 只对「磁盘不够 / 重复」发通知条）。
+- 下一步：外壳动作集（`install_shell_actions`：导航 / 搜索 / 通知条 / 消息框 / 拖放，
+  含「新建任务」入口）→ 草稿对话框缺的五个子对话框（目录选择 / 编辑 / 批量添加 /
+  导入文件 / 分类菜单）→ OOBE / 组件库（P2–P6）。
+- 卡点：无（真窗口里对话框的观感仍需人工验收）。

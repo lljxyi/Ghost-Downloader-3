@@ -163,10 +163,21 @@ aria2 HTTP 传输、`test_runtime_install`、`test_github_probe` 等既有红灯
    把探测卡在 `probe` 里、钉死「跑着取消 → 结果丢弃」时序）+ 1 条 e2e（本地服务器 +
    真 `NetProber`：粘 URL → 立刻 `ParseSubmitted` → tick 里 `drain_into` 拿到真记录 →
    `accept` → `Runtime` 下完、逐字节一致）。
-   **仍未接**：`boot` 还没有 `task_draft_ui::install`（`ui/task_draft.slint` 已在
-   `appwindow.slint` 里），差「装回调 + 一个真 `DraftHost` + Slint 定时器里 `drain_into`」；
-   位置参数 URL / 浏览器扩展 / aria2 RPC 三处入口也还没接这条链路。
-7. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI，以及上面第 6 项的宿主适配。
+   仍是机制层。
+7. ~~**草稿对话框装进真窗口**~~ **第 139 步已解决**：新模块 `gd3-ui::draft_host`。
+   `UiDraftHost` 是生产 `DraftHost`：解析甩给后台线程、`confirmed` → `TaskService::add`
+   （派发交给下一轮 `Runtime::tick` 的 `pump`）、`has_conflict` → `probe_conflict`、
+   解析失败落到窗口通知条；`DraftUi::build` 一次装齐「状态机 + 宿主 + 100ms 回灌
+   定时器 + 窗口回调」（分类规则来自 `engine.category()`、下载目录来自
+   `cfg.downloadFolder`、`preBlockNum` 来自配置）。`boot` 在有头分支用
+   `open_with_urls(&cli.urls)` 把位置参数 URL 灌进对话框（= `Ghost-Downloader-3.py:191`），
+   无头分支故意不灌（冒烟模式不该发真探测）。6 条单测 + 真二进制 × `Xvfb :99`
+   冒烟（18 s 后进程仍活、本地服务器收到**一条** `GET`= 真探测、且没有自动下载）。
+   **仍未接**：「新建任务」导航项没有触发点（`boot` 还没装
+   `install_shell_actions`），`pick_folder` / `edit_task` / `batch_url` /
+   `import_files` / `category_menu` 五个子对话框只打一行 stderr。
+8. **OOBE / 组件库 / 其它对话框**等 P2–P6 剩余 UI，以及外壳动作集
+   （导航 / 搜索 / 通知条 / 消息框 / 拖放）。
 
 ## 6. 已知差异与风险
 

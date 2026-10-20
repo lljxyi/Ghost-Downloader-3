@@ -642,6 +642,29 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
     // 定时器会让事件循环活着 —— 必须显式接管，否则关窗后进程变成看不见的僵尸。
     crate::close_request::install(&window, Rc::clone(&writer));
 
+    // 草稿对话框（`TaskDraftDialog`）：建任务链路（第 137 步）+ 后台解析
+    // （第 138 步）在这里装成真窗口上的对话框（第 139 步）。解析线程起不来只影响
+    // 「粘 URL 自动解析」，窗口照常（与托盘同口径的软失败）。
+    let draft = {
+        let config = engine.borrow().config().clone();
+        let defaults = crate::task_create::CreateDefaults::from_config(&config);
+        let subworker = gd3_core::settings::read_i64(&config, "preBlockNum").unwrap_or(8) as i32;
+        match crate::draft_worker::ParseWorker::spawn(defaults) {
+            Ok(worker) => Some(crate::draft_host::DraftUi::build(
+                &window,
+                Rc::clone(&engine),
+                std::sync::Arc::new(worker),
+                &default_download,
+                &[],
+                subworker,
+            )),
+            Err(err) => {
+                eprintln!("后台解析线程起不来（草稿对话框不可用）：{err}");
+                None
+            }
+        }
+    };
+
     // 下载运行期（`task_runner` → 工作线程 → `gd3-net`）。设置每 tick 现读
     // `engine.config()`，所以设置页改 `maxTaskNum` 下一 tick 就生效（Python 的
     // `_rebalance`）。
@@ -708,10 +731,18 @@ pub fn run(cli: &Cli) -> Result<RunOutcome, String> {
         window
             .show()
             .map_err(|err| format!("窗口显示失败：{err}"))?;
+        // 位置参数里的 URL 直接进草稿对话框（`main_window.addUrls(urls)` →
+        // `Ghost-Downloader-3.py:191`）。无头分支不这么做：那是冒烟模式，
+        // 不该在单测里发真探测。
+        if let Some(draft) = &draft {
+            draft.open_with_urls(&cli.urls);
+        }
         let loop_result = slint::run_event_loop_until_quit();
         runtime.clear_tick_hook();
         let _ = window.hide();
         drop(tray);
+        // 对话框的定时器随它一起停（`slint::Timer` 一 drop 就停）。
+        drop(draft);
         loop_result.map_err(|err| format!("事件循环失败：{err}"))?;
         bridge.stop();
     }
