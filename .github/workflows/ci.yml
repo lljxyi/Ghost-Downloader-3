@@ -13,7 +13,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Slint 在无显示环境下跑测试
   QT_QPA_PLATFORM: offscreen
 
 jobs:
@@ -61,7 +60,8 @@ jobs:
         run: cargo test -p gd3-core -p gd3-net -p gd3-servers -p gd3-ui
 
   # ---------------------------------------------------------------------------
-  # PyO3 桥：gd3-py 是 cdylib，cargo test 覆盖不到，必须 maturin 构建后验证
+  # PyO3 桥：gd3-py 是 cdylib，cargo test 覆盖不到，必须 maturin 构建后验证。
+  # 产出的 wheel 供下面的 python job 复用，避免重复编译 BoringSSL。
   # ---------------------------------------------------------------------------
   python-bridge:
     name: PyO3 桥 (maturin + 导入冒烟)
@@ -87,31 +87,47 @@ jobs:
           workspaces: rust
           key: pyo3
 
-      - name: 构建并安装扩展
+      - name: 构建 wheel
         run: |
           python -m pip install --upgrade pip maturin
           maturin build --release --manifest-path rust/crates/gd3-py/Cargo.toml -o dist
-          python -m pip install dist/*.whl
 
-      - name: 导入冒烟
+      - name: 安装并做导入冒烟
         run: |
+          python -m pip install dist/*.whl
           python - <<'PY'
           import gd3_py
           print("gd3_py 导入成功")
-          # 逐个点名关键导出，缺一个就失败（避免空壳通过）
+
+          # 点名若干关键导出（名字取自 lib.rs 的 pymodule 注册表）。
+          # 缺一个就失败，避免「导入了但全是空壳」。
           expected = [
-              "TaskRecord", "to_safe_filename",
+              "to_safe_filename",   # 文件名安全化
+              "split_stem_ext",     # 扩展名拆分
+              "probe",              # URL 探测
+              "probe_size",         # 尺寸探测
+              "ftp_source",         # FTP 源解析
+              "ed2k_parse_link",    # ed2k 链接
+              "m3u8_probe",         # m3u8 探测
           ]
           missing = [name for name in expected if not hasattr(gd3_py, name)]
           assert not missing, f"缺少导出: {missing}"
           print("导出检查通过:", ", ".join(expected))
           PY
 
+      - name: 上传 wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: gd3-py-wheel
+          path: dist/*.whl
+          retention-days: 7
+
   # ---------------------------------------------------------------------------
-  # Python：全量回归（与基线比对）
+  # Python：全量回归。测试依赖 gd3_py 扩展，所以复用上面构建的 wheel。
   # ---------------------------------------------------------------------------
   python:
     name: Python 回归
+    needs: python-bridge
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,16 +143,28 @@ jobs:
         with:
           enable-cache: true
 
+      - name: 取 gd3_py wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: gd3-py-wheel
+          path: dist
+
       - name: 同步依赖
         run: uv sync --frozen
 
+      - name: 安装 gd3_py 扩展
+        run: |
+          uv pip install dist/*.whl
+          uv run python -c "import gd3_py; print('gd3_py OK')"
+
       # 说明：
-      # - android 系列测试需要 Android 运行时（VPS 基线上就是 35 个 collection error），
-      #   在 CI 里没有任何意义，直接忽略；
+      # - android 系列测试需要 Android 运行时（基线上就是 35 个 collection error），
+      #   CI 里没有意义，直接忽略；
       # - 下列 3 项是环境相关红灯（android 配置对齐 / 网络代理站 / 文件删除权限），
       #   与本次重构无关，先 deselect，等有人认领再修。
       - name: 全量测试
         run: |
+          set -o pipefail
           uv run pytest -q --continue-on-collection-errors \
             --ignore=tests/test_android_browser_bridge.py \
             --ignore=tests/test_android_checksum_bridge.py \
@@ -149,7 +177,6 @@ jobs:
             --deselect tests/test_github_probe.py::testProxySiteGetsNoCredentials \
             --deselect tests/test_runtime_install.py::test_delete_raises_when_a_path_cannot_be_deleted \
             | tee pytest.log
-          exit ${PIPESTATUS[0]}
 
       - name: 上传测试日志
         if: always()

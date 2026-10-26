@@ -384,9 +384,16 @@ mod tests {
 
     #[test]
     fn a_cancelled_work_id_never_reports_back() {
-        let worker = worker();
-        assert!(worker.submit("draft-1", options("http://example.com/a.bin")));
+        // 必须让「取消」确定地发生在解析途中，否则解析可能先跑完、
+        // 结果照常投递 —— 那是测试的竞态，不是产品行为（CI 上调度更慢会必现）。
+        let (gate, entered, release) = Gate::new();
+        let worker = worker_with(StubProber { gate: Some(gate) });
+        assert!(worker.submit("draft-1", options("http://example.com/gate.bin")));
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("桩探测器应当已经进入 probe");
         worker.cancel("draft-1");
+        release.send(()).expect("放行探测器");
         assert!(worker.recv_timeout(Duration::from_millis(500)).is_none());
         assert!(worker.drain().is_empty());
         worker.shutdown();
