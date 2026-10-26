@@ -172,8 +172,11 @@ cmake 3.31.6 + nasm 2.16.03 + libclang   ← BoringSSL(btls-sys) 需要
    同步探测会卡 UI 线程。需要一条后台 worker 线程 + 通道，`draft_worker` 已有可复用模式。
 2. **`gd3-py` 不被 `cargo test` 覆盖**：它是 cdylib，只能用 maturin 构建后由 Python 侧
    测试间接验证。CI 里要显式加这一步。
-3. **没有 CI**：目前全靠手工跑质量门。建议加 GitHub Actions：
-   fmt / clippy / test / Python 全量 / Windows 构建。
+3. ~~没有 CI~~ **已加**：`.github/workflows/ci.yml` 四个 job ——
+   `rust`（fmt / clippy / 单测）、`python-bridge`（maturin 构建 + 导入冒烟）、
+   `python`（全量回归）、`windows`（构建 `gd3-ui.exe` 并上传 artifact）。
+   CI 里忽略了 android 系列测试并 deselect 了 3 项环境相关红灯，
+   理由写在 workflow 注释里。
 
 ### 中优先级（补齐能力）
 
