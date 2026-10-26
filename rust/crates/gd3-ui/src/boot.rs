@@ -463,6 +463,17 @@ pub fn load_config(paths: &Paths) -> LoadedConfig {
 // ---------------------------------------------------------------------------
 
 /// 是否有可用的显示服务（决定走 winit 后端还是无头软件渲染）。
+///
+/// Windows 上没有 `DISPLAY`/`WAYLAND_DISPLAY` 这套约定：桌面会话由 winit 直接接管，
+/// 交互式进程必然有窗口可用，所以恒为 `true`。非交互场景（服务、计划任务）想跑无头，
+/// 请显式传 `--headless`。
+#[cfg(windows)]
+pub fn has_display() -> bool {
+    true
+}
+
+/// 是否有可用的显示服务（决定走 winit 后端还是无头软件渲染）。
+#[cfg(not(windows))]
 pub fn has_display() -> bool {
     ["DISPLAY", "WAYLAND_DISPLAY"].iter().any(|key| {
         std::env::var(key)

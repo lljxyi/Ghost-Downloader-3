@@ -6,9 +6,15 @@
 //! - **通道**：Windows 用 `WM_COPYDATA`（`COPYDATA_OPEN_FILES`）/ `WM_USER_WAKE`，
 //!   Linux 用会话总线上的 `org.freedesktop.Application.Open` / `Activate`。
 //!
-//! 这里换成一个 **Unix domain socket**：`bind()` 成功即抢到锁，`connect()` 成功即
-//! 「已有实例」，同一条连接顺带把参数送过去 —— 一个机制同时给出锁与通道，不依赖
-//! D-Bus、不依赖显示器，能在构建机上测。
+//! # 两个平台各用什么
+//!
+//! - **Unix**：Unix domain socket。`bind()` 成功即抢到锁，`connect()` 成功即
+//!   「已有实例」，同一条连接顺带把参数送过去 —— 一个机制同时给出锁与通道，
+//!   不依赖 D-Bus、不依赖显示器，能在构建机上测。
+//! - **Windows**：独占打开锁文件（`share_mode(0)` → 第二个进程拿到
+//!   `ERROR_SHARING_VIOLATION`），交接载荷写到旁边的 `instance.handoff` 文件，
+//!   主实例的后台线程轮询它。同样只用 `std`，不引入 `win32gui` / `windows-sys`。
+//!   独占句柄在进程退出（含崩溃）时由系统释放，所以不需要陈旧检测。
 //!
 //! # 协议
 //!
@@ -25,10 +31,9 @@
 //!
 //! # 与 Python 的差异
 //!
-//! - **锁的位置**：Python 是 `QSharedMemory` 的全局 key；这里是 `APP_DATA_DIR/instance.sock`。
-//!   两者都是「每用户一份」，但换 `--data-dir` 就会换锁（Python 不会）—— 便携模式与普通
-//!   模式因此可以同时跑；
-//! - **Windows 后端没实现**（`WM_COPYDATA` 那套要 `win32gui`）；本项目只在 Linux 上跑；
+//! - **锁的位置**：Python 是 `QSharedMemory` 的全局 key；这里是 `APP_DATA_DIR/instance.sock`
+//!   （Windows 上是 `instance.lock`）。两者都是「每用户一份」，但换 `--data-dir` 就会换锁
+//!   （Python 不会）—— 便携模式与普通模式因此可以同时跑；
 //! - **不注册 D-Bus 服务名**：Python 在 Linux 上把 `DESKTOP_ID` 注册成
 //!   `org.freedesktop.Application`，让桌面环境直接调 `Open`/`Activate`。这里没有注册，
 //!   从桌面双击 `ghostdownloader://` 链接进来仍然是「第二个实例 → socket 交接」，
@@ -39,25 +44,31 @@
 //!   进程；socket 文件靠下面的陈旧检测回收；
 //! - **退出码**：Python `sys.exit(-1)` → 这里 `ExitCode::from(255)`（`-1 & 0xff`）。
 //!
-//! # 陈旧 socket
+//! # 陈旧 socket（仅 Unix）
 //!
 //! 进程被 `SIGKILL` 掉会留下 socket 文件，此后 `bind()` 报 `AddrInUse`。所以
 //! [`acquire_with_handoff`] 在 `AddrInUse` 之后先 `connect()` 探活：连不上
 //! （`ConnectionRefused`/`NotFound`）就认定是陈旧文件，删掉重试一次 `bind`。
 //! 这与 Python 的 `QSharedMemory` 陈旧处理（先 `attach`/`detach` 清一遍）意图相同。
+//!
+//! Windows 不需要这一步：独占文件句柄由内核在进程死亡时释放。
 
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
 
 use crate::boot::{is_launch_uri, is_wake_uri, uris_from_argv};
 
-/// 锁文件 / socket 文件名（放在 `APP_DATA_DIR` 下）。
+/// 锁文件名（放在 `APP_DATA_DIR` 下）。Unix 上是 socket 文件，Windows 上是锁文件。
+#[cfg(unix)]
 pub const LOCK_FILE: &str = "instance.sock";
+#[cfg(windows)]
+pub const LOCK_FILE: &str = "instance.lock";
+
+/// Windows 上的交接载荷文件（与锁文件同目录）。
+#[cfg(windows)]
+pub const HANDOFF_FILE: &str = "instance.handoff";
 
 /// 协议首行。
 pub const PROTOCOL: &str = "gd3-ipc/1";
@@ -148,7 +159,7 @@ pub fn plan_from_argv(args: &[String]) -> Option<Handoff> {
 }
 
 // ---------------------------------------------------------------------------
-// 抢锁
+// 抢锁的结果类型（两平台共用）
 // ---------------------------------------------------------------------------
 
 /// 第二个实例的结果：`handoff` 是「本打算发什么」，`delivered` 是「真的写进去了没有」。
@@ -169,140 +180,309 @@ pub enum Acquire {
     Secondary(Secondary),
 }
 
-/// 抢锁；成为第二个实例时把 `handoff` 交给主实例。
-pub fn acquire_with_handoff(path: &Path, handoff: Option<Handoff>) -> std::io::Result<Acquire> {
+fn ensure_parent(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
-    match UnixListener::bind(path) {
-        Ok(listener) => Ok(Acquire::Primary(Instance::spawn(path, listener))),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            match connect_and_send(path, handoff.as_ref()) {
-                Ok(delivered) => Ok(Acquire::Secondary(Secondary { handoff, delivered })),
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    // 陈旧 socket：没人监听 → 删掉重试一次。
-                    let _ = fs::remove_file(path);
-                    let listener = UnixListener::bind(path)?;
-                    Ok(Acquire::Primary(Instance::spawn(path, listener)))
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unix 实现：Unix domain socket
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod imp {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::thread::{self, JoinHandle};
+
+    pub fn acquire_with_handoff(path: &Path, handoff: Option<Handoff>) -> std::io::Result<Acquire> {
+        ensure_parent(path)?;
+        match UnixListener::bind(path) {
+            Ok(listener) => Ok(Acquire::Primary(Instance::spawn(path, listener))),
+            Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                match connect_and_send(path, handoff.as_ref()) {
+                    Ok(delivered) => Ok(Acquire::Secondary(Secondary { handoff, delivered })),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        // 陈旧 socket：没人监听 → 删掉重试一次。
+                        let _ = fs::remove_file(path);
+                        let listener = UnixListener::bind(path)?;
+                        Ok(Acquire::Primary(Instance::spawn(path, listener)))
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(err),
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// 连上去把载荷写进去；`handoff` 为 `None` 时只探活（Python 在 wake URI 分支里
+    /// 一个字节都不发，但仍然要判断「有没有实例在跑」）。
+    fn connect_and_send(path: &Path, handoff: Option<&Handoff>) -> std::io::Result<bool> {
+        let mut stream = UnixStream::connect(path)?;
+        let Some(handoff) = handoff else {
+            return Ok(false);
+        };
+        stream.write_all(handoff.to_payload().as_bytes())?;
+        stream.flush()?;
+        Ok(true)
+    }
+
+    /// 主实例手里的锁 + 收件箱。`Drop` 时自动释放（与 Python `exec()` 的
+    /// `finally: _unlockSingleInstance()` 同位置）。
+    pub struct Instance {
+        path: PathBuf,
+        inbox: Arc<Mutex<Vec<Handoff>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Instance {
+        pub(super) fn spawn(path: &Path, listener: UnixListener) -> Self {
+            let inbox = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let inbox = Arc::clone(&inbox);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        // `release()` 会自连一次把 `accept()` 唤醒，此时直接收工。
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        let Ok(mut stream) = stream else { continue };
+                        let mut text = String::new();
+                        if (&mut stream)
+                            .take(MAX_PAYLOAD)
+                            .read_to_string(&mut text)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        if let Some(handoff) = Handoff::parse_payload(&text) {
+                            inbox.lock().expect("收件箱锁中毒").push(handoff);
+                        }
+                    }
+                })
+            };
+            Self {
+                path: path.to_path_buf(),
+                inbox,
+                stop,
+                thread: Some(thread),
             }
         }
-        Err(err) => Err(err),
+
+        /// socket 路径（= 锁的位置）。
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// 收件箱的共享句柄（给事件循环里的轮询用；当前没有消费方）。
+        pub fn inbox(&self) -> Arc<Mutex<Vec<Handoff>>> {
+            Arc::clone(&self.inbox)
+        }
+
+        /// 取走已到达的交接消息（破坏性：取过就没了）。
+        pub fn take_handoffs(&self) -> Vec<Handoff> {
+            let mut guard = self.inbox.lock().expect("收件箱锁中毒");
+            std::mem::take(&mut *guard)
+        }
+
+        /// 释放锁：停线程 → join → 删 socket 文件。可重复调用。
+        pub fn release(&mut self) {
+            let Some(handle) = self.thread.take() else {
+                return;
+            };
+            self.stop.store(true, Ordering::SeqCst);
+            // 自连一次解开阻塞的 `accept()`。
+            let _ = UnixStream::connect(&self.path);
+            let _ = handle.join();
+            let _ = fs::remove_file(&self.path);
+        }
+
+        /// 锁是否已经放掉。
+        pub fn is_released(&self) -> bool {
+            self.thread.is_none()
+        }
     }
+
+    impl Drop for Instance {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows 实现：独占文件句柄 + 交接文件
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use std::fs::{File, OpenOptions};
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    /// `ERROR_SHARING_VIOLATION`：文件已被别的进程以不共享方式打开。
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    /// 主实例轮询交接文件的间隔。
+    const POLL: Duration = Duration::from_millis(50);
+
+    fn handoff_path(lock: &Path) -> PathBuf {
+        lock.with_file_name(HANDOFF_FILE)
+    }
+
+    /// 以「不共享」方式打开锁文件：成功即抢到锁，失败且是共享冲突即已有实例。
+    fn open_exclusive(path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+    }
+
+    pub fn acquire_with_handoff(path: &Path, handoff: Option<Handoff>) -> std::io::Result<Acquire> {
+        ensure_parent(path)?;
+        match open_exclusive(path) {
+            Ok(lock) => Ok(Acquire::Primary(Instance::spawn(path, lock))),
+            Err(err) if err.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                let delivered = match write_handoff(path, handoff.as_ref()) {
+                    Ok(ok) => ok,
+                    Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
+                    Err(err) => return Err(err),
+                };
+                Ok(Acquire::Secondary(Secondary { handoff, delivered }))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// 把载荷写进交接文件；`handoff` 为 `None` 时只探活（同 Unix 分支）。
+    fn write_handoff(lock: &Path, handoff: Option<&Handoff>) -> std::io::Result<bool> {
+        let Some(handoff) = handoff else {
+            return Ok(false);
+        };
+        let target = handoff_path(lock);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(target)?;
+        file.write_all(handoff.to_payload().as_bytes())?;
+        file.flush()?;
+        Ok(true)
+    }
+
+    /// 主实例手里的锁 + 收件箱。
+    ///
+    /// 锁由独占文件句柄承载：进程退出（含崩溃）时内核自动释放，所以没有陈旧锁问题。
+    /// 交接靠轮询旁边的文件。
+    pub struct Instance {
+        path: PathBuf,
+        lock: Option<File>,
+        inbox: Arc<Mutex<Vec<Handoff>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Instance {
+        pub(super) fn spawn(path: &Path, lock: File) -> Self {
+            let inbox = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let inbox = Arc::clone(&inbox);
+                let stop = Arc::clone(&stop);
+                let source = handoff_path(path);
+                thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        // 先读后删：读到就消费掉，避免重复投递。
+                        if let Ok(text) = fs::read_to_string(&source) {
+                            let _ = fs::remove_file(&source);
+                            if text.len() as u64 <= MAX_PAYLOAD
+                                && let Some(handoff) = Handoff::parse_payload(&text)
+                            {
+                                inbox.lock().expect("收件箱锁中毒").push(handoff);
+                            }
+                        }
+                        thread::sleep(POLL);
+                    }
+                })
+            };
+            Self {
+                path: path.to_path_buf(),
+                lock: Some(lock),
+                inbox,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        /// 锁文件路径（= 锁的位置）。
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// 收件箱的共享句柄（给事件循环里的轮询用；当前没有消费方）。
+        pub fn inbox(&self) -> Arc<Mutex<Vec<Handoff>>> {
+            Arc::clone(&self.inbox)
+        }
+
+        /// 取走已到达的交接消息（破坏性：取过就没了）。
+        pub fn take_handoffs(&self) -> Vec<Handoff> {
+            let mut guard = self.inbox.lock().expect("收件箱锁中毒");
+            std::mem::take(&mut *guard)
+        }
+
+        /// 释放锁：停线程 → join → 关句柄 → 删锁文件。可重复调用。
+        pub fn release(&mut self) {
+            let Some(handle) = self.thread.take() else {
+                return;
+            };
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+            self.lock.take();
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(handoff_path(&self.path));
+        }
+
+        /// 锁是否已经放掉。
+        pub fn is_released(&self) -> bool {
+            self.thread.is_none()
+        }
+    }
+
+    impl Drop for Instance {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+}
+
+pub use imp::Instance;
+
+/// 抢锁；成为第二个实例时把 `handoff` 交给主实例。
+pub fn acquire_with_handoff(path: &Path, handoff: Option<Handoff>) -> std::io::Result<Acquire> {
+    imp::acquire_with_handoff(path, handoff)
 }
 
 /// 只抢锁、不交接（测试与「不需要传参」的入口用）。
 pub fn acquire(path: &Path) -> std::io::Result<Acquire> {
     acquire_with_handoff(path, None)
-}
-
-/// 连上去把载荷写进去；`handoff` 为 `None` 时只探活（Python 在 wake URI 分支里
-/// 一个字节都不发，但仍然要判断「有没有实例在跑」）。
-fn connect_and_send(path: &Path, handoff: Option<&Handoff>) -> std::io::Result<bool> {
-    let mut stream = UnixStream::connect(path)?;
-    let Some(handoff) = handoff else {
-        return Ok(false);
-    };
-    stream.write_all(handoff.to_payload().as_bytes())?;
-    stream.flush()?;
-    Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// 主实例
-// ---------------------------------------------------------------------------
-
-/// 主实例手里的锁 + 收件箱。`Drop` 时自动释放（与 Python `exec()` 的
-/// `finally: _unlockSingleInstance()` 同位置）。
-pub struct Instance {
-    path: PathBuf,
-    inbox: Arc<Mutex<Vec<Handoff>>>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl Instance {
-    fn spawn(path: &Path, listener: UnixListener) -> Self {
-        let inbox = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread = {
-            let inbox = Arc::clone(&inbox);
-            let stop = Arc::clone(&stop);
-            thread::spawn(move || {
-                for stream in listener.incoming() {
-                    // `release()` 会自连一次把 `accept()` 唤醒，此时直接收工。
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let Ok(mut stream) = stream else { continue };
-                    let mut text = String::new();
-                    if (&mut stream)
-                        .take(MAX_PAYLOAD)
-                        .read_to_string(&mut text)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    if let Some(handoff) = Handoff::parse_payload(&text) {
-                        inbox.lock().expect("收件箱锁中毒").push(handoff);
-                    }
-                }
-            })
-        };
-        Self {
-            path: path.to_path_buf(),
-            inbox,
-            stop,
-            thread: Some(thread),
-        }
-    }
-
-    /// socket 路径（= 锁的位置）。
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// 收件箱的共享句柄（给事件循环里的轮询用；当前没有消费方）。
-    pub fn inbox(&self) -> Arc<Mutex<Vec<Handoff>>> {
-        Arc::clone(&self.inbox)
-    }
-
-    /// 取走已到达的交接消息（破坏性：取过就没了）。
-    pub fn take_handoffs(&self) -> Vec<Handoff> {
-        let mut guard = self.inbox.lock().expect("收件箱锁中毒");
-        std::mem::take(&mut *guard)
-    }
-
-    /// 释放锁：停线程 → join → 删 socket 文件。可重复调用。
-    pub fn release(&mut self) {
-        let Some(handle) = self.thread.take() else {
-            return;
-        };
-        self.stop.store(true, Ordering::SeqCst);
-        // 自连一次解开阻塞的 `accept()`。
-        let _ = UnixStream::connect(&self.path);
-        let _ = handle.join();
-        let _ = fs::remove_file(&self.path);
-    }
-
-    /// 锁是否已经放掉。
-    pub fn is_released(&self) -> bool {
-        self.thread.is_none()
-    }
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        self.release();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +493,7 @@ impl Drop for Instance {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -331,12 +512,12 @@ mod tests {
 
     /// 收件箱是另一个线程在填，测试要等一会儿。
     fn wait_handoffs(instance: &Instance, want: usize) -> Vec<Handoff> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
         let mut got = Vec::new();
         while got.len() < want && Instant::now() < deadline {
             got.extend(instance.take_handoffs());
             if got.len() < want {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(10));
             }
         }
         got
@@ -403,15 +584,19 @@ mod tests {
         assert!(path.exists());
         instance.release();
         assert!(instance.is_released());
-        assert!(!path.exists(), "释放后应当删掉 socket 文件");
+        assert!(!path.exists(), "释放后应当删掉锁文件");
         instance.release(); // 可重复调用
 
         let again = acquire(&path).expect("重新抢锁");
         assert!(matches!(again, Acquire::Primary(_)));
     }
 
+    /// Unix 专有：陈旧 socket 的回收（Windows 用内核释放句柄，不需要这一步）。
+    #[cfg(unix)]
     #[test]
     fn stale_socket_is_reclaimed() {
+        use std::os::unix::net::UnixListener;
+
         let dir = temp_dir("stale");
         let path = dir.join(LOCK_FILE);
         // 造一个「监听者已经没了、文件还在」的陈旧 socket。
@@ -419,7 +604,7 @@ mod tests {
             let listener = UnixListener::bind(&path).expect("建 socket");
             drop(listener);
         }
-        assert!(path.exists(), "Linux 上 drop 不会删 socket 文件");
+        assert!(path.exists(), "Unix 上 drop 不会删 socket 文件");
 
         match acquire(&path).expect("抢锁") {
             Acquire::Primary(instance) => assert_eq!(instance.path(), path),
